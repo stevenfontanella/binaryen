@@ -99,8 +99,8 @@ Result<WASTModule> wastModule(Lexer& in, bool maybeInvalid = false) {
     return in.err("expected module");
   }
 
-  // If this is a QuotedModule, nothing to do. Otherwise if it's a normal WAT module, the WAT parser will handle this.
-  bool isDefinition = in.takeKeyword("definition"sv);
+  // // If this is a QuotedModule, nothing to do. Otherwise if it's a normal WAT module, the WAT parser will handle this.
+  // bool isDefinition = in.takeKeyword("definition"sv);
 
   // TODO: use ID?
   [[maybe_unused]] auto id = in.takeID();
@@ -129,9 +129,23 @@ Result<WASTModule> wastModule(Lexer& in, bool maybeInvalid = false) {
     // This is a normal inline module that should be parseable. Reset to the
     // start and parse it normally.
     in = std::move(reset);
+    if (!in.takeSExprStart("module"sv)) {
+      // todo
+      return in.err("impossible");
+    }
+    bool isDefinition = in.takeKeyword("definition"sv);
+
     auto wasm = std::make_shared<Module>();
+    if (auto id = in.takeID()) {
+      wasm->name = *id;
+    }
+
     wasm->features = FeatureSet::All;
     CHECK_ERR(parseModule(*wasm, in));
+    if (!in.takeRParen()) {
+      return in.err("expected end of module");
+    }
+
     wasm->instantiate = !isDefinition;
     return wasm;
   }

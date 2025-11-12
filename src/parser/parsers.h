@@ -3852,16 +3852,13 @@ template<typename Ctx> MaybeResult<> modulefield(Ctx& ctx) {
     CHECK_ERR(res);
     return Ok{};
   }
-  return ctx.in.err("unrecognized module field " + std::string(ctx.in.buffer.substr(ctx.in.getPos())));
+  return ctx.in.err("unrecognized module field");
 }
 
 // module ::= '(' 'module' id? (m:modulefield)* ')'
 //          | (m:modulefield)* eof
 template<typename Ctx> Result<> module(Ctx& ctx) {
   bool outer = ctx.in.takeSExprStart("module"sv);
-  if (ctx.in.takeKeyword("definition"sv)) {
-    ctx.wasm.instantiate = false;
-  }
 
   if (outer) {
     if (auto id = ctx.in.takeID()) {
