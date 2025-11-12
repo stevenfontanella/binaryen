@@ -88,14 +88,20 @@ Result<Action> action(Lexer& in) {
   return in.err("expected action");
 }
 
-// (module id? binary string*)
-// (module id? quote string*)
+// (module id binary string*)
+// (module id quote string*)
+// TODO
+// (module definition ....)
 // (module ...)
 Result<WASTModule> wastModule(Lexer& in, bool maybeInvalid = false) {
   Lexer reset = in;
   if (!in.takeSExprStart("module"sv)) {
     return in.err("expected module");
   }
+
+  // If this is a QuotedModule, nothing to do. Otherwise if it's a normal WAT module, the WAT parser will handle this.
+  bool isDefinition = in.takeKeyword("definition"sv);
+
   // TODO: use ID?
   [[maybe_unused]] auto id = in.takeID();
   QuotedModuleType type;
@@ -126,6 +132,7 @@ Result<WASTModule> wastModule(Lexer& in, bool maybeInvalid = false) {
     auto wasm = std::make_shared<Module>();
     wasm->features = FeatureSet::All;
     CHECK_ERR(parseModule(*wasm, in));
+    wasm->instantiate = !isDefinition;
     return wasm;
   }
 
@@ -441,16 +448,68 @@ MaybeResult<Register> register_(Lexer& in) {
   }
 
   // TODO: Do we need to use this optional id?
-  in.takeID();
+  auto instanceName = in.takeID();
 
   if (!in.takeRParen()) {
     // TODO: handle optional module id.
     return in.err("expected end of register command");
   }
-  return Register{*name};
+
+  Register r;
+  r.name = *name;
+  r.instanceName = instanceName;
+  return r;
+
+  // todo why doesn't this work?
+  // return Register{name=*name, instanceName=instanceName};
 }
 
-// module | register | action | assertion
+// (module instance instance_name module_name)
+MaybeResult<ModuleInstantiation> instantiation(Lexer& in) {
+  if (!in.takeSExprStart("module"sv)) {
+    std::optional<std::string_view> actual = in.peekKeyword();
+    return in.err(std::string(std::string("expected `module` keyword but got ") + std::string(actual.has_value() ? *actual : "<not a keyword>"sv)));
+  }
+  if (!in.takeKeyword("instance"sv)) {
+    return {};
+    // std::optional<std::string_view> actual = in.peekKeyword();
+    // return in.err(std::string(std::string("expected `instance` keyword but got ") + std::string(actual.has_value() ? *actual : "<not a keyword>"sv)));
+  }
+
+  auto instanceId = in.takeID();
+  if (!instanceId.has_value()) {
+    return in.err("expected an instance id during module instantiation");
+  }
+  auto moduleId = in.takeID();
+  if (!moduleId.has_value()) {
+    return in.err("expected an module id during module instantiation");
+  }
+
+  if (!in.takeRParen()) {
+    return in.err("expected end of module instantiation");
+  }
+
+  return ModuleInstantiation{.moduleName = *moduleId, .instanceName = *instanceId};
+}
+
+using ModuleOrInstantiation = std::variant<ModuleInstantiation, WASTModule>;
+
+// module instance | module
+Result<ModuleOrInstantiation> moduleOrInstantiation(Lexer& in) {
+  auto reset = in;
+
+  if (auto inst = instantiation(in)) {
+    CHECK_ERR(inst);
+    return *inst;
+  }
+  in = reset;
+
+  auto module = wastModule(in);
+  CHECK_ERR(module);
+  return *module;
+}
+
+// instantiate | module | register | action | assertion
 Result<WASTCommand> command(Lexer& in) {
   if (auto cmd = register_(in)) {
     CHECK_ERR(cmd);
@@ -464,9 +523,18 @@ Result<WASTCommand> command(Lexer& in) {
     CHECK_ERR(cmd);
     return *cmd;
   }
-  auto mod = wastModule(in);
-  CHECK_ERR(mod);
-  return *mod;
+  auto cmd = moduleOrInstantiation(in);
+  CHECK_ERR(cmd);
+
+  if (auto inst = std::get_if<ModuleInstantiation>(&*cmd)) {
+    return static_cast<WASTCommand>(*inst);
+  }
+  if (auto mod = std::get_if<WASTModule>(&*cmd)) {
+    return WASTCommand(*mod);
+    // return static_cast<WASTCommand>(*mod);
+  }
+
+  WASM_UNREACHABLE("");
 }
 
 #pragma GCC diagnostic push

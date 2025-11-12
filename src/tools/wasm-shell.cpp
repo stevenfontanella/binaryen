@@ -40,6 +40,8 @@ using namespace wasm::WATParser;
 
 struct Shell {
   std::map<Name, std::shared_ptr<Module>> modules;
+
+  // Keyed by instance
   std::map<Name, std::shared_ptr<ShellExternalInterface>> interfaces;
   std::map<Name, std::shared_ptr<ModuleRunner>> instances;
   // used for imports
@@ -86,6 +88,8 @@ struct Shell {
       return Ok{};
     } else if (auto* assn = std::get_if<Assertion>(&cmd)) {
       return doAssertion(*assn);
+    } else if (auto* instantiateModule = std::get_if<ModuleInstantiation>(&cmd)) {
+      return doInstantiation(*instantiateModule);
     } else {
       WASM_UNREACHABLE("unexpected command");
     }
@@ -156,30 +160,39 @@ struct Shell {
     auto wasm = *module;
     CHECK_ERR(validateModule(*wasm));
 
-    auto instanceInfo = instantiate(*wasm);
-    CHECK_ERR(instanceInfo);
-
-    auto& [interface, instance] = *instanceInfo;
     lastModule = wasm->name;
-    modules[lastModule] = std::move(wasm);
-    interfaces[lastModule] = std::move(interface);
-    instances[lastModule] = std::move(instance);
+    modules[lastModule] = wasm;
+    if (wasm->instantiate) {
+      // todo reuse the function?
+      auto instanceInfo = instantiate(*wasm);
+      CHECK_ERR(instanceInfo);
+
+      auto& [interface, instance] = *instanceInfo;
+      interfaces[lastModule] = std::move(interface);
+      instances[lastModule] = std::move(instance);
+    }
 
     return Ok{};
   }
 
   Result<> addRegistration(Register& reg) {
-    auto instance = instances[lastModule];
+    wasm::Name instanceName = reg.instanceName.has_value() ? *reg.instanceName : lastModule;
+
+    auto instance = instances[instanceName];
     if (!instance) {
       return Err{"register called without a module"};
     }
-    linkedInstances[reg.name] = instance;
+    linkedInstances[instanceName] = instance;
 
     // We copy pointers as a registered module's name might still be used
     // in an assertion or invoke command.
+
+    // todo: This should be deleted?
     modules[reg.name] = modules[lastModule];
-    interfaces[reg.name] = interfaces[lastModule];
-    instances[reg.name] = instances[lastModule];
+
+    // this should be fine
+    interfaces[reg.name] = interfaces[instanceName];
+    instances[reg.name] = instances[instanceName];
     return Ok{};
   }
 
@@ -212,10 +225,13 @@ struct Shell {
   }
 
   ActionResult doAction(Action& act) {
+    std::cerr<<"Last module is "<< lastModule.toString() << "\n";
     assert(instances[lastModule].get());
     if (auto* invoke = std::get_if<InvokeAction>(&act)) {
+      std::cerr<<"InvokeAction "<< (invoke->base ? *invoke->base : lastModule.toString() ) << " " << invoke->name<<"\n";
       auto it = instances.find(invoke->base ? *invoke->base : lastModule);
       if (it == instances.end()) {
+        std::cerr<<"No instance\n";
         return TrapResult{};
       }
       auto& instance = it->second;
@@ -266,6 +282,18 @@ struct Shell {
     } else {
       WASM_UNREACHABLE("unexpected assertion");
     }
+  }
+
+  // TODO no const?
+  Result<> doInstantiation(const ModuleInstantiation& instantiateModule) {
+      auto instanceInfo = instantiate(*modules[instantiateModule.moduleName]);
+      CHECK_ERR(instanceInfo);
+
+      auto& [interface, instance] = *instanceInfo;
+      interfaces[instantiateModule.instanceName] = std::move(interface);
+      instances[instantiateModule.instanceName] = std::move(instance);
+
+      return Ok{};
   }
 
   Result<> checkNaN(Literal val, NaNResult nan) {
@@ -513,6 +541,8 @@ struct Shell {
 
     // print_* functions are handled separately, no need to define here.
 
+    // todo call instantiate manually?
+    spectest->instantiate = true;
     WASTModule mod = std::move(spectest);
     auto added = addModule(mod);
     if (added.getErr()) {
@@ -521,7 +551,7 @@ struct Shell {
     Register registration{"spectest"};
     auto registered = addRegistration(registration);
     if (registered.getErr()) {
-      WASM_UNREACHABLE("error registering spectest module");
+      WASM_UNREACHABLE((std::string("error registering spectest module: ") + registered.getErr()->msg).c_str());
     }
   }
 };

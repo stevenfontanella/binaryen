@@ -104,10 +104,17 @@ struct AssertModule {
 using Assertion = std::variant<AssertReturn, AssertAction, AssertModule>;
 
 struct Register {
+  // todo rename this
   Name name;
+  std::optional<Name> instanceName = std::nullopt;
 };
 
-using WASTCommand = std::variant<WASTModule, Register, Action, Assertion>;
+struct ModuleInstantiation {
+  Name moduleName;
+  Name instanceName;
+};
+
+using WASTCommand = std::variant<WASTModule, Register, Action, Assertion, ModuleInstantiation>;
 
 struct ScriptEntry {
   WASTCommand cmd;
