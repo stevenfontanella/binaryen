@@ -138,11 +138,21 @@ struct Shell {
                                  std::shared_ptr<ModuleRunner>>;
 
   Result<InstanceInfo> instantiate(Module& wasm) {
+
     try {
+      std::cerr<< "Instantiating "<< wasm.name.toString() <<". LinkedInstances are ";
+      for (auto& linkedInstance : linkedInstances) {
+        std::cerr<< ", "<< linkedInstance.first.toString() << ": " << linkedInstance.second.get();
+      }
+      std::cerr<<"\n";
+
       auto interface =
         std::make_shared<ShellExternalInterface>(linkedInstances);
       auto instance =
         std::make_shared<ModuleRunner>(wasm, interface.get(), linkedInstances);
+
+      // interfaces[lastModule] = interface;
+      // instances[lastModule] = instance;
       // This is not an optimization: we want to execute anything, even relaxed
       // SIMD instructions.
       instance->setRelaxedBehavior(ModuleRunner::RelaxedBehavior::Execute);
@@ -469,6 +479,7 @@ struct Shell {
       return Err{"expected invalid module"};
     }
 
+    // doinstantiate or instantiate?
     auto instance = instantiate(**wasm);
     if (auto* err = instance.getErr()) {
       if (assn.type == ModuleAssertionType::Unlinkable ||

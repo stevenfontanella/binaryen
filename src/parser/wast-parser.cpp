@@ -99,11 +99,9 @@ Result<WASTModule> wastModule(Lexer& in, bool maybeInvalid = false) {
     return in.err("expected module");
   }
 
-  // // If this is a QuotedModule, nothing to do. Otherwise if it's a normal WAT module, the WAT parser will handle this.
-  // bool isDefinition = in.takeKeyword("definition"sv);
+  // We'll read this again in the 'inline module' case
+  (void) in.takeID();
 
-  // TODO: use ID?
-  [[maybe_unused]] auto id = in.takeID();
   QuotedModuleType type;
   if (in.takeKeyword("quote"sv)) {
     type = QuotedModuleType::Text;
@@ -126,8 +124,7 @@ Result<WASTModule> wastModule(Lexer& in, bool maybeInvalid = false) {
     std::string mod(reset.next().substr(0, in.getPos() - reset.getPos()));
     return QuotedModule{QuotedModuleType::Text, mod};
   } else {
-    // This is a normal inline module that should be parseable. Reset to the
-    // start and parse it normally.
+    // In this case the module is mostly valid WAT, unless it is a module definition in which case it will begin with (module definition ...)
     in = std::move(reset);
     if (!in.takeSExprStart("module"sv)) {
       // todo
@@ -141,7 +138,7 @@ Result<WASTModule> wastModule(Lexer& in, bool maybeInvalid = false) {
     }
 
     wasm->features = FeatureSet::All;
-    CHECK_ERR(parseModule(*wasm, in));
+    CHECK_ERR(parseModuleBody(*wasm, in));
     if (!in.takeRParen()) {
       return in.err("expected end of module");
     }
@@ -461,7 +458,6 @@ MaybeResult<Register> register_(Lexer& in) {
     return in.err("expected name");
   }
 
-  // TODO: Do we need to use this optional id?
   auto instanceName = in.takeID();
 
   if (!in.takeRParen()) {
