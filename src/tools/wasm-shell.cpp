@@ -195,7 +195,7 @@ struct Shell {
       return Err{"register called without a module"};
     }
     std::cerr<<"Adding linkedInstance "<< reg.name << " to "<< instanceName.toString() << "\n";
-    linkedInstances[instanceName] = instance;
+    linkedInstances[reg.name] = instance;
 
     // We copy pointers as a registered module's name might still be used
     // in an assertion or invoke command.
