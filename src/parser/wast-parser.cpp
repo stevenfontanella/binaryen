@@ -99,8 +99,12 @@ Result<WASTModule> wastModule(Lexer& in, bool maybeInvalid = false) {
     return in.err("expected module");
   }
 
-  // We'll read this again in the 'inline module' case
+  // We'll read these again in the 'inline module' case
+  bool isDefinition = in.takeKeyword("definition"sv);
+  (void) isDefinition;
   (void) in.takeID();
+
+  // (void) in.takeID();
 
   QuotedModuleType type;
   if (in.takeKeyword("quote"sv)) {
@@ -126,10 +130,10 @@ Result<WASTModule> wastModule(Lexer& in, bool maybeInvalid = false) {
   } else {
     // In this case the module is mostly valid WAT, unless it is a module definition in which case it will begin with (module definition ...)
     in = std::move(reset);
-    if (!in.takeSExprStart("module"sv)) {
-      // todo
-      return in.err("impossible");
-    }
+
+    // We already checked this before resetting
+    assert(in.takeSExprStart("module"sv));
+
     bool isDefinition = in.takeKeyword("definition"sv);
 
     auto wasm = std::make_shared<Module>();
@@ -465,13 +469,7 @@ MaybeResult<Register> register_(Lexer& in) {
     return in.err("expected end of register command");
   }
 
-  Register r;
-  r.name = *name;
-  r.instanceName = instanceName;
-  return r;
-
-  // todo why doesn't this work?
-  // return Register{name=*name, instanceName=instanceName};
+  return Register{.name=*name, .instanceName=instanceName};
 }
 
 // (module instance instance_name module_name)

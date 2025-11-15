@@ -1,7 +1,7 @@
 ;; Test that we can create a function in one module and call it using call_ref
 ;; from another.
 
-(module
+(module $A
   (type $func-i32 (func (result i32)))
 
   (func $inner (result i32)
@@ -18,7 +18,7 @@
 
 (register "first")
 
-(module
+(module $B
   (type $func-i32 (func (result i32)))
 
   (import "first" "get-func-i32" (func $imported (result (ref $func-i32))))

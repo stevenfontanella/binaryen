@@ -103,8 +103,15 @@ struct ShellExternalInterface : ModuleRunner::ExternalInterface {
   virtual ~ShellExternalInterface() = default;
 
   ModuleRunner* getImportInstanceOrNull(Importable* import) {
+    std::cerr<< "getImportInstanceOrNull: ";
+    for (const auto& linkedInstance : linkedInstances) {
+      std::cerr<< linkedInstance.first.str << " ";
+    }
+    std::cerr<<"\n";
+
     auto it = linkedInstances.find(import->module);
     if (it == linkedInstances.end()) {
+      std::cerr<<"returning null, didn't find " << import->module.toString() << "\n";
       return nullptr;
     }
     return it->second.get();

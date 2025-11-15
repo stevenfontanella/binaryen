@@ -186,12 +186,15 @@ struct Shell {
   }
 
   Result<> addRegistration(Register& reg) {
+    std::cerr<<"Register\n";
     wasm::Name instanceName = reg.instanceName.has_value() ? *reg.instanceName : lastModule;
 
     auto instance = instances[instanceName];
     if (!instance) {
+      std::cerr<<"returned\n";
       return Err{"register called without a module"};
     }
+    std::cerr<<"Adding linkedInstance "<< reg.name << " to "<< instanceName.toString() << "\n";
     linkedInstances[instanceName] = instance;
 
     // We copy pointers as a registered module's name might still be used
