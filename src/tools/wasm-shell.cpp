@@ -102,6 +102,7 @@ struct Shell {
       switch (quoted->type) {
         case QuotedModuleType::Text: {
           CHECK_ERR(parseModule(*wasm, quoted->module));
+          wasm->instantiate = quoted->instantiate;
           break;
         }
         case QuotedModuleType::Binary: {
@@ -115,6 +116,7 @@ struct Shell {
             p.dump(ss);
             return Err{ss.str()};
           }
+          wasm->instantiate = quoted->instantiate;
           break;
         }
       }

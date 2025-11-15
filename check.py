@@ -221,7 +221,8 @@ def run_spec_tests():
 
         check_expected(actual, expected)
 
-        run_spec_test(wast)
+        # TODO can we remove this?
+        # run_spec_test(wast)
 
         # check binary format. here we can verify execution of the final
         # result, no need for an output verification

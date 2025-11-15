@@ -102,9 +102,8 @@ Result<WASTModule> wastModule(Lexer& in, bool maybeInvalid = false) {
   // We'll read these again in the 'inline module' case
   bool isDefinition = in.takeKeyword("definition"sv);
   (void) isDefinition;
-  (void) in.takeID();
 
-  // (void) in.takeID();
+  (void) in.takeID();
 
   QuotedModuleType type;
   if (in.takeKeyword("quote"sv)) {
@@ -126,7 +125,7 @@ Result<WASTModule> wastModule(Lexer& in, bool maybeInvalid = false) {
       }
     }
     std::string mod(reset.next().substr(0, in.getPos() - reset.getPos()));
-    return QuotedModule{QuotedModuleType::Text, mod};
+    return QuotedModule{!isDefinition, QuotedModuleType::Text, mod};
   } else {
     // In this case the module is mostly valid WAT, unless it is a module definition in which case it will begin with (module definition ...)
     in = std::move(reset);
@@ -161,7 +160,8 @@ Result<WASTModule> wastModule(Lexer& in, bool maybeInvalid = false) {
     return in.err("expected end of module");
   }
 
-  return QuotedModule{type, ss.str()};
+  // std::cerr<<"Parsed " << static_cast<int>(type) << " " << ss.str()<< "\n";
+  return QuotedModule{!isDefinition, type, ss.str()};
 }
 
 Result<NaNKind> nan(Lexer& in) {

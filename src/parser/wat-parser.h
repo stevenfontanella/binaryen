@@ -91,6 +91,7 @@ struct AssertAction {
 enum class QuotedModuleType { Text, Binary };
 
 struct QuotedModule {
+  bool instantiate = false;
   QuotedModuleType type;
   std::string module;
 };

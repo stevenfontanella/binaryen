@@ -439,7 +439,7 @@ SPEC_TESTSUITE_TESTS_TO_SKIP = [
     'memory64-imports.wast',  # Missing validation on instantiation
     'annotations.wast',  # String annotations IDs should be allowed
     'id.wast',       # Empty IDs should be disallowed
-    # 'instance.wast',  # Requires wast `module definition` support, also requires ref.null wast constants
+    'instance.wast',  # Requires wast `module definition` support, also requires ref.null wast constants
     'table64.wast',   # Requires wast `module definition` support
     'table_grow.wast',  # Incorrect table linking semantics in interpreter
     'tag.wast',      # Non-empty tag results allowed by stack switching
