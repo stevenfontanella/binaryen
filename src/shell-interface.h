@@ -149,6 +149,7 @@ struct ShellExternalInterface : ModuleRunner::ExternalInterface {
   }
 
   Literal getImportedFunction(Function* import) override {
+    std::cerr<<"getImportedFunction "<< import->name.toString() << "\n";
     // TODO: We should perhaps restrict the types with which the well-known
     // functions can be imported.
     if (import->module == SPECTEST && import->base.startsWith(PRINT)) {

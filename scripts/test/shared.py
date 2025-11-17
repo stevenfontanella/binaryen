@@ -435,12 +435,10 @@ SPEC_TESTSUITE_TESTS_TO_SKIP = [
     'if.wast',      # Requires more precise unreachable validation
     'imports.wast',  # Missing validation of missing function on instantiation
     'linking.wast',  # Missing function type validation on instantiation
-    'memory.wast',   # Requires wast `module definition` support
     'memory64-imports.wast',  # Missing validation on instantiation
     'annotations.wast',  # String annotations IDs should be allowed
     'id.wast',       # Empty IDs should be disallowed
-    'instance.wast',  # Requires wast `module definition` support, also requires ref.null wast constants
-    'table64.wast',   # Requires wast `module definition` support
+    # 'instance.wast',  # Requires wast `module definition` support, also requires ref.null wast constants
     'table_grow.wast',  # Incorrect table linking semantics in interpreter
     'tag.wast',      # Non-empty tag results allowed by stack switching
     'try_table.wast',  # Requires try_table interpretation
@@ -464,7 +462,7 @@ SPEC_TESTSUITE_TESTS_TO_SKIP = [
     'type-rec.wast',  # Missing function type validation on instantiation
     'type-subtyping.wast',  # ShellExternalInterface::callTable does not handle subtyping
     'call_indirect.wast',   # Bug with 64-bit inline element segment parsing
-    'memory64.wast',        # Requires wast `module definition` support
+    # 'memory64.wast',        # Requires wast `module definition` support
     'imports0.wast',        # Missing memory type validation on instantiation
     'imports2.wast',        # Missing memory type validation on instantiation
     'imports3.wast',        # Missing memory type validation on instantiation

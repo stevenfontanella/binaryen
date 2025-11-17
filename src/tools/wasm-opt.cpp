@@ -19,6 +19,9 @@
 // then writes it.
 //
 
+
+// need WAST support here too?
+
 #include <memory>
 
 #include "execution-results.h"

@@ -3229,6 +3229,7 @@ public:
   }
 
   Tag* getExportedTag(Name name) {
+    std::cerr<<"getExportedTag "<< name.toString() << "\n";
     Export* export_ = wasm.getExportOrNull(name);
     if (!export_ || export_->kind != ExternalKind::Tag) {
       externalInterface->trap("exported tag not found");
@@ -3270,8 +3271,10 @@ private:
   };
 
   TableInstanceInfo getTableInstanceInfo(Name name) {
+    std::cerr<<"getTableInstanceInfo " << name.toString() << "\n";
     auto* table = wasm.getTable(name);
     if (table->imported()) {
+      std::cerr<<"getTableInstanceInfo "<< table->module.toString() << "\n";
       auto& importedInstance = linkedInstances.at(table->module);
       auto* tableExport = importedInstance->wasm.getExport(table->base);
       return importedInstance->getTableInstanceInfo(
@@ -3509,8 +3512,10 @@ protected:
   // Tag* object for it: the Tag in this module, if not imported, and if
   // imported, the Tag in the originating module.
   Tag* getCanonicalTag(Name name) {
+    std::cerr<<"getCanonicalTag "<< name.toString() << "\n";
     auto* inst = self();
     auto* tag = inst->wasm.getTag(name);
+    std::cerr<<"tag module is "<< tag->module.toString() << "\n";
     if (!tag->imported()) {
       return tag;
     }
