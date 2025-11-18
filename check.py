@@ -243,6 +243,7 @@ def run_spec_tests():
                     transformed_spec_file.write(result_wast + '\n' + '\n'.join(asserts))
 
         # compare all the outputs to the expected output
+        print("Running base", base)
         actual = run_spec_test(base)
         check_expected(actual, os.path.join(shared.get_test_dir('spec'), 'expected-output', base + '.log'))
 

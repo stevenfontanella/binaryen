@@ -90,7 +90,10 @@ def untar(tarfile, outdir):
 
 QUOTED = re.compile(r'\(module\s*(\$\S*)?\s+(quote|binary)')
 
+MODULE_DEFINITION_OR_INSTANCE = re.compile(r'(?m)\(module\s+(instance|definition)')
 
+# Returns a list of pairs of module definitions and assertions
+# Module invalidity tests, as well as (module definition ...) and (module instance ...) are skipped
 def split_wast(wastFile):
     # if it's a binary, leave it as is, we can't split it
     wast = None
@@ -152,6 +155,8 @@ def split_wast(wastFile):
             ignoring_quoted = True
             continue
         if chunk.startswith('(module'):
+            if MODULE_DEFINITION_OR_INSTANCE.match(chunk):
+                continue
             ignoring_quoted = False
             ret += [(chunk, [])]
         elif chunk.startswith('(assert_invalid'):
