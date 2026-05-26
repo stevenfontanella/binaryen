@@ -479,6 +479,7 @@ private:
   Expression* makeTupleMake(Type type);
   Expression* makeWideIntAddSub(Type type);
   Expression* makeWideIntMul(Type type);
+  Expression* makeWideIntExpression(Type type);
   Expression* makeTupleExtract(Type type);
   Expression* makePointer();
   Expression* makeNonAtomicLoad(Type type);
@@ -495,7 +496,8 @@ private:
   // able to emit a literal Const, like say if the type is a function reference
   // then we may emit a RefFunc, but also we may have other requirements, like
   // we may add a GC cast to fixup the type.
-  Expression* makeConst(Type type);
+  Expression* makeConst(Type type, bool isGlobalInitializer = false);
+  Expression* makeConstForNonGlobal(Type type) { return makeConst(type, false); }
 
   // Generate reference values. One function handles basic types, and the other
   // compound ones.
