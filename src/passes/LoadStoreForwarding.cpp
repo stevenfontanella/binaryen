@@ -15,14 +15,23 @@
  */
 
 //
-// Load-store forwarding for GC references. When a struct field is stored
-// with a value we can repeat later - a local.get or a constant - and then
-// loaded from the same object before anything can change the field, we can
-// use the stored value directly, avoiding the load:
+// Load-store forwarding for GC references. When a struct field is stored and
+// then loaded from the same object before anything can change the field, we
+// can use the stored value directly, avoiding the load. Values we can repeat
+// at the load - constants and local.gets - are forwarded as they are:
 //
 //  (struct.set $T 0 (local.get $ref) (local.get $value))
 //  ..
 //  (struct.get $T 0 (local.get $ref)) ;; can be (local.get $value)
+//
+// (We deliberately do not introduce locals for those, as constants are best
+// left visible to other passes - see also LocalCSE - and as it allows
+// forwarding even when paths merge, see below.) Other values are captured in
+// a fresh local at the store, when a load actually wants them:
+//
+//  (struct.set $T 0 (local.get $ref) (local.tee $new (..complex..)))
+//  ..
+//  (struct.get $T 0 (local.get $ref)) ;; can be (local.get $new)
 //
 // We also learn the values of constant-initialized fields from allocations:
 //
@@ -49,11 +58,14 @@
 //
 // TODO: Also forward from packed fields, by masking the stored value.
 // TODO: Also forward array.set values to array.gets of constant indexes.
+// TODO: When the stored value is already a local.tee, reuse its local
+//       instead of adding a second one.
 //
 
 #include <optional>
 
 #include "cfg/cfg-traversal.h"
+#include "support/insert_ordered.h"
 #include "ir/effects.h"
 #include "ir/manipulation.h"
 #include "ir/properties.h"
@@ -72,10 +84,21 @@ struct KnownValue {
   // reason about aliasing: a write through a reference of an unrelated type
   // cannot refer to the same object.
   HeapType type;
-  // The stored value, a local.get or a constant.
+  // The stored value.
   Expression* value;
+  // If the value is not repeatable at a load (it is neither a local.get nor a
+  // constant), then forwarding it requires capturing it in a local at the
+  // store, and this is the store.
+  StructSet* source = nullptr;
 
   bool operator==(const KnownValue& other) const {
+    if (source || other.source) {
+      // A value that needs to be captured in a local can only be provided by
+      // the one store that computes it: compare by identity. (In particular,
+      // structurally identical values from different stores must not merge,
+      // as they would be captured in different locals.)
+      return source == other.source;
+    }
     return type == other.type && ExpressionAnalyzer::equal(value, other.value);
   }
 };
@@ -107,8 +130,9 @@ struct LoadStoreForwarding
 
   bool isFunctionParallel() override { return true; }
 
-  // We only replace struct.gets with existing values; locals are unchanged.
-  bool requiresNonNullableLocalFixups() override { return false; }
+  // Note that we may add locals of non-nullable reference types, whose gets,
+  // while dominated by the tees in the CFG, may not satisfy wasm's structural
+  // validation rule for them, so we need the pass runner's default fixups.
 
   std::unique_ptr<Pass> create() override {
     return std::make_unique<LoadStoreForwarding>();
@@ -121,6 +145,10 @@ struct LoadStoreForwarding
   // Whether we replaced a get with a value of a more refined type, which
   // requires refinalization at the end.
   bool refinalize = false;
+
+  // The loads that want the value of a store that must be captured in a
+  // local, in insertion order so that the locals we add are deterministic.
+  InsertOrderedMap<StructSet*, std::vector<Expression**>> teeRequests;
 
   // While building the CFG, note the expressions relevant to the analysis.
   void visitExpression(Expression* curr) {
@@ -146,6 +174,7 @@ struct LoadStoreForwarding
       return;
     }
     refinalize = false;
+    teeRequests.clear();
 
     // Build the CFG, noting the relevant actions in each basic block.
     Super::doWalkFunction(func);
@@ -186,6 +215,27 @@ struct LoadStoreForwarding
       for (auto** currp : block->contents.actions) {
         transfer(state, currp, /*apply=*/true);
       }
+    }
+
+    // Capture the values that loads requested in locals. We replace all of
+    // the loads before modifying the stores: a load that we forward may
+    // itself be the value of a later store that we tee, and we must tee the
+    // load's replacement, not overwrite the tee.
+    Builder builder(*getModule());
+    std::vector<std::pair<StructSet*, Index>> tees;
+    for (auto& [set, users] : teeRequests) {
+      auto type = set->value->type;
+      auto var = Builder::addVar(func, type);
+      tees.push_back({set, var});
+      for (auto** currp : users) {
+        if ((*currp)->type != type) {
+          refinalize = true;
+        }
+        *currp = builder.makeLocalGet(var, type);
+      }
+    }
+    for (auto& [set, var] : tees) {
+      set->value = builder.makeLocalTee(var, set->value, set->value->type);
     }
 
     if (refinalize) {
@@ -262,10 +312,14 @@ struct LoadStoreForwarding
       // The stored value is truncated, so the loaded value may differ.
       return;
     }
-    if (!isForwardable(curr->value)) {
-      return;
+    if (isForwardable(curr->value)) {
+      state[{ref->index, curr->index}] = {heapType, curr->value};
+    } else if (curr->value->type.isConcrete()) {
+      // We cannot repeat this value at a load, but we can capture it in a
+      // local at this store if a load wants it. (Skip non-concrete values:
+      // this is unreachable code, best left for DCE.)
+      state[{ref->index, curr->index}] = {heapType, curr->value, curr};
     }
-    state[{ref->index, curr->index}] = {heapType, curr->value};
   }
 
   void transferStructGet(KnownValues& state, StructGet* curr,
@@ -283,6 +337,12 @@ struct LoadStoreForwarding
     }
     auto iter = state.find({ref->index, curr->index});
     if (iter == state.end()) {
+      return;
+    }
+    if (auto* source = iter->second.source) {
+      // The value must be captured in a local at the store, which we do at
+      // the end, once we know all of the loads that want it.
+      teeRequests[source].push_back(currp);
       return;
     }
     auto* value = ExpressionManipulator::copy(iter->second.value, *getModule());

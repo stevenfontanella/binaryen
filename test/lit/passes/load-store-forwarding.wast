@@ -6,6 +6,8 @@
  ;; field, so writes to it can never alias writes to $A or $B.
  ;; CHECK:      (type $A (sub (struct (field (mut i32)) (field (mut i32)))))
  (type $A (sub (struct (field (mut i32)) (field (mut i32)))))
+ ;; CHECK:      (type $refs (sub (struct (field (mut (ref null $A))))))
+
  ;; CHECK:      (type $packed (struct (field (mut i8))))
 
  ;; CHECK:      (type $B (sub $A (struct (field (mut i32)) (field (mut i32)))))
@@ -15,11 +17,12 @@
 
  (type $packed (struct (field (mut i8))))
 
- ;; CHECK:      (type $refs (sub (struct (field (mut (ref null $A))))))
  (type $refs (sub (struct (field (mut (ref null $A))))))
 
  ;; CHECK:      (import "env" "import" (func $import (type $9)))
  (import "env" "import" (func $import))
+ ;; CHECK:      (import "env" "import-i32" (func $import-i32 (type $6) (result i32)))
+ (import "env" "import-i32" (func $import-i32 (result i32)))
 
  ;; CHECK:      (tag $e (type $9))
  (tag $e)
@@ -136,7 +139,7 @@
 
  ;; The load is through a different local (which might refer to a different
  ;; object), so nothing is forwarded.
- ;; CHECK:      (func $no-forward-other-local (type $5) (param $x (ref $A)) (param $y (ref $A)) (param $value i32) (result i32)
+ ;; CHECK:      (func $no-forward-other-local (type $7) (param $x (ref $A)) (param $y (ref $A)) (param $value i32) (result i32)
  ;; CHECK-NEXT:  (struct.set $A 0
  ;; CHECK-NEXT:   (local.get $x)
  ;; CHECK-NEXT:   (local.get $value)
@@ -157,7 +160,7 @@
 
  ;; A store through another reference of the same type may write to the same
  ;; object, invalidating what we know about the first store.
- ;; CHECK:      (func $invalidate-aliasing-store (type $5) (param $x (ref $A)) (param $y (ref $A)) (param $value i32) (result i32)
+ ;; CHECK:      (func $invalidate-aliasing-store (type $7) (param $x (ref $A)) (param $y (ref $A)) (param $value i32) (result i32)
  ;; CHECK-NEXT:  (struct.set $A 0
  ;; CHECK-NEXT:   (local.get $x)
  ;; CHECK-NEXT:   (local.get $value)
@@ -186,7 +189,7 @@
 
  ;; The same, with a store through a reference of a subtype: it may still
  ;; alias, so nothing is forwarded.
- ;; CHECK:      (func $invalidate-subtype-store (type $11) (param $x (ref $A)) (param $y (ref $B)) (param $value i32) (result i32)
+ ;; CHECK:      (func $invalidate-subtype-store (type $12) (param $x (ref $A)) (param $y (ref $B)) (param $value i32) (result i32)
  ;; CHECK-NEXT:  (struct.set $A 0
  ;; CHECK-NEXT:   (local.get $x)
  ;; CHECK-NEXT:   (local.get $value)
@@ -215,7 +218,7 @@
 
  ;; A possibly-aliasing store to a *different* field does not interfere, and
  ;; we still forward.
- ;; CHECK:      (func $forward-past-other-field-store (type $5) (param $x (ref $A)) (param $y (ref $A)) (param $value i32) (result i32)
+ ;; CHECK:      (func $forward-past-other-field-store (type $7) (param $x (ref $A)) (param $y (ref $A)) (param $value i32) (result i32)
  ;; CHECK-NEXT:  (struct.set $A 0
  ;; CHECK-NEXT:   (local.get $x)
  ;; CHECK-NEXT:   (local.get $value)
@@ -242,7 +245,7 @@
 
  ;; A store through a reference of an unrelated type cannot alias, and we
  ;; still forward.
- ;; CHECK:      (func $forward-past-unrelated-store (type $12) (param $x (ref $A)) (param $z (ref $C)) (param $value i32) (result i32)
+ ;; CHECK:      (func $forward-past-unrelated-store (type $13) (param $x (ref $A)) (param $z (ref $C)) (param $value i32) (result i32)
  ;; CHECK-NEXT:  (struct.set $A 0
  ;; CHECK-NEXT:   (local.get $x)
  ;; CHECK-NEXT:   (local.get $value)
@@ -291,7 +294,7 @@
 
  ;; The reference local is written in between, so the load may be of another
  ;; object, and nothing is forwarded.
- ;; CHECK:      (func $invalidate-ref-local-set (type $5) (param $ref (ref $A)) (param $other (ref $A)) (param $value i32) (result i32)
+ ;; CHECK:      (func $invalidate-ref-local-set (type $7) (param $ref (ref $A)) (param $other (ref $A)) (param $value i32) (result i32)
  ;; CHECK-NEXT:  (struct.set $A 0
  ;; CHECK-NEXT:   (local.get $ref)
  ;; CHECK-NEXT:   (local.get $value)
@@ -575,7 +578,7 @@
 
  ;; One arm of the if writes to the field through a possibly-aliasing
  ;; reference, so the paths disagree after the if and nothing is forwarded.
- ;; CHECK:      (func $no-forward-past-if-invalidating (type $13) (param $ref (ref $A)) (param $other (ref $A)) (param $value i32) (param $cond i32) (result i32)
+ ;; CHECK:      (func $no-forward-past-if-invalidating (type $14) (param $ref (ref $A)) (param $other (ref $A)) (param $value i32) (param $cond i32) (result i32)
  ;; CHECK-NEXT:  (struct.set $A 0
  ;; CHECK-NEXT:   (local.get $ref)
  ;; CHECK-NEXT:   (local.get $value)
@@ -801,7 +804,7 @@
 
  ;; A non-constant struct.new operand is not forwarded (a later operand could
  ;; have changed the local before the allocation is assigned).
- ;; CHECK:      (func $no-forward-new-local (type $14) (param $value i32) (result i32)
+ ;; CHECK:      (func $no-forward-new-local (type $15) (param $value i32) (result i32)
  ;; CHECK-NEXT:  (local $ref (ref null $A))
  ;; CHECK-NEXT:  (local.set $ref
  ;; CHECK-NEXT:   (struct.new $A
@@ -828,7 +831,7 @@
 
  ;; The stored value is truncated when written to a packed field, so nothing
  ;; is forwarded.
- ;; CHECK:      (func $no-forward-packed (type $15) (param $ref (ref $packed)) (param $value i32) (result i32)
+ ;; CHECK:      (func $no-forward-packed (type $16) (param $ref (ref $packed)) (param $value i32) (result i32)
  ;; CHECK-NEXT:  (struct.set $packed 0
  ;; CHECK-NEXT:   (local.get $ref)
  ;; CHECK-NEXT:   (local.get $value)
@@ -868,7 +871,7 @@
 
  ;; The stored value is more refined than the field: forwarding it refines the
  ;; type of the load as well.
- ;; CHECK:      (func $forward-refined (type $16) (param $ref (ref $refs)) (param $value (ref $B)) (result anyref)
+ ;; CHECK:      (func $forward-refined (type $17) (param $ref (ref $refs)) (param $value (ref $B)) (result anyref)
  ;; CHECK-NEXT:  (struct.set $refs 0
  ;; CHECK-NEXT:   (local.get $ref)
  ;; CHECK-NEXT:   (local.get $value)
@@ -885,21 +888,22 @@
   )
  )
 
- ;; The stored value is too complex to repeat at the load, so nothing is
- ;; forwarded.
- ;; CHECK:      (func $no-forward-complex (type $1) (param $ref (ref $A)) (param $value i32) (result i32)
+ ;; The stored value cannot be repeated at the load, so it is captured in a
+ ;; new local at the store, and the load reads that local.
+ ;; CHECK:      (func $forward-complex (type $1) (param $ref (ref $A)) (param $value i32) (result i32)
+ ;; CHECK-NEXT:  (local $2 i32)
  ;; CHECK-NEXT:  (struct.set $A 0
  ;; CHECK-NEXT:   (local.get $ref)
- ;; CHECK-NEXT:   (i32.add
- ;; CHECK-NEXT:    (local.get $value)
- ;; CHECK-NEXT:    (i32.const 1)
+ ;; CHECK-NEXT:   (local.tee $2
+ ;; CHECK-NEXT:    (i32.add
+ ;; CHECK-NEXT:     (local.get $value)
+ ;; CHECK-NEXT:     (i32.const 1)
+ ;; CHECK-NEXT:    )
  ;; CHECK-NEXT:   )
  ;; CHECK-NEXT:  )
- ;; CHECK-NEXT:  (struct.get $A 0
- ;; CHECK-NEXT:   (local.get $ref)
- ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (local.get $2)
  ;; CHECK-NEXT: )
- (func $no-forward-complex (param $ref (ref $A)) (param $value i32) (result i32)
+ (func $forward-complex (param $ref (ref $A)) (param $value i32) (result i32)
   (struct.set $A 0
    (local.get $ref)
    (i32.add
@@ -908,6 +912,269 @@
    )
   )
   (struct.get $A 0
+   (local.get $ref)
+  )
+ )
+
+ ;; The same even when the stored value is a call: it executes once, in its
+ ;; original position, and only the result is captured.
+ ;; CHECK:      (func $forward-complex-call (type $10) (param $ref (ref $A)) (result i32)
+ ;; CHECK-NEXT:  (local $1 i32)
+ ;; CHECK-NEXT:  (struct.set $A 0
+ ;; CHECK-NEXT:   (local.get $ref)
+ ;; CHECK-NEXT:   (local.tee $1
+ ;; CHECK-NEXT:    (call $import-i32)
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (local.get $1)
+ ;; CHECK-NEXT: )
+ (func $forward-complex-call (param $ref (ref $A)) (result i32)
+  (struct.set $A 0
+   (local.get $ref)
+   (call $import-i32)
+  )
+  (struct.get $A 0
+   (local.get $ref)
+  )
+ )
+
+ ;; The captured value is immune to changes of the locals it was computed
+ ;; from, unlike a plain local.get value (see $invalidate-value-local-set).
+ ;; CHECK:      (func $forward-complex-past-source-change (type $1) (param $ref (ref $A)) (param $value i32) (result i32)
+ ;; CHECK-NEXT:  (local $2 i32)
+ ;; CHECK-NEXT:  (struct.set $A 0
+ ;; CHECK-NEXT:   (local.get $ref)
+ ;; CHECK-NEXT:   (local.tee $2
+ ;; CHECK-NEXT:    (i32.add
+ ;; CHECK-NEXT:     (local.get $value)
+ ;; CHECK-NEXT:     (i32.const 1)
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (local.set $value
+ ;; CHECK-NEXT:   (i32.const 9)
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (local.get $2)
+ ;; CHECK-NEXT: )
+ (func $forward-complex-past-source-change (param $ref (ref $A)) (param $value i32) (result i32)
+  (struct.set $A 0
+   (local.get $ref)
+   (i32.add
+    (local.get $value)
+    (i32.const 1)
+   )
+  )
+  (local.set $value
+   (i32.const 9)
+  )
+  (struct.get $A 0
+   (local.get $ref)
+  )
+ )
+
+ ;; Multiple loads share a single captured value.
+ ;; CHECK:      (func $forward-complex-twice (type $1) (param $ref (ref $A)) (param $value i32) (result i32)
+ ;; CHECK-NEXT:  (local $2 i32)
+ ;; CHECK-NEXT:  (struct.set $A 0
+ ;; CHECK-NEXT:   (local.get $ref)
+ ;; CHECK-NEXT:   (local.tee $2
+ ;; CHECK-NEXT:    (i32.add
+ ;; CHECK-NEXT:     (local.get $value)
+ ;; CHECK-NEXT:     (i32.const 1)
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (i32.add
+ ;; CHECK-NEXT:   (local.get $2)
+ ;; CHECK-NEXT:   (local.get $2)
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT: )
+ (func $forward-complex-twice (param $ref (ref $A)) (param $value i32) (result i32)
+  (struct.set $A 0
+   (local.get $ref)
+   (i32.add
+    (local.get $value)
+    (i32.const 1)
+   )
+  )
+  (i32.add
+   (struct.get $A 0
+    (local.get $ref)
+   )
+   (struct.get $A 0
+    (local.get $ref)
+   )
+  )
+ )
+
+ ;; No load wants this value, so we add no local and change nothing.
+ ;; CHECK:      (func $no-tee-unused (type $1) (param $ref (ref $A)) (param $value i32) (result i32)
+ ;; CHECK-NEXT:  (struct.set $A 0
+ ;; CHECK-NEXT:   (local.get $ref)
+ ;; CHECK-NEXT:   (i32.add
+ ;; CHECK-NEXT:    (local.get $value)
+ ;; CHECK-NEXT:    (i32.const 1)
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (struct.get $A 1
+ ;; CHECK-NEXT:   (local.get $ref)
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT: )
+ (func $no-tee-unused (param $ref (ref $A)) (param $value i32) (result i32)
+  (struct.set $A 0
+   (local.get $ref)
+   (i32.add
+    (local.get $value)
+    (i32.const 1)
+   )
+  )
+  (struct.get $A 1
+   (local.get $ref)
+  )
+ )
+
+ ;; The arms store structurally identical values, but each would be captured
+ ;; in its own local, so nothing is forwarded after the merge (compare with
+ ;; $forward-merge-same-value, where the constants merge fine).
+ ;; CHECK:      (func $no-forward-complex-merge (type $2) (param $ref (ref $A)) (param $value i32) (param $cond i32) (result i32)
+ ;; CHECK-NEXT:  (if
+ ;; CHECK-NEXT:   (local.get $cond)
+ ;; CHECK-NEXT:   (then
+ ;; CHECK-NEXT:    (struct.set $A 0
+ ;; CHECK-NEXT:     (local.get $ref)
+ ;; CHECK-NEXT:     (i32.add
+ ;; CHECK-NEXT:      (local.get $value)
+ ;; CHECK-NEXT:      (i32.const 1)
+ ;; CHECK-NEXT:     )
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (else
+ ;; CHECK-NEXT:    (struct.set $A 0
+ ;; CHECK-NEXT:     (local.get $ref)
+ ;; CHECK-NEXT:     (i32.add
+ ;; CHECK-NEXT:      (local.get $value)
+ ;; CHECK-NEXT:      (i32.const 1)
+ ;; CHECK-NEXT:     )
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (struct.get $A 0
+ ;; CHECK-NEXT:   (local.get $ref)
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT: )
+ (func $no-forward-complex-merge (param $ref (ref $A)) (param $value i32) (param $cond i32) (result i32)
+  (if
+   (local.get $cond)
+   (then
+    (struct.set $A 0
+     (local.get $ref)
+     (i32.add
+      (local.get $value)
+      (i32.const 1)
+     )
+    )
+   )
+   (else
+    (struct.set $A 0
+     (local.get $ref)
+     (i32.add
+      (local.get $value)
+      (i32.const 1)
+     )
+    )
+   )
+  )
+  (struct.get $A 0
+   (local.get $ref)
+  )
+ )
+
+ ;; A captured value of non-nullable reference type, forwarded across an if.
+ ;; The tee structurally dominates the load here, so the new local can remain
+ ;; non-nullable.
+ ;; CHECK:      (func $forward-complex-ref (type $11) (param $ref (ref $refs)) (param $cond i32) (result anyref)
+ ;; CHECK-NEXT:  (local $2 (ref (exact $A)))
+ ;; CHECK-NEXT:  (struct.set $refs 0
+ ;; CHECK-NEXT:   (local.get $ref)
+ ;; CHECK-NEXT:   (local.tee $2
+ ;; CHECK-NEXT:    (struct.new $A
+ ;; CHECK-NEXT:     (i32.const 1)
+ ;; CHECK-NEXT:     (i32.const 2)
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (if
+ ;; CHECK-NEXT:   (local.get $cond)
+ ;; CHECK-NEXT:   (then
+ ;; CHECK-NEXT:    (return
+ ;; CHECK-NEXT:     (ref.null none)
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (local.get $2)
+ ;; CHECK-NEXT: )
+ (func $forward-complex-ref (param $ref (ref $refs)) (param $cond i32) (result anyref)
+  (struct.set $refs 0
+   (local.get $ref)
+   (struct.new $A
+    (i32.const 1)
+    (i32.const 2)
+   )
+  )
+  (if
+   (local.get $cond)
+   (then
+    (return
+     (ref.null none)
+    )
+   )
+  )
+  (struct.get $refs 0
+   (local.get $ref)
+  )
+ )
+
+ ;; Here the tee is inside a block that can be branched over, and the load is
+ ;; after it: the load is still on every path (the store precedes the br_if),
+ ;; but the new local does not structurally dominate it, so the non-nullable
+ ;; local fixups that run after us make the local nullable and insert a
+ ;; ref.as_non_null.
+ ;; CHECK:      (func $forward-complex-ref-fixup (type $11) (param $ref (ref $refs)) (param $cond i32) (result anyref)
+ ;; CHECK-NEXT:  (local $2 (ref null (exact $A)))
+ ;; CHECK-NEXT:  (block $b
+ ;; CHECK-NEXT:   (struct.set $refs 0
+ ;; CHECK-NEXT:    (local.get $ref)
+ ;; CHECK-NEXT:    (ref.as_non_null
+ ;; CHECK-NEXT:     (local.tee $2
+ ;; CHECK-NEXT:      (struct.new $A
+ ;; CHECK-NEXT:       (i32.const 1)
+ ;; CHECK-NEXT:       (i32.const 2)
+ ;; CHECK-NEXT:      )
+ ;; CHECK-NEXT:     )
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (br_if $b
+ ;; CHECK-NEXT:    (local.get $cond)
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (ref.as_non_null
+ ;; CHECK-NEXT:   (local.get $2)
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT: )
+ (func $forward-complex-ref-fixup (param $ref (ref $refs)) (param $cond i32) (result anyref)
+  (block $b
+   (struct.set $refs 0
+    (local.get $ref)
+    (struct.new $A
+     (i32.const 1)
+     (i32.const 2)
+    )
+   )
+   (br_if $b
+    (local.get $cond)
+   )
+  )
+  (struct.get $refs 0
    (local.get $ref)
   )
  )
