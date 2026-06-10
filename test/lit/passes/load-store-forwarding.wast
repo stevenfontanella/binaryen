@@ -21,6 +21,9 @@
  ;; CHECK:      (import "env" "import" (func $import (type $9)))
  (import "env" "import" (func $import))
 
+ ;; CHECK:      (tag $e (type $9))
+ (tag $e)
+
  ;; The stored local value is forwarded to the load.
  ;; CHECK:      (func $forward-local (type $1) (param $ref (ref $A)) (param $value i32) (result i32)
  ;; CHECK-NEXT:  (struct.set $A 0
@@ -133,7 +136,7 @@
 
  ;; The load is through a different local (which might refer to a different
  ;; object), so nothing is forwarded.
- ;; CHECK:      (func $no-forward-other-local (type $4) (param $x (ref $A)) (param $y (ref $A)) (param $value i32) (result i32)
+ ;; CHECK:      (func $no-forward-other-local (type $5) (param $x (ref $A)) (param $y (ref $A)) (param $value i32) (result i32)
  ;; CHECK-NEXT:  (struct.set $A 0
  ;; CHECK-NEXT:   (local.get $x)
  ;; CHECK-NEXT:   (local.get $value)
@@ -154,7 +157,7 @@
 
  ;; A store through another reference of the same type may write to the same
  ;; object, invalidating what we know about the first store.
- ;; CHECK:      (func $invalidate-aliasing-store (type $4) (param $x (ref $A)) (param $y (ref $A)) (param $value i32) (result i32)
+ ;; CHECK:      (func $invalidate-aliasing-store (type $5) (param $x (ref $A)) (param $y (ref $A)) (param $value i32) (result i32)
  ;; CHECK-NEXT:  (struct.set $A 0
  ;; CHECK-NEXT:   (local.get $x)
  ;; CHECK-NEXT:   (local.get $value)
@@ -212,7 +215,7 @@
 
  ;; A possibly-aliasing store to a *different* field does not interfere, and
  ;; we still forward.
- ;; CHECK:      (func $forward-past-other-field-store (type $4) (param $x (ref $A)) (param $y (ref $A)) (param $value i32) (result i32)
+ ;; CHECK:      (func $forward-past-other-field-store (type $5) (param $x (ref $A)) (param $y (ref $A)) (param $value i32) (result i32)
  ;; CHECK-NEXT:  (struct.set $A 0
  ;; CHECK-NEXT:   (local.get $x)
  ;; CHECK-NEXT:   (local.get $value)
@@ -288,7 +291,7 @@
 
  ;; The reference local is written in between, so the load may be of another
  ;; object, and nothing is forwarded.
- ;; CHECK:      (func $invalidate-ref-local-set (type $4) (param $ref (ref $A)) (param $other (ref $A)) (param $value i32) (result i32)
+ ;; CHECK:      (func $invalidate-ref-local-set (type $5) (param $ref (ref $A)) (param $other (ref $A)) (param $value i32) (result i32)
  ;; CHECK-NEXT:  (struct.set $A 0
  ;; CHECK-NEXT:   (local.get $ref)
  ;; CHECK-NEXT:   (local.get $value)
@@ -341,7 +344,7 @@
  )
 
  ;; The store only happens on one path to the load, so nothing is forwarded.
- ;; CHECK:      (func $no-forward-past-merge (type $5) (param $ref (ref $A)) (param $value i32) (param $cond i32) (result i32)
+ ;; CHECK:      (func $no-forward-past-merge (type $2) (param $ref (ref $A)) (param $value i32) (param $cond i32) (result i32)
  ;; CHECK-NEXT:  (if
  ;; CHECK-NEXT:   (local.get $cond)
  ;; CHECK-NEXT:   (then
@@ -371,7 +374,7 @@
  )
 
  ;; The store dominates the load in the if arm, so we forward.
- ;; CHECK:      (func $forward-into-if (type $5) (param $ref (ref $A)) (param $value i32) (param $cond i32) (result i32)
+ ;; CHECK:      (func $forward-into-if (type $2) (param $ref (ref $A)) (param $value i32) (param $cond i32) (result i32)
  ;; CHECK-NEXT:  (struct.set $A 0
  ;; CHECK-NEXT:   (local.get $ref)
  ;; CHECK-NEXT:   (local.get $value)
@@ -405,7 +408,7 @@
  )
 
  ;; The store also dominates the load past a br_if, so we forward.
- ;; CHECK:      (func $forward-past-br-if (type $5) (param $ref (ref $A)) (param $value i32) (param $cond i32) (result i32)
+ ;; CHECK:      (func $forward-past-br-if (type $2) (param $ref (ref $A)) (param $value i32) (param $cond i32) (result i32)
  ;; CHECK-NEXT:  (block $out
  ;; CHECK-NEXT:   (struct.set $A 0
  ;; CHECK-NEXT:    (local.get $ref)
@@ -438,28 +441,318 @@
   (i32.const 0)
  )
 
- ;; A load in a loop may not be dominated by the store before it, so nothing
- ;; is forwarded.
- ;; CHECK:      (func $no-forward-into-loop (type $1) (param $ref (ref $A)) (param $value i32) (result i32)
+ ;; The stored value flows into the loop, and around its backedge: nothing in
+ ;; the loop can change the field, so both loads are forwarded.
+ ;; CHECK:      (func $forward-into-loop (type $2) (param $ref (ref $A)) (param $value i32) (param $cond i32) (result i32)
  ;; CHECK-NEXT:  (struct.set $A 0
  ;; CHECK-NEXT:   (local.get $ref)
  ;; CHECK-NEXT:   (local.get $value)
  ;; CHECK-NEXT:  )
- ;; CHECK-NEXT:  (loop $loop (result i32)
- ;; CHECK-NEXT:   (struct.get $A 0
- ;; CHECK-NEXT:    (local.get $ref)
+ ;; CHECK-NEXT:  (loop $loop
+ ;; CHECK-NEXT:   (drop
+ ;; CHECK-NEXT:    (local.get $value)
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (br_if $loop
+ ;; CHECK-NEXT:    (local.get $cond)
  ;; CHECK-NEXT:   )
  ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (local.get $value)
  ;; CHECK-NEXT: )
- (func $no-forward-into-loop (param $ref (ref $A)) (param $value i32) (result i32)
+ (func $forward-into-loop (param $ref (ref $A)) (param $value i32) (param $cond i32) (result i32)
   (struct.set $A 0
    (local.get $ref)
    (local.get $value)
   )
-  (loop $loop (result i32)
-   (struct.get $A 0
-    (local.get $ref)
+  (loop $loop
+   (drop
+    (struct.get $A 0
+     (local.get $ref)
+    )
    )
+   (br_if $loop
+    (local.get $cond)
+   )
+  )
+  (struct.get $A 0
+   (local.get $ref)
+  )
+ )
+
+ ;; The loop stores to the field, so the load in it sees a different value on
+ ;; later iterations, and is not forwarded. But the load after the loop is
+ ;; forwarded: every path to it passes through the store of 7 last.
+ ;; CHECK:      (func $no-forward-loop-invalidated (type $2) (param $ref (ref $A)) (param $value i32) (param $cond i32) (result i32)
+ ;; CHECK-NEXT:  (struct.set $A 0
+ ;; CHECK-NEXT:   (local.get $ref)
+ ;; CHECK-NEXT:   (local.get $value)
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (loop $loop
+ ;; CHECK-NEXT:   (drop
+ ;; CHECK-NEXT:    (struct.get $A 0
+ ;; CHECK-NEXT:     (local.get $ref)
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (struct.set $A 0
+ ;; CHECK-NEXT:    (local.get $ref)
+ ;; CHECK-NEXT:    (i32.const 7)
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (br_if $loop
+ ;; CHECK-NEXT:    (local.get $cond)
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (i32.const 7)
+ ;; CHECK-NEXT: )
+ (func $no-forward-loop-invalidated (param $ref (ref $A)) (param $value i32) (param $cond i32) (result i32)
+  (struct.set $A 0
+   (local.get $ref)
+   (local.get $value)
+  )
+  (loop $loop
+   (drop
+    (struct.get $A 0
+     (local.get $ref)
+    )
+   )
+   (struct.set $A 0
+    (local.get $ref)
+    (i32.const 7)
+   )
+   (br_if $loop
+    (local.get $cond)
+   )
+  )
+  (struct.get $A 0
+   (local.get $ref)
+  )
+ )
+
+ ;; The stored value survives an if whose arms do nothing dangerous, and the
+ ;; load after it is forwarded.
+ ;; CHECK:      (func $forward-past-if (type $2) (param $ref (ref $A)) (param $value i32) (param $cond i32) (result i32)
+ ;; CHECK-NEXT:  (local $scratch i32)
+ ;; CHECK-NEXT:  (struct.set $A 0
+ ;; CHECK-NEXT:   (local.get $ref)
+ ;; CHECK-NEXT:   (local.get $value)
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (if
+ ;; CHECK-NEXT:   (local.get $cond)
+ ;; CHECK-NEXT:   (then
+ ;; CHECK-NEXT:    (local.set $scratch
+ ;; CHECK-NEXT:     (i32.const 1)
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (else
+ ;; CHECK-NEXT:    (local.set $scratch
+ ;; CHECK-NEXT:     (i32.const 2)
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (local.get $value)
+ ;; CHECK-NEXT: )
+ (func $forward-past-if (param $ref (ref $A)) (param $value i32) (param $cond i32) (result i32)
+  (local $scratch i32)
+  (struct.set $A 0
+   (local.get $ref)
+   (local.get $value)
+  )
+  (if
+   (local.get $cond)
+   (then
+    (local.set $scratch
+     (i32.const 1)
+    )
+   )
+   (else
+    (local.set $scratch
+     (i32.const 2)
+    )
+   )
+  )
+  (struct.get $A 0
+   (local.get $ref)
+  )
+ )
+
+ ;; One arm of the if writes to the field through a possibly-aliasing
+ ;; reference, so the paths disagree after the if and nothing is forwarded.
+ ;; CHECK:      (func $no-forward-past-if-invalidating (type $13) (param $ref (ref $A)) (param $other (ref $A)) (param $value i32) (param $cond i32) (result i32)
+ ;; CHECK-NEXT:  (struct.set $A 0
+ ;; CHECK-NEXT:   (local.get $ref)
+ ;; CHECK-NEXT:   (local.get $value)
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (if
+ ;; CHECK-NEXT:   (local.get $cond)
+ ;; CHECK-NEXT:   (then
+ ;; CHECK-NEXT:    (struct.set $A 0
+ ;; CHECK-NEXT:     (local.get $other)
+ ;; CHECK-NEXT:     (i32.const 7)
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (struct.get $A 0
+ ;; CHECK-NEXT:   (local.get $ref)
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT: )
+ (func $no-forward-past-if-invalidating (param $ref (ref $A)) (param $other (ref $A)) (param $value i32) (param $cond i32) (result i32)
+  (struct.set $A 0
+   (local.get $ref)
+   (local.get $value)
+  )
+  (if
+   (local.get $cond)
+   (then
+    (struct.set $A 0
+     (local.get $other)
+     (i32.const 7)
+    )
+   )
+  )
+  (struct.get $A 0
+   (local.get $ref)
+  )
+ )
+
+ ;; Both arms of the if store the same value to the same field, so the load
+ ;; after the merge is forwarded.
+ ;; CHECK:      (func $forward-merge-same-value (type $1) (param $ref (ref $A)) (param $cond i32) (result i32)
+ ;; CHECK-NEXT:  (if
+ ;; CHECK-NEXT:   (local.get $cond)
+ ;; CHECK-NEXT:   (then
+ ;; CHECK-NEXT:    (struct.set $A 0
+ ;; CHECK-NEXT:     (local.get $ref)
+ ;; CHECK-NEXT:     (i32.const 42)
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (else
+ ;; CHECK-NEXT:    (struct.set $A 0
+ ;; CHECK-NEXT:     (local.get $ref)
+ ;; CHECK-NEXT:     (i32.const 42)
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (i32.const 42)
+ ;; CHECK-NEXT: )
+ (func $forward-merge-same-value (param $ref (ref $A)) (param $cond i32) (result i32)
+  (if
+   (local.get $cond)
+   (then
+    (struct.set $A 0
+     (local.get $ref)
+     (i32.const 42)
+    )
+   )
+   (else
+    (struct.set $A 0
+     (local.get $ref)
+     (i32.const 42)
+    )
+   )
+  )
+  (struct.get $A 0
+   (local.get $ref)
+  )
+ )
+
+ ;; The arms store different values, so nothing is forwarded after the merge.
+ ;; CHECK:      (func $no-forward-merge-different-values (type $1) (param $ref (ref $A)) (param $cond i32) (result i32)
+ ;; CHECK-NEXT:  (if
+ ;; CHECK-NEXT:   (local.get $cond)
+ ;; CHECK-NEXT:   (then
+ ;; CHECK-NEXT:    (struct.set $A 0
+ ;; CHECK-NEXT:     (local.get $ref)
+ ;; CHECK-NEXT:     (i32.const 42)
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (else
+ ;; CHECK-NEXT:    (struct.set $A 0
+ ;; CHECK-NEXT:     (local.get $ref)
+ ;; CHECK-NEXT:     (i32.const 43)
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (struct.get $A 0
+ ;; CHECK-NEXT:   (local.get $ref)
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT: )
+ (func $no-forward-merge-different-values (param $ref (ref $A)) (param $cond i32) (result i32)
+  (if
+   (local.get $cond)
+   (then
+    (struct.set $A 0
+     (local.get $ref)
+     (i32.const 42)
+    )
+   )
+   (else
+    (struct.set $A 0
+     (local.get $ref)
+     (i32.const 43)
+    )
+   )
+  )
+  (struct.get $A 0
+   (local.get $ref)
+  )
+ )
+
+ ;; A throw transfers control without changing any fields, so the stored
+ ;; value flows into the catch and the load there is forwarded.
+ ;; CHECK:      (func $forward-into-catch (type $1) (param $ref (ref $A)) (param $value i32) (result i32)
+ ;; CHECK-NEXT:  (block $catch
+ ;; CHECK-NEXT:   (try_table (catch_all $catch)
+ ;; CHECK-NEXT:    (struct.set $A 0
+ ;; CHECK-NEXT:     (local.get $ref)
+ ;; CHECK-NEXT:     (local.get $value)
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:    (throw $e)
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (local.get $value)
+ ;; CHECK-NEXT: )
+ (func $forward-into-catch (param $ref (ref $A)) (param $value i32) (result i32)
+  (block $catch
+   (try_table (catch_all $catch)
+    (struct.set $A 0
+     (local.get $ref)
+     (local.get $value)
+    )
+    (throw $e)
+   )
+  )
+  (struct.get $A 0
+   (local.get $ref)
+  )
+ )
+
+ ;; Here the catch is reached by a call, which might have written to the
+ ;; field before throwing, so nothing is forwarded (on the normal path out of
+ ;; the try as well).
+ ;; CHECK:      (func $no-forward-into-catch-call (type $1) (param $ref (ref $A)) (param $value i32) (result i32)
+ ;; CHECK-NEXT:  (block $catch
+ ;; CHECK-NEXT:   (try_table (catch_all $catch)
+ ;; CHECK-NEXT:    (struct.set $A 0
+ ;; CHECK-NEXT:     (local.get $ref)
+ ;; CHECK-NEXT:     (local.get $value)
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:    (call $import)
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (struct.get $A 0
+ ;; CHECK-NEXT:   (local.get $ref)
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT: )
+ (func $no-forward-into-catch-call (param $ref (ref $A)) (param $value i32) (result i32)
+  (block $catch
+   (try_table (catch_all $catch)
+    (struct.set $A 0
+     (local.get $ref)
+     (local.get $value)
+    )
+    (call $import)
+   )
+  )
+  (struct.get $A 0
+   (local.get $ref)
   )
  )
 
@@ -508,7 +801,7 @@
 
  ;; A non-constant struct.new operand is not forwarded (a later operand could
  ;; have changed the local before the allocation is assigned).
- ;; CHECK:      (func $no-forward-new-local (type $13) (param $value i32) (result i32)
+ ;; CHECK:      (func $no-forward-new-local (type $14) (param $value i32) (result i32)
  ;; CHECK-NEXT:  (local $ref (ref null $A))
  ;; CHECK-NEXT:  (local.set $ref
  ;; CHECK-NEXT:   (struct.new $A
@@ -535,7 +828,7 @@
 
  ;; The stored value is truncated when written to a packed field, so nothing
  ;; is forwarded.
- ;; CHECK:      (func $no-forward-packed (type $14) (param $ref (ref $packed)) (param $value i32) (result i32)
+ ;; CHECK:      (func $no-forward-packed (type $15) (param $ref (ref $packed)) (param $value i32) (result i32)
  ;; CHECK-NEXT:  (struct.set $packed 0
  ;; CHECK-NEXT:   (local.get $ref)
  ;; CHECK-NEXT:   (local.get $value)
@@ -575,7 +868,7 @@
 
  ;; The stored value is more refined than the field: forwarding it refines the
  ;; type of the load as well.
- ;; CHECK:      (func $forward-refined (type $15) (param $ref (ref $refs)) (param $value (ref $B)) (result anyref)
+ ;; CHECK:      (func $forward-refined (type $16) (param $ref (ref $refs)) (param $value (ref $B)) (result anyref)
  ;; CHECK-NEXT:  (struct.set $refs 0
  ;; CHECK-NEXT:   (local.get $ref)
  ;; CHECK-NEXT:   (local.get $value)
