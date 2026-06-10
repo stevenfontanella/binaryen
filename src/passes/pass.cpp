@@ -245,6 +245,9 @@ void PassRegistry::registerPasses() {
   registerPass("legalize-and-prune-js-interface",
                "legalizes the import/export boundary and prunes when needed",
                createLegalizeAndPruneJSInterfacePass);
+  registerPass("load-store-forwarding",
+               "forward stored GC struct field values to later loads",
+               createLoadStoreForwardingPass);
   registerPass("local-cse",
                "common subexpression elimination inside basic blocks",
                createLocalCSEPass);

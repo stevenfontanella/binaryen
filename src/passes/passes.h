@@ -77,6 +77,7 @@ Pass* createJ2CLOptsPass();
 Pass* createLegalizeAndPruneJSInterfacePass();
 Pass* createLegalizeJSInterfacePass();
 Pass* createLimitSegmentsPass();
+Pass* createLoadStoreForwardingPass();
 Pass* createLocalCSEPass();
 Pass* createLocalSubtypingPass();
 Pass* createLogExecutionPass();

@@ -61,6 +61,7 @@ set(passes_SOURCES
   LegalizeJSInterface.cpp
   LimitSegments.cpp
   LLVMMemoryCopyFillLowering.cpp
+  LoadStoreForwarding.cpp
   LocalCSE.cpp
   LocalSubtyping.cpp
   LogExecution.cpp
