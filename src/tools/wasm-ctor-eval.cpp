@@ -885,6 +885,11 @@ public:
       // We cannot serialize truly external things, only data and i31s.
       assert(value.isData() ||
              value.type.getHeapType().isMaybeShared(HeapType::i31));
+
+      // The global we are in, if any, holds the externalized value, so its type
+      // is extern and not the type of the data itself. It cannot be the
+      // defining global for that data.
+      possibleDefiningGlobal = Name();
     }
 
     // MVP types as well as i31s (even externalized i31s) and strings can be
