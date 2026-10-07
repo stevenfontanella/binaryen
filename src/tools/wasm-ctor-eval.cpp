@@ -874,114 +874,43 @@ public:
       return nullptr;
     }
 
-    Builder builder(*wasm);
-
     // If this is externalized then we want to inspect the inner data, handle
     // that, and emit a ref.externalize around it as needed. To simplify the
     // logic here, we save the original (possible externalized) value, and then
     // look at the internals from here on out.
     Literal original = value;
-    if (value.type.isRef() &&
-        value.type.getHeapType().isMaybeShared(HeapType::ext)) {
+    bool externalized = isExternalized(value);
+    if (externalized) {
       value = value.internalize();
 
-      // We cannot serialize truly external things, only data and i31s.
-      assert(value.isData() ||
+      // We cannot serialize truly external things, only allocations and i31s.
+      assert(isAllocation(value) ||
              value.type.getHeapType().isMaybeShared(HeapType::i31));
+
+      // The global we are in, if any, holds the externalized value, so its type
+      // is extern and not the type of the data itself. It cannot be the
+      // defining global for that data.
+      possibleDefiningGlobal = Name();
     }
 
-    // GC data (structs and arrays) must be handled with the special global-
-    // creating logic later down. But MVP types as well as i31s (even
-    // externalized i31s) can be handled by the general makeConstantExpression
-    // logic (which knows how to handle externalization, for i31s; and it also
-    // can handle string constants).
-    if (!value.isData() || value.isString()) {
-      return builder.makeConstantExpression(original);
+    // MVP types as well as i31s (even externalized i31s) and strings can be
+    // handled by the general makeConstantExpression logic (which knows how to
+    // handle externalization, for i31s).
+    if (!isAllocation(value)) {
+      return Builder(*wasm).makeConstantExpression(original);
     }
 
-    // This is GC data, which we must handle in a more careful way.
-    auto* data = value.getGCData().get();
-    assert(data);
-
-    auto type = value.type;
-    Name definingGlobalName;
-
-    if (auto it = definingGlobals.find(data); it != definingGlobals.end()) {
-      // Use the existing defining global.
-      definingGlobalName = it->second.name;
-    } else {
-      // This is the first usage of this data. Generate a struct.new /
-      // array.new for it.
-      std::vector<Expression*> args;
-
-      // The initial values for this allocation may themselves be GC
-      // allocations. Recurse and add globals as necessary. First, pick the
-      // global name (note that we must do so first, as we may need to read from
-      // definingGlobals to find where this global will be, in the case of a
-      // cycle; see below).
-      if (possibleDefiningGlobal.is()) {
-        // No need to allocate a new global, as we are in the definition of
-        // one, which will be the defining global.
-        definingGlobals[data] =
-          DefiningGlobalInfo{possibleDefiningGlobal, type};
-        definingGlobalName = possibleDefiningGlobal;
-      } else {
-        // Allocate a new defining global.
-        definingGlobalName =
-          Names::getValidNameGivenExisting("ctor-eval$global", usedGlobalNames);
-        usedGlobalNames.insert(definingGlobalName);
-        definingGlobals[data] = DefiningGlobalInfo{definingGlobalName, type};
-      }
-
-      for (size_t i = 0; i < value.getNumElements(); i++) {
-        auto* serialized = getSerialization(value.getElement(i));
-        if (!serialized) {
-          return nullptr;
-        }
-        args.push_back(serialized);
-      }
-
-      Expression* desc = nullptr;
-      if (data->desc.getGCData()) {
-        desc = getSerialization(data->desc);
-        if (!desc) {
-          return nullptr;
-        }
-      }
-
-      Expression* init;
-      auto heapType = type.getHeapType();
-      if (heapType.isStruct()) {
-        init = builder.makeStructNew(heapType, args, desc);
-      } else if (heapType.isArray()) {
-        // TODO: for repeated identical values, can use ArrayNew
-        init = builder.makeArrayNewFixed(heapType, args);
-      } else {
-        WASM_UNREACHABLE("bad gc type");
-      }
-
-      if (possibleDefiningGlobal.is()) {
-        // We didn't need to allocate a new global, as we are in the definition
-        // of one, so just return the initialization expression, which will be
-        // placed in that global's |init| field.
-        return init;
-      }
-
-      // There is no existing defining global, so we must allocate a new one.
-      //
-      // We set the global's init to null temporarily, and we'll fix it up
-      // later down after we create the init expression.
-      wasm->addGlobal(
-        builder.makeGlobal(definingGlobalName, type, init, Builder::Immutable));
+    // This is a GC allocation (a struct, array, or waitqueue), which has
+    // identity, and so must be handled with the more careful defining-global
+    // logic.
+    auto* ret = getGCDataSerialization(value, possibleDefiningGlobal);
+    if (!ret) {
+      return nullptr;
     }
 
-    // Refer to this GC allocation by reading from the global that is
-    // designated to contain it.
-    Expression* ret = builder.makeGlobalGet(definingGlobalName, value.type);
-    if (original != value) {
-      // The original is externalized.
-      assert(original.type.getHeapType().isMaybeShared(HeapType::ext));
-      ret = builder.makeRefAs(ExternConvertAny, ret);
+    // Re-apply the externalization, if there was one.
+    if (externalized) {
+      ret = Builder(*wasm).makeRefAs(ExternConvertAny, ret);
     }
     return ret;
   }
@@ -1005,6 +934,123 @@ public:
     return getSerialization(values[0], possibleDefiningGlobal);
   }
 
+private:
+  static bool isExternalized(const Literal& value) {
+    return value.type.isRef() &&
+           value.type.getHeapType().isMaybeShared(HeapType::ext);
+  }
+
+  // Whether a value is a GC allocation with identity: a struct, array, or
+  // waitqueue. (Strings are GC data but have no identity, and are handled as
+  // constants.)
+  static bool isAllocation(const Literal& value) {
+    if (value.isData()) {
+      return !value.isString();
+    }
+    return value.type.isRef() &&
+           value.type.getHeapType().isMaybeShared(HeapType::waitqueue);
+  }
+
+  // Serializes a GC allocation (a struct, array, or waitqueue). Such data has
+  // identity, so it must be created in exactly one place, its defining global
+  // (see |definingGlobals| and applyGlobalsToModule); all references to it are
+  // then global.gets of that global.
+  //
+  // |possibleDefiningGlobal| is as in getSerialization. Returns nullptr if we
+  // cannot serialize.
+  Expression* getGCDataSerialization(Literal value,
+                                     Name possibleDefiningGlobal) {
+    auto* data = value.getGCData().get();
+    assert(data);
+
+    Builder builder(*wasm);
+
+    if (auto it = definingGlobals.find(data); it != definingGlobals.end()) {
+      // We have already seen this data: just refer to its defining global.
+      return builder.makeGlobalGet(it->second.name, value.type);
+    }
+
+    // This is the first usage of this data, so we must emit the allocation
+    // itself (a struct.new / array.new_fixed / waitqueue.new) in a defining
+    // global.
+    //
+    // Note that we must register the defining global in |definingGlobals|
+    // before we serialize the allocation's contents below, as they may refer
+    // back to this very data (a cycle), in which case the recursive
+    // serialization must find the global that will contain it.
+    if (possibleDefiningGlobal.is()) {
+      // We are in the init expression of a global that can be the defining
+      // global, so there is no need to allocate a new one: the allocation is
+      // the serialization, and will be placed in that global's init.
+      definingGlobals[data] =
+        DefiningGlobalInfo{possibleDefiningGlobal, value.type};
+      return getAllocationSerialization(value);
+    }
+
+    // Allocate a new defining global to contain the allocation.
+    auto name =
+      Names::getValidNameGivenExisting("ctor-eval$global", usedGlobalNames);
+    usedGlobalNames.insert(name);
+    definingGlobals[data] = DefiningGlobalInfo{name, value.type};
+
+    auto* init = getAllocationSerialization(value);
+    if (!init) {
+      return nullptr;
+    }
+    wasm->addGlobal(
+      builder.makeGlobal(name, value.type, init, Builder::Immutable));
+
+    // Refer to this GC allocation by reading from the global that is
+    // designated to contain it.
+    return builder.makeGlobalGet(name, value.type);
+  }
+
+  // Emits the allocation (struct.new / array.new_fixed / waitqueue.new) of GC
+  // data, recursively serializing its contents. Returns nullptr if we cannot
+  // serialize.
+  Expression* getAllocationSerialization(Literal value) {
+    auto* data = value.getGCData().get();
+    assert(data);
+
+    Builder builder(*wasm);
+    auto heapType = value.type.getHeapType();
+
+    if (heapType.isMaybeShared(HeapType::waitqueue)) {
+      // Waitqueues have no contents.
+      return builder.makeWaitqueueNew();
+    }
+
+    // The initial values for this allocation may themselves be GC allocations.
+    // Recurse, which adds defining globals as necessary (and before ours, which
+    // is added by our caller only after we return).
+    std::vector<Expression*> args;
+    for (size_t i = 0; i < value.getNumElements(); i++) {
+      auto* serialized = getSerialization(value.getElement(i));
+      if (!serialized) {
+        return nullptr;
+      }
+      args.push_back(serialized);
+    }
+
+    Expression* desc = nullptr;
+    if (data->desc.getGCData()) {
+      desc = getSerialization(data->desc);
+      if (!desc) {
+        return nullptr;
+      }
+    }
+
+    if (heapType.isStruct()) {
+      return builder.makeStructNew(heapType, args, desc);
+    }
+    if (heapType.isArray()) {
+      // TODO: for repeated identical values, can use ArrayNew
+      return builder.makeArrayNewFixed(heapType, args);
+    }
+    WASM_UNREACHABLE("bad gc type");
+  }
+
+public:
   // This is called when we hit a cycle in setting up defining globals. For
   // example, if the data we want to emit is
   //

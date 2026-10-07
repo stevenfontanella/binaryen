@@ -504,6 +504,10 @@ bool Literal::operator==(const Literal& other) const {
     if (type.isData()) {
       return gcData == other.gcData;
     }
+    if (type.getHeapType().isMaybeShared(HeapType::waitqueue)) {
+      // Waitqueues have identity, like data.
+      return gcData == other.gcData;
+    }
     auto heapType = type.getHeapType();
     assert(heapType.isBasic());
     if (heapType.isMaybeShared(HeapType::i31)) {
