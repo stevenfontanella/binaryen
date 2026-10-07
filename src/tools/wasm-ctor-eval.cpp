@@ -879,11 +879,12 @@ public:
     // logic here, we save the original (possible externalized) value, and then
     // look at the internals from here on out.
     Literal original = value;
-    if (isExternalized(value)) {
+    bool externalized = isExternalized(value);
+    if (externalized) {
       value = value.internalize();
 
-      // We cannot serialize truly external things, only data and i31s.
-      assert(value.isData() ||
+      // We cannot serialize truly external things, only allocations and i31s.
+      assert(isAllocation(value) ||
              value.type.getHeapType().isMaybeShared(HeapType::i31));
 
       // The global we are in, if any, holds the externalized value, so its type
@@ -895,19 +896,20 @@ public:
     // MVP types as well as i31s (even externalized i31s) and strings can be
     // handled by the general makeConstantExpression logic (which knows how to
     // handle externalization, for i31s).
-    if (!value.isData() || value.isString()) {
+    if (!isAllocation(value)) {
       return Builder(*wasm).makeConstantExpression(original);
     }
 
-    // This is GC data (a struct or array), which has identity, and so must be
-    // handled with the more careful defining-global logic.
+    // This is a GC allocation (a struct, array, or waitqueue), which has
+    // identity, and so must be handled with the more careful defining-global
+    // logic.
     auto* ret = getGCDataSerialization(value, possibleDefiningGlobal);
     if (!ret) {
       return nullptr;
     }
 
     // Re-apply the externalization, if there was one.
-    if (original != value) {
+    if (externalized) {
       ret = Builder(*wasm).makeRefAs(ExternConvertAny, ret);
     }
     return ret;
@@ -938,10 +940,21 @@ private:
            value.type.getHeapType().isMaybeShared(HeapType::ext);
   }
 
-  // Serializes GC data (a struct or array). Such data has identity, so it must
-  // be created in exactly one place, its defining global (see |definingGlobals|
-  // and applyGlobalsToModule); all references to it are then global.gets of
-  // that global.
+  // Whether a value is a GC allocation with identity: a struct, array, or
+  // waitqueue. (Strings are GC data but have no identity, and are handled as
+  // constants.)
+  static bool isAllocation(const Literal& value) {
+    if (value.isData()) {
+      return !value.isString();
+    }
+    return value.type.isRef() &&
+           value.type.getHeapType().isMaybeShared(HeapType::waitqueue);
+  }
+
+  // Serializes a GC allocation (a struct, array, or waitqueue). Such data has
+  // identity, so it must be created in exactly one place, its defining global
+  // (see |definingGlobals| and applyGlobalsToModule); all references to it are
+  // then global.gets of that global.
   //
   // |possibleDefiningGlobal| is as in getSerialization. Returns nullptr if we
   // cannot serialize.
@@ -958,7 +971,8 @@ private:
     }
 
     // This is the first usage of this data, so we must emit the allocation
-    // itself (a struct.new / array.new_fixed) in a defining global.
+    // itself (a struct.new / array.new_fixed / waitqueue.new) in a defining
+    // global.
     //
     // Note that we must register the defining global in |definingGlobals|
     // before we serialize the allocation's contents below, as they may refer
@@ -991,11 +1005,20 @@ private:
     return builder.makeGlobalGet(name, value.type);
   }
 
-  // Emits the allocation (struct.new / array.new_fixed) of GC data, recursively
-  // serializing its contents. Returns nullptr if we cannot serialize.
+  // Emits the allocation (struct.new / array.new_fixed / waitqueue.new) of GC
+  // data, recursively serializing its contents. Returns nullptr if we cannot
+  // serialize.
   Expression* getAllocationSerialization(Literal value) {
     auto* data = value.getGCData().get();
     assert(data);
+
+    Builder builder(*wasm);
+    auto heapType = value.type.getHeapType();
+
+    if (heapType.isMaybeShared(HeapType::waitqueue)) {
+      // Waitqueues have no contents.
+      return builder.makeWaitqueueNew();
+    }
 
     // The initial values for this allocation may themselves be GC allocations.
     // Recurse, which adds defining globals as necessary (and before ours, which
@@ -1017,8 +1040,6 @@ private:
       }
     }
 
-    Builder builder(*wasm);
-    auto heapType = value.type.getHeapType();
     if (heapType.isStruct()) {
       return builder.makeStructNew(heapType, args, desc);
     }
