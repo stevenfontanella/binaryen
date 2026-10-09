@@ -117,6 +117,7 @@ Pass* createOptimizeInstructionsPass();
 Pass* createOptimizeCastsPass();
 Pass* createOptimizeForJSPass();
 Pass* createOptimizeNoReturnPass();
+Pass* createOutlineAllocationsPass();
 // Outlining currently relies on LLVM's SuffixTree, which we can't rely upon
 // when building Binaryen for Emscripten.
 #ifdef __EMSCRIPTEN__

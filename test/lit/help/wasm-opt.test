@@ -399,6 +399,10 @@
 ;; CHECK-NEXT:   --optimize-noreturn                           optimizes calls to 
 ;; CHECK-NEXT:                                                 @binaryen.noreturn functions
 ;; CHECK-EMPTY:
+;; CHECK-NEXT:   --outline-allocations                         outline duplicated allocations 
+;; CHECK-NEXT:                                                 of constants into helper 
+;; CHECK-NEXT:                                                 functions
+;; CHECK-EMPTY:
 ;; CHECK-NEXT:   --outlining                                   outline instructions
 ;; CHECK-EMPTY:
 ;; CHECK-NEXT:   --pick-load-signs                             pick load signs based on their 

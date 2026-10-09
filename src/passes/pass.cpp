@@ -370,6 +370,10 @@ void PassRegistry::registerPasses() {
   registerPass("optimize-noreturn",
                "optimizes calls to @binaryen.noreturn functions",
                createOptimizeNoReturnPass);
+  registerPass("outline-allocations",
+               "outline duplicated allocations of constants into helper "
+               "functions",
+               createOutlineAllocationsPass);
 // Outlining currently relies on LLVM's SuffixTree, which we can't rely upon
 // when building Binaryen for Emscripten.
 #ifndef SKIP_OUTLINING
@@ -857,6 +861,13 @@ void PassRunner::addDefaultGlobalOptimizationPostPasses() {
   }
   if (options.optimizeLevel >= 2 || options.shrinkLevel >= 1) {
     addIfNoDWARFIssues("reorder-globals");
+  }
+  // Run after inlining (which creates the duplicated allocations this pass
+  // outlines) and after simplify-globals (which may inline constant globals
+  // into the allocations).
+  if (wasm->features.hasGC() &&
+      (options.optimizeLevel >= 3 || options.shrinkLevel >= 1)) {
+    addIfNoDWARFIssues("outline-allocations");
   }
   // may allow more inlining/dae/etc., need --converge for that
   addIfNoDWARFIssues("directize");
