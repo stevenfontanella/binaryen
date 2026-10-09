@@ -231,6 +231,9 @@ void PassRegistry::registerPasses() {
   registerPass("heap-store-optimization",
                "optimize heap (GC) stores",
                createHeapStoreOptimizationPass);
+  registerPass("hoist-constants",
+               "hoist repeated wide constants into immutable globals",
+               createHoistConstantsPass);
   registerPass(
     "inline-main", "inline __original_main into main", createInlineMainPass);
   registerPass("inlining",

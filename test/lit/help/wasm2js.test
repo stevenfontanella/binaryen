@@ -170,6 +170,9 @@
 ;; CHECK-NEXT:   --heap2local                                  replace GC allocations with 
 ;; CHECK-NEXT:                                                 locals
 ;; CHECK-EMPTY:
+;; CHECK-NEXT:   --hoist-constants                             hoist repeated wide constants 
+;; CHECK-NEXT:                                                 into immutable globals
+;; CHECK-EMPTY:
 ;; CHECK-NEXT:   --i64-to-i32-lowering                         lower all uses of i64s to use 
 ;; CHECK-NEXT:                                                 i32s instead
 ;; CHECK-EMPTY:

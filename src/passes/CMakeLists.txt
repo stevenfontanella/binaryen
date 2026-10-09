@@ -51,6 +51,7 @@ set(passes_SOURCES
   Outlining.cpp
   Heap2Local.cpp
   HeapStoreOptimization.cpp
+  HoistConstants.cpp
   I64ToI32Lowering.cpp
   Inlining.cpp
   InstrumentBranchHints.cpp
