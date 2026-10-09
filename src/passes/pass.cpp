@@ -536,6 +536,10 @@ void PassRegistry::registerPasses() {
   registerPass("souperify-single-use",
                "emit Souper IR in text form (single-use nodes only)",
                createSouperifySingleUsePass);
+  registerPass("sparse-field-to-lookup",
+               "replace reads of sparse immutable fields with a lookup "
+               "function so --gto can remove the field",
+               createSparseFieldToLookupPass);
   registerPass("spill-pointers",
                "spill pointers to the C stack (useful for Boehm-style GC)",
                createSpillPointersPass);

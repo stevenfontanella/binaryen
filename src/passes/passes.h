@@ -178,6 +178,7 @@ Pass* createSimplifyLocalsNoStructurePass();
 Pass* createSimplifyLocalsNoTeeNoStructurePass();
 Pass* createSouperifyPass();
 Pass* createSouperifySingleUsePass();
+Pass* createSparseFieldToLookupPass();
 Pass* createSpillPointersPass();
 Pass* createStackCheckPass();
 Pass* createStringGatheringPass();

@@ -474,6 +474,11 @@
 ;; CHECK-NEXT:   --souperify-single-use                        emit Souper IR in text form 
 ;; CHECK-NEXT:                                                 (single-use nodes only)
 ;; CHECK-EMPTY:
+;; CHECK-NEXT:   --sparse-field-to-lookup                      replace reads of sparse 
+;; CHECK-NEXT:                                                 immutable fields with a lookup 
+;; CHECK-NEXT:                                                 function so --gto can remove the
+;; CHECK-NEXT:                                                 field
+;; CHECK-EMPTY:
 ;; CHECK-NEXT:   --spill-pointers                              spill pointers to the C stack 
 ;; CHECK-NEXT:                                                 (useful for Boehm-style GC)
 ;; CHECK-EMPTY:

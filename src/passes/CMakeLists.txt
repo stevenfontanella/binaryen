@@ -139,6 +139,7 @@ set(passes_SOURCES
   SimplifyGlobals.cpp
   SimplifyLocals.cpp
   Souperify.cpp
+  SparseFieldToLookup.cpp
   SpillPointers.cpp
   StackCheck.cpp
   StripEH.cpp
