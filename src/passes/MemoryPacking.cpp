@@ -27,12 +27,20 @@
 // been dropped in globals. We are careful to emit only as many of these globals
 // as necessary.
 //
+// With GC enabled, this pass also replaces array.new_data instructions that
+// read a constant range of a passive segment with array.new_fixed of the
+// decoded constants, when that is smaller than keeping the segment (which is
+// then removed). This runs even when the module has no memory at all.
+//
+
+#include <unordered_set>
 
 #include "ir/manipulation.h"
 #include "ir/module-utils.h"
 #include "ir/names.h"
 #include "ir/utils.h"
 #include "pass.h"
+#include "support/bits.h"
 #include "support/space.h"
 #include "support/stdckdint.h"
 #include "wasm-binary.h"
@@ -95,6 +103,86 @@ makeGtShiftedMemorySize(Builder& builder, Module& module, MemoryInit* curr) {
                        builder.makeConstPtr(16, mem->addressType)));
 }
 
+// The number of bytes used to encode a value as a signed LEB128.
+size_t getSLEBSize(int64_t value) {
+  size_t size = 0;
+  while (true) {
+    uint8_t byte = value & 0x7f;
+    value >>= 7;
+    size++;
+    if ((value == 0 && !(byte & 0x40)) || (value == -1 && (byte & 0x40))) {
+      return size;
+    }
+  }
+}
+
+// The number of bytes used to encode a value as an unsigned LEB128.
+size_t getULEBSize(uint64_t value) {
+  size_t size = 1;
+  while (value >>= 7) {
+    size++;
+  }
+  return size;
+}
+
+// The number of bytes used to encode a numeric constant instruction.
+size_t getConstSize(const Literal& value) {
+  switch (value.type.getBasic()) {
+    case Type::i32:
+      return 1 + getSLEBSize(value.geti32());
+    case Type::i64:
+      return 1 + getSLEBSize(value.geti64());
+    case Type::f32:
+      return 1 + 4;
+    case Type::f64:
+      return 1 + 8;
+    default:
+      WASM_UNREACHABLE("unexpected const type");
+  }
+}
+
+// Decodes |size| elements of |element| type starting at |offset| in the data
+// of |segment| into literals. Returns false if the element type cannot be
+// decoded into a numeric constant.
+bool decodeSegmentElements(const DataSegment& segment,
+                           const Field& element,
+                           size_t offset,
+                           size_t size,
+                           std::vector<Literal>& values) {
+  const auto* data = reinterpret_cast<const uint8_t*>(segment.data.data());
+  auto elemBytes = element.getByteSize();
+  for (size_t i = 0; i < size; i++) {
+    const auto* p = data + offset + i * elemBytes;
+    if (element.isPacked()) {
+      // Read packed values as signed, which gives the smallest encoding for
+      // the values near the top of the unsigned range (the extra bits are
+      // truncated away when stored into the array anyhow).
+      if (element.packedType == Field::i8) {
+        values.push_back(Literal(int32_t(Bits::readLE<int8_t>(p))));
+      } else {
+        assert(element.packedType == Field::i16);
+        values.push_back(Literal(int32_t(Bits::readLE<int16_t>(p))));
+      }
+      continue;
+    }
+    if (!element.type.isNumber() || element.type == Type::v128) {
+      return false;
+    }
+    values.push_back(Literal::makeFromMemory(p, element.type));
+  }
+  return true;
+}
+
+// Maximum number of elements of an array.new_data we are willing to turn into
+// an array.new_fixed when not optimizing for size. Very long lists of operands
+// are not necessarily efficient for engines to handle, and a copy from a data
+// segment is a fine way to initialize a large array, but short lists are
+// cheaper to decode and avoid the segment entirely.
+const size_t MaxArrayNewFixedOperandsForSpeed = 64;
+
+// The maximum number of operands allowed on array.new_fixed by the spec.
+const size_t MaxArrayNewFixedOperands = 10000;
+
 } // anonymous namespace
 
 struct MemoryPacking : public Pass {
@@ -103,6 +191,7 @@ struct MemoryPacking : public Pass {
   bool requiresNonNullableLocalFixups() override { return false; }
 
   void run(Module* module) override;
+  void optimizeArrayNewData(Module* module);
   bool canOptimize(std::vector<std::unique_ptr<Memory>>& memories,
                    std::vector<std::unique_ptr<DataSegment>>& dataSegments);
   void
@@ -132,6 +221,12 @@ struct MemoryPacking : public Pass {
 };
 
 void MemoryPacking::run(Module* module) {
+  // Turn small constant segments that are only used by array.new_data into
+  // array.new_fixed. This does not depend on the memory at all.
+  if (module->features.hasGC() && !module->dataSegments.empty()) {
+    optimizeArrayNewData(module);
+  }
+
   // Does not have multimemory support
   if (!canOptimize(module->memories, module->dataSegments)) {
     return;
@@ -193,6 +288,128 @@ void MemoryPacking::run(Module* module) {
   if (canHaveSegmentReferrers) {
     replaceSegmentOps(module, replacements);
   }
+}
+
+void MemoryPacking::optimizeArrayNewData(Module* module) {
+  ReferrersMap referrers;
+  getSegmentReferrers(module, referrers);
+
+  auto maxOperands = getPassOptions().shrinkLevel > 0
+                       ? MaxArrayNewFixedOperands
+                       : MaxArrayNewFixedOperandsForSpeed;
+
+  Replacements replacements;
+  std::unordered_set<Name> removedSegments;
+
+  for (Index segmentIndex = 0; segmentIndex < module->dataSegments.size();
+       segmentIndex++) {
+    auto& segment = module->dataSegments[segmentIndex];
+    if (!segment->isPassive()) {
+      // An active segment is dropped after instantiation, so array.new_data on
+      // it traps (or has size 0). Leave such code alone.
+      continue;
+    }
+    auto iter = referrers.find(segment->name);
+    if (iter == referrers.end() || iter->second.empty()) {
+      // Unused segments are left for RemoveUnusedModuleElements.
+      continue;
+    }
+    auto& segmentReferrers = iter->second;
+
+    // The bytes needed for the segment itself: the passive flag, the size, and
+    // the data.
+    auto dataSize = segment->data.size();
+    size_t segmentBytes = 1 + getULEBSize(dataSize) + dataSize;
+    // The bytes of the array.new_data instructions, and of the array.new_fixed
+    // instructions that would replace them. The type index immediate is common
+    // to both and is not counted.
+    size_t newDataBytes = 0;
+    size_t newFixedBytes = 0;
+    size_t segmentIndexBytes = getULEBSize(segmentIndex);
+
+    struct Candidate {
+      ArrayNewData* curr;
+      std::vector<Literal> values;
+    };
+    std::vector<Candidate> candidates;
+
+    bool fail = false;
+    for (auto* referrer : segmentReferrers) {
+      // All referrers must be array.new_data with constant, in-bounds operands
+      // so that the segment can be removed afterwards. In particular a
+      // data.drop would make a later array.new_data trap, which we would not
+      // preserve if we replaced it.
+      auto* curr = referrer->dynCast<ArrayNewData>();
+      if (!curr || curr->type == Type::unreachable) {
+        fail = true;
+        break;
+      }
+      auto* offset = curr->offset->dynCast<Const>();
+      auto* size = curr->size->dynCast<Const>();
+      if (!offset || !size) {
+        fail = true;
+        break;
+      }
+      const auto& element = curr->type.getHeapType().getArray().element;
+      uint64_t offsetValue = offset->value.getUnsigned();
+      uint64_t sizeValue = size->value.getUnsigned();
+      uint64_t end;
+      if (std::ckd_add(&end, offsetValue, sizeValue * element.getByteSize()) ||
+          end > dataSize || sizeValue > maxOperands) {
+        fail = true;
+        break;
+      }
+      Candidate candidate{curr, {}};
+      if (!decodeSegmentElements(
+            *segment, element, offsetValue, sizeValue, candidate.values)) {
+        fail = true;
+        break;
+      }
+      // array.new_data: prefix + opcode, segment index, offset and size
+      // constants.
+      newDataBytes += 2 + segmentIndexBytes + 1 +
+                      getSLEBSize(offset->value.geti32()) + 1 +
+                      getSLEBSize(size->value.geti32());
+      // array.new_fixed: prefix + opcode, count, and the constants.
+      newFixedBytes += 2 + getULEBSize(sizeValue);
+      for (auto& value : candidate.values) {
+        newFixedBytes += getConstSize(value);
+      }
+      candidates.push_back(std::move(candidate));
+    }
+    if (fail || newFixedBytes > newDataBytes + segmentBytes) {
+      continue;
+    }
+
+    // Replacing is worthwhile (or at least not worse, and avoids the segment
+    // entirely, which also allows the result to be used in constant
+    // expressions).
+    for (auto& candidate : candidates) {
+      auto* curr = candidate.curr;
+      auto heapType = curr->type.getHeapType();
+      auto values = std::move(candidate.values);
+      replacements[curr] = [module, heapType, values](Function*) {
+        Builder builder(*module);
+        std::vector<Expression*> operands;
+        operands.reserve(values.size());
+        for (auto& value : values) {
+          operands.push_back(builder.makeConst(value));
+        }
+        return builder.makeArrayNewFixed(heapType, operands);
+      };
+    }
+    removedSegments.insert(segment->name);
+  }
+
+  if (replacements.empty()) {
+    return;
+  }
+
+  replaceSegmentOps(module, replacements);
+
+  module->removeDataSegments([&](DataSegment* segment) {
+    return removedSegments.count(segment->name) > 0;
+  });
 }
 
 // Whether the byte range [offset, offset + size) provably fits in the
