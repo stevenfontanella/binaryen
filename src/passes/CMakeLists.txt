@@ -89,6 +89,7 @@ set(passes_SOURCES
   OptimizeForJS.cpp
   OptimizeNoReturn.cpp
   OutlineAllocations.cpp
+  OutlineExpressions.cpp
   PickLoadSigns.cpp
   Poppify.cpp
   PostEmscripten.cpp

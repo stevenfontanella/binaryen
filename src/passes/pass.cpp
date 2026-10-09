@@ -374,6 +374,9 @@ void PassRegistry::registerPasses() {
                "outline duplicated allocations of constants into helper "
                "functions",
                createOutlineAllocationsPass);
+  registerPass("outline-expressions",
+               "outline duplicated expression trees into helper functions",
+               createOutlineExpressionsPass);
 // Outlining currently relies on LLVM's SuffixTree, which we can't rely upon
 // when building Binaryen for Emscripten.
 #ifndef SKIP_OUTLINING

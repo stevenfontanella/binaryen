@@ -322,6 +322,9 @@
 ;; CHECK-NEXT:                                                 of constants into helper 
 ;; CHECK-NEXT:                                                 functions
 ;; CHECK-EMPTY:
+;; CHECK-NEXT:   --outline-expressions                         outline duplicated expression 
+;; CHECK-NEXT:                                                 trees into helper functions
+;; CHECK-EMPTY:
 ;; CHECK-NEXT:   --outlining                                   outline instructions
 ;; CHECK-EMPTY:
 ;; CHECK-NEXT:   --pick-load-signs                             pick load signs based on their 
