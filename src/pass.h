@@ -108,6 +108,14 @@ struct InliningOptions {
   // TODO: Investigate enabling this. Locally 4 appears useful on real-world
   //       code, but reports of regressions have arrived.
   Index partialInliningIfs = 0;
+  // Max size of functions that we inline at call sites where every argument
+  // is a constant (a Const, ref.null, ref.func, string.const, or a global.get
+  // of an immutable global with a constant initializer), when the function
+  // branches on one of its parameters. Such inlinings are likely to fold away
+  // most of the inlined code, even though the function is above
+  // flexibleInlineMaxSize and may contain calls. Only applies at -O3 without
+  // shrinking. A value of zero disables this.
+  Index constantArgInlineMaxSize = 60;
 };
 
 // Assume code outside of the module does not inspect or interact with GC and

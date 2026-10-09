@@ -276,6 +276,18 @@ struct OptimizationOptions : public ToolOptions {
              passOptions.inlining.partialInliningIfs =
                static_cast<Index>(std::stoi(argument));
            })
+      .add("--const-arg-inline-max-function-size",
+           "-caimfs",
+           "Max size of functions that are inlined at call sites where all "
+           "arguments are constants and the function branches on a parameter "
+           "(-O3 only; zero disables). Default: " +
+             std::to_string(InliningOptions().constantArgInlineMaxSize),
+           OptimizationOptionsCategory,
+           Options::Arguments::One,
+           [this](Options* o, const std::string& argument) {
+             passOptions.inlining.constantArgInlineMaxSize =
+               static_cast<Index>(std::stoi(argument));
+           })
       .add("--ignore-implicit-traps",
            "-iit",
            "Optimize under the helpful assumption that no surprising traps "

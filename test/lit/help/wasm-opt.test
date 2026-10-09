@@ -731,6 +731,13 @@
 ;; CHECK-NEXT:                                                 inlining is disabled) (default: 
 ;; CHECK-NEXT:                                                 0)
 ;; CHECK-EMPTY:
+;; CHECK-NEXT:   --const-arg-inline-max-function-size,-caimfs  Max size of functions that are 
+;; CHECK-NEXT:                                                 inlined at call sites where all 
+;; CHECK-NEXT:                                                 arguments are constants and the 
+;; CHECK-NEXT:                                                 function branches on a parameter
+;; CHECK-NEXT:                                                 (-O3 only; zero disables). 
+;; CHECK-NEXT:                                                 Default: 60
+;; CHECK-EMPTY:
 ;; CHECK-NEXT:   --ignore-implicit-traps,-iit                  Optimize under the helpful 
 ;; CHECK-NEXT:                                                 assumption that no surprising 
 ;; CHECK-NEXT:                                                 traps occur (from load, div/mod,

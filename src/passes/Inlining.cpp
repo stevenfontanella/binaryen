@@ -29,6 +29,7 @@
 //
 
 #include <atomic>
+#include <sstream>
 
 #include "ir/branch-hints.h"
 #include "ir/branch-utils.h"
@@ -112,6 +113,11 @@ struct FunctionInfo {
   // Something is used globally if there is a reference to it in a table or
   // export etc.
   bool usedGlobally;
+  // Whether some control flow in the function (an if, select, br_if, br_table
+  // or br_on*) depends on a parameter. If so, then calling the function with
+  // constant arguments is likely to let that control flow be folded away after
+  // inlining.
+  bool hasParamDependentBranch;
   TrivialInstruction trivialInstruction;
   InliningMode inliningMode;
   std::optional<uint8_t> toolchainInlineHint;
@@ -125,6 +131,7 @@ struct FunctionInfo {
     hasLoops = false;
     hasTryDelegate = false;
     usedGlobally = false;
+    hasParamDependentBranch = false;
     trivialInstruction = TrivialInstruction::NotTrivial;
     inliningMode = InliningMode::Unknown;
     toolchainInlineHint = std::nullopt;
@@ -138,6 +145,7 @@ struct FunctionInfo {
     hasLoops = other.hasLoops;
     hasTryDelegate = other.hasTryDelegate;
     usedGlobally = other.usedGlobally;
+    hasParamDependentBranch = other.hasParamDependentBranch;
     trivialInstruction = other.trivialInstruction;
     inliningMode = other.inliningMode;
     toolchainInlineHint = other.toolchainInlineHint;
@@ -194,6 +202,30 @@ struct FunctionInfo {
     // 2. The function doesn't have loops, or we allow inlining with loops.
     return !hasCalls && (!hasLoops || options.inlining.allowFunctionsWithLoops);
   }
+
+  // Whether the function is worth inlining at call sites where every argument
+  // is a constant (see Planner::hasConstantArgs). We only do that when the
+  // function branches on a parameter, so that constant arguments are likely to
+  // fold away a large part of the inlined code (and possibly all of it, which
+  // can then enable further optimizations in the caller).
+  bool worthConstantArgInlining(PassOptions& options) {
+    if (hasTryDelegate) {
+      return false;
+    }
+    if (toolchainInlineHint == CodeAnnotation::NeverInline) {
+      return false;
+    }
+    if (options.shrinkLevel > 0 || options.optimizeLevel < 3) {
+      return false;
+    }
+    if (size > options.inlining.constantArgInlineMaxSize) {
+      return false;
+    }
+    if (hasLoops && !options.inlining.allowFunctionsWithLoops) {
+      return false;
+    }
+    return hasParamDependentBranch;
+  }
 };
 
 using NameInfoMap = std::unordered_map<Name, FunctionInfo>;
@@ -241,6 +273,41 @@ struct FunctionInfoScanner
     assert(infos.contains(curr->func));
     infos[curr->func].refs++;
   }
+
+  // Note control flow that depends on a parameter. (We do not check that the
+  // parameter is never written to; that is rare and only makes this a less
+  // precise heuristic.)
+  void noteCondition(Expression* condition) {
+    if (!getFunction()) {
+      // Module-level code (global initializers etc.).
+      return;
+    }
+    auto& info = infos[getFunction()->name];
+    if (info.hasParamDependentBranch) {
+      return;
+    }
+    auto numParams = getFunction()->getNumParams();
+    for (auto* get : FindAll<LocalGet>(condition).list) {
+      if (get->index < numParams) {
+        info.hasParamDependentBranch = true;
+        return;
+      }
+    }
+  }
+
+  void visitIf(If* curr) { noteCondition(curr->condition); }
+
+  void visitSelect(Select* curr) { noteCondition(curr->condition); }
+
+  void visitSwitch(Switch* curr) { noteCondition(curr->condition); }
+
+  void visitBreak(Break* curr) {
+    if (curr->condition) {
+      noteCondition(curr->condition);
+    }
+  }
+
+  void visitBrOn(BrOn* curr) { noteCondition(curr->ref); }
 
   void visitFunction(Function* curr) {
     auto& info = infos[curr->name];
@@ -308,6 +375,11 @@ struct InliningAction {
   // UniqueNameMapper::uniquify).
   Index nameHint = 0;
 
+  // Whether to inline the entire function regardless of its inlining mode.
+  // This is set for constant-argument call sites, see
+  // FunctionInfo::worthConstantArgInlining.
+  bool forceFull = false;
+
   InliningAction(Expression** callSite,
                  Function* contents,
                  bool insideATry,
@@ -319,6 +391,13 @@ struct InliningAction {
 struct InliningState {
   // Maps functions worth inlining to the mode with which we can inline them.
   std::unordered_map<Name, InliningMode> inlinableFunctions;
+  // Functions that are worth fully inlining at call sites where all the
+  // arguments are constants (these are not fully inlineable in general).
+  std::unordered_set<Name> constantArgFunctions;
+  // Immutable globals whose initializer is a constant, or an allocation of
+  // constants (which has a fixed identity). A global.get of such a global
+  // counts as a constant argument.
+  std::unordered_set<Name> constantGlobals;
   // function name => actions that can be performed in it
   std::unordered_map<Name, std::vector<InliningAction>> actionsForFunction;
 };
@@ -348,19 +427,52 @@ struct Planner : public WalkerPass<TryDepthWalker<Planner>> {
     } else {
       isUnreachable = curr->type == Type::unreachable;
     }
-    if (state->inlinableFunctions.contains(curr->target) && !isUnreachable &&
-        curr->target != getFunction()->name) {
-      // can't add a new element in parallel
-      assert(state->actionsForFunction.contains(getFunction()->name));
-      state->actionsForFunction[getFunction()->name].emplace_back(
-        getCurrentPointer(),
-        getModule()->getFunction(curr->target),
-        tryDepth > 0);
+    if (isUnreachable || curr->target == getFunction()->name) {
+      return;
     }
+    bool forceFull = false;
+    if (state->constantArgFunctions.contains(curr->target) &&
+        hasConstantArgs(curr)) {
+      forceFull = true;
+    } else if (!state->inlinableFunctions.contains(curr->target)) {
+      return;
+    }
+    // can't add a new element in parallel
+    assert(state->actionsForFunction.contains(getFunction()->name));
+    auto& actions = state->actionsForFunction[getFunction()->name];
+    actions.emplace_back(
+      getCurrentPointer(), getModule()->getFunction(curr->target), tryDepth > 0);
+    actions.back().forceFull = forceFull;
   }
 
 private:
   InliningState* state;
+
+  bool isConstantArg(Expression* curr) {
+    if (Properties::isSingleConstantExpression(curr)) {
+      return true;
+    }
+    if (auto* get = curr->dynCast<GlobalGet>()) {
+      return state->constantGlobals.contains(get->name);
+    }
+    if (auto* i31 = curr->dynCast<RefI31>()) {
+      return i31->value->is<Const>();
+    }
+    return false;
+  }
+
+  bool hasConstantArgs(Call* curr) {
+    // A call without arguments has nothing to specialize on.
+    if (curr->operands.empty()) {
+      return false;
+    }
+    for (auto* operand : curr->operands) {
+      if (!isConstantArg(operand)) {
+        return false;
+      }
+    }
+    return true;
+  }
 };
 
 struct Updater : public TryDepthWalker<Updater> {
@@ -1386,15 +1498,29 @@ struct Inlining : public Pass {
   void iteration(std::unordered_set<Function*>& inlinedInto) {
     // decide which to inline
     InliningState state;
+    auto& options = getPassOptions();
     ModuleUtils::iterDefinedFunctions(*module, [&](Function* func) {
       InliningMode inliningMode = getInliningMode(func->name);
       assert(inliningMode != InliningMode::Unknown);
       if (inliningMode != InliningMode::Uninlineable) {
         state.inlinableFunctions[func->name] = inliningMode;
       }
+      // Functions that are not fully inlined everywhere may still be worth
+      // fully inlining at call sites with constant arguments. That is only
+      // useful if we optimize after inlining, as the benefit comes from the
+      // inlined code folding away.
+      if (optimize && inliningMode != InliningMode::Full &&
+          !func->noFullInline &&
+          infos[func->name].worthConstantArgInlining(options)) {
+        state.constantArgFunctions.insert(func->name);
+      }
     });
-    if (state.inlinableFunctions.empty()) {
+    if (state.inlinableFunctions.empty() &&
+        state.constantArgFunctions.empty()) {
       return;
+    }
+    if (!state.constantArgFunctions.empty()) {
+      findConstantGlobals(state.constantGlobals);
     }
     // Fill in actionsForFunction, as we operate on it in parallel (each
     // function to its own entry). Also generate a vector of the function names
@@ -1441,6 +1567,11 @@ struct Inlining : public Pass {
         if (!isUnderSizeLimit(func->name, inlinedName)) {
           continue;
         }
+        if (action.forceFull &&
+            !constantArgInliningShrinks((*action.callSite)->cast<Call>(),
+                                        inlinedFunction)) {
+          continue;
+        }
 
         // Success - we can inline.
 #if INLINING_DEBUG
@@ -1453,7 +1584,9 @@ struct Inlining : public Pass {
         // we are still removing a call to the original function here, and so
         // we do not need to change anything else lower down - we still want to
         // note that we got rid of one use of the original function).
-        action.contents = getActuallyInlinedFunction(action.contents);
+        if (!action.forceFull) {
+          action.contents = getActuallyInlinedFunction(action.contents);
+        }
         action.nameHint = inlinedNameHint++;
         chosenActions[func->name].push_back(action);
         inlinedUses[inlinedName]++;
@@ -1548,6 +1681,76 @@ struct Inlining : public Pass {
     auto estimatedBinarySize = Measurer::BytesPerExpr * combinedSize;
     auto& options = getPassRunner()->options;
     return estimatedBinarySize < options.inlining.maxCombinedBinarySize;
+  }
+
+  // Finds immutable globals whose value is a constant, or an allocation whose
+  // fields are all constants (such a value has a fixed identity and contents,
+  // so comparisons and immutable field reads of it can be precomputed). Globals
+  // can only refer to earlier globals, so a single pass in order suffices.
+  void findConstantGlobals(std::unordered_set<Name>& constantGlobals) {
+    std::function<bool(Expression*)> isConstant = [&](Expression* curr) {
+      if (Properties::isSingleConstantExpression(curr)) {
+        return true;
+      }
+      if (auto* get = curr->dynCast<GlobalGet>()) {
+        return constantGlobals.contains(get->name);
+      }
+      if (curr->is<StructNew>() || curr->is<ArrayNewFixed>() ||
+          curr->is<ArrayNew>() || curr->is<RefI31>()) {
+        for (auto* child : ChildIterator(curr)) {
+          if (!isConstant(child)) {
+            return false;
+          }
+        }
+        return true;
+      }
+      return false;
+    };
+    for (auto& global : module->globals) {
+      if (!global->imported() && !global->mutable_ && isConstant(global->init)) {
+        constantGlobals.insert(global->name);
+      }
+    }
+  }
+
+  // Memoized results of constant-argument trial inlinings, keyed by the callee
+  // and the constant arguments (which fully determine the result).
+  std::unordered_map<std::string, bool> constantArgTrialResults;
+
+  // Checks whether inlining the callee at a call site whose arguments are all
+  // constants would shrink the code, by actually doing that in a scratch
+  // function, optimizing it, and measuring. This is the crucial check for
+  // constant-argument inlining: inlining a large callee is only worthwhile when
+  // the constant arguments let the inlined code fold away.
+  bool constantArgInliningShrinks(Call* call, Function* callee) {
+    std::stringstream key;
+    key << callee->name;
+    for (auto* operand : call->operands) {
+      key << ' ' << *operand;
+    }
+    auto [iter, inserted] =
+      constantArgTrialResults.try_emplace(key.str(), false);
+    if (inserted) {
+      iter->second = runConstantArgTrial(call, callee);
+    }
+    return iter->second;
+  }
+
+  bool runConstantArgTrial(Call* call, Function* callee) {
+    auto& options = getPassOptions();
+    Function trial;
+    trial.name = Name("constant-arg-trial");
+    trial.setResults(callee->getResults());
+    auto* copy = ExpressionManipulator::copy(call, *module)->cast<Call>();
+    copy->isReturn = false;
+    copy->type = callee->getResults();
+    trial.body = copy;
+    doInlining(module, &trial, InliningAction(&trial.body, callee, false), options);
+    PassRunner runner(module, options);
+    runner.setIsNested(true);
+    OptUtils::addUsefulPassesAfterInlining(runner);
+    runner.runOnFunction(&trial);
+    return Measurer::measure(trial.body) <= Measurer::measure(call);
   }
 };
 
