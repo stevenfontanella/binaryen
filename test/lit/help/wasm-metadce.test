@@ -531,6 +531,9 @@
 ;; CHECK-NEXT:   --stack-check                                 enforce limits on llvm's 
 ;; CHECK-NEXT:                                                 __stack_pointer global
 ;; CHECK-EMPTY:
+;; CHECK-NEXT:   --string-consts-to-data                       move lowered string constants 
+;; CHECK-NEXT:                                                 from imports to a data segment
+;; CHECK-EMPTY:
 ;; CHECK-NEXT:   --string-gathering                            gathers wasm strings to globals
 ;; CHECK-EMPTY:
 ;; CHECK-NEXT:   --string-lifting                              lift string imports to wasm 

@@ -183,6 +183,7 @@ Pass* createSparseFieldToLookupPass();
 Pass* createSpillPointersPass();
 Pass* createStackCheckPass();
 Pass* createStringGatheringPass();
+Pass* createStringConstsToDataPass();
 Pass* createStringLiftingPass();
 Pass* createThunkFieldsToDataPass();
 Pass* createStringLoweringPass();

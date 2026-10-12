@@ -560,6 +560,9 @@ void PassRegistry::registerPasses() {
     "ssa-nomerge",
     "ssa-ify variables so that they have a single assignment, ignoring merges",
     createSSAifyNoMergePass);
+  registerPass("string-consts-to-data",
+               "move lowered string constants from imports to a data segment",
+               createStringConstsToDataPass);
   registerPass("string-gathering",
                "gathers wasm strings to globals",
                createStringGatheringPass);
