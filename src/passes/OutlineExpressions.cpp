@@ -58,6 +58,17 @@
 // a sub-tree that also appears elsewhere), so the pass repeats itself a few
 // times until nothing more is outlined.
 //
+// Once that converges, a final round also treats constants (i32.const etc.,
+// global.get of an immutable global, ref.func) as holes, so that trees that
+// differ only in their constants share a helper, for example
+//
+//   (struct.new $T (global.get $vtable) (i32.const 0) (f64.const 1.5))
+//   (struct.new $T (global.get $vtable) (i32.const 0) (f64.const 2.5))
+//
+// A constant on which all the sites agree (the vtable and the 0 here) is
+// "fixed": it stays inline in the helper. The others become parameters, passed
+// at each site, in evaluation order with the local holes.
+//
 // This pass is not part of the default pipelines: it works best once at the
 // very end, after all inlining and other optimizations are done, as the
 // helpers it creates hide information from passes that run later.
@@ -192,6 +203,26 @@ Index getShallowBytes(Expression* curr) {
   }
 }
 
+// Whether an expression is a constant that a round with constants as holes
+// treats as a hole.
+bool isConstHole(Module& wasm, Expression* curr) {
+  if (curr->is<Const>() || curr->is<RefFunc>()) {
+    return true;
+  }
+  if (auto* get = curr->dynCast<GlobalGet>()) {
+    return !wasm.getGlobal(get->name)->mutable_;
+  }
+  return false;
+}
+
+// A leaf of a tree that may become a parameter of the helper: a local.get (the
+// same local read several times is a single hole), or, in a round with
+// constants as holes, a constant.
+struct Hole {
+  Expression* expr;
+  bool isLocal;
+};
+
 // A group of sites with the same shape.
 struct KeyInfo {
   std::vector<struct Site*> sites;
@@ -199,6 +230,15 @@ struct KeyInfo {
   Function* helper = nullptr;
   // Whether we decided to outline the sites with this key.
   bool outline = false;
+  // Whether the fields below have been computed.
+  bool prepared = false;
+  // For each hole position, whether all sites have the same constant there, so
+  // that it stays inline in the helper instead of becoming a parameter.
+  std::vector<bool> fixed;
+  // The number of parameters the helper has: the local holes, and the
+  // constant holes that are not fixed.
+  Index numLocals = 0;
+  Index numVarying = 0;
 };
 
 // An expression tree in a function body that we may outline.
@@ -209,8 +249,6 @@ struct Site {
   size_t hash = 0;
   // The estimated binary size of the tree.
   Index bytes = 0;
-  // The number of holes, that is, of distinct locals the tree reads.
-  Index holes = 0;
   // The nearest enclosing site, if any. Outlining that makes this site vanish.
   Site* parent = nullptr;
   // The key this site belongs to.
@@ -218,6 +256,11 @@ struct Site {
   // Whether this site is the entire body of the function that we use as the
   // helper for its shape (either one we created earlier, or by coincidence).
   bool helperBody = false;
+  // The holes, in evaluation order, computed when the key is prepared.
+  std::vector<Hole> holes;
+  // The estimated size of the constants at positions that are not fixed, which
+  // the site must pass as arguments.
+  Index varyingBytes = 0;
 };
 
 // Information about a tree, computed bottom-up.
@@ -249,13 +292,15 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
   Module& wasm;
   FunctionInfo& info;
   Mode mode;
+  // Whether constants are holes in this round.
+  bool constHoles;
 
   // Infos of the already-visited children of the expressions we are in the
   // middle of visiting.
   std::vector<NodeInfo> stack;
 
-  Scanner(Module& wasm, FunctionInfo& info, Mode mode)
-    : wasm(wasm), info(info), mode(mode) {}
+  Scanner(Module& wasm, FunctionInfo& info, Mode mode, bool constHoles)
+    : wasm(wasm), info(info), mode(mode), constHoles(constHoles) {}
 
   void visitExpression(Expression* curr) {
     NodeInfo node;
@@ -270,6 +315,7 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
         node.trivialChildren = false;
       }
       hash_combine(node.hash, child.hash);
+
       node.bytes += child.bytes;
       for (auto local : child.locals) {
         noteLocal(node, local);
@@ -333,7 +379,6 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
     site.expr = curr;
     site.hash = node.hash;
     site.bytes = node.bytes;
-    site.holes = node.locals.size();
   }
 
   void noteLocal(NodeInfo& node, Index local) {
@@ -346,8 +391,8 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
   }
 
   size_t getShallowHash(Expression* curr) {
-    if (curr->is<LocalGet>()) {
-      // A hole. Only the type matters.
+    if (curr->is<LocalGet>() || (constHoles && isConstHole(wasm, curr))) {
+      // A hole. Only the kind and type matter.
       auto digest = hash(curr->_id);
       rehash(digest, curr->type.getID());
       return digest;
@@ -428,23 +473,36 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
   }
 };
 
-// The holes of a tree: the distinct locals it reads, in order of first use,
-// with the first local.get of each.
-std::vector<std::pair<Index, LocalGet*>> getHoles(Expression* curr) {
-  std::vector<std::pair<Index, LocalGet*>> holes;
-  for (auto* get : FindAll<LocalGet>(curr).list) {
-    bool seen = false;
-    for (auto& [local, _] : holes) {
-      if (local == get->index) {
-        seen = true;
-        break;
+// Finds the holes of a tree, in evaluation order: the distinct locals it reads
+// (with the first local.get of each) and, if constants are holes, each
+// constant.
+struct HoleFinder
+  : public PostWalker<HoleFinder, UnifiedExpressionVisitor<HoleFinder>> {
+  Module& wasm;
+  bool constHoles;
+  std::vector<Hole> holes;
+
+  HoleFinder(Module& wasm, bool constHoles)
+    : wasm(wasm), constHoles(constHoles) {}
+
+  void visitExpression(Expression* curr) {
+    if (auto* get = curr->dynCast<LocalGet>()) {
+      for (auto& hole : holes) {
+        if (hole.isLocal && hole.expr->cast<LocalGet>()->index == get->index) {
+          return;
+        }
       }
-    }
-    if (!seen) {
-      holes.emplace_back(get->index, get);
+      holes.push_back({curr, true});
+    } else if (constHoles && isConstHole(wasm, curr)) {
+      holes.push_back({curr, false});
     }
   }
-  return holes;
+};
+
+std::vector<Hole> getHoles(Module& wasm, Expression* expr, bool constHoles) {
+  HoleFinder finder(wasm, constHoles);
+  finder.walk(expr);
+  return std::move(finder.holes);
 }
 
 // Information about a replacement of a site with a call to a helper.
@@ -469,19 +527,23 @@ struct Replacer : public WalkerPass<
 
   // We do not replace a site inside another replaced site, so we can use a
   // simple postorder walk here (the holes we pass to the helper are the
-  // original local.gets, which no replacement of a child could touch).
+  // original leaves, which no replacement of a child could touch).
   void visitExpression(Expression* curr) {
     auto iter = replacements.find(curr);
     if (iter == replacements.end()) {
       return;
     }
     auto& replacement = iter->second;
+    auto* site = replacement.site;
+    auto& fixed = site->key->fixed;
     Builder builder(*getModule());
     std::vector<Expression*> args;
-    for (auto& [local, get] : getHoles(curr)) {
-      args.push_back(get);
+    for (Index i = 0; i < site->holes.size(); i++) {
+      if (!fixed[i]) {
+        args.push_back(site->holes[i].expr);
+      }
     }
-    assert(args.size() == replacement.site->holes);
+    assert(args.size() == site->key->numLocals + site->key->numVarying);
     if (curr->type == Type::unreachable) {
       replaceCurrent(builder.makeSequence(
         builder.makeCall(replacement.helper, args, Type::none),
@@ -517,15 +579,25 @@ struct OutlineExpressions : public Pass {
   // again in the same round. Repeat until nothing more is outlined, with a
   // limit, as later rounds find little.
   static const Index MaxRounds = 4;
+  // Then do the same with constants as holes.
+  static const Index MaxConstRounds = 2;
+
+  // Whether constants are holes in the current round.
+  bool constHoles = false;
 
   void run(Module* module) override {
     wasm = module;
 
     auto mode = getMode();
 
+    constHoles = false;
     for (Index round = 0; round < MaxRounds; round++) {
-      keys.clear();
-      keysByHash.clear();
+      if (!runRound(mode)) {
+        break;
+      }
+    }
+    constHoles = true;
+    for (Index round = 0; round < MaxConstRounds; round++) {
       if (!runRound(mode)) {
         break;
       }
@@ -534,22 +606,31 @@ struct OutlineExpressions : public Pass {
 
   // Scans, decides, and replaces once. Returns whether anything was replaced.
   bool runRound(Mode mode) {
+    keys.clear();
+    keysByHash.clear();
+
     ModuleUtils::ParallelFunctionAnalysis<FunctionInfo> analysis(
       *wasm, [&](Function* func, FunctionInfo& info) {
         if (func->imported()) {
           return;
         }
-        Scanner(*wasm, info, mode).walk(func->body);
+        Scanner(*wasm, info, mode, constHoles).walk(func->body);
         noteParents(func->body, info);
       });
 
-    // Group the sites by key, and find existing helpers.
+    // Group the sites by key.
     for (auto& func : wasm->functions) {
       auto& info = analysis.map[func.get()];
       for (auto& site : info.sites) {
         site.key = getKey(&site);
         site.key->sites.push_back(&site);
       }
+    }
+
+    // Find existing helpers. This needs the keys to be complete, as whether a
+    // function can be the helper for its key depends on all the sites.
+    for (auto& func : wasm->functions) {
+      auto& info = analysis.map[func.get()];
       if (!info.sites.empty() && info.sites.back().expr == func->body) {
         noteExistingHelper(func.get(), info.sites.back());
       }
@@ -563,24 +644,31 @@ struct OutlineExpressions : public Pass {
     for (Index i = 0; i < 10; i++) {
       bool changed = false;
       for (auto& info : keys) {
-        Index count = 0;
-        for (auto* site : info.sites) {
-          if (isCandidate(site)) {
-            count++;
-          }
-        }
-        bool outline;
+        bool outline = false;
         if (info.helper) {
           // The helper already exists, so any use of it is a win.
-          outline = count > 0;
-        } else {
+          for (auto* site : info.sites) {
+            if (isCandidate(site)) {
+              outline = true;
+              break;
+            }
+          }
+        } else if (info.sites.size() >= 2) {
           // Each site shrinks to a call with the holes as arguments, and the
           // helper contains a copy of the tree plus overhead.
+          prepareKey(info);
+          int64_t saved = 0;
+          for (auto* site : info.sites) {
+            if (isCandidate(site)) {
+              saved += int64_t(site->bytes) - getCallBytes(site) -
+                       LocalGetBytes * int64_t(info.numLocals) -
+                       int64_t(site->varyingBytes);
+            }
+          }
           auto* site = info.sites[0];
-          int64_t saved =
-            int64_t(count) * (int64_t(site->bytes) - getCallBytes(site) -
-                              LocalGetBytes * int64_t(site->holes));
-          int64_t cost = int64_t(site->bytes) + HelperOverheadBytes;
+          int64_t cost = int64_t(site->bytes) - int64_t(site->varyingBytes) +
+                         LocalGetBytes * int64_t(info.numVarying) +
+                         HelperOverheadBytes;
           outline = saved > cost;
         }
         if (outline != info.outline) {
@@ -667,11 +755,23 @@ struct OutlineExpressions : public Pass {
 
   // Two trees have the same shape if they are equal apart from the locals that
   // their holes read, where the same local must be used in the same places in
-  // both trees.
+  // both trees (and, with constants as holes, apart from the constants, which
+  // must have the same type).
   bool sameShape(Expression* left, Expression* right) {
     std::unordered_map<Index, Index> leftToRight, rightToLeft;
     bool mismatch = false;
     auto comparer = [&](Expression* left, Expression* right) {
+      if (constHoles) {
+        bool leftConst = isConstHole(*wasm, left);
+        bool rightConst = isConstHole(*wasm, right);
+        if (leftConst || rightConst) {
+          if (!leftConst || !rightConst || left->_id != right->_id ||
+              left->type != right->type) {
+            mismatch = true;
+          }
+          return true;
+        }
+      }
       auto* leftGet = left->dynCast<LocalGet>();
       auto* rightGet = right->dynCast<LocalGet>();
       if (!leftGet || !rightGet) {
@@ -705,6 +805,48 @@ struct OutlineExpressions : public Pass {
     auto* key = &keys.back();
     candidates.push_back(key);
     return key;
+  }
+
+  // Computes the holes of a key's sites, which constant holes are fixed (all
+  // sites have the same constant there), and the resulting parameter counts
+  // and per-site argument sizes.
+  void prepareKey(KeyInfo& key) {
+    if (key.prepared) {
+      return;
+    }
+    key.prepared = true;
+    for (auto* site : key.sites) {
+      site->holes = getHoles(*wasm, site->expr, constHoles);
+    }
+    auto& first = key.sites[0]->holes;
+    key.fixed.resize(first.size());
+    for (Index i = 0; i < first.size(); i++) {
+      key.fixed[i] = !first[i].isLocal;
+    }
+    for (auto* site : key.sites) {
+      assert(site->holes.size() == first.size());
+      for (Index i = 0; i < first.size(); i++) {
+        if (key.fixed[i] &&
+            !ExpressionAnalyzer::equal(first[i].expr, site->holes[i].expr)) {
+          key.fixed[i] = false;
+        }
+      }
+    }
+    for (Index i = 0; i < first.size(); i++) {
+      if (first[i].isLocal) {
+        key.numLocals++;
+      } else if (!key.fixed[i]) {
+        key.numVarying++;
+      }
+    }
+    for (auto* site : key.sites) {
+      for (Index i = 0; i < first.size(); i++) {
+        auto& hole = site->holes[i];
+        if (!hole.isLocal && !key.fixed[i]) {
+          site->varyingBytes += getShallowBytes(hole.expr);
+        }
+      }
+    }
   }
 
   // The bytes a site costs after outlining: a call, plus an unreachable if the
@@ -741,40 +883,79 @@ struct OutlineExpressions : public Pass {
   }
 
   // If the function's body is just a tree whose holes are its params, in
-  // order, note it as the helper for the tree's key.
+  // order, note it as the helper for the tree's key. With constants as holes,
+  // all the constants in the body must be fixed, as the function has them
+  // baked in.
   void noteExistingHelper(Function* func, Site& site) {
-    if (site.holes != func->getNumParams() ||
-        func->getResults() != getHelperResults(site.expr)) {
+    if (func->getResults() != getHelperResults(site.expr)) {
+      return;
+    }
+    auto& key = *site.key;
+    prepareKey(key);
+    if (key.numVarying != 0 || key.numLocals != func->getNumParams()) {
       return;
     }
     Index i = 0;
-    for (auto& [local, get] : getHoles(site.expr)) {
-      if (local != i || get->type != func->getLocalType(i)) {
+    for (auto& hole : site.holes) {
+      if (!hole.isLocal) {
+        continue;
+      }
+      auto* get = hole.expr->cast<LocalGet>();
+      if (get->index != i || get->type != func->getLocalType(i)) {
         return;
       }
       i++;
     }
-    if (site.key->helper) {
+    if (key.helper) {
       // We already have a helper for this key. This function can just call it
       // like any other site.
       return;
     }
     site.helperBody = true;
-    site.key->helper = func;
+    key.helper = func;
   }
 
-  Function* createHelper(Site* site) {
-    auto* body = ExpressionManipulator::copy(site->expr, *wasm);
-    std::vector<Type> params;
+  // Turns the non-fixed holes of a copied tree into local.gets of the params.
+  struct HoleReplacer
+    : public PostWalker<HoleReplacer, UnifiedExpressionVisitor<HoleReplacer>> {
+    Module& wasm;
     std::unordered_map<Index, Index> paramOfLocal;
-    for (auto& [local, get] : getHoles(body)) {
-      paramOfLocal[local] = params.size();
-      params.push_back(get->type);
+    std::unordered_map<Expression*, Index> paramOfConst;
+
+    HoleReplacer(Module& wasm) : wasm(wasm) {}
+
+    void visitExpression(Expression* curr) {
+      if (auto* get = curr->dynCast<LocalGet>()) {
+        get->index = paramOfLocal.at(get->index);
+      } else if (auto iter = paramOfConst.find(curr);
+                 iter != paramOfConst.end()) {
+        replaceCurrent(Builder(wasm).makeLocalGet(iter->second, curr->type));
+      }
     }
-    assert(params.size() == site->holes);
-    for (auto* get : FindAll<LocalGet>(body).list) {
-      get->index = paramOfLocal.at(get->index);
+  };
+
+  Function* createHelper(Site* site) {
+    auto& key = *site->key;
+    auto* body = ExpressionManipulator::copy(site->expr, *wasm);
+    auto holes = getHoles(*wasm, body, constHoles);
+    assert(holes.size() == site->holes.size());
+    std::vector<Type> params;
+    HoleReplacer replacer(*wasm);
+    for (Index i = 0; i < holes.size(); i++) {
+      if (key.fixed[i]) {
+        continue;
+      }
+      auto& hole = holes[i];
+      if (hole.isLocal) {
+        replacer.paramOfLocal[hole.expr->cast<LocalGet>()->index] =
+          params.size();
+      } else {
+        replacer.paramOfConst[hole.expr] = params.size();
+      }
+      params.push_back(hole.expr->type);
     }
+    assert(params.size() == key.numLocals + key.numVarying);
+    replacer.walk(body);
     auto name = Names::getValidFunctionName(*wasm, "outlined");
     return wasm->addFunction(Builder::makeFunction(
       name, Signature(Type(params), getHelperResults(site->expr)), {}, body));

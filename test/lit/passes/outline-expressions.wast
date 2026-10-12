@@ -430,8 +430,9 @@
   )
 )
 
-;; The constants differ, so the shapes differ and nothing is outlined.
-;; (TODO: constants could be holes too.)
+;; The constants differ, so the shapes differ for the exact rounds, but the
+;; final round treats constants as holes: the differing constant becomes a
+;; param, while the constant 1 that all sites agree on stays in the helper.
 
 ;; CHECK:      (func $outlined (type $1) (param $0 (ref null $A)) (param $1 i32) (result i32)
 ;; CHECK-NEXT:  (if (result i32)
@@ -473,8 +474,12 @@
 
   ;; CHECK:      (type $1 (func (param (ref null $A)) (result i32)))
 
+  ;; CHECK:      (type $2 (func (param (ref null $A) i32) (result i32)))
+
   ;; CHECK:      (type $B (sub $A (struct (field i32) (field i32))))
   ;; SHRINK:      (type $1 (func (param (ref null $A)) (result i32)))
+
+  ;; SHRINK:      (type $2 (func (param (ref null $A) i32) (result i32)))
 
   ;; SHRINK:      (type $B (sub $A (struct (field i32) (field i32))))
   (type $B (sub $A (struct (field i32) (field i32))))
@@ -490,39 +495,15 @@
   )
 
   ;; CHECK:      (func $a (type $1) (param $x (ref null $A)) (result i32)
-  ;; CHECK-NEXT:  (i32.add
-  ;; CHECK-NEXT:   (i32.const 1)
-  ;; CHECK-NEXT:   (if (result i32)
-  ;; CHECK-NEXT:    (ref.test (ref $B)
-  ;; CHECK-NEXT:     (local.get $x)
-  ;; CHECK-NEXT:    )
-  ;; CHECK-NEXT:    (then
-  ;; CHECK-NEXT:     (call $f
-  ;; CHECK-NEXT:      (local.get $x)
-  ;; CHECK-NEXT:     )
-  ;; CHECK-NEXT:    )
-  ;; CHECK-NEXT:    (else
-  ;; CHECK-NEXT:     (i32.const 2147483647)
-  ;; CHECK-NEXT:    )
-  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  (call $outlined
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (i32.const 2147483647)
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
   ;; SHRINK:      (func $a (type $1) (param $x (ref null $A)) (result i32)
-  ;; SHRINK-NEXT:  (i32.add
-  ;; SHRINK-NEXT:   (i32.const 1)
-  ;; SHRINK-NEXT:   (if (result i32)
-  ;; SHRINK-NEXT:    (ref.test (ref $B)
-  ;; SHRINK-NEXT:     (local.get $x)
-  ;; SHRINK-NEXT:    )
-  ;; SHRINK-NEXT:    (then
-  ;; SHRINK-NEXT:     (call $f
-  ;; SHRINK-NEXT:      (local.get $x)
-  ;; SHRINK-NEXT:     )
-  ;; SHRINK-NEXT:    )
-  ;; SHRINK-NEXT:    (else
-  ;; SHRINK-NEXT:     (i32.const 2147483647)
-  ;; SHRINK-NEXT:    )
-  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  (call $outlined
+  ;; SHRINK-NEXT:   (local.get $x)
+  ;; SHRINK-NEXT:   (i32.const 2147483647)
   ;; SHRINK-NEXT:  )
   ;; SHRINK-NEXT: )
   (func $a (param $x (ref null $A)) (result i32)
@@ -541,39 +522,15 @@
   )
 
   ;; CHECK:      (func $b (type $1) (param $y (ref null $A)) (result i32)
-  ;; CHECK-NEXT:  (i32.add
-  ;; CHECK-NEXT:   (i32.const 1)
-  ;; CHECK-NEXT:   (if (result i32)
-  ;; CHECK-NEXT:    (ref.test (ref $B)
-  ;; CHECK-NEXT:     (local.get $y)
-  ;; CHECK-NEXT:    )
-  ;; CHECK-NEXT:    (then
-  ;; CHECK-NEXT:     (call $f
-  ;; CHECK-NEXT:      (local.get $y)
-  ;; CHECK-NEXT:     )
-  ;; CHECK-NEXT:    )
-  ;; CHECK-NEXT:    (else
-  ;; CHECK-NEXT:     (i32.const 2147483646)
-  ;; CHECK-NEXT:    )
-  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  (call $outlined
+  ;; CHECK-NEXT:   (local.get $y)
+  ;; CHECK-NEXT:   (i32.const 2147483646)
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
   ;; SHRINK:      (func $b (type $1) (param $y (ref null $A)) (result i32)
-  ;; SHRINK-NEXT:  (i32.add
-  ;; SHRINK-NEXT:   (i32.const 1)
-  ;; SHRINK-NEXT:   (if (result i32)
-  ;; SHRINK-NEXT:    (ref.test (ref $B)
-  ;; SHRINK-NEXT:     (local.get $y)
-  ;; SHRINK-NEXT:    )
-  ;; SHRINK-NEXT:    (then
-  ;; SHRINK-NEXT:     (call $f
-  ;; SHRINK-NEXT:      (local.get $y)
-  ;; SHRINK-NEXT:     )
-  ;; SHRINK-NEXT:    )
-  ;; SHRINK-NEXT:    (else
-  ;; SHRINK-NEXT:     (i32.const 2147483646)
-  ;; SHRINK-NEXT:    )
-  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  (call $outlined
+  ;; SHRINK-NEXT:   (local.get $y)
+  ;; SHRINK-NEXT:   (i32.const 2147483646)
   ;; SHRINK-NEXT:  )
   ;; SHRINK-NEXT: )
   (func $b (param $y (ref null $A)) (result i32)
@@ -592,39 +549,15 @@
   )
 
   ;; CHECK:      (func $c (type $1) (param $z (ref null $A)) (result i32)
-  ;; CHECK-NEXT:  (i32.add
-  ;; CHECK-NEXT:   (i32.const 1)
-  ;; CHECK-NEXT:   (if (result i32)
-  ;; CHECK-NEXT:    (ref.test (ref $B)
-  ;; CHECK-NEXT:     (local.get $z)
-  ;; CHECK-NEXT:    )
-  ;; CHECK-NEXT:    (then
-  ;; CHECK-NEXT:     (call $f
-  ;; CHECK-NEXT:      (local.get $z)
-  ;; CHECK-NEXT:     )
-  ;; CHECK-NEXT:    )
-  ;; CHECK-NEXT:    (else
-  ;; CHECK-NEXT:     (i32.const 2147483645)
-  ;; CHECK-NEXT:    )
-  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  (call $outlined
+  ;; CHECK-NEXT:   (local.get $z)
+  ;; CHECK-NEXT:   (i32.const 2147483645)
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
   ;; SHRINK:      (func $c (type $1) (param $z (ref null $A)) (result i32)
-  ;; SHRINK-NEXT:  (i32.add
-  ;; SHRINK-NEXT:   (i32.const 1)
-  ;; SHRINK-NEXT:   (if (result i32)
-  ;; SHRINK-NEXT:    (ref.test (ref $B)
-  ;; SHRINK-NEXT:     (local.get $z)
-  ;; SHRINK-NEXT:    )
-  ;; SHRINK-NEXT:    (then
-  ;; SHRINK-NEXT:     (call $f
-  ;; SHRINK-NEXT:      (local.get $z)
-  ;; SHRINK-NEXT:     )
-  ;; SHRINK-NEXT:    )
-  ;; SHRINK-NEXT:    (else
-  ;; SHRINK-NEXT:     (i32.const 2147483645)
-  ;; SHRINK-NEXT:    )
-  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  (call $outlined
+  ;; SHRINK-NEXT:   (local.get $z)
+  ;; SHRINK-NEXT:   (i32.const 2147483645)
   ;; SHRINK-NEXT:  )
   ;; SHRINK-NEXT: )
   (func $c (param $z (ref null $A)) (result i32)
@@ -644,6 +577,43 @@
 )
 
 ;; Holes with different types are different shapes: $b is not outlined.
+;; CHECK:      (func $outlined (type $2) (param $0 (ref null $A)) (param $1 i32) (result i32)
+;; CHECK-NEXT:  (i32.add
+;; CHECK-NEXT:   (i32.const 1)
+;; CHECK-NEXT:   (if (result i32)
+;; CHECK-NEXT:    (ref.test (ref $B)
+;; CHECK-NEXT:     (local.get $0)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:    (then
+;; CHECK-NEXT:     (call $f
+;; CHECK-NEXT:      (local.get $0)
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:    (else
+;; CHECK-NEXT:     (local.get $1)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:  )
+;; CHECK-NEXT: )
+
+;; SHRINK:      (func $outlined (type $2) (param $0 (ref null $A)) (param $1 i32) (result i32)
+;; SHRINK-NEXT:  (i32.add
+;; SHRINK-NEXT:   (i32.const 1)
+;; SHRINK-NEXT:   (if (result i32)
+;; SHRINK-NEXT:    (ref.test (ref $B)
+;; SHRINK-NEXT:     (local.get $0)
+;; SHRINK-NEXT:    )
+;; SHRINK-NEXT:    (then
+;; SHRINK-NEXT:     (call $f
+;; SHRINK-NEXT:      (local.get $0)
+;; SHRINK-NEXT:     )
+;; SHRINK-NEXT:    )
+;; SHRINK-NEXT:    (else
+;; SHRINK-NEXT:     (local.get $1)
+;; SHRINK-NEXT:    )
+;; SHRINK-NEXT:   )
+;; SHRINK-NEXT:  )
+;; SHRINK-NEXT: )
 (module
   ;; CHECK:      (type $A (sub (struct (field i32))))
   ;; SHRINK:      (type $A (sub (struct (field i32))))
