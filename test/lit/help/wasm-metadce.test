@@ -127,6 +127,9 @@
 ;; CHECK-NEXT:   --dealign                                     forces all loads and stores to 
 ;; CHECK-NEXT:                                                 have alignment 1
 ;; CHECK-EMPTY:
+;; CHECK-NEXT:   --defer-global-allocations                    lazily create constant global 
+;; CHECK-NEXT:                                                 objects on first use
+;; CHECK-EMPTY:
 ;; CHECK-NEXT:   --denan                                       instrument the wasm to convert 
 ;; CHECK-NEXT:                                                 NaNs into 0 at runtime
 ;; CHECK-EMPTY:

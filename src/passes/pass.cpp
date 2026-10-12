@@ -134,6 +134,9 @@ void PassRegistry::registerPasses() {
                createConstraintAnalysisPass);
   registerPass(
     "dce", "removes unreachable code", createDeadCodeEliminationPass);
+  registerPass("defer-global-allocations",
+               "lazily create constant global objects on first use",
+               createDeferGlobalAllocationsPass);
   registerPass("dealign",
                "forces all loads and stores to have alignment 1",
                createDeAlignPass);

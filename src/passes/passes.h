@@ -34,6 +34,7 @@ Pass* createConstHoistingPass();
 Pass* createConstantFieldPropagationPass();
 Pass* createConstantFieldPropagationRefTestPass();
 Pass* createConstraintAnalysisPass();
+Pass* createDeferGlobalAllocationsPass();
 Pass* createDAEPass();
 Pass* createDAEOptimizingPass();
 Pass* createDAE2Pass();

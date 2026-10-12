@@ -32,6 +32,7 @@ set(passes_SOURCES
   DeadArgumentElimination2.cpp
   DeadCodeElimination.cpp
   DeAlign.cpp
+  DeferGlobalAllocations.cpp
   DebugLocationPropagation.cpp
   DeNaN.cpp
   Directize.cpp
