@@ -146,6 +146,7 @@ set(passes_SOURCES
   StripEH.cpp
   SSAify.cpp
   TailCall.cpp
+  ThunkFieldsToData.cpp
   TupleOptimization.cpp
   TranslateEH.cpp
   TypeFinalizing.cpp

@@ -625,6 +625,10 @@
 ;; CHECK-NEXT:   --tail-call                                   convert calls in tail position 
 ;; CHECK-NEXT:                                                 to return calls
 ;; CHECK-EMPTY:
+;; CHECK-NEXT:   --thunk-fields-to-data                        replace fields holding 
+;; CHECK-NEXT:                                                 constant-returning thunks with 
+;; CHECK-NEXT:                                                 the data they return
+;; CHECK-EMPTY:
 ;; CHECK-NEXT:   --trace-calls                                 instrument the build with code 
 ;; CHECK-NEXT:                                                 to intercept specific function 
 ;; CHECK-NEXT:                                                 calls

@@ -299,6 +299,10 @@ void PassRegistry::registerPasses() {
   registerPass("table64-lowering",
                "alias for memory64-lowering",
                createMemory64LoweringPass);
+  registerPass("thunk-fields-to-data",
+               "replace fields holding constant-returning thunks with the "
+               "data they return",
+               createThunkFieldsToDataPass);
   registerPass("llvm-memory-copy-fill-lowering",
                "Lower memory.copy and memory.fill to wasm mvp and disable "
                "the bulk-memory feature.",

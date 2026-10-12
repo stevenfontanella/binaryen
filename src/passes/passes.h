@@ -184,6 +184,7 @@ Pass* createSpillPointersPass();
 Pass* createStackCheckPass();
 Pass* createStringGatheringPass();
 Pass* createStringLiftingPass();
+Pass* createThunkFieldsToDataPass();
 Pass* createStringLoweringPass();
 Pass* createStringLoweringMagicImportPass();
 Pass* createStringLoweringMagicImportAssertPass();
