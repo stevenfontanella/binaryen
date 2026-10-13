@@ -69,11 +69,28 @@
 // --pass-arg=string-consts-to-data-always@1 ignores the model.
 // --pass-arg=string-consts-to-data-compress@0 emits only literal runs.
 //
+// --pass-arg=string-consts-to-data-start-fill@1 additionally removes the
+// strings that are operands of struct.new or array.new_fixed in global
+// initializers (string wrapper objects, string arrays, enum-like constants).
+// Such a "slot" is initialized with a null instead, the field or element is
+// made mutable, and a start function (created, or run before the existing one)
+// decodes the unit stream and fills the slots in order, reading the strings
+// one after the other with a shared helper. Consecutive elements of an array
+// global with the same shape are filled by a loop. Strings with code uses are
+// then always converted to direct uses, so that no import remains and all
+// defined globals get the smallest indices.
+//
 
 #include <algorithm>
+#include <functional>
+#include <set>
+#include <unordered_set>
 
+#include "ir/iteration.h"
 #include "ir/module-utils.h"
 #include "ir/names.h"
+#include "ir/subtypes.h"
+#include "ir/type-updating.h"
 #include "pass.h"
 #include "passes/string-utils.h"
 #include "support/insert_ordered.h"
@@ -105,6 +122,8 @@ struct StringConstsToData : public Pass {
     bool inColumn = false;
     // Whether the string has a use that cannot be rewritten.
     bool pinned = false;
+    // Whether the string has a slot in a global initializer (start-fill mode).
+    bool hasSlot = false;
   };
 
   struct ColumnInfo {
@@ -123,11 +142,25 @@ struct StringConstsToData : public Pass {
     std::unordered_map<Name, Index> columnGets;
   };
 
+  // A use of a string as a struct.new operand or array.new_fixed element in a
+  // global initializer, which start-fill mode fills at instantiation.
+  struct Slot {
+    Name string;
+    // The struct or array type holding the string, and the field or element
+    // index.
+    HeapType container;
+    Index index;
+    // The use itself.
+    Expression** ptr;
+  };
+
   Module* module;
   bool always = false;
   bool compress = true;
+  bool startFill = false;
   InsertOrderedMap<Name, StringInfo> strings;
   InsertOrderedMap<Name, ColumnInfo> columns;
+  std::vector<Slot> slots;
 
   Name segmentName;
   Name dataGlobalName;
@@ -152,6 +185,8 @@ struct StringConstsToData : public Pass {
     always = !getArgumentOrDefault("string-consts-to-data-always", "").empty();
     compress =
       getArgumentOrDefault("string-consts-to-data-compress", "1") != "0";
+    startFill =
+      !getArgumentOrDefault("string-consts-to-data-start-fill", "").empty();
 
     if (!readStrings()) {
       return;
@@ -210,11 +245,20 @@ struct StringConstsToData : public Pass {
       }
     }
 
-    // A column is convertible only if every global.get of it is a read.
+    // A column is convertible only if every global.get of it is a read. In
+    // start-fill mode the elements of a column that stays become slots.
     auto pinColumn = [&](ColumnInfo& column) {
       column.pinned = true;
-      for (auto* value : column.init->values) {
-        strings[value->cast<GlobalGet>()->name].pinned = true;
+      auto type = column.init->type.getHeapType();
+      for (Index i = 0; i < column.init->values.size(); i++) {
+        auto*& value = column.init->values[i];
+        auto name = value->cast<GlobalGet>()->name;
+        if (startFill) {
+          slots.push_back({name, type, i, &value});
+          strings[name].hasSlot = true;
+        } else {
+          strings[name].pinned = true;
+        }
       }
     };
     for (auto& [name, column] : columns) {
@@ -250,7 +294,20 @@ struct StringConstsToData : public Pass {
       }
     }
 
-    // Strings with direct code uses that can be removed.
+    // The slots whose containers can be made mutable.
+    std::unordered_map<HeapType, std::set<Index>> mutableFields;
+    if (startFill) {
+      validateSlots(mutableFields);
+      for (auto& slot : slots) {
+        auto& string = strings[slot.string];
+        // The import is removed; the fill costs a few bytes per slot.
+        modelSaving += int64_t(getImportBytes(string.wtf16)) -
+                       int64_t(getEntryBytes(string.wtf16)) - 6;
+      }
+    }
+
+    // Strings with direct code uses that can be removed. In start-fill mode
+    // every such string is converted, so that no import remains.
     std::vector<std::pair<Name, StringInfo*>> rawStrings;
     for (auto& [name, string] : strings) {
       if (string.pinned || string.codeUses == 0) {
@@ -261,14 +318,14 @@ struct StringConstsToData : public Pass {
       int64_t saving = int64_t(getImportBytes(string.wtf16)) -
                        int64_t(getEntryBytes(string.wtf16)) -
                        int64_t(string.codeUses) * 4;
-      if (always || saving > 0) {
+      if (always || startFill || saving > 0) {
         rawStrings.emplace_back(name, &string);
         modelSaving += saving;
       } else {
         string.pinned = true;
       }
     }
-    if (convertibleColumns.empty() && rawStrings.empty()) {
+    if (convertibleColumns.empty() && rawStrings.empty() && slots.empty()) {
       return;
     }
     // The decoder and fill functions, the segment, and the raw helpers.
@@ -279,7 +336,9 @@ struct StringConstsToData : public Pass {
     // Build everything.
     Builder builder(*module);
     prepareNames();
-    makeFiller();
+    if (!convertibleColumns.empty() || !rawStrings.empty()) {
+      makeFiller();
+    }
 
     for (auto* column : convertibleColumns) {
       std::vector<std::string*> contents;
@@ -327,6 +386,10 @@ struct StringConstsToData : public Pass {
       }
     }
 
+    if (!slots.empty()) {
+      makeStartFill();
+    }
+
     // Compress the unit stream, add the segment and the decoder.
     auto segmentData = compressUnits();
     module->addDataSegment(Builder::makeDataSegment(
@@ -335,11 +398,16 @@ struct StringConstsToData : public Pass {
 
     // Remove the imports whose uses are all gone, and rebuild the JSON.
     for (auto& [name, string] : strings) {
-      if (!string.pinned && (string.codeUses > 0 || string.inColumn)) {
+      if (!string.pinned &&
+          (string.codeUses > 0 || string.inColumn || string.hasSlot)) {
         module->removeGlobal(name);
       }
     }
     writeStrings();
+
+    if (!mutableFields.empty()) {
+      makeFieldsMutable(mutableFields);
+    }
   }
 
 private:
@@ -430,7 +498,11 @@ private:
       if (global->imported() || columns.count(global->name)) {
         continue;
       }
-      scanner.walk(global->init);
+      if (startFill) {
+        collectSlots(&global->init);
+      } else {
+        scanner.walk(global->init);
+      }
     }
     for (auto& segment : module->elementSegments) {
       if (segment->offset) {
@@ -455,6 +527,526 @@ private:
         }
       }
     }
+  }
+
+  // Start-fill mode.
+
+  // Records the string uses in a global initializer that are operands of a
+  // struct.new or elements of an array.new_fixed with a nullable type as
+  // slots, and pins all other uses.
+  void collectSlots(Expression** ptr) {
+    auto* curr = *ptr;
+    if (auto* get = curr->dynCast<GlobalGet>()) {
+      if (auto iter = strings.find(get->name); iter != strings.end()) {
+        iter->second.pinned = true;
+      } else if (auto iter = columns.find(get->name); iter != columns.end()) {
+        iter->second.pinned = true;
+      }
+      return;
+    }
+    auto addSlot =
+      [&](HeapType container, Index index, Expression** child, Type type) {
+        auto* get = (*child)->dynCast<GlobalGet>();
+        if (!get || !type.isNullable() || !strings.count(get->name)) {
+          return false;
+        }
+        slots.push_back({get->name, container, index, child});
+        strings[get->name].hasSlot = true;
+        return true;
+      };
+    if (auto* structNew = curr->dynCast<StructNew>()) {
+      if (!structNew->desc) {
+        auto type = structNew->type.getHeapType();
+        auto& fields = type.getStruct().fields;
+        for (Index i = 0; i < structNew->operands.size(); i++) {
+          auto** child = &structNew->operands[i];
+          if (!addSlot(type, i, child, fields[i].type)) {
+            collectSlots(child);
+          }
+        }
+        return;
+      }
+    } else if (auto* arrayNew = curr->dynCast<ArrayNewFixed>()) {
+      auto type = arrayNew->type.getHeapType();
+      auto elementType = type.getArray().element.type;
+      for (Index i = 0; i < arrayNew->values.size(); i++) {
+        auto** child = &arrayNew->values[i];
+        if (!addSlot(type, i, child, elementType)) {
+          collectSlots(child);
+        }
+      }
+      return;
+    }
+    for (auto& child : ChildIterator(curr)) {
+      collectSlots(&child);
+    }
+  }
+
+  // Drops the slots whose string is pinned, too long for the fill helper, or
+  // whose container cannot be made mutable, and collects the fields to make
+  // mutable. A field must have the same mutability in all the types of its
+  // hierarchy, and only private types can be changed.
+  void
+  validateSlots(std::unordered_map<HeapType, std::set<Index>>& mutableFields) {
+    if (slots.empty()) {
+      return;
+    }
+    auto typeInfo = ModuleUtils::collectHeapTypeInfo(
+      *module,
+      getPassOptions().worldMode,
+      ModuleUtils::TypeInclusion::UsedIRTypes,
+      ModuleUtils::VisibilityHandling::FindVisibility);
+    SubTypes subTypes(*module);
+    // Whether the field can be made mutable, per container and index.
+    std::unordered_map<HeapType, std::unordered_map<Index, bool>> checked;
+    auto canMutate = [&](HeapType type, Index index) {
+      auto& entry = checked[type];
+      if (auto iter = entry.find(index); iter != entry.end()) {
+        return iter->second;
+      }
+      // Find the topmost type that has the field, then all its subtypes.
+      auto top = type;
+      while (auto super = top.getDeclaredSuperType()) {
+        if (type.isStruct() && super->getStruct().fields.size() <= index) {
+          break;
+        }
+        top = *super;
+      }
+      auto family = subTypes.getSubTypes(top);
+      bool ok = true;
+      for (auto member : family) {
+        auto iter = typeInfo.find(member);
+        if (iter == typeInfo.end() ||
+            iter->second.visibility != ModuleUtils::Visibility::Private) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) {
+        for (auto member : family) {
+          mutableFields[member].insert(index);
+        }
+      }
+      entry[index] = ok;
+      return ok;
+    };
+    // Pin the strings that cannot be filled, then drop all their slots.
+    for (auto& slot : slots) {
+      auto& string = strings[slot.string];
+      if (string.wtf16.size() / 2 >= 0xFFFF ||
+          !canMutate(slot.container, slot.index)) {
+        string.pinned = true;
+      }
+    }
+    slots.erase(std::remove_if(slots.begin(),
+                               slots.end(),
+                               [&](const Slot& slot) {
+                                 return strings[slot.string].pinned;
+                               }),
+                slots.end());
+  }
+
+  // Creates the start function that fills the slots, and the helper that
+  // returns the next string of the start group:
+  //
+  //   (func $next (result (ref extern))
+  //     (local $len i32) (local $start i32) (local $data (ref $i16))
+  //     (local.set $data (ref.as_non_null (global.get $data)))
+  //     (local.set $len (array.get_u $i16 (local.get $data) (global.get $lp)))
+  //     (global.set $lp (i32.add (global.get $lp) (i32.const 1)))
+  //     (local.set $start (global.get $sp))
+  //     (global.set $sp (i32.add (local.get $start) (local.get $len)))
+  //     (call $fromCharCodeArray (local.get $data) (local.get $start)
+  //                              (global.get $sp)))
+  //
+  // The start function calls the decoder and then fills the slots in the
+  // order in which their strings were added to the group, either one by one,
+  //
+  //   (struct.set $T f (..navigation to the struct..) (call $next))
+  //   (array.set $A (..navigation to the array..) (i32.const k) (call $next))
+  //
+  // or, for runs of at least 3 consecutive elements of an array global that
+  // hold strings in the same way, with a loop:
+  //
+  //   (local.set $i (i32.const from))
+  //   (loop $l
+  //     (struct.set $T f (ref.cast (ref $T) (array.get $A (global.get $arr)
+  //                                                        (local.get $i)))
+  //                      (call $next))
+  //     (br_if $l (i32.lt_u (local.tee $i (i32.add (local.get $i) 1))
+  //                         (i32.const to))))
+  //
+  // An element that is a global.get of another global holding a struct is
+  // followed in a loop, and that struct's slot is then filled by the loop.
+  void makeStartFill() {
+    Builder builder(*module);
+    auto i32 = Type::i32;
+    std::unordered_map<Expression*, Index> slotIndexes;
+    for (Index i = 0; i < slots.size(); i++) {
+      slotIndexes[*slots[i].ptr] = i;
+    }
+    std::vector<Expression*> items;
+    std::vector<std::string*> contents;
+    std::vector<bool> filled(slots.size(), false);
+    Name nextName = Names::getValidFunctionName(*module, "string.consts$next");
+    Index iLocal = 0;
+
+    auto getSlot = [&](Expression* curr) -> Index {
+      auto iter = slotIndexes.find(curr);
+      return iter == slotIndexes.end() ? Index(-1) : iter->second;
+    };
+    std::function<bool(Expression*)> containsSlot = [&](Expression* curr) {
+      if (getSlot(curr) != Index(-1)) {
+        return true;
+      }
+      for (auto* child : ChildIterator(curr)) {
+        if (containsSlot(child)) {
+          return true;
+        }
+      }
+      return false;
+    };
+    auto castTo = [&](Expression* ref, HeapType type) -> Expression* {
+      if (HeapType::isSubType(ref->type.getHeapType(), type)) {
+        return ref;
+      }
+      return builder.makeRefCast(ref, Type(type, NonNullable));
+    };
+    auto next = [&]() { return builder.makeCall(nextName, {}, refExtern); };
+    // Whether a slot is still to be filled by an item (not planned for a loop
+    // and not filled yet).
+    std::unordered_set<Index> inLoop;
+    auto needsItem = [&](Index slot) {
+      return !filled[slot] && !inLoop.count(slot);
+    };
+    auto fill = [&](Index slot, Expression* ref) -> Expression* {
+      filled[slot] = true;
+      contents.push_back(&strings[slots[slot].string].wtf16);
+      auto& info = slots[slot];
+      if (info.container.isStruct()) {
+        return builder.makeStructSet(info.index,
+                                     castTo(ref, info.container),
+                                     next(),
+                                     MemoryOrder::Unordered);
+      }
+      return builder.makeArraySet(castTo(ref, info.container),
+                                  builder.makeConst(int32_t(info.index)),
+                                  next(),
+                                  MemoryOrder::Unordered);
+    };
+
+    // Fills the slots below curr, whose value is created by makeRef. The
+    // container of a slot is the parent of the slot, so a slot is handled when
+    // visiting its parent.
+    std::function<void(Expression*, std::function<Expression*()>)> emit =
+      [&](Expression* curr, std::function<Expression*()> makeRef) {
+        if (auto* structNew = curr->dynCast<StructNew>()) {
+          auto type = structNew->type.getHeapType();
+          for (Index i = 0; i < structNew->operands.size(); i++) {
+            auto* operand = structNew->operands[i];
+            if (auto slot = getSlot(operand); slot != Index(-1)) {
+              if (needsItem(slot)) {
+                items.push_back(fill(slot, makeRef()));
+              }
+            } else if (containsSlot(operand)) {
+              auto fieldType = type.getStruct().fields[i].type;
+              emit(operand, [=, &builder]() {
+                return builder.makeStructGet(i,
+                                             castTo(makeRef(), type),
+                                             MemoryOrder::Unordered,
+                                             fieldType);
+              });
+            }
+          }
+        } else if (auto* arrayNew = curr->dynCast<ArrayNewFixed>()) {
+          auto type = arrayNew->type.getHeapType();
+          auto elementType = type.getArray().element.type;
+          for (Index i = 0; i < arrayNew->values.size(); i++) {
+            auto* value = arrayNew->values[i];
+            if (auto slot = getSlot(value); slot != Index(-1)) {
+              if (needsItem(slot)) {
+                items.push_back(fill(slot, makeRef()));
+              }
+            } else if (containsSlot(value)) {
+              emit(value, [=, &builder]() {
+                return builder.makeArrayGet(castTo(makeRef(), type),
+                                            builder.makeConst(int32_t(i)),
+                                            MemoryOrder::Unordered,
+                                            elementType);
+              });
+            }
+          }
+        }
+      };
+
+    // The way an element of an array global holds a string: directly, or in
+    // a struct created inline or in another global.
+    struct Shape {
+      Index slot = Index(-1);
+      // The struct type and field, if any.
+      HeapType type;
+      Index field = 0;
+      bool matches(const Shape& other) const {
+        return slot != Index(-1) && other.slot != Index(-1) &&
+               type == other.type && field == other.field;
+      }
+    };
+    auto getStructShape = [&](Expression* curr) {
+      Shape shape;
+      auto* structNew = curr->dynCast<StructNew>();
+      if (!structNew) {
+        return shape;
+      }
+      Index numSlots = 0;
+      for (Index i = 0; i < structNew->operands.size(); i++) {
+        auto* operand = structNew->operands[i];
+        if (auto slot = getSlot(operand); slot != Index(-1)) {
+          shape.slot = slot;
+          shape.type = structNew->type.getHeapType();
+          shape.field = i;
+          numSlots++;
+        } else if (containsSlot(operand)) {
+          numSlots += 2;
+        }
+      }
+      if (numSlots != 1) {
+        shape.slot = Index(-1);
+      }
+      return shape;
+    };
+    auto getShape = [&](Expression* value) {
+      Shape shape;
+      if (auto slot = getSlot(value); slot != Index(-1)) {
+        shape.slot = slot;
+        return shape;
+      }
+      if (auto* get = value->dynCast<GlobalGet>()) {
+        auto* global = module->getGlobal(get->name);
+        if (global->imported()) {
+          return shape;
+        }
+        return getStructShape(global->init);
+      }
+      return getStructShape(value);
+    };
+
+    // Plan the loops first, so that the slots of other globals that they fill
+    // are not filled on their own.
+    struct Run {
+      Index from, to;
+      Shape shape;
+    };
+    std::unordered_map<Name, std::vector<Run>> runs;
+    for (auto& global : module->globals) {
+      if (global->imported()) {
+        continue;
+      }
+      auto* arrayNew = global->init->dynCast<ArrayNewFixed>();
+      if (!arrayNew || !containsSlot(arrayNew)) {
+        continue;
+      }
+      std::vector<Shape> shapes;
+      for (auto* value : arrayNew->values) {
+        shapes.push_back(getShape(value));
+      }
+      Index numValues = shapes.size();
+      for (Index i = 0; i < numValues;) {
+        Index j = i + 1;
+        while (j < numValues && shapes[j].matches(shapes[i])) {
+          j++;
+        }
+        if (shapes[i].slot != Index(-1) && j - i >= 3) {
+          runs[global->name].push_back({i, j, shapes[i]});
+          for (Index k = i; k < j; k++) {
+            inLoop.insert(shapes[k].slot);
+          }
+        }
+        i = j;
+      }
+    }
+
+    // Emit, in module order.
+    Index numLoops = 0;
+    for (auto& global : module->globals) {
+      if (global->imported()) {
+        continue;
+      }
+      auto* init = global->init;
+      if (!containsSlot(init)) {
+        continue;
+      }
+      auto globalName = global->name;
+      auto globalType = global->type;
+      auto makeRoot = [=, &builder]() -> Expression* {
+        return builder.makeGlobalGet(globalName, globalType);
+      };
+      auto iter = runs.find(global->name);
+      if (iter == runs.end()) {
+        emit(init, makeRoot);
+        continue;
+      }
+      auto* arrayNew = init->cast<ArrayNewFixed>();
+      auto type = arrayNew->type.getHeapType();
+      auto elementType = type.getArray().element.type;
+      Index nextRun = 0;
+      for (Index i = 0; i < arrayNew->values.size();) {
+        auto* value = arrayNew->values[i];
+        if (nextRun < iter->second.size() && iter->second[nextRun].from == i) {
+          auto& run = iter->second[nextRun++];
+          Name loopName("fill" + std::to_string(numLoops++));
+          auto getI = [&]() { return builder.makeLocalGet(iLocal, i32); };
+          Expression* set;
+          if (run.shape.type.isStruct()) {
+            Expression* element = builder.makeArrayGet(
+              makeRoot(), getI(), MemoryOrder::Unordered, elementType);
+            set = builder.makeStructSet(run.shape.field,
+                                        castTo(element, run.shape.type),
+                                        next(),
+                                        MemoryOrder::Unordered);
+          } else {
+            // The array itself holds the strings.
+            set = builder.makeArraySet(
+              makeRoot(), getI(), next(), MemoryOrder::Unordered);
+          }
+          // A slot in another global may be filled by several loops, each
+          // adding its string again, which is harmless.
+          for (Index k = run.from; k < run.to; k++) {
+            auto slot = getShape(arrayNew->values[k]).slot;
+            filled[slot] = true;
+            contents.push_back(&strings[slots[slot].string].wtf16);
+          }
+          auto* loop = builder.makeLoop(
+            loopName,
+            builder.makeBlock(
+              {set,
+               builder.makeBreak(
+                 loopName,
+                 nullptr,
+                 builder.makeBinary(
+                   LtUInt32,
+                   builder.makeLocalTee(
+                     iLocal,
+                     builder.makeBinary(
+                       AddInt32, getI(), builder.makeConst(int32_t(1))),
+                     i32),
+                   builder.makeConst(int32_t(run.to))))}));
+          items.push_back(
+            builder.makeLocalSet(iLocal, builder.makeConst(int32_t(run.from))));
+          items.push_back(loop);
+          i = run.to;
+          continue;
+        }
+        if (auto slot = getSlot(value); slot != Index(-1)) {
+          if (needsItem(slot)) {
+            items.push_back(fill(slot, makeRoot()));
+          }
+        } else if (containsSlot(value)) {
+          emit(value, [=, &builder]() {
+            return builder.makeArrayGet(makeRoot(),
+                                        builder.makeConst(int32_t(i)),
+                                        MemoryOrder::Unordered,
+                                        elementType);
+          });
+        }
+        i++;
+      }
+    }
+    for (Index i = 0; i < slots.size(); i++) {
+      assert(filled[i]);
+    }
+
+    // Replace the slot operands with nulls.
+    for (auto& slot : slots) {
+      auto heapType = (*slot.ptr)->type.getHeapType();
+      *slot.ptr = builder.makeRefNull(heapType.getBottom());
+    }
+
+    // The group and the helper.
+    auto layout = addGroup(contents);
+    auto spName = Names::getValidGlobalName(*module, "string.consts$sp");
+    auto lpName = Names::getValidGlobalName(*module, "string.consts$lp");
+    module->addGlobal(
+      builder.makeGlobal(spName,
+                         i32,
+                         builder.makeConst(int32_t(layout.stringsOffset)),
+                         Builder::Mutable));
+    module->addGlobal(
+      builder.makeGlobal(lpName,
+                         i32,
+                         builder.makeConst(int32_t(layout.lengthsOffset)),
+                         Builder::Mutable));
+    Index len = 0, start = 1, data = 2;
+    Type i16Ref(i16ArrayType, NonNullable);
+    auto* setData = builder.makeLocalSet(data, getData(true));
+    auto* setLen = builder.makeLocalSet(
+      len,
+      builder.makeArrayGet(builder.makeLocalGet(data, i16Ref),
+                           builder.makeGlobalGet(lpName, i32),
+                           MemoryOrder::Unordered,
+                           i32,
+                           false));
+    auto* incLp = builder.makeGlobalSet(
+      lpName,
+      builder.makeBinary(
+        AddInt32, builder.makeGlobalGet(lpName, i32), builder.makeConst(1)));
+    auto* setStart =
+      builder.makeLocalSet(start, builder.makeGlobalGet(spName, i32));
+    auto* incSp =
+      builder.makeGlobalSet(spName,
+                            builder.makeBinary(AddInt32,
+                                               builder.makeLocalGet(start, i32),
+                                               builder.makeLocalGet(len, i32)));
+    auto* make = builder.makeCall(fromCharCodeArray,
+                                  {builder.makeLocalGet(data, i16Ref),
+                                   builder.makeLocalGet(start, i32),
+                                   builder.makeGlobalGet(spName, i32)},
+                                  refExtern);
+    module->addFunction(builder.makeFunction(
+      nextName,
+      Signature(Type::none, refExtern),
+      {i32, i32, i16Ref},
+      builder.makeBlock({setData, setLen, incLp, setStart, incSp, make},
+                        refExtern)));
+
+    // The start function.
+    std::vector<Expression*> body;
+    body.push_back(builder.makeCall(decodeFuncName, {}, Type::none));
+    body.insert(body.end(), items.begin(), items.end());
+    if (module->start.is()) {
+      body.push_back(builder.makeCall(module->start, {}, Type::none));
+    }
+    auto startName =
+      Names::getValidFunctionName(*module, "string.consts$start");
+    module->addFunction(builder.makeFunction(startName,
+                                             Signature(Type::none, Type::none),
+                                             {i32},
+                                             builder.makeBlock(body)));
+    module->start = startName;
+  }
+
+  // Makes the given fields mutable, throughout the type hierarchy.
+  void
+  makeFieldsMutable(std::unordered_map<HeapType, std::set<Index>>& fields) {
+    struct Rewriter : public GlobalTypeRewriter {
+      std::unordered_map<HeapType, std::set<Index>>& fields;
+      Rewriter(Module& wasm,
+               WorldMode worldMode,
+               std::unordered_map<HeapType, std::set<Index>>& fields)
+        : GlobalTypeRewriter(wasm, worldMode), fields(fields) {}
+      void modifyStruct(HeapType oldType, Struct& struct_) override {
+        if (auto iter = fields.find(oldType); iter != fields.end()) {
+          for (auto index : iter->second) {
+            struct_.fields[index].mutable_ = Mutable;
+          }
+        }
+      }
+      void modifyArray(HeapType oldType, Array& array) override {
+        if (fields.count(oldType)) {
+          array.element.mutable_ = Mutable;
+        }
+      }
+    } rewriter(*module, getPassOptions().worldMode, fields);
+    rewriter.update();
   }
 
   // Size model helpers.
