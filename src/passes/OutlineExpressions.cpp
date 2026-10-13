@@ -33,10 +33,26 @@
 //
 // A tree can be moved into a helper verbatim if it has no local writes and
 // nothing in it branches out of it: that is, it contains no local.set/tee,
-// br/br_if/br_table/br_on_*, return, return_call, try, loop, pop, or stack
-// switching. Control flow like if, block, select and drop is fine. Reading the
+// return, return_call, try, pop, or stack switching, and no br/br_if/br_table/
+// br_on_* to a label outside of it. Control flow like if, block, loop, select
+// and drop is fine, and so are branches to labels inside the tree. Reading the
 // holes before the tree (at the call) instead of inside it is fine as they have
 // no effects, and nothing in the tree can change what they read.
+//
+// A tree of type none that writes a single local, like the loop
+//
+//   (loop $l
+//     (if (i32.lt_s (local.get $i) (i32.const 3))
+//       (then
+//         (call $foo (local.get $x))
+//         (local.set $i (i32.add (local.get $i) (i32.const 1)))
+//         (br $l))))
+//
+// can also be outlined: the helper returns the final value of that local, and
+// the site becomes (local.set $i (call $helper (local.get $i) (local.get $x))).
+// If the tree reads the local, its incoming value is a parameter (as here);
+// otherwise it is just a local of the helper. The local must have a defaultable
+// type, so that reading it at the site is always valid.
 //
 // Trees whose type is unreachable (e.g. ones rooted in a throw) become a call
 // to a helper returning nothing, followed by an unreachable.
@@ -99,6 +115,9 @@ namespace {
 const Index CallBytes = 3;
 // A local.get in the helper, for each hole, and at the site.
 const Index LocalGetBytes = 2;
+// The local.set at a site whose tree writes a local, and the local.get of the
+// final value in the helper.
+const Index LocalSetBytes = 2;
 // Function section entry, code size, local declarations, end opcode, and a
 // share of a type section entry.
 const Index HelperOverheadBytes = 6;
@@ -223,6 +242,12 @@ struct Hole {
   bool isLocal;
 };
 
+// The local a tree writes, if any.
+struct WrittenLocal {
+  Index index;
+  Type type;
+};
+
 // A group of sites with the same shape.
 struct KeyInfo {
   std::vector<struct Site*> sites;
@@ -244,11 +269,15 @@ struct KeyInfo {
 // An expression tree in a function body that we may outline.
 struct Site {
   Expression* expr;
+  Function* func;
   // A hash of the tree's shape, with holes abstracted away. Trees with equal
   // shapes can share a helper.
   size_t hash = 0;
   // The estimated binary size of the tree.
   Index bytes = 0;
+  // The local the tree writes, if any. The tree then has type none, and the
+  // helper returns the local's final value.
+  std::optional<WrittenLocal> written;
   // The nearest enclosing site, if any. Outlining that makes this site vanish.
   Site* parent = nullptr;
   // The key this site belongs to.
@@ -269,6 +298,11 @@ struct NodeInfo {
   Index bytes = 0;
   // The distinct locals the tree reads, in order of first use.
   SmallVector<Index, 4> locals;
+  // The distinct locals the tree writes.
+  SmallVector<Index, 2> written;
+  // The labels of branches in the tree that no block or loop in the tree
+  // defines.
+  SmallVector<Name, 2> openLabels;
   // Whether the root has children, and whether all of them are leaves.
   bool hasChildren = false;
   bool trivialChildren = true;
@@ -290,6 +324,7 @@ enum class Mode { Calls, Guards, Trees, All };
 
 struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
   Module& wasm;
+  Function* func;
   FunctionInfo& info;
   Mode mode;
   // Whether constants are holes in this round.
@@ -299,8 +334,12 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
   // middle of visiting.
   std::vector<NodeInfo> stack;
 
-  Scanner(Module& wasm, FunctionInfo& info, Mode mode, bool constHoles)
-    : wasm(wasm), info(info), mode(mode), constHoles(constHoles) {}
+  Scanner(Module& wasm,
+          Function* func,
+          FunctionInfo& info,
+          Mode mode,
+          bool constHoles)
+    : wasm(wasm), func(func), info(info), mode(mode), constHoles(constHoles) {}
 
   void visitExpression(Expression* curr) {
     NodeInfo node;
@@ -318,16 +357,31 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
 
       node.bytes += child.bytes;
       for (auto local : child.locals) {
-        noteLocal(node, local);
+        noteUnique(node.locals, local);
+      }
+      for (auto local : child.written) {
+        noteUnique(node.written, local);
+      }
+      for (auto label : child.openLabels) {
+        noteUnique(node.openLabels, label);
       }
       node.movable = node.movable && child.movable;
       node.interesting = node.interesting || child.interesting;
       node.hasGuard = node.hasGuard || child.hasGuard;
     }
+    if (auto* set = curr->dynCast<LocalSet>()) {
+      // We compare the values of local.sets separately (see sameShape), which
+      // only works if they do not branch out of themselves.
+      if (!stack.back().openLabels.empty()) {
+        node.movable = false;
+      }
+      noteUnique(node.written, set->index);
+    }
     stack.resize(stack.size() - numChildren);
     if (auto* get = curr->dynCast<LocalGet>()) {
-      noteLocal(node, get->index);
+      noteUnique(node.locals, get->index);
     }
+    noteLabels(curr, node);
     if (!isMovable(curr)) {
       node.movable = false;
     }
@@ -338,8 +392,27 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
       node.hasGuard = true;
     }
     stack.push_back(node);
-    if (!node.movable) {
+    if (!node.movable || !node.openLabels.empty()) {
       return;
+    }
+    std::optional<WrittenLocal> written;
+    if (!node.written.empty()) {
+      // We can only return the final value of a single local, and the site
+      // must be able to read the local before the tree.
+      if (node.written.size() > 1 || curr->type != Type::none) {
+        return;
+      }
+      Index index = node.written[0];
+      auto type = func->getLocalType(index);
+      if (!type.isDefaultable()) {
+        return;
+      }
+      // A local.set itself is never worth outlining: its value is a better
+      // tree (it does not need to pass and return the local).
+      if (curr->is<LocalSet>()) {
+        return;
+      }
+      written = WrittenLocal{index, type};
     }
     // A single instruction with trivial operands, like a call with constant
     // arguments or a struct.get of a local.
@@ -365,7 +438,11 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
         break;
     }
     // Nothing to gain without saving at least a byte per site.
-    if (node.bytes <= LocalGetBytes * node.locals.size() + CallBytes) {
+    Index siteBytes = LocalGetBytes * node.locals.size() + CallBytes;
+    if (written) {
+      siteBytes += LocalSetBytes;
+    }
+    if (node.bytes <= siteBytes) {
       return;
     }
     // A constant expression is better left for other passes to hoist (and for
@@ -377,46 +454,97 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
     info.sites.emplace_back();
     auto& site = info.sites.back();
     site.expr = curr;
+    site.func = func;
     site.hash = node.hash;
     site.bytes = node.bytes;
+    site.written = written;
   }
 
-  void noteLocal(NodeInfo& node, Index local) {
-    for (auto other : node.locals) {
-      if (other == local) {
+  template<typename T, typename V> void noteUnique(T& vec, V value) {
+    for (auto other : vec) {
+      if (other == value) {
         return;
       }
     }
-    node.locals.push_back(local);
+    vec.push_back(value);
+  }
+
+  // Notes the labels a branch uses, and removes the one a block or loop
+  // defines.
+  void noteLabels(Expression* curr, NodeInfo& node) {
+    Name defined;
+    if (auto* block = curr->dynCast<Block>()) {
+      defined = block->name;
+    } else if (auto* loop = curr->dynCast<Loop>()) {
+      defined = loop->name;
+    } else if (auto* br = curr->dynCast<Break>()) {
+      noteUnique(node.openLabels, br->name);
+    } else if (auto* sw = curr->dynCast<Switch>()) {
+      for (auto target : sw->targets) {
+        noteUnique(node.openLabels, target);
+      }
+      noteUnique(node.openLabels, sw->default_);
+    } else if (auto* brOn = curr->dynCast<BrOn>()) {
+      noteUnique(node.openLabels, brOn->name);
+    }
+    if (defined.is()) {
+      for (Index i = 0; i < node.openLabels.size(); i++) {
+        if (node.openLabels[i] == defined) {
+          node.openLabels[i] = node.openLabels.back();
+          node.openLabels.pop_back();
+          break;
+        }
+      }
+    }
   }
 
   size_t getShallowHash(Expression* curr) {
-    if (curr->is<LocalGet>() || (constHoles && isConstHole(wasm, curr))) {
-      // A hole. Only the kind and type matter.
+    if (curr->is<LocalGet>() || curr->is<LocalSet>() ||
+        (constHoles && isConstHole(wasm, curr))) {
+      // A hole (or a write to one). Only the kind and type matter.
       auto digest = hash(curr->_id);
       rehash(digest, curr->type.getID());
+      return digest;
+    }
+    // Labels differ between sites, so hash branches without them (the
+    // comparison checks they match up with the blocks and loops in the tree).
+    if (auto* br = curr->dynCast<Break>()) {
+      auto digest = hash(curr->_id);
+      rehash(digest, curr->type.getID());
+      rehash(digest, !!br->condition);
+      rehash(digest, !!br->value);
+      return digest;
+    }
+    if (auto* sw = curr->dynCast<Switch>()) {
+      auto digest = hash(curr->_id);
+      rehash(digest, curr->type.getID());
+      rehash(digest, sw->targets.size());
+      rehash(digest, !!sw->value);
+      return digest;
+    }
+    if (auto* brOn = curr->dynCast<BrOn>()) {
+      auto digest = hash(curr->_id);
+      rehash(digest, curr->type.getID());
+      rehash(digest, brOn->op);
+      rehash(digest, brOn->castType.getID());
       return digest;
     }
     return ExpressionAnalyzer::shallowHash(curr);
   }
 
   // Whether an expression can be moved verbatim into a helper function,
-  // assuming its children can be.
+  // assuming its children can be. Branches and local writes are checked
+  // separately, see above.
   bool isMovable(Expression* curr) {
     if (curr->type.isTuple()) {
       return false;
     }
     switch (curr->_id) {
-      case Expression::BreakId:
-      case Expression::SwitchId:
       case Expression::ReturnId:
-      case Expression::LocalSetId:
-      case Expression::LoopId:
       case Expression::TryId:
       case Expression::TryTableId:
       case Expression::RethrowId:
       case Expression::PopId:
-      case Expression::BrOnId:
       case Expression::TupleMakeId:
       case Expression::TupleExtractId:
       case Expression::ContNewId:
@@ -548,6 +676,11 @@ struct Replacer : public WalkerPass<
       replaceCurrent(builder.makeSequence(
         builder.makeCall(replacement.helper, args, Type::none),
         builder.makeUnreachable()));
+    } else if (site->written) {
+      auto& written = *site->written;
+      replaceCurrent(builder.makeLocalSet(
+        written.index,
+        builder.makeCall(replacement.helper, args, written.type)));
     } else {
       replaceCurrent(builder.makeCall(replacement.helper, args, curr->type));
     }
@@ -614,7 +747,7 @@ struct OutlineExpressions : public Pass {
         if (func->imported()) {
           return;
         }
-        Scanner(*wasm, info, mode, constHoles).walk(func->body);
+        Scanner(*wasm, func, info, mode, constHoles).walk(func->body);
         noteParents(func->body, info);
       });
 
@@ -669,6 +802,14 @@ struct OutlineExpressions : public Pass {
           int64_t cost = int64_t(site->bytes) - int64_t(site->varyingBytes) +
                          LocalGetBytes * int64_t(info.numVarying) +
                          HelperOverheadBytes;
+          if (site->written) {
+            // The helper returns the local's final value, and may need to
+            // declare the local.
+            cost += LocalSetBytes;
+            if (!isWrittenParam(site)) {
+              cost += LocalSetBytes;
+            }
+          }
           outline = saved > cost;
         }
         if (outline != info.outline) {
@@ -754,13 +895,21 @@ struct OutlineExpressions : public Pass {
   }
 
   // Two trees have the same shape if they are equal apart from the locals that
-  // their holes read, where the same local must be used in the same places in
-  // both trees (and, with constants as holes, apart from the constants, which
-  // must have the same type).
-  bool sameShape(Expression* left, Expression* right) {
+  // their holes read and write, where the same local must be used in the same
+  // places in both trees (and, with constants as holes, apart from the
+  // constants, which must have the same type).
+  bool sameShape(Site* leftSite, Site* rightSite) {
     std::unordered_map<Index, Index> leftToRight, rightToLeft;
     bool mismatch = false;
-    auto comparer = [&](Expression* left, Expression* right) {
+    auto mapLocals = [&](Index leftIndex, Index rightIndex) {
+      auto [l, lInserted] = leftToRight.try_emplace(leftIndex, rightIndex);
+      auto [r, rInserted] = rightToLeft.try_emplace(rightIndex, leftIndex);
+      if (l->second != rightIndex || r->second != leftIndex) {
+        mismatch = true;
+      }
+    };
+    ExpressionAnalyzer::ExprComparer comparer = [&](Expression* left,
+                                                    Expression* right) {
       if (constHoles) {
         bool leftConst = isConstHole(*wasm, left);
         bool rightConst = isConstHole(*wasm, right);
@@ -772,32 +921,51 @@ struct OutlineExpressions : public Pass {
           return true;
         }
       }
-      auto* leftGet = left->dynCast<LocalGet>();
-      auto* rightGet = right->dynCast<LocalGet>();
-      if (!leftGet || !rightGet) {
-        return false;
-      }
-      if (leftGet->type != rightGet->type) {
-        mismatch = true;
+      if (auto* leftGet = left->dynCast<LocalGet>()) {
+        auto* rightGet = right->dynCast<LocalGet>();
+        if (!rightGet) {
+          return false;
+        }
+        if (leftGet->type != rightGet->type) {
+          mismatch = true;
+          return true;
+        }
+        mapLocals(leftGet->index, rightGet->index);
         return true;
       }
-      auto [l, lInserted] =
-        leftToRight.try_emplace(leftGet->index, rightGet->index);
-      auto [r, rInserted] =
-        rightToLeft.try_emplace(rightGet->index, leftGet->index);
-      if (l->second != rightGet->index || r->second != leftGet->index) {
-        mismatch = true;
+      if (auto* leftSet = left->dynCast<LocalSet>()) {
+        auto* rightSet = right->dynCast<LocalSet>();
+        if (!rightSet) {
+          return false;
+        }
+        // The local's type matters as the helper returns it.
+        if (leftSet->type != rightSet->type ||
+            leftSite->func->getLocalType(leftSet->index) !=
+              rightSite->func->getLocalType(rightSet->index)) {
+          mismatch = true;
+          return true;
+        }
+        mapLocals(leftSet->index, rightSet->index);
+        // Returning true skips the children, so compare them here. That is
+        // fine as a value we consider does not branch out of itself, so all
+        // the labels it uses are defined inside it.
+        if (!ExpressionAnalyzer::flexibleEqual(
+              leftSet->value, rightSet->value, comparer)) {
+          mismatch = true;
+        }
+        return true;
       }
-      return true;
+      return false;
     };
-    return ExpressionAnalyzer::flexibleEqual(left, right, comparer) &&
+    return ExpressionAnalyzer::flexibleEqual(
+             leftSite->expr, rightSite->expr, comparer) &&
            !mismatch;
   }
 
   KeyInfo* getKey(Site* site) {
     auto& candidates = keysByHash[site->hash];
     for (auto* key : candidates) {
-      if (sameShape(key->sites[0]->expr, site->expr)) {
+      if (sameShape(key->sites[0], site)) {
         return key;
       }
     }
@@ -850,9 +1018,29 @@ struct OutlineExpressions : public Pass {
   }
 
   // The bytes a site costs after outlining: a call, plus an unreachable if the
-  // tree is unreachable.
+  // tree is unreachable, or a local.set if it writes a local.
   Index getCallBytes(Site* site) {
-    return site->expr->type == Type::unreachable ? CallBytes + 1 : CallBytes;
+    if (site->expr->type == Type::unreachable) {
+      return CallBytes + 1;
+    }
+    if (site->written) {
+      return CallBytes + LocalSetBytes;
+    }
+    return CallBytes;
+  }
+
+  // Whether the local a site writes is also read in the tree, so that its
+  // incoming value must be a parameter of the helper. (The holes contain the
+  // locals the tree reads, so this needs the key to be prepared.)
+  bool isWrittenParam(Site* site) {
+    assert(site->written);
+    for (auto& hole : site->holes) {
+      if (hole.isLocal &&
+          hole.expr->cast<LocalGet>()->index == site->written->index) {
+        return true;
+      }
+    }
+    return false;
   }
 
   // Whether a site is eligible to be outlined, given the current decisions.
@@ -878,16 +1066,21 @@ struct OutlineExpressions : public Pass {
   // Whether a site will be replaced, given the current decisions.
   bool isReplaced(Site* site) { return isEligible(site) && isCandidate(site); }
 
-  Type getHelperResults(Expression* expr) {
-    return expr->type == Type::unreachable ? Type::none : expr->type;
+  Type getHelperResults(Site* site) {
+    if (site->written) {
+      return site->written->type;
+    }
+    return site->expr->type == Type::unreachable ? Type::none
+                                                 : site->expr->type;
   }
 
   // If the function's body is just a tree whose holes are its params, in
   // order, note it as the helper for the tree's key. With constants as holes,
   // all the constants in the body must be fixed, as the function has them
-  // baked in.
+  // baked in. (The helpers of trees that write a local are blocks that end in
+  // a read of the local, which we do not try to recognize.)
   void noteExistingHelper(Function* func, Site& site) {
-    if (func->getResults() != getHelperResults(site.expr)) {
+    if (site.written || func->getResults() != getHelperResults(&site)) {
       return;
     }
     auto& key = *site.key;
@@ -915,7 +1108,9 @@ struct OutlineExpressions : public Pass {
     key.helper = func;
   }
 
-  // Turns the non-fixed holes of a copied tree into local.gets of the params.
+  // Turns the non-fixed holes of a copied tree into local.gets of the params,
+  // and local.sets of the written local into local.sets of the helper's local
+  // for it.
   struct HoleReplacer
     : public PostWalker<HoleReplacer, UnifiedExpressionVisitor<HoleReplacer>> {
     Module& wasm;
@@ -927,6 +1122,8 @@ struct OutlineExpressions : public Pass {
     void visitExpression(Expression* curr) {
       if (auto* get = curr->dynCast<LocalGet>()) {
         get->index = paramOfLocal.at(get->index);
+      } else if (auto* set = curr->dynCast<LocalSet>()) {
+        set->index = paramOfLocal.at(set->index);
       } else if (auto iter = paramOfConst.find(curr);
                  iter != paramOfConst.end()) {
         replaceCurrent(Builder(wasm).makeLocalGet(iter->second, curr->type));
@@ -955,10 +1152,33 @@ struct OutlineExpressions : public Pass {
       params.push_back(hole.expr->type);
     }
     assert(params.size() == key.numLocals + key.numVarying);
-    replacer.walk(body);
+    std::vector<Type> vars;
+    if (site->written) {
+      // Return the final value of the written local, which is a param if the
+      // tree reads it, and otherwise a local of the helper.
+      auto& written = *site->written;
+      auto iter = replacer.paramOfLocal.find(written.index);
+      Index index;
+      if (iter != replacer.paramOfLocal.end()) {
+        index = iter->second;
+      } else {
+        index = params.size();
+        vars.push_back(written.type);
+        replacer.paramOfLocal[written.index] = index;
+      }
+      replacer.walk(body);
+      Builder builder(*wasm);
+      body = builder.makeBlock(
+        {body, builder.makeLocalGet(index, written.type)}, written.type);
+    } else {
+      replacer.walk(body);
+    }
     auto name = Names::getValidFunctionName(*wasm, "outlined");
-    return wasm->addFunction(Builder::makeFunction(
-      name, Signature(Type(params), getHelperResults(site->expr)), {}, body));
+    return wasm->addFunction(
+      Builder::makeFunction(name,
+                            Signature(Type(params), getHelperResults(site)),
+                            std::move(vars),
+                            body));
   }
 };
 

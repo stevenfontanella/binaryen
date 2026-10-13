@@ -794,8 +794,10 @@
   )
 )
 
-;; Trees that write locals or branch out cannot be outlined. The inner calls are
-;; too small to be worth outlining on their own.
+;; Trees that write locals (and have a value) or return cannot be outlined. The
+;; inner calls are too small to be worth outlining on their own. A block that
+;; closes the label of a branch inside it can be outlined, however ($br is
+;; recognized as the helper for $br2 and $br3).
 (module
   ;; CHECK:      (type $A (sub (struct (field i32))))
   ;; SHRINK:      (type $A (sub (struct (field i32))))
@@ -1010,41 +1012,13 @@
   )
 
   ;; CHECK:      (func $br2 (type $1) (param $x (ref null $A)) (result i32)
-  ;; CHECK-NEXT:  (block $out (result i32)
-  ;; CHECK-NEXT:   (if (result i32)
-  ;; CHECK-NEXT:    (ref.test (ref $B)
-  ;; CHECK-NEXT:     (local.get $x)
-  ;; CHECK-NEXT:    )
-  ;; CHECK-NEXT:    (then
-  ;; CHECK-NEXT:     (call $f
-  ;; CHECK-NEXT:      (local.get $x)
-  ;; CHECK-NEXT:     )
-  ;; CHECK-NEXT:    )
-  ;; CHECK-NEXT:    (else
-  ;; CHECK-NEXT:     (br $out
-  ;; CHECK-NEXT:      (i32.const 2147483647)
-  ;; CHECK-NEXT:     )
-  ;; CHECK-NEXT:    )
-  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  (call $br
+  ;; CHECK-NEXT:   (local.get $x)
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
   ;; SHRINK:      (func $br2 (type $1) (param $x (ref null $A)) (result i32)
-  ;; SHRINK-NEXT:  (block $out (result i32)
-  ;; SHRINK-NEXT:   (if (result i32)
-  ;; SHRINK-NEXT:    (ref.test (ref $B)
-  ;; SHRINK-NEXT:     (local.get $x)
-  ;; SHRINK-NEXT:    )
-  ;; SHRINK-NEXT:    (then
-  ;; SHRINK-NEXT:     (call $f
-  ;; SHRINK-NEXT:      (local.get $x)
-  ;; SHRINK-NEXT:     )
-  ;; SHRINK-NEXT:    )
-  ;; SHRINK-NEXT:    (else
-  ;; SHRINK-NEXT:     (br $out
-  ;; SHRINK-NEXT:      (i32.const 2147483647)
-  ;; SHRINK-NEXT:     )
-  ;; SHRINK-NEXT:    )
-  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  (call $br
+  ;; SHRINK-NEXT:   (local.get $x)
   ;; SHRINK-NEXT:  )
   ;; SHRINK-NEXT: )
   (func $br2 (param $x (ref null $A)) (result i32)
@@ -1062,41 +1036,13 @@
   )
 
   ;; CHECK:      (func $br3 (type $1) (param $x (ref null $A)) (result i32)
-  ;; CHECK-NEXT:  (block $out (result i32)
-  ;; CHECK-NEXT:   (if (result i32)
-  ;; CHECK-NEXT:    (ref.test (ref $B)
-  ;; CHECK-NEXT:     (local.get $x)
-  ;; CHECK-NEXT:    )
-  ;; CHECK-NEXT:    (then
-  ;; CHECK-NEXT:     (call $f
-  ;; CHECK-NEXT:      (local.get $x)
-  ;; CHECK-NEXT:     )
-  ;; CHECK-NEXT:    )
-  ;; CHECK-NEXT:    (else
-  ;; CHECK-NEXT:     (br $out
-  ;; CHECK-NEXT:      (i32.const 2147483647)
-  ;; CHECK-NEXT:     )
-  ;; CHECK-NEXT:    )
-  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  (call $br
+  ;; CHECK-NEXT:   (local.get $x)
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
   ;; SHRINK:      (func $br3 (type $1) (param $x (ref null $A)) (result i32)
-  ;; SHRINK-NEXT:  (block $out (result i32)
-  ;; SHRINK-NEXT:   (if (result i32)
-  ;; SHRINK-NEXT:    (ref.test (ref $B)
-  ;; SHRINK-NEXT:     (local.get $x)
-  ;; SHRINK-NEXT:    )
-  ;; SHRINK-NEXT:    (then
-  ;; SHRINK-NEXT:     (call $f
-  ;; SHRINK-NEXT:      (local.get $x)
-  ;; SHRINK-NEXT:     )
-  ;; SHRINK-NEXT:    )
-  ;; SHRINK-NEXT:    (else
-  ;; SHRINK-NEXT:     (br $out
-  ;; SHRINK-NEXT:      (i32.const 2147483647)
-  ;; SHRINK-NEXT:     )
-  ;; SHRINK-NEXT:    )
-  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  (call $br
+  ;; SHRINK-NEXT:   (local.get $x)
   ;; SHRINK-NEXT:  )
   ;; SHRINK-NEXT: )
   (func $br3 (param $x (ref null $A)) (result i32)
