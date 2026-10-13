@@ -23,12 +23,15 @@
 // global entry (type, mutability, struct.new, operands, end) even if it is
 // used only once.
 //
-// This pass groups such globals by struct type. For each group the operands
-// that are identical in all members stay in a shared factory function, while
-// the operands that vary become columns of immutable array "tables" (one
-// array.new_fixed per column). A mutable array caches the created objects so
-// that each original global still corresponds to exactly one object (identity
-// and mutable fields are preserved). The factory is
+// This pass groups such globals by struct type and by the shape of their
+// initializer (nested constant struct.news are allowed, e.g. an enum constant
+// holding a freshly allocated string wrapper). The initializer is flattened
+// into a list of constant leaves; the leaves that are identical in all
+// members stay in a shared factory function, while the leaves that vary
+// become columns of immutable array "tables" (one array.new_fixed per
+// column). A mutable array caches the created objects so that each original
+// global still corresponds to exactly one object (identity and mutable fields
+// are preserved). The factory is
 //
 //   (func $factory (param $i i32) (result (ref $T))
 //     (block $cached (result (ref $T))
@@ -49,12 +52,21 @@
 // cost; --pass-arg=defer-global-allocations-allocation-operands@1 includes
 // them.
 //
+// --pass-arg=defer-global-allocations-import-bonus@N adds N bytes of
+// estimated savings for every imported global whose only uses are in the
+// initializer of a candidate: after deferral the import is only read from a
+// table column, which allows a later pass (e.g. --string-consts-to-data) to
+// remove the import entirely.
+//
 // This moves the allocation from instantiation to first use, and adds a call,
 // an array read and a null check to every use. It is meant for the very end
 // of a size-focused pipeline (before reorder-globals/reorder-functions).
 //
 
 #include <algorithm>
+#include <functional>
+#include <string>
+#include <tuple>
 
 #include "ir/module-utils.h"
 #include "ir/names.h"
@@ -77,17 +89,24 @@ constexpr Index MaxChunkSize = 8192;
 struct DeferGlobalAllocations : public Pass {
   // Per-function information about global.get uses.
   struct FunctionInfo {
-    // All global.gets, in traversal order.
+    // All global.gets of candidates, in traversal order.
     std::vector<Expression**> gets;
-    // Globals used directly as operands of an allocation.
+    // Candidates used directly as operands of a struct.new.
     std::unordered_map<Name, Index> allocOperandUses;
+    // Uses of imported globals.
+    std::unordered_map<Name, Index> importUses;
   };
 
   struct Candidate {
     Global* global;
     StructNew* init;
+    // The constant leaves of the initializer, in a pre-order traversal of the
+    // nested struct.news.
+    std::vector<Expression*> leaves;
     // Estimated size of the global entry in the binary.
     Index initBytes = 0;
+    // Estimated bytes saved elsewhere (imports) if this global is deferred.
+    Index bonus = 0;
     // Code uses.
     Index uses = 0;
     Index allocOperandUses = 0;
@@ -98,6 +117,8 @@ struct DeferGlobalAllocations : public Pass {
   struct Group {
     HeapType type;
     Type globalType;
+    // The field each leaf is stored in.
+    std::vector<Field> leafFields;
     std::vector<Candidate> members;
   };
 
@@ -106,6 +127,8 @@ struct DeferGlobalAllocations : public Pass {
     Index index;
   };
 
+  using GroupKey = std::tuple<HeapType, Type, std::string>;
+
   Module* module;
   std::unordered_map<Name, Index> globalIndexes;
   std::unordered_map<Name, Index> functionIndexes;
@@ -113,6 +136,7 @@ struct DeferGlobalAllocations : public Pass {
   // Ignore the size model and defer every candidate (for testing, and for
   // startup-focused builds).
   bool always = false;
+  Index importBonus = 0;
   Index numFactories = 0;
 
   void run(Module* module_) override {
@@ -125,22 +149,83 @@ struct DeferGlobalAllocations : public Pass {
          .empty();
     always =
       !getArgumentOrDefault("defer-global-allocations-always", "").empty();
+    importBonus = std::stoul(
+      getArgumentOrDefault("defer-global-allocations-import-bonus", "0"));
 
     computeIndexes();
 
-    // Globals that are used outside of function code must stay eager.
+    // Find the structurally valid candidates and group them by type and
+    // shape.
+    InsertOrderedMap<GroupKey, Group> groups;
+    std::unordered_map<Name, std::pair<Group*, Index>> candidateMap;
+    for (auto& global : module->globals) {
+      if (global->imported() || global->mutable_) {
+        continue;
+      }
+      auto* init = global->init->dynCast<StructNew>();
+      if (!init || init->desc || !init->type.isRef()) {
+        continue;
+      }
+      auto type = init->type.getHeapType();
+      // The global's type must be the struct type itself (possibly exact), so
+      // that a call to the factory can have the same type as the global.get.
+      if (type.isShared() || !global->type.isRef() ||
+          global->type.isNullable() || global->type.getHeapType() != type ||
+          init->operands.size() != type.getStruct().fields.size()) {
+        continue;
+      }
+      Candidate candidate;
+      std::vector<Field> leafFields;
+      std::string shape;
+      if (!flatten(init, candidate.leaves, leafFields, shape)) {
+        continue;
+      }
+      candidate.global = global.get();
+      candidate.init = init;
+      candidate.initBytes = getGlobalEntryBytes(init);
+      auto& group = groups[{type, global->type, shape}];
+      group.type = type;
+      group.globalType = global->type;
+      group.leafFields = std::move(leafFields);
+      group.members.push_back(std::move(candidate));
+      candidateMap[global->name] = {&group, Index(group.members.size() - 1)};
+    }
+    if (groups.empty()) {
+      return;
+    }
+
+    // Globals that are used outside of function code must stay eager. Also
+    // count the uses of imported globals: those used only from a single
+    // candidate's initializer may become removable once that candidate is
+    // deferred.
     std::unordered_set<Name> nonCodeUses;
+    // Uses of imports anywhere except in the initializers of candidates.
+    std::unordered_map<Name, Index> importOtherUses;
+    // Uses of imports in the initializers of candidates.
+    std::unordered_map<Name, Index> importCandidateUses;
     {
       struct Scanner : public PostWalker<Scanner> {
+        DeferGlobalAllocations& parent;
         std::unordered_set<Name>& names;
-        Scanner(std::unordered_set<Name>& names) : names(names) {}
-        void visitGlobalGet(GlobalGet* curr) { names.insert(curr->name); }
-      } scanner(nonCodeUses);
+        std::unordered_map<Name, Index>* importUses = nullptr;
+        Scanner(DeferGlobalAllocations& parent, std::unordered_set<Name>& names)
+          : parent(parent), names(names) {}
+        void visitGlobalGet(GlobalGet* curr) {
+          names.insert(curr->name);
+          if (parent.module->getGlobal(curr->name)->imported()) {
+            (*importUses)[curr->name]++;
+          }
+        }
+      } scanner(*this, nonCodeUses);
       for (auto& global : module->globals) {
         if (!global->imported()) {
+          scanner.importUses = candidateMap.count(global->name)
+                                 ? &importCandidateUses
+                                 : &importOtherUses;
           scanner.walk(global->init);
         }
       }
+      scanner.importUses = &importOtherUses;
       for (auto& segment : module->elementSegments) {
         if (segment->offset) {
           scanner.walk(segment->offset);
@@ -157,43 +242,9 @@ struct DeferGlobalAllocations : public Pass {
       for (auto& ex : module->exports) {
         if (ex->kind == ExternalKind::Global) {
           nonCodeUses.insert(*ex->getInternalName());
+          importOtherUses[*ex->getInternalName()]++;
         }
       }
-    }
-
-    // Find the candidate globals and group them by type.
-    InsertOrderedMap<std::pair<HeapType, Type>, Group> groups;
-    std::unordered_map<Name, std::pair<Group*, Index>> candidateMap;
-    for (auto& global : module->globals) {
-      if (global->imported() || global->mutable_ ||
-          nonCodeUses.count(global->name)) {
-        continue;
-      }
-      auto* init = global->init->dynCast<StructNew>();
-      if (!init || init->desc || !init->type.isRef()) {
-        continue;
-      }
-      auto type = init->type.getHeapType();
-      // The global's type must be the struct type itself (possibly exact), so
-      // that a call to the factory can have the same type as the global.get.
-      if (type.isShared() || !global->type.isRef() ||
-          global->type.isNullable() || global->type.getHeapType() != type ||
-          init->operands.size() != type.getStruct().fields.size() ||
-          !isValidOperands(init)) {
-        continue;
-      }
-      Candidate candidate;
-      candidate.global = global.get();
-      candidate.init = init;
-      candidate.initBytes = getGlobalEntryBytes(global.get(), init);
-      auto& group = groups[{type, global->type}];
-      group.type = type;
-      group.globalType = global->type;
-      group.members.push_back(candidate);
-      candidateMap[global->name] = {&group, Index(group.members.size() - 1)};
-    }
-    if (groups.empty()) {
-      return;
     }
 
     // Count the uses in function code, in parallel.
@@ -203,19 +254,23 @@ struct DeferGlobalAllocations : public Pass {
           return;
         }
         struct Scanner : public PostWalker<Scanner> {
+          Module& module;
           FunctionInfo& info;
           const std::unordered_map<Name, std::pair<Group*, Index>>& candidates;
-          Scanner(FunctionInfo& info,
+          Scanner(Module& module,
+                  FunctionInfo& info,
                   const std::unordered_map<Name, std::pair<Group*, Index>>&
                     candidates)
-            : info(info), candidates(candidates) {}
+            : module(module), info(info), candidates(candidates) {}
           void visitGlobalGet(GlobalGet* curr) {
             if (candidates.count(curr->name)) {
               info.gets.push_back(getCurrentPointer());
+            } else if (module.getGlobal(curr->name)->imported()) {
+              info.importUses[curr->name]++;
             }
           }
-          void noteOperands(ExpressionList& operands) {
-            for (auto* operand : operands) {
+          void visitStructNew(StructNew* curr) {
+            for (auto* operand : curr->operands) {
               if (auto* get = operand->dynCast<GlobalGet>()) {
                 if (candidates.count(get->name)) {
                   info.allocOperandUses[get->name]++;
@@ -223,20 +278,8 @@ struct DeferGlobalAllocations : public Pass {
               }
             }
           }
-          void visitStructNew(StructNew* curr) { noteOperands(curr->operands); }
-          void visitArrayNewFixed(ArrayNewFixed* curr) {
-            noteOperands(curr->values);
-          }
-          void visitArrayNew(ArrayNew* curr) {
-            if (auto* get =
-                  curr->init ? curr->init->dynCast<GlobalGet>() : nullptr) {
-              if (candidates.count(get->name)) {
-                info.allocOperandUses[get->name]++;
-              }
-            }
-          }
         };
-        Scanner(info, candidateMap).walk(func->body);
+        Scanner(*module, info, candidateMap).walk(func->body);
       });
 
     // Merge the per-function information in a deterministic order.
@@ -255,6 +298,40 @@ struct DeferGlobalAllocations : public Pass {
       for (auto& [name, count] : info.allocOperandUses) {
         auto& [group, i] = candidateMap[name];
         group->members[i].allocOperandUses += count;
+      }
+      for (auto& [name, count] : info.importUses) {
+        importOtherUses[name] += count;
+      }
+    }
+
+    // Remove the candidates with non-code uses, and compute the bonuses.
+    for (auto& [key, group] : groups) {
+      auto& members = group.members;
+      members.erase(std::remove_if(members.begin(),
+                                   members.end(),
+                                   [&](const Candidate& c) {
+                                     return nonCodeUses.count(c.global->name);
+                                   }),
+                    members.end());
+      if (importBonus == 0) {
+        continue;
+      }
+      for (auto& member : members) {
+        std::unordered_map<Name, Index> counts;
+        for (auto* leaf : member.leaves) {
+          if (auto* get = leaf->dynCast<GlobalGet>()) {
+            if (module->getGlobal(get->name)->imported()) {
+              counts[get->name]++;
+            }
+          }
+        }
+        for (auto& [name, count] : counts) {
+          // All uses of the import must be in this initializer.
+          if (!importOtherUses.count(name) &&
+              importCandidateUses[name] == count) {
+            member.bonus += importBonus;
+          }
+        }
       }
     }
 
@@ -314,8 +391,15 @@ private:
     }
   }
 
+  // Whether a struct.new is a nested allocation with operands that we can
+  // flatten (as opposed to a struct.new_default, which is a leaf).
+  static bool isNestedNew(Expression* curr) {
+    auto* structNew = curr->dynCast<StructNew>();
+    return structNew && !structNew->operands.empty();
+  }
+
   // Whether an operand is a constant we can move into the factory or a table.
-  bool isValidOperand(Expression* curr) {
+  bool isValidLeaf(Expression* curr) {
     if (curr->is<Const>() || curr->is<RefNull>() || curr->is<RefFunc>()) {
       return true;
     }
@@ -332,12 +416,41 @@ private:
     return false;
   }
 
-  bool isValidOperands(StructNew* init) {
-    for (auto* operand : init->operands) {
-      if (!isValidOperand(operand)) {
+  // Flattens the operands of a struct.new (recursively through nested
+  // struct.news) into leaves. The shape string identifies the nesting
+  // structure, so that members of a group have the same leaves.
+  bool flatten(StructNew* curr,
+               std::vector<Expression*>& leaves,
+               std::vector<Field>& leafFields,
+               std::string& shape) {
+    if (curr->desc || !curr->type.isRef()) {
+      return false;
+    }
+    auto type = curr->type.getHeapType();
+    if (type.isShared()) {
+      return false;
+    }
+    auto& fields = type.getStruct().fields;
+    if (curr->operands.size() != fields.size()) {
+      return false;
+    }
+    shape += '(';
+    shape += std::to_string(type.getID());
+    for (Index i = 0; i < fields.size(); i++) {
+      auto* operand = curr->operands[i];
+      if (isNestedNew(operand)) {
+        if (!flatten(operand->cast<StructNew>(), leaves, leafFields, shape)) {
+          return false;
+        }
+      } else if (isValidLeaf(operand)) {
+        leaves.push_back(operand);
+        leafFields.push_back(fields[i]);
+        shape += '.';
+      } else {
         return false;
       }
     }
+    shape += ')';
     return true;
   }
 
@@ -375,18 +488,18 @@ private:
     if (auto* i31 = curr->dynCast<RefI31>()) {
       return 2 + getOperandBytes(i31->value);
     }
-    // struct.new_default: opcode and a type index.
-    return 4;
-  }
-
-  Index getGlobalEntryBytes(Global* global, StructNew* init) {
-    // The type (ref $T) and mutability, struct.new with a type index, the
-    // operands, and the end.
-    Index bytes = 3 + 1 + 4 + 1;
-    for (auto* operand : init->operands) {
+    // struct.new or struct.new_default: opcode and a type index, plus the
+    // operands.
+    Index bytes = 4;
+    for (auto* operand : curr->cast<StructNew>()->operands) {
       bytes += getOperandBytes(operand);
     }
     return bytes;
+  }
+
+  Index getGlobalEntryBytes(StructNew* init) {
+    // The type (ref $T) and mutability, the struct.new, and the end.
+    return 3 + 1 + getOperandBytes(init) + 1;
   }
 
   Index getSLEBSize(Index value) { return getLEBSize(S32LEB(int32_t(value))); }
@@ -415,9 +528,8 @@ private:
       }
     }
 
-    auto& fields = group.type.getStruct().fields;
-    Index numFields = fields.size();
-    auto varying = getVaryingColumns(members, numFields);
+    Index numLeaves = group.leafFields.size();
+    auto varying = getVaryingColumns(members, numLeaves);
 
     // A global.get is replaced by a call (opcode + function index; the factory
     // is used often, so assume a 2-byte index) and an i32.const.
@@ -440,14 +552,15 @@ private:
     for (auto* member : sorted) {
       Index tableBytes = 0;
       for (auto i : varying) {
-        tableBytes += getOperandBytes(member->init->operands[i]);
+        tableBytes += getOperandBytes(member->leaves[i]);
       }
       Index index = chosen.size() % MaxChunkSize;
       Index getBytes =
         1 + getLEBSize(U32LEB(globalIndexes[member->global->name]));
       int64_t siteDelta =
         int64_t(callBytes + 1 + getSLEBSize(index)) - int64_t(getBytes);
-      int64_t memberSaving = int64_t(member->initBytes) - int64_t(tableBytes) -
+      int64_t memberSaving = int64_t(member->initBytes) +
+                             int64_t(member->bonus) - int64_t(tableBytes) -
                              int64_t(member->uses) * siteDelta;
       if (always || memberSaving > 0) {
         chosen.push_back(member);
@@ -462,7 +575,7 @@ private:
     for (auto* member : chosen) {
       chosenMembers.push_back(*member);
     }
-    varying = getVaryingColumns(chosenMembers, numFields);
+    varying = getVaryingColumns(chosenMembers, numLeaves);
 
     // Fixed costs per chunk: the factory function (code, function section
     // entry, type), the cache global and its type, and per table column the
@@ -491,12 +604,12 @@ private:
   }
 
   std::vector<Index> getVaryingColumns(std::vector<Candidate>& members,
-                                       Index numFields) {
+                                       Index numLeaves) {
     std::vector<Index> varying;
-    for (Index i = 0; i < numFields; i++) {
-      auto* first = members[0].init->operands[i];
+    for (Index i = 0; i < numLeaves; i++) {
+      auto* first = members[0].leaves[i];
       for (auto& member : members) {
-        if (!ExpressionAnalyzer::equal(first, member.init->operands[i])) {
+        if (!ExpressionAnalyzer::equal(first, member.leaves[i])) {
           varying.push_back(i);
           break;
         }
@@ -511,7 +624,7 @@ private:
     Builder builder(*module);
     auto type = group.type;
     auto resultType = group.globalType;
-    auto& fields = type.getStruct().fields;
+    auto& leafFields = group.leafFields;
     std::string typeName;
     if (auto iter = module->typeNames.find(type);
         iter != module->typeNames.end()) {
@@ -536,22 +649,22 @@ private:
                            builder.makeConst(int32_t(members.size()))),
       Builder::Immutable));
 
-    // The tables.
+    // The tables, indexed by leaf.
     struct Column {
-      Index field;
       Name global;
       Type globalType;
     };
-    std::vector<Column> columns;
+    std::unordered_map<Index, Column> columns;
     for (auto i : varying) {
-      HeapType tableType(Array(Field(fields[i].type, Immutable)));
-      if (fields[i].isPacked()) {
-        tableType = HeapType(Array(Field(fields[i].packedType, Immutable)));
+      auto& field = leafFields[i];
+      HeapType tableType(Array(Field(field.type, Immutable)));
+      if (field.isPacked()) {
+        tableType = HeapType(Array(Field(field.packedType, Immutable)));
       }
       std::vector<Expression*> values;
       for (auto* member : members) {
         values.push_back(
-          ExpressionManipulator::copy(member->init->operands[i], *module));
+          ExpressionManipulator::copy(member->leaves[i], *module));
       }
       auto tableName = Names::getValidGlobalName(
         *module, baseName + "$table$" + std::to_string(i));
@@ -561,7 +674,7 @@ private:
                            tableGlobalType,
                            builder.makeArrayNewFixed(tableType, values),
                            Builder::Immutable));
-      columns.push_back({i, tableName, tableGlobalType});
+      columns[i] = {tableName, tableGlobalType};
     }
 
     // The factory.
@@ -574,23 +687,35 @@ private:
                            MemoryOrder::Unordered,
                            cacheElementType);
     auto* brOn = builder.makeBrOn(BrOnNonNull, label, cacheGet);
-    std::vector<Expression*> operands;
-    Index column = 0;
-    for (Index i = 0; i < fields.size(); i++) {
-      if (column < columns.size() && columns[column].field == i) {
-        auto& col = columns[column++];
-        operands.push_back(builder.makeArrayGet(
-          builder.makeGlobalGet(col.global, col.globalType),
-          builder.makeLocalGet(indexLocal, Type::i32),
-          MemoryOrder::Unordered,
-          fields[i].type,
-          false));
-      } else {
-        operands.push_back(
-          ExpressionManipulator::copy(members[0]->init->operands[i], *module));
+
+    // Rebuild the (nested) allocation from the first member, reading the
+    // varying leaves from the tables.
+    Index leaf = 0;
+    std::function<Expression*(StructNew*)> rebuild =
+      [&](StructNew* templ) -> Expression* {
+      std::vector<Expression*> operands;
+      for (auto* operand : templ->operands) {
+        if (isNestedNew(operand)) {
+          operands.push_back(rebuild(operand->cast<StructNew>()));
+          continue;
+        }
+        Index i = leaf++;
+        if (auto iter = columns.find(i); iter != columns.end()) {
+          auto& col = iter->second;
+          operands.push_back(builder.makeArrayGet(
+            builder.makeGlobalGet(col.global, col.globalType),
+            builder.makeLocalGet(indexLocal, Type::i32),
+            MemoryOrder::Unordered,
+            leafFields[i].type,
+            false));
+        } else {
+          operands.push_back(ExpressionManipulator::copy(operand, *module));
+        }
       }
-    }
-    auto* structNew = builder.makeStructNew(type, operands);
+      return builder.makeStructNew(templ->type.getHeapType(), operands);
+    };
+    auto* structNew = rebuild(members[0]->init);
+    assert(leaf == leafFields.size());
     auto* tee = builder.makeLocalTee(objectLocal, structNew, resultType);
     auto* cacheSet =
       builder.makeArraySet(builder.makeGlobalGet(cacheName, cacheGlobalType),

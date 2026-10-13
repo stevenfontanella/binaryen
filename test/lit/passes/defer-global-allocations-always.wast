@@ -166,10 +166,10 @@
   )
 )
 
-;; Operands that are not constant (a nested struct.new with operands) or a
-;; global whose type is not exactly the struct.new's type keep the global
-;; eager. ref.func, ref.null, ref.i31 and struct.new_default
-;; operands are fine.
+;; A global whose type is not exactly the struct.new's type keeps the global
+;; eager. ref.func, ref.null, ref.i31 and struct.new_default operands are fine.
+;; A nested struct.new with operands has a different shape and gets its own
+;; group (and factory, as the size model is disabled here).
 (module
   ;; CHECK:      (type $pair (struct (field i32) (field i32)))
 
@@ -187,9 +187,9 @@
 
   ;; CHECK:      (type $6 (array i31ref))
 
-  ;; CHECK:      (type $7 (func (result (ref $obj))))
+  ;; CHECK:      (type $7 (func (param i32) (result (ref $obj))))
 
-  ;; CHECK:      (type $8 (func (param i32) (result (ref $obj))))
+  ;; CHECK:      (type $8 (func (result (ref $obj))))
 
   ;; CHECK:      (global $vt (ref $vt) (struct.new $vt
   ;; CHECK-NEXT:  (i32.const 42)
@@ -208,15 +208,6 @@
     (struct.new_default $pair)
     (ref.i31 (i32.const 2))
   ))
-  ;; CHECK:      (global $nested (ref $obj) (struct.new $obj
-  ;; CHECK-NEXT:  (global.get $vt)
-  ;; CHECK-NEXT:  (ref.null nofunc)
-  ;; CHECK-NEXT:  (struct.new $pair
-  ;; CHECK-NEXT:   (i32.const 1)
-  ;; CHECK-NEXT:   (i32.const 2)
-  ;; CHECK-NEXT:  )
-  ;; CHECK-NEXT:  (ref.null none)
-  ;; CHECK-NEXT: ))
   (global $nested (ref $obj) (struct.new $obj
     (global.get $vt)
     (ref.null func)
@@ -259,9 +250,13 @@
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: ))
 
+  ;; CHECK:      (global $defer$obj$cache_9 (ref $3) (array.new_default $3
+  ;; CHECK-NEXT:  (i32.const 1)
+  ;; CHECK-NEXT: ))
+
   ;; CHECK:      (export "use" (func $use))
 
-  ;; CHECK:      (func $use (type $7) (result (ref $obj))
+  ;; CHECK:      (func $use (type $8) (result (ref $obj))
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (call $defer$obj
   ;; CHECK-NEXT:    (i32.const 0)
@@ -275,7 +270,9 @@
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (global.get $supertype)
   ;; CHECK-NEXT:  )
-  ;; CHECK-NEXT:  (global.get $nested)
+  ;; CHECK-NEXT:  (call $defer$obj_2
+  ;; CHECK-NEXT:   (i32.const 0)
+  ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
   (func $use (export "use") (result (ref $obj))
     (drop (global.get $o0))
@@ -287,7 +284,7 @@
 
 ;; Globals with an exact type (as optimization passes refine them to the type
 ;; of their struct.new) are deferred too; the factory returns the exact type.
-;; CHECK:      (func $defer$obj (type $8) (param $0 i32) (result (ref $obj))
+;; CHECK:      (func $defer$obj (type $7) (param $0 i32) (result (ref $obj))
 ;; CHECK-NEXT:  (local $1 (ref $obj))
 ;; CHECK-NEXT:  (block $cached (result (ref $obj))
 ;; CHECK-NEXT:   (br_on_non_null $cached
@@ -314,6 +311,34 @@
 ;; CHECK-NEXT:       (global.get $defer$obj$table$3)
 ;; CHECK-NEXT:       (local.get $0)
 ;; CHECK-NEXT:      )
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (local.get $1)
+;; CHECK-NEXT:  )
+;; CHECK-NEXT: )
+
+;; CHECK:      (func $defer$obj_2 (type $7) (param $0 i32) (result (ref $obj))
+;; CHECK-NEXT:  (local $1 (ref $obj))
+;; CHECK-NEXT:  (block $cached (result (ref $obj))
+;; CHECK-NEXT:   (br_on_non_null $cached
+;; CHECK-NEXT:    (array.get $3
+;; CHECK-NEXT:     (global.get $defer$obj$cache_9)
+;; CHECK-NEXT:     (local.get $0)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (array.set $3
+;; CHECK-NEXT:    (global.get $defer$obj$cache_9)
+;; CHECK-NEXT:    (local.get $0)
+;; CHECK-NEXT:    (local.tee $1
+;; CHECK-NEXT:     (struct.new $obj
+;; CHECK-NEXT:      (global.get $vt)
+;; CHECK-NEXT:      (ref.null nofunc)
+;; CHECK-NEXT:      (struct.new $pair
+;; CHECK-NEXT:       (i32.const 1)
+;; CHECK-NEXT:       (i32.const 2)
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:      (ref.null none)
 ;; CHECK-NEXT:     )
 ;; CHECK-NEXT:    )
 ;; CHECK-NEXT:   )
