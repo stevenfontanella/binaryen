@@ -163,6 +163,7 @@ Pass* createReorderTypesPass();
 Pass* createReorderTypesForTestingPass();
 Pass* createReReloopPass();
 Pass* createRedundantSetEliminationPass();
+Pass* createRollConstantTablesPass();
 Pass* createRollRepeatedCallsPass();
 Pass* createRoundTripPass();
 Pass* createSafeHeapPass();

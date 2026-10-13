@@ -423,6 +423,9 @@
 ;; CHECK-NEXT:   --rereloop                                    re-optimize control flow using 
 ;; CHECK-NEXT:                                                 the relooper algorithm
 ;; CHECK-EMPTY:
+;; CHECK-NEXT:   --roll-constant-tables                        roll constant table globals into
+;; CHECK-NEXT:                                                 data segments and lazy factories
+;; CHECK-EMPTY:
 ;; CHECK-NEXT:   --roll-repeated-calls                         roll runs of similar statements 
 ;; CHECK-NEXT:                                                 into loops over data columns
 ;; CHECK-EMPTY:

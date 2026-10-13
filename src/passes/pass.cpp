@@ -493,6 +493,10 @@ void PassRegistry::registerPasses() {
                createReReloopPass);
   registerPass(
     "rse", "remove redundant local.sets", createRedundantSetEliminationPass);
+  registerPass("roll-constant-tables",
+               "roll constant table globals into data segments and lazy "
+               "factories",
+               createRollConstantTablesPass);
   registerPass("roll-repeated-calls",
                "roll runs of similar statements into loops over data columns",
                createRollRepeatedCallsPass);
