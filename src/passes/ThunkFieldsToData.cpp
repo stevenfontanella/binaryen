@@ -57,17 +57,36 @@
 //
 //    and (call_ref (struct.get $vt 0 (X))) becomes (call $helper (X)).
 //
+//  * Indexed: when every thunk is a call to the same function $F whose
+//    operands are the thunk's parameters (in order, each used at most once)
+//    plus exactly one constant,
+//
+//    (func $thunk5 (param $this (ref $vt)) (result (ref $Str))
+//      (call $F (i32.const 5)))
+//
+//    the field becomes the constant's type (the constant is the data that
+//    differs per vtable) and the call becomes a direct call of $F:
+//
+//    (call_ref $sig (struct.get $vt 0 (X)) (args...)) =>
+//    (call $F (args... with (struct.get $vt 0 (X)) in the constant's place))
+//
+//    (the receiver and arguments are spilled to locals first if they have
+//    side effects, to keep the evaluation order). This handles factory thunks
+//    like those DeferGlobalAllocations creates.
+//
 // The thunks (and the globals they returned, in lazy mode) become
 // unreferenced; a following --remove-unused-module-elements removes them.
 //
 // Conditions (closed world only): the cone of the declaring type is private,
 // all its instances are created in global initializers, the field is
-// immutable, and its type is a nullary signature. A byte-size model decides
-// per field; --pass-arg=thunk-fields-to-data-always@1 ignores the model.
+// immutable, and its type is a signature (nullary, except in indexed mode).
+// A byte-size model decides per field; --pass-arg=thunk-fields-to-data-always@1
+// ignores the model.
 //
 
 #include <algorithm>
 
+#include "ir/effects.h"
 #include "ir/find_all.h"
 #include "ir/module-utils.h"
 #include "ir/names.h"
@@ -137,12 +156,14 @@ struct ThunkFieldsToData : public Pass {
     GlobalSite* globalSite;
     Function* thunk;
     SiteMode mode;
+    // Indexed mode: the constant the thunk passes to the callee.
+    Const* constant = nullptr;
   };
 
   struct Decision {
     HeapType type;
     Index index;
-    bool lazy;
+    bool lazy = false;
     // The thunk result type.
     Type resultType;
     // The new field type.
@@ -151,6 +172,20 @@ struct ThunkFieldsToData : public Pass {
     // Lazy mode: the template object and the helper.
     StructNew* lazyTemplate = nullptr;
     Name helper;
+    // Indexed mode: the callee and its operand shape (ConstOperand for the
+    // constant, otherwise the index of the thunk parameter).
+    bool indexed = false;
+    Name callee;
+    std::vector<Index> shape;
+  };
+
+  static constexpr Index ConstOperand = Index(-1);
+
+  // The classification of a thunk in indexed mode.
+  struct IndexedThunk {
+    Name callee;
+    std::vector<Index> shape;
+    Const* constant;
   };
 
   Module* module;
@@ -189,10 +224,8 @@ struct ThunkFieldsToData : public Pass {
             }
             info.reads[FieldKey{type.getHeapType(), curr->index}]++;
           }
+          // Reads that are directly the target of a call_ref.
           void visitCallRef(CallRef* curr) {
-            if (!curr->operands.empty()) {
-              return;
-            }
             auto* get = curr->target->dynCast<StructGet>();
             if (!get || get->type == Type::unreachable ||
                 get->order != MemoryOrder::Unordered) {
@@ -344,8 +377,7 @@ struct ThunkFieldsToData : public Pass {
           continue;
         }
         auto sig = field.type.getHeapType().getSignature();
-        if (sig.params != Type::none || !sig.results.isConcrete() ||
-            sig.results.isTuple()) {
+        if (!sig.results.isConcrete() || sig.results.isTuple()) {
           continue;
         }
         auto decision = analyzeField(type, k, cone, codeInfo, globalSites);
@@ -501,6 +533,45 @@ private:
     return nullptr;
   }
 
+  // Classifies a thunk whose body is a call of another function with the
+  // thunk's parameters (in order, each at most once) and exactly one constant
+  // as operands.
+  std::optional<IndexedThunk> getIndexedThunk(Function* func) {
+    if (func->imported()) {
+      return {};
+    }
+    auto* call = func->body->dynCast<Call>();
+    if (!call || call->target == func->name) {
+      return {};
+    }
+    IndexedThunk info;
+    info.callee = call->target;
+    info.constant = nullptr;
+    Index nextParam = 0;
+    Index numParams = func->getNumParams();
+    for (auto* operand : call->operands) {
+      if (auto* c = operand->dynCast<Const>()) {
+        if (info.constant || !c->type.isNumber()) {
+          return {};
+        }
+        info.constant = c;
+        info.shape.push_back(ConstOperand);
+      } else if (auto* get = operand->dynCast<LocalGet>()) {
+        if (get->index < nextParam || get->index >= numParams) {
+          return {};
+        }
+        nextParam = get->index + 1;
+        info.shape.push_back(get->index);
+      } else {
+        return {};
+      }
+    }
+    if (!info.constant) {
+      return {};
+    }
+    return info;
+  }
+
   std::optional<Decision>
   analyzeField(HeapType type,
                Index k,
@@ -526,7 +597,7 @@ private:
       return {};
     }
 
-    // All operands must be ref.funcs of nullary functions.
+    // All operands must be ref.funcs of functions.
     Decision decision;
     decision.type = type;
     decision.index = k;
@@ -546,15 +617,24 @@ private:
           return {};
         }
         auto* func = module->getFunction(refFunc->func);
-        if (func->getParams() != Type::none) {
-          return {};
-        }
         siteUses[func->name]++;
         decision.sites.push_back(Site{&site, func, SiteMode::Eager});
       }
     }
     if (decision.sites.empty()) {
       return {};
+    }
+
+    // Indexed mode: all thunks call the same function with the same shape.
+    if (auto indexed = analyzeIndexed(decision, reads)) {
+      return indexed;
+    }
+
+    // Eager and lazy modes need nullary thunks.
+    for (auto& site : decision.sites) {
+      if (site.thunk->getParams() != Type::none) {
+        return {};
+      }
     }
 
     // Classify the sites. Lazy candidates are thunks used only here that
@@ -697,6 +777,53 @@ private:
     return decision;
   }
 
+  // Indexed mode: every thunk calls the same function with the same operand
+  // shape. The field then holds the constant.
+  std::optional<Decision> analyzeIndexed(Decision decision, Index reads) {
+    auto k = decision.index;
+    std::unordered_map<Name, Index> deadThunkUses;
+    int64_t benefit = 0, cost = 0;
+    bool first = true;
+    for (auto& site : decision.sites) {
+      auto info = getIndexedThunk(site.thunk);
+      if (!info) {
+        return {};
+      }
+      if (first) {
+        decision.callee = info->callee;
+        decision.shape = info->shape;
+        decision.fieldType = info->constant->type;
+        first = false;
+      } else if (info->callee != decision.callee ||
+                 info->shape != decision.shape ||
+                 info->constant->type != decision.fieldType) {
+        return {};
+      }
+      site.constant = info->constant;
+      deadThunkUses[site.thunk->name]++;
+      benefit += getOperandBytes(site.globalSite->structNew->operands[k]);
+      cost += getOperandBytes(site.constant);
+    }
+    decision.indexed = true;
+    for (auto& [name, uses] : deadThunkUses) {
+      if (funcUses[name] == uses) {
+        auto* func = module->getFunction(name);
+        auto* call = func->body->cast<Call>();
+        benefit += FunctionOverheadBytes + 1 +
+                   getLEBSize(U32LEB(functionIndexes[call->target]));
+        for (auto* operand : call->operands) {
+          benefit += operand->is<Const>() ? getOperandBytes(operand) : 2;
+        }
+      }
+    }
+    // call_ref with a type index becomes a call with a function index.
+    cost += reads;
+    if (!always && benefit <= cost) {
+      return {};
+    }
+    return decision;
+  }
+
   void apply(std::vector<Decision>& decisions) {
     Builder builder(*module);
     bool addedGlobals = false;
@@ -713,6 +840,10 @@ private:
       std::vector<std::pair<Name, Name>> exceptions;
       for (auto& site : decision.sites) {
         auto& operand = site.globalSite->structNew->operands[k];
+        if (decision.indexed) {
+          operand = ExpressionManipulator::copy(site.constant, *module);
+          continue;
+        }
         switch (site.mode) {
           case SiteMode::Lazy:
           case SiteMode::Exception:
@@ -763,7 +894,9 @@ private:
         auto& decision = *iter->second;
         Builder builder(*getModule());
         Expression* replacement;
-        if (decision.lazy) {
+        if (decision.indexed) {
+          replacement = makeIndexedCall(curr, get, decision);
+        } else if (decision.lazy) {
           replacement = builder.makeCall(
             decision.helper, {get->ref}, decision.resultType, curr->isReturn);
         } else {
@@ -774,6 +907,78 @@ private:
           }
         }
         replaceCurrent(replacement);
+      }
+
+      // (call_ref (struct.get k (X)) (args)) => (call F (args with the field
+      // read in the constant's place)). The receiver is evaluated first in the
+      // original; if moving things around could change the behavior, spill
+      // the receiver and the arguments to locals in the original order.
+      Expression*
+      makeIndexedCall(CallRef* curr, StructGet* get, Decision& decision) {
+        Builder builder(*getModule());
+        auto& options = getPassOptions();
+        auto& wasm = *getModule();
+        get->type = decision.fieldType;
+        std::vector<Expression*> prelude;
+        auto spill = [&](Expression*& value) {
+          if (value->type == Type::unreachable) {
+            // Keep it where it is; what follows is unreachable anyway.
+            prelude.push_back(value);
+            value = builder.makeUnreachable();
+            return;
+          }
+          auto index = Builder::addVar(getFunction(), value->type);
+          prelude.push_back(builder.makeLocalSet(index, value));
+          value = builder.makeLocalGet(index, value->type);
+        };
+        // The arguments before the constant in the shape are now evaluated
+        // before the field read, and the arguments the thunk ignores vanish.
+        bool needsSpill = false;
+        std::vector<bool> used(curr->operands.size(), false);
+        bool beforeConst = true;
+        for (auto index : decision.shape) {
+          if (index == ConstOperand) {
+            beforeConst = false;
+            continue;
+          }
+          assert(index < curr->operands.size());
+          used[index] = true;
+          if (beforeConst && !EffectAnalyzer::canReorder(
+                               options, wasm, get, curr->operands[index])) {
+            needsSpill = true;
+          }
+        }
+        for (Index i = 0; i < curr->operands.size(); i++) {
+          if (!used[i] && EffectAnalyzer(options, wasm, curr->operands[i])
+                            .hasSideEffects()) {
+            needsSpill = true;
+          }
+        }
+        if (needsSpill) {
+          spill(get->ref);
+          for (auto& operand : curr->operands) {
+            spill(operand);
+          }
+        }
+        // Arguments the thunk ignores vanish: they are side effect free, or
+        // have been spilled.
+        std::vector<Expression*> operands;
+        for (auto index : decision.shape) {
+          if (index == ConstOperand) {
+            operands.push_back(get);
+          } else {
+            assert(index < curr->operands.size());
+            operands.push_back(curr->operands[index]);
+          }
+        }
+        auto* callee = wasm.getFunction(decision.callee);
+        Expression* call = builder.makeCall(
+          decision.callee, operands, callee->getResults(), curr->isReturn);
+        if (prelude.empty()) {
+          return call;
+        }
+        prelude.push_back(call);
+        return builder.makeBlock(prelude, call->type);
       }
     };
     Replacer(decisionMap).run(getPassRunner(), module);

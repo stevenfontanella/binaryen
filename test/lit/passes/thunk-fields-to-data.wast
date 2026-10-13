@@ -511,3 +511,355 @@
     (drop (global.get $vt.a))
   )
 )
+
+;; Indexed mode: every thunk in the slot calls the same function $make with a
+;; different constant, so the slot becomes an i32 field holding the constant,
+;; and the call_ref becomes a direct call of $make with the field read as its
+;; argument (return_call_ref becomes return_call). The thunks are removed.
+(module
+  ;; CHECK:      (rec
+  ;; CHECK-NEXT:  (type $vt (sub (struct (field i32))))
+
+  ;; CHECK:       (type $get-str (func (result (ref $str))))
+
+  ;; CHECK:       (type $str (struct (field i32)))
+  (type $str (struct (field i32)))
+  (rec
+    (type $vt (sub (struct (field (ref $get-str)))))
+    ;; CHECK:       (type $3 (func (param i32) (result (ref $str))))
+
+    ;; CHECK:       (type $vt.sub (sub $vt (struct (field i32) (field i32))))
+    (type $vt.sub (sub $vt (struct (field (ref $get-str)) (field i32))))
+    (type $get-str (func (result (ref $str))))
+  )
+
+  ;; CHECK:      (type $5 (func (param anyref) (result anyref)))
+
+  ;; CHECK:      (type $6 (func))
+
+  ;; CHECK:      (global $vt.a (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 1)
+  ;; CHECK-NEXT: ))
+  (global $vt.a (ref $vt) (struct.new $vt (ref.func $thunk.1)))
+  ;; CHECK:      (global $vt.b (ref $vt.sub) (struct.new $vt.sub
+  ;; CHECK-NEXT:  (i32.const 2)
+  ;; CHECK-NEXT:  (i32.const 1)
+  ;; CHECK-NEXT: ))
+  (global $vt.b (ref $vt.sub) (struct.new $vt.sub (ref.func $thunk.2) (i32.const 1)))
+  ;; CHECK:      (global $vt.c (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 3)
+  ;; CHECK-NEXT: ))
+  (global $vt.c (ref $vt) (struct.new $vt (ref.func $thunk.3)))
+  ;; CHECK:      (global $vt.c2 (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 3)
+  ;; CHECK-NEXT: ))
+  (global $vt.c2 (ref $vt) (struct.new $vt (ref.func $thunk.3)))
+
+  ;; CHECK:      (export "get" (func $get))
+
+  ;; CHECK:      (export "get-sub" (func $get-sub))
+
+  ;; CHECK:      (export "keep" (func $keep))
+
+  ;; CHECK:      (func $make (type $3) (param $index i32) (result (ref $str))
+  ;; CHECK-NEXT:  (struct.new $str
+  ;; CHECK-NEXT:   (local.get $index)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $make (param $index i32) (result (ref $str))
+    (struct.new $str (local.get $index))
+  )
+
+  (func $thunk.1 (type $get-str) (result (ref $str))
+    (call $make (i32.const 1))
+  )
+  (func $thunk.2 (type $get-str) (result (ref $str))
+    (call $make (i32.const 2))
+  )
+  (func $thunk.3 (type $get-str) (result (ref $str))
+    (return_call $make (i32.const 3))
+  )
+
+  ;; CHECK:      (func $get (type $5) (param $vt anyref) (result anyref)
+  ;; CHECK-NEXT:  (call $make
+  ;; CHECK-NEXT:   (struct.get $vt 0
+  ;; CHECK-NEXT:    (ref.cast (ref $vt)
+  ;; CHECK-NEXT:     (local.get $vt)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $get (export "get") (param $vt anyref) (result anyref)
+    (call_ref $get-str
+      (struct.get $vt 0
+        (ref.cast (ref $vt)
+          (local.get $vt)
+        )
+      )
+    )
+  )
+
+  ;; CHECK:      (func $get-sub (type $5) (param $vt anyref) (result anyref)
+  ;; CHECK-NEXT:  (return_call $make
+  ;; CHECK-NEXT:   (struct.get $vt.sub 0
+  ;; CHECK-NEXT:    (ref.cast (ref $vt.sub)
+  ;; CHECK-NEXT:     (local.get $vt)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $get-sub (export "get-sub") (param $vt anyref) (result anyref)
+    (return_call_ref $get-str
+      (struct.get $vt.sub 0
+        (ref.cast (ref $vt.sub)
+          (local.get $vt)
+        )
+      )
+    )
+  )
+
+  ;; CHECK:      (func $keep (type $6)
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $vt.a)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $vt.b)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $vt.c)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $vt.c2)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $keep (export "keep")
+    (drop (global.get $vt.a))
+    (drop (global.get $vt.b))
+    (drop (global.get $vt.c))
+    (drop (global.get $vt.c2))
+  )
+)
+
+;; Indexed mode with parameters. Slot 0: the constant comes after the
+;; parameter, so the receiver is evaluated after the argument in the new call;
+;; $get-pure's argument has no side effects and nothing is spilled, while
+;; $get-effects's argument is a call, so the receiver and the argument are
+;; spilled to locals in the original order. Slot 1: the constant comes first,
+;; and the thunks ignore their parameter, so the argument is not passed on (it
+;; is still evaluated, as it has side effects). Slot 2 mixes two callees and is
+;; not optimized.
+(module
+  (rec
+    ;; CHECK:      (rec
+    ;; CHECK-NEXT:  (type $0 (func (param i32) (result (ref $vt))))
+
+    ;; CHECK:       (type $nullary (func (result i32)))
+
+    ;; CHECK:       (type $unary (func (param (ref $vt)) (result i32)))
+
+    ;; CHECK:       (type $3 (func (param (ref $vt) i32) (result i32)))
+
+    ;; CHECK:       (type $vt (sub (struct (field i32) (field i32) (field (ref $nullary)))))
+    (type $vt (sub (struct (field (ref $unary)) (field (ref $unary)) (field (ref $nullary)))))
+    (type $unary (func (param (ref $vt)) (result i32)))
+    (type $nullary (func (result i32)))
+  )
+
+  ;; CHECK:      (type $5 (func (param i32) (result i32)))
+
+  ;; CHECK:      (type $6 (func (param anyref anyref) (result i32)))
+
+  ;; CHECK:      (type $7 (func (param anyref) (result i32)))
+
+  ;; CHECK:      (global $vt.a (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 1)
+  ;; CHECK-NEXT:  (i32.const 10)
+  ;; CHECK-NEXT:  (ref.func $f.1)
+  ;; CHECK-NEXT: ))
+  (global $vt.a (ref $vt) (struct.new $vt (ref.func $after.1) (ref.func $ignore.1) (ref.func $f.1)))
+  ;; CHECK:      (global $vt.b (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 2)
+  ;; CHECK-NEXT:  (i32.const 20)
+  ;; CHECK-NEXT:  (ref.func $h.2)
+  ;; CHECK-NEXT: ))
+  (global $vt.b (ref $vt) (struct.new $vt (ref.func $after.2) (ref.func $ignore.2) (ref.func $h.2)))
+
+  ;; CHECK:      (export "get-pure" (func $get-pure))
+
+  ;; CHECK:      (export "get-effects" (func $get-effects))
+
+  ;; CHECK:      (export "get-ignored" (func $get-ignored))
+
+  ;; CHECK:      (export "get-mixed" (func $get-mixed))
+
+  ;; CHECK:      (func $f (type $5) (param $index i32) (result i32)
+  ;; CHECK-NEXT:  (local.get $index)
+  ;; CHECK-NEXT: )
+  (func $f (param $index i32) (result i32)
+    (local.get $index)
+  )
+  ;; CHECK:      (func $g (type $3) (param $vt (ref $vt)) (param $index i32) (result i32)
+  ;; CHECK-NEXT:  (local.get $index)
+  ;; CHECK-NEXT: )
+  (func $g (param $vt (ref $vt)) (param $index i32) (result i32)
+    (local.get $index)
+  )
+  ;; CHECK:      (func $h (type $5) (param $index i32) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (local.get $index)
+  ;; CHECK-NEXT:   (i32.const 1)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $h (param $index i32) (result i32)
+    (i32.add (local.get $index) (i32.const 1))
+  )
+
+  (func $after.1 (type $unary) (param $vt (ref $vt)) (result i32)
+    (call $g (local.get $vt) (i32.const 1))
+  )
+  (func $after.2 (type $unary) (param $vt (ref $vt)) (result i32)
+    (call $g (local.get $vt) (i32.const 2))
+  )
+
+  (func $ignore.1 (type $unary) (param $vt (ref $vt)) (result i32)
+    (call $f (i32.const 10))
+  )
+  (func $ignore.2 (type $unary) (param $vt (ref $vt)) (result i32)
+    (call $f (i32.const 20))
+  )
+
+  ;; CHECK:      (func $f.1 (type $nullary) (result i32)
+  ;; CHECK-NEXT:  (call $f
+  ;; CHECK-NEXT:   (i32.const 1)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $f.1 (type $nullary) (result i32)
+    (call $f (i32.const 1))
+  )
+  ;; CHECK:      (func $h.2 (type $nullary) (result i32)
+  ;; CHECK-NEXT:  (call $h
+  ;; CHECK-NEXT:   (i32.const 2)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $h.2 (type $nullary) (result i32)
+    (call $h (i32.const 2))
+  )
+
+  ;; CHECK:      (func $pick (type $0) (param $i i32) (result (ref $vt))
+  ;; CHECK-NEXT:  (if (result (ref $vt))
+  ;; CHECK-NEXT:   (local.get $i)
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (global.get $vt.a)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (else
+  ;; CHECK-NEXT:    (global.get $vt.b)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $pick (param $i i32) (result (ref $vt))
+    (if (result (ref $vt))
+      (local.get $i)
+      (then (global.get $vt.a))
+      (else (global.get $vt.b))
+    )
+  )
+
+  ;; CHECK:      (func $get-pure (type $6) (param $vt anyref) (param $arg anyref) (result i32)
+  ;; CHECK-NEXT:  (call $g
+  ;; CHECK-NEXT:   (ref.cast (ref $vt)
+  ;; CHECK-NEXT:    (local.get $arg)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (struct.get $vt 0
+  ;; CHECK-NEXT:    (ref.cast (ref $vt)
+  ;; CHECK-NEXT:     (local.get $vt)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $get-pure (export "get-pure") (param $vt anyref) (param $arg anyref) (result i32)
+    (call_ref $unary
+      (ref.cast (ref $vt) (local.get $arg))
+      (struct.get $vt 0
+        (ref.cast (ref $vt)
+          (local.get $vt)
+        )
+      )
+    )
+  )
+
+  ;; CHECK:      (func $get-effects (type $5) (param $i i32) (result i32)
+  ;; CHECK-NEXT:  (local $1 (ref $vt))
+  ;; CHECK-NEXT:  (local $2 (ref $vt))
+  ;; CHECK-NEXT:  (local.set $1
+  ;; CHECK-NEXT:   (call $pick
+  ;; CHECK-NEXT:    (local.get $i)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $2
+  ;; CHECK-NEXT:   (call $pick
+  ;; CHECK-NEXT:    (i32.const 0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (call $g
+  ;; CHECK-NEXT:   (local.get $2)
+  ;; CHECK-NEXT:   (struct.get $vt 0
+  ;; CHECK-NEXT:    (local.get $1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $get-effects (export "get-effects") (param $i i32) (result i32)
+    (call_ref $unary
+      (call $pick (i32.const 0))
+      (struct.get $vt 0
+        (call $pick (local.get $i))
+      )
+    )
+  )
+
+  ;; CHECK:      (func $get-ignored (type $5) (param $i i32) (result i32)
+  ;; CHECK-NEXT:  (local $1 (ref $vt))
+  ;; CHECK-NEXT:  (local $2 (ref $vt))
+  ;; CHECK-NEXT:  (local.set $1
+  ;; CHECK-NEXT:   (call $pick
+  ;; CHECK-NEXT:    (local.get $i)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $2
+  ;; CHECK-NEXT:   (call $pick
+  ;; CHECK-NEXT:    (i32.const 1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (return_call $f
+  ;; CHECK-NEXT:   (struct.get $vt 1
+  ;; CHECK-NEXT:    (local.get $1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $get-ignored (export "get-ignored") (param $i i32) (result i32)
+    (return_call_ref $unary
+      (call $pick (i32.const 1))
+      (struct.get $vt 1
+        (call $pick (local.get $i))
+      )
+    )
+  )
+
+  ;; CHECK:      (func $get-mixed (type $7) (param $vt anyref) (result i32)
+  ;; CHECK-NEXT:  (call_ref $nullary
+  ;; CHECK-NEXT:   (struct.get $vt 2
+  ;; CHECK-NEXT:    (ref.cast (ref $vt)
+  ;; CHECK-NEXT:     (local.get $vt)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $get-mixed (export "get-mixed") (param $vt anyref) (result i32)
+    (call_ref $nullary
+      (struct.get $vt 2
+        (ref.cast (ref $vt)
+          (local.get $vt)
+        )
+      )
+    )
+  )
+)
