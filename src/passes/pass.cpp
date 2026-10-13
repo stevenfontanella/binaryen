@@ -493,6 +493,9 @@ void PassRegistry::registerPasses() {
                createReReloopPass);
   registerPass(
     "rse", "remove redundant local.sets", createRedundantSetEliminationPass);
+  registerPass("roll-repeated-calls",
+               "roll runs of similar statements into loops over data columns",
+               createRollRepeatedCallsPass);
   registerPass("roundtrip",
                "write the module to binary, then read it",
                createRoundTripPass);

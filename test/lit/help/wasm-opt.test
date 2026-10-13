@@ -504,6 +504,9 @@
 ;; CHECK-NEXT:   --rereloop                                    re-optimize control flow using 
 ;; CHECK-NEXT:                                                 the relooper algorithm
 ;; CHECK-EMPTY:
+;; CHECK-NEXT:   --roll-repeated-calls                         roll runs of similar statements 
+;; CHECK-NEXT:                                                 into loops over data columns
+;; CHECK-EMPTY:
 ;; CHECK-NEXT:   --roundtrip                                   write the module to binary, then
 ;; CHECK-NEXT:                                                 read it
 ;; CHECK-EMPTY:

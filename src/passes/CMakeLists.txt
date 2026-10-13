@@ -102,6 +102,7 @@ set(passes_SOURCES
   PrintFeatures.cpp
   PrintFunctionMap.cpp
   RemoveStart.cpp
+  RollRepeatedCalls.cpp
   RoundTrip.cpp
   SetGlobals.cpp
   SignaturePruning.cpp
