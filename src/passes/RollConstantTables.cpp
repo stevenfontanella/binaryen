@@ -51,6 +51,18 @@
 // Members that force a wider column (outliers) are excluded when that pays.
 // --pass-arg=roll-constant-tables-always@1 ignores the size model.
 //
+// When all varying leaves are i32, a "varint" layout is considered as well:
+// the segment holds [byte offsets (M+1)][one ULEB stream per table], where
+// each table's stream is its element count followed by, per element and
+// column, the ULEB (zigzag-encoded if negative residuals occur) of the value
+// minus an optional predictor: an earlier column of the same element and/or a
+// column of the previous element (the previous element's values start at 0
+// for each table). Sorted range tables thus store (gap, length, category)
+// bytes. The factory loads the table's byte range as an i8 array and decodes
+// it with a shared ULEB reader ($tables$read, position in the mutable global
+// $tables$pos). The layout with the smaller model size wins;
+// --pass-arg=roll-constant-tables-mode@fixed|varint forces one.
+//
 // This is meant for the end of a size-focused pipeline, before
 // --roll-repeated-calls (whose loops absorb the new indexed call sites) and
 // --remove-unused-module-elements.
@@ -81,6 +93,14 @@ constexpr Index MaxLeaves = 64;
 constexpr Index GroupOverhead = 170;
 // Per column: the array.new_data, the local and the read in the factory.
 constexpr Index ColumnOverhead = 14;
+// Varint layout: the byte slice, the position reset and the count read in the
+// factory; per column the read call, the predictor adds and the local; the
+// zigzag decoding of a signed column; the shared reader function and its
+// position global (once per module).
+constexpr Index VarintGroupOverhead = 30;
+constexpr Index VarintColumnOverhead = 9;
+constexpr Index ZigzagOverhead = 14;
+constexpr Index ReaderOverhead = 75;
 // At most this fraction of the elements may be excluded as outliers in one
 // step.
 constexpr Index OutlierPercent = 10;
@@ -90,6 +110,33 @@ void appendLE(std::vector<char>& data, uint64_t value, Index width) {
   for (Index i = 0; i < width; i++) {
     data.push_back(char(uint8_t(value >> (8 * i))));
   }
+}
+
+Index getULEBSize(uint32_t value) {
+  Index bytes = 1;
+  while (value >= 128) {
+    value >>= 7;
+    bytes++;
+  }
+  return bytes;
+}
+
+void appendULEB(std::vector<char>& data, uint32_t value) {
+  while (true) {
+    uint8_t byte = value & 127;
+    value >>= 7;
+    if (value) {
+      data.push_back(char(byte | 128));
+    } else {
+      data.push_back(char(byte));
+      return;
+    }
+  }
+}
+
+uint32_t zigzag(uint32_t value) {
+  int32_t s = int32_t(value);
+  return (uint32_t(s) << 1) ^ uint32_t(s >> 31);
 }
 
 struct RollConstantTables : public Pass {
@@ -114,9 +161,13 @@ struct RollConstantTables : public Pass {
   struct Encoding {
     // The column whose value of the same element is subtracted, or -1.
     int base = -1;
-    // 1, 2, 4 or 8 bytes.
+    // 1, 2, 4 or 8 bytes (fixed layout only).
     Index width = 4;
+    // Fixed layout: signed reads. Varint layout: zigzag-encoded residuals.
     bool signed_ = false;
+    // Varint layout only: the column whose value of the previous element is
+    // subtracted as well (>= this column, or -1).
+    int prevBase = -1;
   };
 
   struct Plan {
@@ -127,6 +178,8 @@ struct RollConstantTables : public Pass {
     std::vector<Encoding> encodings;
     Index numElements = 0;
     int64_t saving = 0;
+    // Whether the columns are stored as ULEB streams.
+    bool varint = false;
   };
 
   struct Replacement {
@@ -136,11 +189,17 @@ struct RollConstantTables : public Pass {
 
   using GroupKey = std::tuple<Type, std::string>;
 
+  enum class Mode { Auto, Fixed, Varint };
+
   Module* module = nullptr;
   std::unordered_map<Name, Index> globalIndexes;
   Index numGroups = 0;
   // Ignore the size model (for testing).
   bool always = false;
+  Mode mode = Mode::Auto;
+  // The shared ULEB reader, created on demand.
+  Name readerName;
+  Name posName;
 
   void run(Module* module_) override {
     module = module_;
@@ -148,6 +207,14 @@ struct RollConstantTables : public Pass {
       return;
     }
     always = !getArgumentOrDefault("roll-constant-tables-always", "").empty();
+    auto modeArg = getArgumentOrDefault("roll-constant-tables-mode", "auto");
+    if (modeArg == "fixed") {
+      mode = Mode::Fixed;
+    } else if (modeArg == "varint") {
+      mode = Mode::Varint;
+    } else if (modeArg != "auto") {
+      Fatal() << "Invalid roll-constant-tables-mode: " << modeArg;
+    }
     computeGlobalIndexes();
 
     // Find the candidates and group them.
@@ -577,9 +644,66 @@ private:
     return getWidth(min, max);
   }
 
-  // Chooses the encodings of the varying columns for the given members and
-  // computes the saving.
-  void evaluate(Plan& plan) {
+  // The residual stored for varying column c of an element in the varint
+  // layout, given the previous element of the same table (or nullptr).
+  static uint32_t getResidual(const Plan& plan,
+                              const std::vector<Expression*>& leaves,
+                              const std::vector<Expression*>* prevLeaves,
+                              Index c,
+                              int base,
+                              int prevBase) {
+    uint32_t value = uint32_t(getBits(leaves[plan.varying[c]]));
+    if (base >= 0) {
+      value -= uint32_t(getBits(leaves[plan.varying[base]]));
+    }
+    if (prevBase >= 0 && prevLeaves) {
+      value -= uint32_t(getBits((*prevLeaves)[plan.varying[prevBase]]));
+    }
+    return value;
+  }
+
+  static uint32_t getResidual(const Plan& plan,
+                              const std::vector<Expression*>& leaves,
+                              const std::vector<Expression*>* prevLeaves,
+                              Index c) {
+    auto& enc = plan.encodings[c];
+    auto value =
+      getResidual(plan, leaves, prevLeaves, c, enc.base, enc.prevBase);
+    return enc.signed_ ? zigzag(value) : value;
+  }
+
+  // The bytes of column c under the given predictors, and whether zigzag
+  // encoding is needed.
+  std::pair<int64_t, bool>
+  getVarintColumnBytes(const Plan& plan, Index c, int base, int prevBase) {
+    bool negative = false;
+    for (auto* member : plan.members) {
+      const std::vector<Expression*>* prev = nullptr;
+      for (auto& leaves : member->elements) {
+        if (int32_t(getResidual(plan, leaves, prev, c, base, prevBase)) < 0) {
+          negative = true;
+          break;
+        }
+        prev = &leaves;
+      }
+      if (negative) {
+        break;
+      }
+    }
+    int64_t bytes = 0;
+    for (auto* member : plan.members) {
+      const std::vector<Expression*>* prev = nullptr;
+      for (auto& leaves : member->elements) {
+        auto value = getResidual(plan, leaves, prev, c, base, prevBase);
+        bytes += getULEBSize(negative ? zigzag(value) : value);
+        prev = &leaves;
+      }
+    }
+    return {bytes, negative};
+  }
+
+  // Computes the element count and the varying leaves of a plan.
+  void computeVarying(Plan& plan) {
     auto& members = plan.members;
     plan.numElements = 0;
     for (auto* member : members) {
@@ -587,7 +711,6 @@ private:
     }
     auto& first = members[0]->elements[0];
     Index numLeaves = first.size();
-    // Varying leaves.
     plan.varying.clear();
     for (Index i = 0; i < numLeaves; i++) {
       bool varies = false;
@@ -606,6 +729,84 @@ private:
         plan.varying.push_back(i);
       }
     }
+  }
+
+  // The saving of a plan given its data bytes and fixed overhead.
+  int64_t getSaving(const Plan& plan, int64_t overhead, int64_t dataBytes) {
+    auto& members = plan.members;
+    int64_t saving = -overhead - dataBytes;
+    // A global.get becomes a call (opcode + 2-byte function index) and an
+    // i32.const.
+    const Index callBytes = 3;
+    for (Index k = 0; k < members.size(); k++) {
+      auto* member = members[k];
+      Index getBytes =
+        1 + getLEBSize(U32LEB(globalIndexes[member->global->name]));
+      int64_t siteDelta =
+        int64_t(callBytes + 1 + getLEBSize(S32LEB(int32_t(k)))) -
+        int64_t(getBytes);
+      saving += int64_t(member->initBytes) - int64_t(member->uses) * siteDelta;
+    }
+    return saving;
+  }
+
+  // Chooses the varint encodings of the varying columns for the given members
+  // and computes the saving. All varying leaves must be i32.
+  void evaluateVarint(Plan& plan) {
+    plan.varint = true;
+    computeVarying(plan);
+    auto& first = plan.members[0]->elements[0];
+    for (auto index : plan.varying) {
+      if (first[index]->type != Type::i32) {
+        plan.saving = INT64_MIN;
+        return;
+      }
+    }
+    plan.encodings.assign(plan.varying.size(), Encoding());
+    int64_t streamBytes = 0;
+    int64_t overhead = GroupOverhead + VarintGroupOverhead +
+                       (readerName.is() ? 0 : ReaderOverhead);
+    for (auto* member : plan.members) {
+      streamBytes += getULEBSize(member->elements.size());
+    }
+    Index numColumns = plan.varying.size();
+    for (Index c = 0; c < numColumns; c++) {
+      int64_t best = INT64_MAX;
+      for (int base = -1; base < int(c); base++) {
+        for (int prevBase = -1; prevBase < int(numColumns); prevBase++) {
+          if (prevBase >= 0 && prevBase < int(c)) {
+            continue;
+          }
+          auto [bytes, negative] =
+            getVarintColumnBytes(plan, c, base, prevBase);
+          if (negative) {
+            bytes += ZigzagOverhead;
+          }
+          if (bytes < best) {
+            best = bytes;
+            plan.encodings[c] = {base, 0, negative, prevBase};
+          }
+        }
+      }
+      streamBytes += best;
+      overhead += VarintColumnOverhead;
+      if (plan.encodings[c].signed_) {
+        streamBytes -= ZigzagOverhead;
+        overhead += ZigzagOverhead;
+      }
+    }
+    Index numOffsets = plan.members.size() + 1;
+    Index offsetsWidth = 2 * numOffsets + streamBytes <= 0xffff ? 2 : 4;
+    plan.saving =
+      getSaving(plan, overhead, streamBytes + offsetsWidth * numOffsets);
+  }
+
+  // Chooses the fixed-width encodings of the varying columns for the given
+  // members and computes the saving.
+  void evaluate(Plan& plan) {
+    auto& members = plan.members;
+    computeVarying(plan);
+    auto& first = members[0]->elements[0];
     // Encodings.
     plan.encodings.assign(plan.varying.size(), Encoding());
     int64_t dataBytes = 0;
@@ -642,21 +843,8 @@ private:
     // Offsets column.
     Index offsetsWidth = plan.numElements + 1 <= 0xffff ? 2 : 4;
     dataBytes += int64_t(offsetsWidth) * (members.size() + 1);
-    int64_t saving = -int64_t(GroupOverhead) -
-                     int64_t(ColumnOverhead) * plan.varying.size() - dataBytes;
-    // A global.get becomes a call (opcode + 2-byte function index) and an
-    // i32.const.
-    const Index callBytes = 3;
-    for (Index k = 0; k < members.size(); k++) {
-      auto* member = members[k];
-      Index getBytes =
-        1 + getLEBSize(U32LEB(globalIndexes[member->global->name]));
-      int64_t siteDelta =
-        int64_t(callBytes + 1 + getLEBSize(S32LEB(int32_t(k)))) -
-        int64_t(getBytes);
-      saving += int64_t(member->initBytes) - int64_t(member->uses) * siteDelta;
-    }
-    plan.saving = saving;
+    plan.saving = getSaving(
+      plan, GroupOverhead + ColumnOverhead * plan.varying.size(), dataBytes);
   }
 
   void processGroup(Group& group,
@@ -724,10 +912,86 @@ private:
       }
       plan = std::move(best);
     }
+    // The varint layout over all members (ULEBs adapt to outliers).
+    if (mode != Mode::Fixed) {
+      Plan varint;
+      varint.members = members;
+      evaluateVarint(varint);
+      if (varint.saving != INT64_MIN &&
+          (mode == Mode::Varint || varint.saving > plan.saving)) {
+        plan = std::move(varint);
+      }
+    }
     if (!always && plan.saving <= 0) {
       return;
     }
     emit(group, plan, replacements);
+  }
+
+  // Creates the shared ULEB reader (once):
+  //
+  //   (global $tables$pos (mut i32))
+  //   (func $tables$read (param $b (ref $i8)) (result i32)
+  //     loop { byte = b[pos]; pos++; v |= (byte & 127) << shift; shift += 7;
+  //            br_if (byte & 128) } v)
+  void ensureReader() {
+    if (readerName.is()) {
+      return;
+    }
+    Builder builder(*module);
+    auto i32 = Type::i32;
+    posName = Names::getValidGlobalName(*module, "tables$pos");
+    module->addGlobal(builder.makeGlobal(
+      posName, i32, builder.makeConst(int32_t(0)), Builder::Mutable));
+    auto bytesType = Type(HeapTypes::getMutI8Array(), NonNullable);
+    auto func =
+      builder.makeFunction(Names::getValidFunctionName(*module, "tables$read"),
+                           Signature(bytesType, i32),
+                           {});
+    Index bLocal = 0;
+    Index vLocal = Builder::addVar(func.get(), i32);
+    Index shiftLocal = Builder::addVar(func.get(), i32);
+    Index byteLocal = Builder::addVar(func.get(), i32);
+    auto pos = [&]() { return builder.makeGlobalGet(posName, i32); };
+    auto byte = [&]() { return builder.makeLocalGet(byteLocal, i32); };
+    Name loopName("read");
+    auto* loop = builder.makeLoop(
+      loopName,
+      builder.makeBlock(
+        {builder.makeLocalSet(
+           byteLocal,
+           builder.makeArrayGet(builder.makeLocalGet(bLocal, bytesType),
+                                pos(),
+                                MemoryOrder::Unordered,
+                                i32,
+                                false)),
+         builder.makeGlobalSet(
+           posName,
+           builder.makeBinary(AddInt32, pos(), builder.makeConst(int32_t(1)))),
+         builder.makeLocalSet(
+           vLocal,
+           builder.makeBinary(
+             OrInt32,
+             builder.makeLocalGet(vLocal, i32),
+             builder.makeBinary(
+               ShlInt32,
+               builder.makeBinary(
+                 AndInt32, byte(), builder.makeConst(int32_t(127))),
+               builder.makeLocalGet(shiftLocal, i32)))),
+         builder.makeLocalSet(
+           shiftLocal,
+           builder.makeBinary(AddInt32,
+                              builder.makeLocalGet(shiftLocal, i32),
+                              builder.makeConst(int32_t(7)))),
+         builder.makeBreak(
+           loopName,
+           nullptr,
+           builder.makeBinary(
+             AndInt32, byte(), builder.makeConst(int32_t(128))))}));
+    func->body =
+      builder.makeBlock({loop, builder.makeLocalGet(vLocal, i32)}, i32);
+    readerName = func->name;
+    module->addFunction(std::move(func));
   }
 
   HeapType getColumnHeapType(const Encoding& enc, Type type) {
@@ -750,25 +1014,55 @@ private:
     auto& first = members[0]->elements[0];
     std::string baseName = "tables$" + std::to_string(numGroups++);
 
-    // The segment: offsets, then the columns.
+    // The segment: offsets, then the columns (fixed) or the per-table streams
+    // (varint).
     std::vector<char> data;
-    Index offsetsWidth = plan.numElements + 1 <= 0xffff ? 2 : 4;
-    Index offset = 0;
-    for (auto* member : members) {
-      appendLE(data, offset, offsetsWidth);
-      offset += member->elements.size();
-    }
-    appendLE(data, offset, offsetsWidth);
+    Index offsetsWidth = 2;
     std::vector<Index> columnOffsets;
-    for (Index c = 0; c < plan.varying.size(); c++) {
-      auto& enc = plan.encodings[c];
-      columnOffsets.push_back(data.size());
+    if (plan.varint) {
+      ensureReader();
+      // The streams, then the byte offsets in front of them.
+      std::vector<char> streams;
+      std::vector<Index> byteOffsets;
       for (auto* member : members) {
+        byteOffsets.push_back(streams.size());
+        appendULEB(streams, member->elements.size());
+        const std::vector<Expression*>* prev = nullptr;
         for (auto& leaves : member->elements) {
-          uint64_t value = enc.width == 8
-                             ? getBits(leaves[plan.varying[c]])
-                             : uint64_t(getStored(plan, leaves, c));
-          appendLE(data, value, enc.width);
+          for (Index c = 0; c < plan.varying.size(); c++) {
+            appendULEB(streams, getResidual(plan, leaves, prev, c));
+          }
+          prev = &leaves;
+        }
+      }
+      byteOffsets.push_back(streams.size());
+      Index headerBytes = 2 * byteOffsets.size();
+      if (headerBytes + streams.size() > 0xffff) {
+        offsetsWidth = 4;
+        headerBytes = 4 * byteOffsets.size();
+      }
+      for (auto byteOffset : byteOffsets) {
+        appendLE(data, headerBytes + byteOffset, offsetsWidth);
+      }
+      data.insert(data.end(), streams.begin(), streams.end());
+    } else {
+      offsetsWidth = plan.numElements + 1 <= 0xffff ? 2 : 4;
+      Index offset = 0;
+      for (auto* member : members) {
+        appendLE(data, offset, offsetsWidth);
+        offset += member->elements.size();
+      }
+      appendLE(data, offset, offsetsWidth);
+      for (Index c = 0; c < plan.varying.size(); c++) {
+        auto& enc = plan.encodings[c];
+        columnOffsets.push_back(data.size());
+        for (auto* member : members) {
+          for (auto& leaves : member->elements) {
+            uint64_t value = enc.width == 8
+                               ? getBits(leaves[plan.varying[c]])
+                               : uint64_t(getStored(plan, leaves, c));
+            appendLE(data, value, enc.width);
+          }
         }
       }
     }
@@ -804,12 +1098,30 @@ private:
       Builder::addVar(func.get(), Type(offsetsType, NonNullable));
     std::vector<Index> columnLocals;
     std::vector<HeapType> columnTypes;
-    for (Index c = 0; c < plan.varying.size(); c++) {
-      auto type =
-        getColumnHeapType(plan.encodings[c], first[plan.varying[c]]->type);
-      columnTypes.push_back(type);
-      columnLocals.push_back(
-        Builder::addVar(func.get(), Type(type, NonNullable)));
+    auto bytesType = Type(HeapTypes::getMutI8Array(), NonNullable);
+    Index bytesLocal = Index(-1);
+    Index tmpLocal = Index(-1);
+    if (plan.varint) {
+      bytesLocal = Builder::addVar(func.get(), bytesType);
+      for (auto& enc : plan.encodings) {
+        if (enc.signed_) {
+          tmpLocal = Builder::addVar(func.get(), Type::i32);
+          break;
+        }
+      }
+      // The columns are decoded into i32 locals, which also hold the previous
+      // element's values (0 at the start).
+      for (Index c = 0; c < plan.varying.size(); c++) {
+        columnLocals.push_back(Builder::addVar(func.get(), Type::i32));
+      }
+    } else {
+      for (Index c = 0; c < plan.varying.size(); c++) {
+        auto type =
+          getColumnHeapType(plan.encodings[c], first[plan.varying[c]]->type);
+        columnTypes.push_back(type);
+        columnLocals.push_back(
+          Builder::addVar(func.get(), Type(type, NonNullable)));
+      }
     }
     auto* arrayNew = builder.makeArrayNew(
       group.arrayType, builder.makeLocalGet(nLocal, Type::i32));
@@ -844,36 +1156,87 @@ private:
     list.push_back(builder.makeLocalSet(
       offLocal,
       builder.makeArrayGet(offsets(), k(), MemoryOrder::Unordered, i32)));
-    list.push_back(builder.makeLocalSet(
-      nLocal,
-      builder.makeBinary(
-        SubInt32,
-        builder.makeArrayGet(
-          offsets(),
-          builder.makeBinary(AddInt32, k(), builder.makeConst(int32_t(1))),
-          MemoryOrder::Unordered,
-          i32),
-        off())));
-    for (Index c = 0; c < plan.varying.size(); c++) {
-      auto& enc = plan.encodings[c];
-      Expression* byteOffset = off();
-      if (enc.width > 1) {
-        byteOffset = builder.makeBinary(
-          MulInt32, byteOffset, builder.makeConst(int32_t(enc.width)));
-      }
-      if (columnOffsets[c] > 0) {
-        byteOffset = builder.makeBinary(
-          AddInt32, byteOffset, builder.makeConst(int32_t(columnOffsets[c])));
-      }
+    auto* nextOffset = builder.makeArrayGet(
+      offsets(),
+      builder.makeBinary(AddInt32, k(), builder.makeConst(int32_t(1))),
+      MemoryOrder::Unordered,
+      i32);
+    // The statements decoding one element in the loop (varint).
+    std::vector<Expression*> decodes;
+    if (plan.varint) {
+      // bytes = the table's byte range; pos = 0; n = read().
+      list.push_back(builder.makeLocalSet(
+        bytesLocal,
+        builder.makeArrayNewData(
+          HeapTypes::getMutI8Array(),
+          segmentName,
+          off(),
+          builder.makeBinary(SubInt32, nextOffset, off()))));
       list.push_back(
-        builder.makeLocalSet(columnLocals[c],
-                             builder.makeArrayNewData(
-                               columnTypes[c], segmentName, byteOffset, n())));
+        builder.makeGlobalSet(posName, builder.makeConst(int32_t(0))));
+      auto read = [&]() {
+        return builder.makeCall(
+          readerName, {builder.makeLocalGet(bytesLocal, bytesType)}, i32);
+      };
+      list.push_back(builder.makeLocalSet(nLocal, read()));
+      for (Index c = 0; c < plan.varying.size(); c++) {
+        auto& enc = plan.encodings[c];
+        Expression* value = read();
+        if (enc.signed_) {
+          // Zigzag: (tmp >>> 1) ^ -(tmp & 1)
+          value = builder.makeBinary(
+            XorInt32,
+            builder.makeBinary(ShrUInt32,
+                               builder.makeLocalTee(tmpLocal, value, i32),
+                               builder.makeConst(int32_t(1))),
+            builder.makeBinary(
+              SubInt32,
+              builder.makeConst(int32_t(0)),
+              builder.makeBinary(AndInt32,
+                                 builder.makeLocalGet(tmpLocal, i32),
+                                 builder.makeConst(int32_t(1)))));
+        }
+        if (enc.base >= 0) {
+          value = builder.makeBinary(
+            AddInt32, value, builder.makeLocalGet(columnLocals[enc.base], i32));
+        }
+        if (enc.prevBase >= 0) {
+          // Not yet overwritten in this iteration (prevBase >= c).
+          assert(enc.prevBase >= int(c));
+          value = builder.makeBinary(
+            AddInt32,
+            value,
+            builder.makeLocalGet(columnLocals[enc.prevBase], i32));
+        }
+        decodes.push_back(builder.makeLocalSet(columnLocals[c], value));
+      }
+    } else {
+      list.push_back(builder.makeLocalSet(
+        nLocal, builder.makeBinary(SubInt32, nextOffset, off())));
+      for (Index c = 0; c < plan.varying.size(); c++) {
+        auto& enc = plan.encodings[c];
+        Expression* byteOffset = off();
+        if (enc.width > 1) {
+          byteOffset = builder.makeBinary(
+            MulInt32, byteOffset, builder.makeConst(int32_t(enc.width)));
+        }
+        if (columnOffsets[c] > 0) {
+          byteOffset = builder.makeBinary(
+            AddInt32, byteOffset, builder.makeConst(int32_t(columnOffsets[c])));
+        }
+        list.push_back(builder.makeLocalSet(
+          columnLocals[c],
+          builder.makeArrayNewData(
+            columnTypes[c], segmentName, byteOffset, n())));
+      }
     }
     list.push_back(builder.makeLocalSet(arrLocal, arrayNew));
 
     // The element, reading the varying leaves from the columns.
     std::function<Expression*(Index)> read = [&](Index c) -> Expression* {
+      if (plan.varint) {
+        return builder.makeLocalGet(columnLocals[c], i32);
+      }
       auto& enc = plan.encodings[c];
       auto type = first[plan.varying[c]]->type;
       Expression* value = builder.makeArrayGet(
@@ -920,23 +1283,23 @@ private:
     assert(leaf == first.size());
 
     Name loopName("fill");
-    auto* loop = builder.makeLoop(
+    auto body = decodes;
+    body.push_back(
+      builder.makeArraySet(builder.makeLocalGet(arrLocal, arrayNew->type),
+                           i(),
+                           element,
+                           MemoryOrder::Unordered));
+    body.push_back(builder.makeBreak(
       loopName,
-      builder.makeBlock(
-        {builder.makeArraySet(builder.makeLocalGet(arrLocal, arrayNew->type),
-                              i(),
-                              element,
-                              MemoryOrder::Unordered),
-         builder.makeBreak(
-           loopName,
-           nullptr,
-           builder.makeBinary(
-             LtUInt32,
-             builder.makeLocalTee(
-               iLocal,
-               builder.makeBinary(AddInt32, i(), builder.makeConst(int32_t(1))),
-               i32),
-             n()))}));
+      nullptr,
+      builder.makeBinary(
+        LtUInt32,
+        builder.makeLocalTee(
+          iLocal,
+          builder.makeBinary(AddInt32, i(), builder.makeConst(int32_t(1))),
+          i32),
+        n())));
+    auto* loop = builder.makeLoop(loopName, builder.makeBlock(body));
     list.push_back(loop);
 
     // The outer object.
