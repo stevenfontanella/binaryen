@@ -312,6 +312,10 @@ void PassRegistry::registerPasses() {
                createMemoryPackingPass);
   registerPass(
     "merge-blocks", "merges blocks to their parents", createMergeBlocksPass);
+  registerPass("merge-identical-globals",
+               "merge immutable globals with identical constant allocations "
+               "and hoist repeated nested allocations",
+               createMergeIdenticalGlobalsPass);
   registerPass("merge-similar-functions",
                "merges similar functions when beneficial",
                createMergeSimilarFunctionsPass);

@@ -244,6 +244,11 @@
 ;; CHECK-EMPTY:
 ;; CHECK-NEXT:   --merge-blocks                                merges blocks to their parents
 ;; CHECK-EMPTY:
+;; CHECK-NEXT:   --merge-identical-globals                     merge immutable globals with 
+;; CHECK-NEXT:                                                 identical constant allocations 
+;; CHECK-NEXT:                                                 and hoist repeated nested 
+;; CHECK-NEXT:                                                 allocations
+;; CHECK-EMPTY:
 ;; CHECK-NEXT:   --merge-j2cl-itables                          Merges itable structures into 
 ;; CHECK-NEXT:                                                 vtables to make types more 
 ;; CHECK-NEXT:                                                 compact
