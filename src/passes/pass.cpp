@@ -444,6 +444,10 @@ void PassRegistry::registerPasses() {
   registerPass("remove-non-js-ops",
                "removes operations incompatible with js",
                createRemoveNonJSOpsPass);
+  registerPass("relax-nullability",
+               "make private function params and locals nullable, keeping "
+               "ref.as_non_null only where demanded (traps-never-happen)",
+               createRelaxNullabilityPass);
   registerPass("remove-relaxed-simd",
                "replaces relaxed SIMD instructions with unreachable",
                createRemoveRelaxedSIMDPass);
