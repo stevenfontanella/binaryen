@@ -151,6 +151,9 @@
 ;; CHECK-NEXT:   --code-pushing                                push code forward, potentially 
 ;; CHECK-NEXT:                                                 making it not always execute
 ;; CHECK-EMPTY:
+;; CHECK-NEXT:   --compress-data-segments                      LZ77 + Huffman code passive data
+;; CHECK-NEXT:                                                 segments read by array.new_data
+;; CHECK-EMPTY:
 ;; CHECK-NEXT:   --const-hoisting                              hoist repeated constants to a 
 ;; CHECK-NEXT:                                                 local
 ;; CHECK-EMPTY:

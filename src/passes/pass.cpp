@@ -120,6 +120,10 @@ void PassRegistry::registerPasses() {
                createCodePushingPass);
   registerPass(
     "code-folding", "fold code, merging duplicates", createCodeFoldingPass);
+  registerPass("compress-data-segments",
+               "LZ77 + Huffman code passive data segments read by "
+               "array.new_data",
+               createCompressDataSegmentsPass);
   registerPass("const-hoisting",
                "hoist repeated constants to a local",
                createConstHoistingPass);
