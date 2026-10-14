@@ -58,6 +58,18 @@
 //   2: a match of length + 3 units, 1 byte distance - 1 follows
 //   3: a match of length + 3 units, 2 bytes distance - 1 follow
 //
+// The bytes of the token stream are then entropy-coded: each byte belongs to
+// one of eight classes (token, extra length, narrow literal, wide literal low
+// and high byte, short distance, long distance low and high byte), and each
+// class gets its own canonical Huffman code with code lengths of at most 15
+// bits. The segment then holds, per used class, the number of codes of each
+// length (15 bytes) followed by the symbols in canonical order, and after the
+// tables one bit stream of the codes in token order (packed LSB-first, each
+// code written from its most significant bit). The decoder reads a code bit
+// by bit, as in zlib's puff.c, directly from the tables in the segment, so no
+// decoding tables are built at runtime. When the bit stream plus the tables
+// would not be smaller than the plain bytes, the plain bytes are kept.
+//
 // On the first use of any string the stream is decoded once into a mutable
 // i16 array kept in a global, and the segment is dropped. On the first use of
 // a group, a helper reads the group's lengths from the array and builds an
@@ -68,6 +80,8 @@
 // A size model skips the transformation when it would not help;
 // --pass-arg=string-consts-to-data-always@1 ignores the model.
 // --pass-arg=string-consts-to-data-compress@0 emits only literal runs.
+// --pass-arg=string-consts-to-data-huffman@0 never entropy-codes the bytes,
+// @1 always does (the default decides by size).
 //
 // --pass-arg=string-consts-to-data-start-fill@1 additionally removes the
 // strings that are operands of struct.new or array.new_fixed in global
@@ -82,7 +96,9 @@
 //
 
 #include <algorithm>
+#include <array>
 #include <functional>
+#include <queue>
 #include <set>
 #include <unordered_set>
 
@@ -157,6 +173,8 @@ struct StringConstsToData : public Pass {
   Module* module;
   bool always = false;
   bool compress = true;
+  // 0: never, 1: always, 2: by size.
+  int huffman = 2;
   bool startFill = false;
   InsertOrderedMap<Name, StringInfo> strings;
   InsertOrderedMap<Name, ColumnInfo> columns;
@@ -166,6 +184,8 @@ struct StringConstsToData : public Pass {
   Name dataGlobalName;
   Name decodeFuncName;
   Name fillFuncName;
+  Name bitsGlobalName;
+  Name symbolFuncName;
   Name fromCharCodeArray;
   HeapType i8ArrayType = HeapTypes::getMutI8Array();
   HeapType i16ArrayType = HeapTypes::getMutI16Array();
@@ -185,6 +205,12 @@ struct StringConstsToData : public Pass {
     always = !getArgumentOrDefault("string-consts-to-data-always", "").empty();
     compress =
       getArgumentOrDefault("string-consts-to-data-compress", "1") != "0";
+    auto huffmanArg = getArgumentOrDefault("string-consts-to-data-huffman", "");
+    if (huffmanArg == "0") {
+      huffman = 0;
+    } else if (huffmanArg == "1") {
+      huffman = 1;
+    }
     startFill =
       !getArgumentOrDefault("string-consts-to-data-start-fill", "").empty();
 
@@ -391,10 +417,10 @@ struct StringConstsToData : public Pass {
     }
 
     // Compress the unit stream, add the segment and the decoder.
-    auto segmentData = compressUnits();
+    auto segment = compressUnits();
     module->addDataSegment(Builder::makeDataSegment(
-      segmentName, Name(), nullptr, segmentData.data(), segmentData.size()));
-    makeDecoder(segmentData.size());
+      segmentName, Name(), nullptr, segment.data.data(), segment.data.size()));
+    makeDecoder(segment);
 
     // Remove the imports whose uses are all gone, and rebuild the JSON.
     for (auto& [name, string] : strings) {
@@ -1177,7 +1203,33 @@ private:
     }
   }
 
-  std::vector<char> compressUnits() {
+  // The classes of bytes in the token stream, each with its own Huffman code.
+  enum Table : uint8_t {
+    TokenTable,
+    ExtraTable,
+    NarrowTable,
+    WideLoTable,
+    WideHiTable,
+    ShortDistTable,
+    DistLoTable,
+    DistHiTable,
+    NumTables
+  };
+
+  // A byte of the token stream and its class.
+  using Symbol = std::pair<Table, uint8_t>;
+
+  struct Segment {
+    std::vector<char> data;
+    // Whether the bytes are Huffman-coded.
+    bool huffman = false;
+    // The offset of the table of each class in the data (unused: 0).
+    std::array<Index, NumTables> tableOffsets{};
+    // The bit offset of the first code.
+    Index firstBit = 0;
+  };
+
+  Segment compressUnits() {
     Index n = units.size();
     std::vector<Match> longMatches, shortMatches;
     if (compress) {
@@ -1227,14 +1279,14 @@ private:
     }
 
     // Emit the tokens.
-    std::vector<char> out;
+    std::vector<Symbol> out;
     auto emitToken = [&](Index kind, Index length) {
       assert(length <= MaxTokenLength);
       if (length < 63) {
-        out.push_back(char(kind | (length << 2)));
+        out.emplace_back(TokenTable, uint8_t(kind | (length << 2)));
       } else {
-        out.push_back(char(kind | (63 << 2)));
-        out.push_back(char(length - 63));
+        out.emplace_back(TokenTable, uint8_t(kind | (63 << 2)));
+        out.emplace_back(ExtraTable, uint8_t(length - 63));
       }
     };
     std::vector<uint16_t> pending;
@@ -1261,9 +1313,11 @@ private:
         }
         emitToken(wide[i] ? 1 : 0, j - i);
         for (Index k = i; k < j; k++) {
-          out.push_back(char(pending[k] & 0xFF));
           if (wide[i]) {
-            out.push_back(char(pending[k] >> 8));
+            out.emplace_back(WideLoTable, uint8_t(pending[k] & 0xFF));
+            out.emplace_back(WideHiTable, uint8_t(pending[k] >> 8));
+          } else {
+            out.emplace_back(NarrowTable, uint8_t(pending[k]));
           }
         }
         i = j;
@@ -1282,15 +1336,160 @@ private:
       flushLiterals();
       Index distance = choice.distance - 1;
       emitToken(distance < ShortDistance ? 2 : 3, choice.length - MinMatch);
-      out.push_back(char(distance & 0xFF));
-      if (distance >= ShortDistance) {
-        out.push_back(char(distance >> 8));
+      if (distance < ShortDistance) {
+        out.emplace_back(ShortDistTable, uint8_t(distance));
+      } else {
+        out.emplace_back(DistLoTable, uint8_t(distance & 0xFF));
+        out.emplace_back(DistHiTable, uint8_t(distance >> 8));
       }
       afterLiteral = false;
       i += choice.length;
     }
     flushLiterals();
-    return out;
+    return packSymbols(out);
+  }
+
+  // Huffman coding of the token stream bytes.
+
+  static constexpr Index MaxCodeLength = 15;
+
+  // Computes code lengths of at most MaxCodeLength bits for the given symbol
+  // counts (0 for unused symbols). Halves the counts until the longest code
+  // fits, which loses very little on real data.
+  static std::vector<uint8_t>
+  computeCodeLengths(const std::vector<uint64_t>& counts) {
+    std::vector<uint8_t> lengths(counts.size(), 0);
+    std::vector<Index> used;
+    for (Index i = 0; i < counts.size(); i++) {
+      if (counts[i]) {
+        used.push_back(i);
+      }
+    }
+    if (used.empty()) {
+      return lengths;
+    }
+    Index m = used.size();
+    if (m == 1) {
+      lengths[used[0]] = 1;
+      return lengths;
+    }
+    std::vector<uint64_t> freqs;
+    for (auto i : used) {
+      freqs.push_back(counts[i]);
+    }
+    while (true) {
+      // Leaves are nodes 0..m-1, internal nodes follow.
+      std::vector<Index> parent(2 * m - 1, Index(-1));
+      using Node = std::pair<uint64_t, Index>;
+      std::priority_queue<Node, std::vector<Node>, std::greater<Node>> queue;
+      for (Index i = 0; i < m; i++) {
+        queue.push({freqs[i], i});
+      }
+      Index next = m;
+      while (queue.size() > 1) {
+        auto a = queue.top();
+        queue.pop();
+        auto b = queue.top();
+        queue.pop();
+        parent[a.second] = parent[b.second] = next;
+        queue.push({a.first + b.first, next});
+        next++;
+      }
+      Index maxLength = 0;
+      for (Index i = 0; i < m; i++) {
+        Index depth = 0;
+        for (Index j = i; parent[j] != Index(-1); j = parent[j]) {
+          depth++;
+        }
+        lengths[used[i]] = depth;
+        maxLength = std::max(maxLength, depth);
+      }
+      if (maxLength <= MaxCodeLength) {
+        break;
+      }
+      for (auto& freq : freqs) {
+        freq = std::max<uint64_t>(1, freq >> 1);
+      }
+    }
+    // The count of codes of a length must fit in a byte, which only fails
+    // when all 256 symbols have 8-bit codes; move to 7 + 253 x 8 + 2 x 9.
+    if (m == 256 && std::all_of(lengths.begin(),
+                                lengths.end(),
+                                [](uint8_t length) { return length == 8; })) {
+      lengths[0] = 7;
+      lengths[1] = lengths[2] = 9;
+    }
+    return lengths;
+  }
+
+  // Lays out the symbols as plain bytes or, when smaller, as Huffman tables
+  // plus a bit stream.
+  Segment packSymbols(const std::vector<Symbol>& symbols) {
+    Segment plain;
+    for (auto& symbol : symbols) {
+      plain.data.push_back(char(symbol.second));
+    }
+    if (huffman == 0) {
+      return plain;
+    }
+
+    Segment coded;
+    coded.huffman = true;
+    std::array<std::vector<uint64_t>, NumTables> counts;
+    for (auto& count : counts) {
+      count.assign(256, 0);
+    }
+    for (auto& symbol : symbols) {
+      counts[symbol.first][symbol.second]++;
+    }
+    std::array<std::vector<uint8_t>, NumTables> lengths;
+    std::array<std::array<uint32_t, 256>, NumTables> codes{};
+    for (Index table = 0; table < NumTables; table++) {
+      lengths[table] = computeCodeLengths(counts[table]);
+      std::array<Index, MaxCodeLength + 1> lengthCounts{};
+      for (auto length : lengths[table]) {
+        lengthCounts[length]++;
+      }
+      if (lengthCounts[0] == 256) {
+        // Unused class.
+        continue;
+      }
+      coded.tableOffsets[table] = coded.data.size();
+      for (Index length = 1; length <= MaxCodeLength; length++) {
+        assert(lengthCounts[length] < 256);
+        coded.data.push_back(char(lengthCounts[length]));
+      }
+      // Canonical codes: for each length in order, the symbols in increasing
+      // order get consecutive codes.
+      uint32_t code = 0;
+      for (Index length = 1; length <= MaxCodeLength; length++) {
+        for (Index symbol = 0; symbol < 256; symbol++) {
+          if (lengths[table][symbol] == length) {
+            coded.data.push_back(char(symbol));
+            codes[table][symbol] = code++;
+          }
+        }
+        code <<= 1;
+      }
+    }
+    coded.firstBit = coded.data.size() * 8;
+    Index bits = 0;
+    for (auto& symbol : symbols) {
+      auto length = lengths[symbol.first][symbol.second];
+      auto code = codes[symbol.first][symbol.second];
+      for (Index i = length; i > 0; i--) {
+        if (bits % 8 == 0) {
+          coded.data.push_back(0);
+        }
+        coded.data.back() |= char(((code >> (i - 1)) & 1) << (bits % 8));
+        bits++;
+      }
+    }
+    // The symbol decoder and the bit position global cost about 100 bytes.
+    if (huffman == 1 || coded.data.size() + 100 < plain.data.size()) {
+      return coded;
+    }
+    return plain;
   }
 
   void prepareNames() {
@@ -1342,13 +1541,11 @@ private:
   //     (local.set $src (array.new_data $i8 $seg (i32.const 0) (i32.const S)))
   //     (local.set $dst (array.new_default $i16 (i32.const N)))
   //     (loop $next
-  //       (local.set $tok (array.get_u $i8 (local.get $src) (local.get $p)))
-  //       (local.set $p (i32.add (local.get $p) (i32.const 1)))
+  //       (local.set $tok (..byte..))
   //       (local.set $len (i32.shr_u (local.get $tok) (i32.const 2)))
   //       (if (i32.eq (local.get $len) (i32.const 63))
   //         (then
-  //           (local.set $len (i32.add (i32.const 63) (..byte at $p..)))
-  //           (local.set $p (i32.add (local.get $p) (i32.const 1)))))
+  //           (local.set $len (i32.add (i32.const 63) (..byte..)))))
   //       (local.set $tok (i32.and (local.get $tok) (i32.const 3)))
   //       (if (i32.lt_u (local.get $tok) (i32.const 2))
   //         (then
@@ -1356,23 +1553,20 @@ private:
   //             (if (local.get $tok)
   //               (then
   //                 (array.set $i16 (local.get $dst) (local.get $q)
-  //                   (i32.or (..byte at $p..)
-  //                           (i32.shl (..byte at $p + 1..) (i32.const 8))))
-  //                 (local.set $p (i32.add (local.get $p) (i32.const 2))))
+  //                   (i32.or (..byte..) (i32.shl (..byte..) (i32.const 8)))))
   //               (else
   //                 (array.set $i16 (local.get $dst) (local.get $q)
-  //                   (..byte at $p..))
-  //                 (local.set $p (i32.add (local.get $p) (i32.const 1)))))
+  //                   (..byte..))))
   //             (local.set $q (i32.add (local.get $q) (i32.const 1)))
   //             (br_if $lit (local.tee $len (i32.sub (local.get $len) 1)))))
   //         (else
-  //           (local.set $d (i32.add (..byte at $p..) (i32.const 1)))
-  //           (local.set $p (i32.add (local.get $p) (i32.const 1)))
   //           (if (i32.eq (local.get $tok) (i32.const 3))
   //             (then
-  //               (local.set $d (i32.add (local.get $d)
-  //                 (i32.shl (..byte at $p..) (i32.const 8))))
-  //               (local.set $p (i32.add (local.get $p) (i32.const 1)))))
+  //               (local.set $d
+  //                 (i32.or (..byte..) (i32.shl (..byte..) (i32.const 8)))))
+  //             (else
+  //               (local.set $d (..byte..))))
+  //           (local.set $d (i32.add (local.get $d) (i32.const 1)))
   //           (local.set $len (i32.add (local.get $len) (i32.const 3)))
   //           (loop $copy
   //             (array.set $i16 (local.get $dst) (local.get $q)
@@ -1384,7 +1578,16 @@ private:
   //     (data.drop $seg)
   //     (global.set $data (local.get $dst)))
   //
-  void makeDecoder(Index segmentSize) {
+  // where (..byte..) reads the next byte of its class: with plain bytes
+  //
+  //   (array.get_u $i8 (local.get $src)
+  //     (i32.sub (local.tee $p (i32.add (local.get $p) (i32.const 1))) 1))
+  //
+  // and with Huffman coding
+  //
+  //   (call $symbol (local.get $src) (i32.const tableOffset))
+  //
+  void makeDecoder(const Segment& segment) {
     Builder builder(*module);
     Index src = 0, dst = 1, p = 2, q = 3, tok = 4, len = 5, d = 6;
     Type i8Ref(i8ArrayType, NonNullable);
@@ -1398,12 +1601,32 @@ private:
       return builder.makeLocalSet(index,
                                   add(get(index), builder.makeConst(value)));
     };
-    auto byteAt = [&](Expression* index) {
-      return builder.makeArrayGet(builder.makeLocalGet(src, i8Ref),
-                                  index,
-                                  MemoryOrder::Unordered,
-                                  i32,
-                                  false);
+    if (segment.huffman) {
+      makeSymbolDecoder(segment);
+    }
+    auto readByte = [&](Table table) -> Expression* {
+      if (segment.huffman) {
+        return builder.makeCall(
+          symbolFuncName,
+          {builder.makeLocalGet(src, i8Ref),
+           builder.makeConst(int32_t(segment.tableOffsets[table]))},
+          i32);
+      }
+      return builder.makeArrayGet(
+        builder.makeLocalGet(src, i8Ref),
+        builder.makeBinary(
+          SubInt32,
+          builder.makeLocalTee(p, add(get(p), builder.makeConst(1)), i32),
+          builder.makeConst(1)),
+        MemoryOrder::Unordered,
+        i32,
+        false);
+    };
+    auto readPair = [&](Table lo, Table hi) {
+      return builder.makeBinary(
+        OrInt32,
+        readByte(lo),
+        builder.makeBinary(ShlInt32, readByte(hi), builder.makeConst(8)));
     };
     auto setDst = [&](Expression* value) {
       return builder.makeArraySet(builder.makeLocalGet(dst, i16Ref),
@@ -1421,57 +1644,43 @@ private:
           i32));
     };
 
-    auto* setSrc = builder.makeLocalSet(
-      src,
-      builder.makeArrayNewData(i8ArrayType,
-                               segmentName,
-                               builder.makeConst(0),
-                               builder.makeConst(int32_t(segmentSize))));
+    auto* setSrc =
+      builder.makeLocalSet(src,
+                           builder.makeArrayNewData(
+                             i8ArrayType,
+                             segmentName,
+                             builder.makeConst(0),
+                             builder.makeConst(int32_t(segment.data.size()))));
     auto* setDstArray = builder.makeLocalSet(
       dst,
       builder.makeArrayNew(i16ArrayType,
                            builder.makeConst(int32_t(units.size()))));
 
-    auto* readTok = builder.makeLocalSet(tok, byteAt(get(p)));
+    auto* readTok = builder.makeLocalSet(tok, readByte(TokenTable));
     auto* setLen = builder.makeLocalSet(
       len, builder.makeBinary(ShrUInt32, get(tok), builder.makeConst(2)));
     auto* extendLen = builder.makeIf(
       builder.makeBinary(EqInt32, get(len), builder.makeConst(63)),
-      builder.makeBlock(
-        {builder.makeLocalSet(len, add(builder.makeConst(63), byteAt(get(p)))),
-         addConst(p, 1)}));
+      builder.makeLocalSet(len,
+                           add(builder.makeConst(63), readByte(ExtraTable))));
     auto* maskTok = builder.makeLocalSet(
       tok, builder.makeBinary(AndInt32, get(tok), builder.makeConst(3)));
 
     Name litLabel("lit");
-    auto* wideUnit = builder.makeBinary(
-      OrInt32,
-      byteAt(get(p)),
-      builder.makeBinary(ShlInt32,
-                         byteAt(add(get(p), builder.makeConst(1))),
-                         builder.makeConst(8)));
     auto* literal = builder.makeLoop(
       litLabel,
       builder.makeBlock(
-        {builder.makeIf(
-           get(tok),
-           builder.makeBlock({setDst(wideUnit), addConst(p, 2)}),
-           builder.makeBlock({setDst(byteAt(get(p))), addConst(p, 1)})),
+        {builder.makeIf(get(tok),
+                        setDst(readPair(WideLoTable, WideHiTable)),
+                        setDst(readByte(NarrowTable))),
          addConst(q, 1),
          countDown(litLabel)}));
 
     Name copyLabel("copy");
-    auto* setD =
-      builder.makeLocalSet(d, add(byteAt(get(p)), builder.makeConst(1)));
-    auto* extendD = builder.makeIf(
+    auto* setD = builder.makeIf(
       builder.makeBinary(EqInt32, get(tok), builder.makeConst(3)),
-      builder.makeBlock(
-        {builder.makeLocalSet(d,
-                              add(get(d),
-                                  builder.makeBinary(ShlInt32,
-                                                     byteAt(get(p)),
-                                                     builder.makeConst(8)))),
-         addConst(p, 1)}));
+      builder.makeLocalSet(d, readPair(DistLoTable, DistHiTable)),
+      builder.makeLocalSet(d, readByte(ShortDistTable)));
     auto* copy = builder.makeLoop(
       copyLabel,
       builder.makeBlock({setDst(builder.makeArrayGet(
@@ -1482,8 +1691,8 @@ private:
                            false)),
                          addConst(q, 1),
                          countDown(copyLabel)}));
-    auto* match = builder.makeBlock(
-      {setD, addConst(p, 1), extendD, addConst(len, MinMatch), copy});
+    auto* match =
+      builder.makeBlock({setD, addConst(d, 1), addConst(len, MinMatch), copy});
 
     auto* dispatch = builder.makeIf(
       builder.makeBinary(LtUInt32, get(tok), builder.makeConst(2)),
@@ -1497,8 +1706,7 @@ private:
         LtUInt32, get(q), builder.makeConst(int32_t(units.size()))));
     auto* loop = builder.makeLoop(
       nextLabel,
-      builder.makeBlock(
-        {readTok, addConst(p, 1), setLen, extendLen, maskTok, dispatch, next}));
+      builder.makeBlock({readTok, setLen, extendLen, maskTok, dispatch, next}));
     auto* body =
       builder.makeBlock({setSrc,
                          setDstArray,
@@ -1511,6 +1719,110 @@ private:
                            Signature(Type::none, Type::none),
                            {i8Ref, i16Ref, i32, i32, i32, i32, i32},
                            body));
+  }
+
+  // The canonical Huffman symbol decoder (see puff.c in zlib), which reads
+  // the code bit by bit from the position in the $bits global and looks the
+  // symbol up in the table at offset $t of the segment (15 counts of the codes
+  // of each length, then the symbols in code order):
+  //
+  //   (func $symbol (param $src (ref $i8)) (param $t i32) (result i32)
+  //     (local $pos i32) (local $code i32) (local $first i32)
+  //     (local $index i32) (local $count i32)
+  //     (local.set $pos (global.get $bits))
+  //     (local.set $index (i32.add (local.get $t) (i32.const 15)))
+  //     (loop $next
+  //       (local.set $code
+  //         (i32.or (local.get $code)
+  //           (i32.and
+  //             (i32.shr_u
+  //               (array.get_u $i8 (local.get $src)
+  //                 (i32.shr_u (local.get $pos) (i32.const 3)))
+  //               (i32.and (local.get $pos) (i32.const 7)))
+  //             (i32.const 1))))
+  //       (local.set $pos (i32.add (local.get $pos) (i32.const 1)))
+  //       (local.set $count (array.get_u $i8 (local.get $src) (local.get $t)))
+  //       (local.set $t (i32.add (local.get $t) (i32.const 1)))
+  //       (if (i32.lt_u (local.get $code)
+  //                     (i32.add (local.get $first) (local.get $count)))
+  //         (then
+  //           (global.set $bits (local.get $pos))
+  //           (return
+  //             (array.get_u $i8 (local.get $src)
+  //               (i32.add (local.get $index)
+  //                        (i32.sub (local.get $code) (local.get $first)))))))
+  //       (local.set $index (i32.add (local.get $index) (local.get $count)))
+  //       (local.set $first
+  //         (i32.shl (i32.add (local.get $first) (local.get $count))
+  //                  (i32.const 1)))
+  //       (local.set $code (i32.shl (local.get $code) (i32.const 1)))
+  //       (br $next)))
+  //
+  void makeSymbolDecoder(const Segment& segment) {
+    Builder builder(*module);
+    auto i32 = Type::i32;
+    bitsGlobalName = Names::getValidGlobalName(*module, "string.consts$bits");
+    module->addGlobal(
+      builder.makeGlobal(bitsGlobalName,
+                         i32,
+                         builder.makeConst(int32_t(segment.firstBit)),
+                         Builder::Mutable));
+    symbolFuncName =
+      Names::getValidFunctionName(*module, "string.consts$symbol");
+    Index src = 0, t = 1, pos = 2, code = 3, first = 4, index = 5, count = 6;
+    Type i8Ref(i8ArrayType, NonNullable);
+    auto get = [&](Index index) { return builder.makeLocalGet(index, i32); };
+    auto add = [&](Expression* a, Expression* b) {
+      return builder.makeBinary(AddInt32, a, b);
+    };
+    auto byteAt = [&](Expression* index) {
+      return builder.makeArrayGet(builder.makeLocalGet(src, i8Ref),
+                                  index,
+                                  MemoryOrder::Unordered,
+                                  i32,
+                                  false);
+    };
+    auto* bit = builder.makeBinary(
+      AndInt32,
+      builder.makeBinary(
+        ShrUInt32,
+        byteAt(builder.makeBinary(ShrUInt32, get(pos), builder.makeConst(3))),
+        builder.makeBinary(AndInt32, get(pos), builder.makeConst(7))),
+      builder.makeConst(1));
+    auto* found = builder.makeIf(
+      builder.makeBinary(LtUInt32, get(code), add(get(first), get(count))),
+      builder.makeBlock(
+        {builder.makeGlobalSet(bitsGlobalName, get(pos)),
+         builder.makeReturn(
+           byteAt(add(get(index),
+                      builder.makeBinary(SubInt32, get(code), get(first)))))}));
+    Name label("next");
+    auto* loop = builder.makeLoop(
+      label,
+      builder.makeBlock(
+        {builder.makeLocalSet(code,
+                              builder.makeBinary(OrInt32, get(code), bit)),
+         builder.makeLocalSet(pos, add(get(pos), builder.makeConst(1))),
+         builder.makeLocalSet(count, byteAt(get(t))),
+         builder.makeLocalSet(t, add(get(t), builder.makeConst(1))),
+         found,
+         builder.makeLocalSet(index, add(get(index), get(count))),
+         builder.makeLocalSet(first,
+                              builder.makeBinary(ShlInt32,
+                                                 add(get(first), get(count)),
+                                                 builder.makeConst(1))),
+         builder.makeLocalSet(
+           code, builder.makeBinary(ShlInt32, get(code), builder.makeConst(1))),
+         builder.makeBreak(label)}));
+    auto* body = builder.makeBlock(
+      {builder.makeLocalSet(pos, builder.makeGlobalGet(bitsGlobalName, i32)),
+       builder.makeLocalSet(
+         index, add(get(t), builder.makeConst(int32_t(MaxCodeLength)))),
+       loop});
+    module->addFunction(builder.makeFunction(symbolFuncName,
+                                             Signature({i8Ref, i32}, i32),
+                                             {i32, i32, i32, i32, i32},
+                                             body));
   }
 
   // Reads the unit array global, which has been decoded at this point.
