@@ -6,11 +6,11 @@
 ;; RUN: wasm-opt %s -all --string-lowering --string-consts-to-data --pass-arg=string-consts-to-data-always@1 -S -o - | filecheck %s
 
 (module
-  ;; CHECK:      (type $0 (array (mut i32)))
+  ;; CHECK:      (type $0 (array (mut i16)))
 
-  ;; CHECK:      (type $1 (array (mut i16)))
+  ;; CHECK:      (type $1 (array (mut i8)))
 
-  ;; CHECK:      (type $2 (array (mut i8)))
+  ;; CHECK:      (type $2 (array (mut i32)))
 
   ;; CHECK:      (type $3 (array (mut externref)))
 
@@ -50,19 +50,17 @@
 
   ;; CHECK:      (type $12 (func (param externref) (result i32)))
 
-  ;; CHECK:      (type $13 (func (param (ref null $1) i32 i32) (result (ref extern))))
+  ;; CHECK:      (type $13 (func (param (ref null $0) i32 i32) (result (ref extern))))
 
   ;; CHECK:      (type $14 (func (param externref externref) (result (ref extern))))
 
-  ;; CHECK:      (type $15 (func (param externref (ref null $1) i32) (result i32)))
+  ;; CHECK:      (type $15 (func (param externref (ref null $0) i32) (result i32)))
 
   ;; CHECK:      (type $16 (func (param externref i32) (result i32)))
 
   ;; CHECK:      (type $17 (func (param externref i32 i32) (result (ref extern))))
 
-  ;; CHECK:      (type $18 (func (param (ref $0) i32)))
-
-  ;; CHECK:      (type $19 (func))
+  ;; CHECK:      (type $18 (func))
 
   ;; CHECK:      (import "string.const" "0" (global $exported (ref extern)))
 
@@ -70,13 +68,13 @@
 
   ;; CHECK:      (import "string.const" "2" (global $"string.const_\"pinned-by-column\"" (ref extern)))
 
-  ;; CHECK:      (import "wasm:js-string" "fromCharCodeArray" (func $fromCharCodeArray (type $13) (param (ref null $1) i32 i32) (result (ref extern))))
+  ;; CHECK:      (import "wasm:js-string" "fromCharCodeArray" (func $fromCharCodeArray (type $13) (param (ref null $0) i32 i32) (result (ref extern))))
 
   ;; CHECK:      (import "wasm:js-string" "fromCodePoint" (func $fromCodePoint (type $4) (param i32) (result (ref extern))))
 
   ;; CHECK:      (import "wasm:js-string" "concat" (func $concat (type $14) (param externref externref) (result (ref extern))))
 
-  ;; CHECK:      (import "wasm:js-string" "intoCharCodeArray" (func $intoCharCodeArray (type $15) (param externref (ref null $1) i32) (result i32)))
+  ;; CHECK:      (import "wasm:js-string" "intoCharCodeArray" (func $intoCharCodeArray (type $15) (param externref (ref null $0) i32) (result i32)))
 
   ;; CHECK:      (import "wasm:js-string" "equals" (func $equals (type $11) (param externref externref) (result i32)))
 
@@ -105,13 +103,11 @@
 
   ;; An exported string stays an import.
   (global $exported (ref string) (string.const "exported"))
-  ;; CHECK:      (global $string.consts$data (mut (ref null $1)) (ref.null none))
+  ;; CHECK:      (global $string.consts$data (mut (ref null $0)) (ref.null none))
 
-  ;; CHECK:      (global $string.consts$col$0$table (mut (ref null $0)) (ref.null none))
+  ;; CHECK:      (global $string.consts$table (mut (ref null $2)) (ref.null none))
 
-  ;; CHECK:      (global $string.consts$raw$1$table (mut (ref null $0)) (ref.null none))
-
-  ;; CHECK:      (global $string.consts$raw$1$cache (ref $3) (array.new_default $3
+  ;; CHECK:      (global $string.consts$raw$0$cache (ref $3) (array.new_default $3
   ;; CHECK-NEXT:  (i32.const 2)
   ;; CHECK-NEXT: ))
 
@@ -121,7 +117,7 @@
   (export "exported" (global $exported))
 
   ;; CHECK:      (func $read-column (type $8) (param $i i32) (result externref)
-  ;; CHECK-NEXT:  (call $string.consts$col$0
+  ;; CHECK-NEXT:  (call $string.consts$get
   ;; CHECK-NEXT:   (local.get $i)
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
@@ -170,13 +166,13 @@
   ;; column; it gets a second copy in the segment (each group is contiguous).
   ;; CHECK:      (func $code-uses (type $6) (result externref externref externref)
   ;; CHECK-NEXT:  (tuple.make 3
-  ;; CHECK-NEXT:   (call $string.consts$raw$1
+  ;; CHECK-NEXT:   (call $string.consts$raw$0
   ;; CHECK-NEXT:    (i32.const 1)
   ;; CHECK-NEXT:   )
-  ;; CHECK-NEXT:   (call $string.consts$raw$1
+  ;; CHECK-NEXT:   (call $string.consts$raw$0
   ;; CHECK-NEXT:    (i32.const 0)
   ;; CHECK-NEXT:   )
-  ;; CHECK-NEXT:   (call $string.consts$raw$1
+  ;; CHECK-NEXT:   (call $string.consts$raw$0
   ;; CHECK-NEXT:    (i32.const 1)
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
@@ -196,197 +192,155 @@
     (global.get $wrapped)
   )
 )
-;; CHECK:      (func $string.consts$fill (type $18) (param $0 (ref $0)) (param $1 i32)
+;; CHECK:      (func $string.consts$get (type $4) (param $0 i32) (result (ref extern))
+;; CHECK-NEXT:  (local $1 i32)
 ;; CHECK-NEXT:  (local $2 i32)
-;; CHECK-NEXT:  (local $3 (ref $1))
+;; CHECK-NEXT:  (local $3 (ref $0))
+;; CHECK-NEXT:  (local $4 (ref $2))
 ;; CHECK-NEXT:  (if
 ;; CHECK-NEXT:   (ref.is_null
-;; CHECK-NEXT:    (global.get $string.consts$data)
+;; CHECK-NEXT:    (global.get $string.consts$table)
 ;; CHECK-NEXT:   )
 ;; CHECK-NEXT:   (then
-;; CHECK-NEXT:    (call $string.consts$decode)
-;; CHECK-NEXT:   )
-;; CHECK-NEXT:  )
-;; CHECK-NEXT:  (local.set $3
-;; CHECK-NEXT:   (ref.as_non_null
-;; CHECK-NEXT:    (global.get $string.consts$data)
-;; CHECK-NEXT:   )
-;; CHECK-NEXT:  )
-;; CHECK-NEXT:  (loop $next
-;; CHECK-NEXT:   (array.set $0
-;; CHECK-NEXT:    (local.get $0)
-;; CHECK-NEXT:    (local.get $2)
-;; CHECK-NEXT:    (local.get $1)
-;; CHECK-NEXT:   )
-;; CHECK-NEXT:   (loop $scan
 ;; CHECK-NEXT:    (if
-;; CHECK-NEXT:     (array.get_u $1
-;; CHECK-NEXT:      (local.get $3)
-;; CHECK-NEXT:      (local.get $1)
+;; CHECK-NEXT:     (ref.is_null
+;; CHECK-NEXT:      (global.get $string.consts$data)
 ;; CHECK-NEXT:     )
 ;; CHECK-NEXT:     (then
-;; CHECK-NEXT:      (local.set $1
-;; CHECK-NEXT:       (i32.add
-;; CHECK-NEXT:        (local.get $1)
-;; CHECK-NEXT:        (i32.const 1)
+;; CHECK-NEXT:      (call $string.consts$decode)
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:    (local.set $3
+;; CHECK-NEXT:     (ref.as_non_null
+;; CHECK-NEXT:      (global.get $string.consts$data)
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:    (global.set $string.consts$table
+;; CHECK-NEXT:     (local.tee $4
+;; CHECK-NEXT:      (array.new_default $2
+;; CHECK-NEXT:       (i32.const 14)
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:    (loop $next
+;; CHECK-NEXT:     (array.set $2
+;; CHECK-NEXT:      (local.get $4)
+;; CHECK-NEXT:      (local.get $1)
+;; CHECK-NEXT:      (local.get $2)
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:     (loop $scan
+;; CHECK-NEXT:      (if
+;; CHECK-NEXT:       (array.get_u $0
+;; CHECK-NEXT:        (local.get $3)
+;; CHECK-NEXT:        (local.get $2)
+;; CHECK-NEXT:       )
+;; CHECK-NEXT:       (then
+;; CHECK-NEXT:        (local.set $2
+;; CHECK-NEXT:         (i32.add
+;; CHECK-NEXT:          (local.get $2)
+;; CHECK-NEXT:          (i32.const 1)
+;; CHECK-NEXT:         )
+;; CHECK-NEXT:        )
+;; CHECK-NEXT:        (br $scan)
 ;; CHECK-NEXT:       )
 ;; CHECK-NEXT:      )
-;; CHECK-NEXT:      (br $scan)
 ;; CHECK-NEXT:     )
-;; CHECK-NEXT:    )
-;; CHECK-NEXT:   )
-;; CHECK-NEXT:   (array.set $0
-;; CHECK-NEXT:    (local.get $0)
-;; CHECK-NEXT:    (i32.or
-;; CHECK-NEXT:     (local.get $2)
-;; CHECK-NEXT:     (i32.const 1)
-;; CHECK-NEXT:    )
-;; CHECK-NEXT:    (local.get $1)
-;; CHECK-NEXT:   )
-;; CHECK-NEXT:   (local.set $1
-;; CHECK-NEXT:    (i32.add
-;; CHECK-NEXT:     (local.get $1)
-;; CHECK-NEXT:     (i32.const 1)
-;; CHECK-NEXT:    )
-;; CHECK-NEXT:   )
-;; CHECK-NEXT:   (br_if $next
-;; CHECK-NEXT:    (i32.lt_u
-;; CHECK-NEXT:     (local.tee $2
+;; CHECK-NEXT:     (array.set $2
+;; CHECK-NEXT:      (local.get $4)
+;; CHECK-NEXT:      (i32.or
+;; CHECK-NEXT:       (local.get $1)
+;; CHECK-NEXT:       (i32.const 1)
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:      (local.get $2)
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:     (local.set $2
 ;; CHECK-NEXT:      (i32.add
 ;; CHECK-NEXT:       (local.get $2)
-;; CHECK-NEXT:       (i32.const 2)
+;; CHECK-NEXT:       (i32.const 1)
 ;; CHECK-NEXT:      )
 ;; CHECK-NEXT:     )
-;; CHECK-NEXT:     (array.len
-;; CHECK-NEXT:      (local.get $0)
-;; CHECK-NEXT:     )
-;; CHECK-NEXT:    )
-;; CHECK-NEXT:   )
-;; CHECK-NEXT:  )
-;; CHECK-NEXT: )
-
-;; CHECK:      (func $string.consts$col$0 (type $4) (param $0 i32) (result (ref extern))
-;; CHECK-NEXT:  (local $1 (ref $0))
-;; CHECK-NEXT:  (if
-;; CHECK-NEXT:   (ref.is_null
-;; CHECK-NEXT:    (global.get $string.consts$col$0$table)
-;; CHECK-NEXT:   )
-;; CHECK-NEXT:   (then
-;; CHECK-NEXT:    (global.set $string.consts$col$0$table
-;; CHECK-NEXT:     (local.tee $1
-;; CHECK-NEXT:      (array.new_default $0
-;; CHECK-NEXT:       (i32.const 10)
+;; CHECK-NEXT:     (br_if $next
+;; CHECK-NEXT:      (i32.lt_u
+;; CHECK-NEXT:       (local.tee $1
+;; CHECK-NEXT:        (i32.add
+;; CHECK-NEXT:         (local.get $1)
+;; CHECK-NEXT:         (i32.const 2)
+;; CHECK-NEXT:        )
+;; CHECK-NEXT:       )
+;; CHECK-NEXT:       (i32.const 14)
 ;; CHECK-NEXT:      )
 ;; CHECK-NEXT:     )
-;; CHECK-NEXT:    )
-;; CHECK-NEXT:    (call $string.consts$fill
-;; CHECK-NEXT:     (local.get $1)
-;; CHECK-NEXT:     (i32.const 0)
 ;; CHECK-NEXT:    )
 ;; CHECK-NEXT:   )
 ;; CHECK-NEXT:  )
 ;; CHECK-NEXT:  (call $fromCharCodeArray
 ;; CHECK-NEXT:   (global.get $string.consts$data)
-;; CHECK-NEXT:   (array.get $0
-;; CHECK-NEXT:    (global.get $string.consts$col$0$table)
-;; CHECK-NEXT:    (i32.shl
-;; CHECK-NEXT:     (local.get $0)
-;; CHECK-NEXT:     (i32.const 1)
-;; CHECK-NEXT:    )
-;; CHECK-NEXT:   )
-;; CHECK-NEXT:   (array.get $0
-;; CHECK-NEXT:    (global.get $string.consts$col$0$table)
-;; CHECK-NEXT:    (i32.or
+;; CHECK-NEXT:   (array.get $2
+;; CHECK-NEXT:    (global.get $string.consts$table)
+;; CHECK-NEXT:    (local.tee $1
 ;; CHECK-NEXT:     (i32.shl
 ;; CHECK-NEXT:      (local.get $0)
 ;; CHECK-NEXT:      (i32.const 1)
 ;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (array.get $2
+;; CHECK-NEXT:    (global.get $string.consts$table)
+;; CHECK-NEXT:    (i32.or
+;; CHECK-NEXT:     (local.get $1)
 ;; CHECK-NEXT:     (i32.const 1)
 ;; CHECK-NEXT:    )
 ;; CHECK-NEXT:   )
 ;; CHECK-NEXT:  )
 ;; CHECK-NEXT: )
 
-;; CHECK:      (func $string.consts$raw$1 (type $4) (param $0 i32) (result (ref extern))
-;; CHECK-NEXT:  (local $1 (ref $0))
-;; CHECK-NEXT:  (local $2 (ref extern))
+;; CHECK:      (func $string.consts$raw$0 (type $4) (param $0 i32) (result (ref extern))
+;; CHECK-NEXT:  (local $1 (ref extern))
 ;; CHECK-NEXT:  (block $cached (result (ref extern))
 ;; CHECK-NEXT:   (br_on_non_null $cached
 ;; CHECK-NEXT:    (array.get $3
-;; CHECK-NEXT:     (global.get $string.consts$raw$1$cache)
+;; CHECK-NEXT:     (global.get $string.consts$raw$0$cache)
 ;; CHECK-NEXT:     (local.get $0)
 ;; CHECK-NEXT:    )
 ;; CHECK-NEXT:   )
-;; CHECK-NEXT:   (if
-;; CHECK-NEXT:    (ref.is_null
-;; CHECK-NEXT:     (global.get $string.consts$raw$1$table)
-;; CHECK-NEXT:    )
-;; CHECK-NEXT:    (then
-;; CHECK-NEXT:     (global.set $string.consts$raw$1$table
-;; CHECK-NEXT:      (local.tee $1
-;; CHECK-NEXT:       (array.new_default $0
-;; CHECK-NEXT:        (i32.const 4)
-;; CHECK-NEXT:       )
-;; CHECK-NEXT:      )
-;; CHECK-NEXT:     )
-;; CHECK-NEXT:     (call $string.consts$fill
-;; CHECK-NEXT:      (local.get $1)
-;; CHECK-NEXT:      (i32.const 32)
-;; CHECK-NEXT:     )
-;; CHECK-NEXT:    )
-;; CHECK-NEXT:   )
 ;; CHECK-NEXT:   (array.set $3
-;; CHECK-NEXT:    (global.get $string.consts$raw$1$cache)
+;; CHECK-NEXT:    (global.get $string.consts$raw$0$cache)
 ;; CHECK-NEXT:    (local.get $0)
-;; CHECK-NEXT:    (local.tee $2
-;; CHECK-NEXT:     (call $fromCharCodeArray
-;; CHECK-NEXT:      (global.get $string.consts$data)
-;; CHECK-NEXT:      (array.get $0
-;; CHECK-NEXT:       (global.get $string.consts$raw$1$table)
-;; CHECK-NEXT:       (i32.shl
-;; CHECK-NEXT:        (local.get $0)
-;; CHECK-NEXT:        (i32.const 1)
-;; CHECK-NEXT:       )
-;; CHECK-NEXT:      )
-;; CHECK-NEXT:      (array.get $0
-;; CHECK-NEXT:       (global.get $string.consts$raw$1$table)
-;; CHECK-NEXT:       (i32.or
-;; CHECK-NEXT:        (i32.shl
-;; CHECK-NEXT:         (local.get $0)
-;; CHECK-NEXT:         (i32.const 1)
-;; CHECK-NEXT:        )
-;; CHECK-NEXT:        (i32.const 1)
-;; CHECK-NEXT:       )
+;; CHECK-NEXT:    (local.tee $1
+;; CHECK-NEXT:     (call $string.consts$get
+;; CHECK-NEXT:      (i32.add
+;; CHECK-NEXT:       (local.get $0)
+;; CHECK-NEXT:       (i32.const 5)
 ;; CHECK-NEXT:      )
 ;; CHECK-NEXT:     )
 ;; CHECK-NEXT:    )
 ;; CHECK-NEXT:   )
-;; CHECK-NEXT:   (local.get $2)
+;; CHECK-NEXT:   (local.get $1)
 ;; CHECK-NEXT:  )
 ;; CHECK-NEXT: )
 
-;; CHECK:      (func $string.consts$decode (type $19)
-;; CHECK-NEXT:  (local $0 (ref $2))
-;; CHECK-NEXT:  (local $1 (ref $1))
+;; CHECK:      (func $string.consts$decode (type $18)
+;; CHECK-NEXT:  (local $0 (ref $1))
+;; CHECK-NEXT:  (local $1 (ref $0))
 ;; CHECK-NEXT:  (local $2 i32)
 ;; CHECK-NEXT:  (local $3 i32)
 ;; CHECK-NEXT:  (local $4 i32)
 ;; CHECK-NEXT:  (local $5 i32)
 ;; CHECK-NEXT:  (local $6 i32)
 ;; CHECK-NEXT:  (local.set $0
-;; CHECK-NEXT:   (array.new_data $2 $string.consts
+;; CHECK-NEXT:   (array.new_data $1 $string.consts
 ;; CHECK-NEXT:    (i32.const 0)
 ;; CHECK-NEXT:    (i32.const 52)
 ;; CHECK-NEXT:   )
 ;; CHECK-NEXT:  )
 ;; CHECK-NEXT:  (local.set $1
-;; CHECK-NEXT:   (array.new_default $1
+;; CHECK-NEXT:   (array.new_default $0
 ;; CHECK-NEXT:    (i32.const 49)
 ;; CHECK-NEXT:   )
 ;; CHECK-NEXT:  )
 ;; CHECK-NEXT:  (loop $next
 ;; CHECK-NEXT:   (local.set $4
-;; CHECK-NEXT:    (array.get_u $2
+;; CHECK-NEXT:    (array.get_u $1
 ;; CHECK-NEXT:     (local.get $0)
 ;; CHECK-NEXT:     (i32.sub
 ;; CHECK-NEXT:      (local.tee $2
@@ -414,7 +368,7 @@
 ;; CHECK-NEXT:     (local.set $5
 ;; CHECK-NEXT:      (i32.add
 ;; CHECK-NEXT:       (i32.const 63)
-;; CHECK-NEXT:       (array.get_u $2
+;; CHECK-NEXT:       (array.get_u $1
 ;; CHECK-NEXT:        (local.get $0)
 ;; CHECK-NEXT:        (i32.sub
 ;; CHECK-NEXT:         (local.tee $2
@@ -446,11 +400,11 @@
 ;; CHECK-NEXT:      (if
 ;; CHECK-NEXT:       (local.get $4)
 ;; CHECK-NEXT:       (then
-;; CHECK-NEXT:        (array.set $1
+;; CHECK-NEXT:        (array.set $0
 ;; CHECK-NEXT:         (local.get $1)
 ;; CHECK-NEXT:         (local.get $3)
 ;; CHECK-NEXT:         (i32.or
-;; CHECK-NEXT:          (array.get_u $2
+;; CHECK-NEXT:          (array.get_u $1
 ;; CHECK-NEXT:           (local.get $0)
 ;; CHECK-NEXT:           (i32.sub
 ;; CHECK-NEXT:            (local.tee $2
@@ -463,7 +417,7 @@
 ;; CHECK-NEXT:           )
 ;; CHECK-NEXT:          )
 ;; CHECK-NEXT:          (i32.shl
-;; CHECK-NEXT:           (array.get_u $2
+;; CHECK-NEXT:           (array.get_u $1
 ;; CHECK-NEXT:            (local.get $0)
 ;; CHECK-NEXT:            (i32.sub
 ;; CHECK-NEXT:             (local.tee $2
@@ -481,10 +435,10 @@
 ;; CHECK-NEXT:        )
 ;; CHECK-NEXT:       )
 ;; CHECK-NEXT:       (else
-;; CHECK-NEXT:        (array.set $1
+;; CHECK-NEXT:        (array.set $0
 ;; CHECK-NEXT:         (local.get $1)
 ;; CHECK-NEXT:         (local.get $3)
-;; CHECK-NEXT:         (array.get_u $2
+;; CHECK-NEXT:         (array.get_u $1
 ;; CHECK-NEXT:          (local.get $0)
 ;; CHECK-NEXT:          (i32.sub
 ;; CHECK-NEXT:           (local.tee $2
@@ -524,7 +478,7 @@
 ;; CHECK-NEXT:      (then
 ;; CHECK-NEXT:       (local.set $6
 ;; CHECK-NEXT:        (i32.or
-;; CHECK-NEXT:         (array.get_u $2
+;; CHECK-NEXT:         (array.get_u $1
 ;; CHECK-NEXT:          (local.get $0)
 ;; CHECK-NEXT:          (i32.sub
 ;; CHECK-NEXT:           (local.tee $2
@@ -537,7 +491,7 @@
 ;; CHECK-NEXT:          )
 ;; CHECK-NEXT:         )
 ;; CHECK-NEXT:         (i32.shl
-;; CHECK-NEXT:          (array.get_u $2
+;; CHECK-NEXT:          (array.get_u $1
 ;; CHECK-NEXT:           (local.get $0)
 ;; CHECK-NEXT:           (i32.sub
 ;; CHECK-NEXT:            (local.tee $2
@@ -556,7 +510,7 @@
 ;; CHECK-NEXT:      )
 ;; CHECK-NEXT:      (else
 ;; CHECK-NEXT:       (local.set $6
-;; CHECK-NEXT:        (array.get_u $2
+;; CHECK-NEXT:        (array.get_u $1
 ;; CHECK-NEXT:         (local.get $0)
 ;; CHECK-NEXT:         (i32.sub
 ;; CHECK-NEXT:          (local.tee $2
@@ -584,10 +538,10 @@
 ;; CHECK-NEXT:      )
 ;; CHECK-NEXT:     )
 ;; CHECK-NEXT:     (loop $copy
-;; CHECK-NEXT:      (array.set $1
+;; CHECK-NEXT:      (array.set $0
 ;; CHECK-NEXT:       (local.get $1)
 ;; CHECK-NEXT:       (local.get $3)
-;; CHECK-NEXT:       (array.get_u $1
+;; CHECK-NEXT:       (array.get_u $0
 ;; CHECK-NEXT:        (local.get $1)
 ;; CHECK-NEXT:        (i32.sub
 ;; CHECK-NEXT:         (local.get $3)

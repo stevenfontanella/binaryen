@@ -87,10 +87,12 @@
 #include <unordered_set>
 
 #include "ir/iteration.h"
+#include "ir/manipulation.h"
 #include "ir/module-utils.h"
 #include "ir/names.h"
 #include "ir/subtypes.h"
 #include "ir/type-updating.h"
+#include "ir/utils.h"
 #include "pass.h"
 #include "passes/lz-huffman.h"
 #include "passes/string-consts.h"
@@ -170,8 +172,9 @@ struct StringConstsToData : public Pass {
 
   Name segmentName;
   Name dataGlobalName;
+  Name tableGlobalName;
   Name decodeFuncName;
-  Name fillFuncName;
+  Name getFuncName;
   Name fromCharCodeArray;
   HeapType i8ArrayType = HeapTypes::getMutI8Array();
   HeapType i16ArrayType = HeapTypes::getMutI16Array();
@@ -355,23 +358,6 @@ struct StringConstsToData : public Pass {
     // Build everything.
     Builder builder(*module);
     prepareNames();
-    if (!convertibleColumns.empty() || !rawStrings.empty()) {
-      makeFiller();
-    }
-
-    for (auto* column : convertibleColumns) {
-      std::vector<std::string*> contents;
-      for (auto* value : column->init->values) {
-        contents.push_back(&strings[value->cast<GlobalGet>()->name].wtf16);
-      }
-      auto helper = makeHelper(contents, false);
-      for (auto** ptr : column->reads) {
-        auto* read = (*ptr)->cast<ArrayGet>();
-        *ptr = builder.makeCall(helper, {read->index}, refExtern);
-      }
-      module->removeGlobal(column->global->name);
-    }
-
     if (!rawStrings.empty()) {
       // Order the group by content (first use breaks ties), which keeps
       // similar strings together for the compressor.
@@ -384,16 +370,66 @@ struct StringConstsToData : public Pass {
                   }
                   return a.second->firstUse < b.second->firstUse;
                 });
+    }
+    Index totalTableStrings = rawStrings.size();
+    for (auto* column : convertibleColumns) {
+      totalTableStrings += column->init->values.size();
+    }
+    Index numChunks = (rawStrings.size() + MaxChunkSize - 1) / MaxChunkSize;
+    bool needSharedGet = !convertibleColumns.empty() || numChunks > 1;
+    if (totalTableStrings > 0) {
+      tableGlobalName =
+        Names::getValidGlobalName(*module, "string.consts$table");
+      module->addGlobal(builder.makeGlobal(tableGlobalName,
+                                           Type(tableType, Nullable),
+                                           builder.makeRefNull(tableType),
+                                           Builder::Mutable));
+      if (needSharedGet) {
+        getFuncName = Names::getValidFunctionName(*module, "string.consts$get");
+        makeGetFunc(totalTableStrings);
+      }
+    }
+
+    Index numTableStrings = 0;
+    for (auto* column : convertibleColumns) {
+      Index base = numTableStrings;
+      std::vector<std::string*> contents;
+      for (auto* value : column->init->values) {
+        contents.push_back(&strings[value->cast<GlobalGet>()->name].wtf16);
+      }
+      addGroup(contents);
+      numTableStrings += contents.size();
+      for (auto** ptr : column->reads) {
+        auto* read = (*ptr)->cast<ArrayGet>();
+        Expression* index = read->index;
+        if (base != 0) {
+          if (auto* c = index->dynCast<Const>()) {
+            index =
+              builder.makeConst(int32_t(uint32_t(c->value.geti32()) + base));
+          } else {
+            index = builder.makeBinary(
+              AddInt32, index, builder.makeConst(int32_t(base)));
+          }
+        }
+        *ptr = builder.makeCall(getFuncName, {index}, refExtern);
+      }
+      module->removeGlobal(column->global->name);
+    }
+
+    if (!rawStrings.empty()) {
       std::unordered_map<Name, std::pair<Name, Index>> rawIndexes;
-      Index numChunks = (rawStrings.size() + MaxChunkSize - 1) / MaxChunkSize;
       for (Index chunk = 0; chunk < numChunks; chunk++) {
         Index begin = chunk * MaxChunkSize;
         Index end = std::min(Index(rawStrings.size()), begin + MaxChunkSize);
+        Index base = numTableStrings;
         std::vector<std::string*> contents;
         for (Index i = begin; i < end; i++) {
           contents.push_back(&rawStrings[i].second->wtf16);
         }
-        auto helper = makeHelper(contents, true);
+        addGroup(contents);
+        numTableStrings += contents.size();
+        auto helper = makeRawHelper(
+          contents.size(), base, needSharedGet, totalTableStrings);
         for (Index i = begin; i < end; i++) {
           rawIndexes[rawStrings[i].first] = {helper, i - begin};
         }
@@ -697,6 +733,7 @@ private:
     struct Item {
       std::vector<Expression*> code;
       std::vector<std::string*> contents;
+      std::string shapeKey = "";
     };
     std::vector<Item> items;
     std::vector<bool> filled(slots.size(), false);
@@ -844,13 +881,110 @@ private:
       return getStructShape(value);
     };
 
+    auto getStructNew = [&](Expression* value) -> StructNew* {
+      if (auto* sn = value->dynCast<StructNew>()) {
+        return sn;
+      }
+      if (auto* get = value->dynCast<GlobalGet>()) {
+        auto* global = module->getGlobal(get->name);
+        if (!global->imported() && !global->mutable_) {
+          return global->init->dynCast<StructNew>();
+        }
+      }
+      return nullptr;
+    };
+    auto isSimpleConstOperand = [&](Expression* curr) {
+      if (curr->is<Const>() || curr->is<RefNull>() || curr->is<RefFunc>()) {
+        return true;
+      }
+      if (auto* get = curr->dynCast<GlobalGet>()) {
+        auto* global = module->getGlobal(get->name);
+        return !global->mutable_ && !strings.count(get->name);
+      }
+      return false;
+    };
+    auto canConstructStruct = [&](const Shape& shape, StructNew* sn) {
+      if (!sn || sn->desc || sn->isWithDefault() || !shape.type.isStruct() ||
+          sn->type.getHeapType() != shape.type) {
+        return false;
+      }
+      for (Index f = 0; f < sn->operands.size(); f++) {
+        if (f != shape.field && !isSimpleConstOperand(sn->operands[f])) {
+          return false;
+        }
+      }
+      return true;
+    };
+    auto sameConstructedStruct =
+      [&](const Shape& shape, StructNew* a, StructNew* b) {
+        if (!canConstructStruct(shape, a) || !canConstructStruct(shape, b) ||
+            a->operands.size() != b->operands.size()) {
+          return false;
+        }
+        for (Index f = 0; f < a->operands.size(); f++) {
+          if (f != shape.field &&
+              !ExpressionAnalyzer::equal(a->operands[f], b->operands[f])) {
+            return false;
+          }
+        }
+        return true;
+      };
+
+    std::unordered_map<Name, Index> allGlobalUses;
+    {
+      struct UseCountScanner : public PostWalker<UseCountScanner> {
+        std::unordered_map<Name, Index>& counts;
+        UseCountScanner(std::unordered_map<Name, Index>& counts)
+          : counts(counts) {}
+        void visitGlobalGet(GlobalGet* curr) { counts[curr->name]++; }
+      };
+      ModuleUtils::ParallelFunctionAnalysis<std::unordered_map<Name, Index>>
+        funcScan(
+          *module, [&](Function* func, std::unordered_map<Name, Index>& map) {
+            if (!func->imported()) {
+              UseCountScanner(map).walk(func->body);
+            }
+          });
+      for (auto& func : module->functions) {
+        for (auto& [name, count] : funcScan.map[func.get()]) {
+          allGlobalUses[name] += count;
+        }
+      }
+      UseCountScanner scanner(allGlobalUses);
+      for (auto& global : module->globals) {
+        if (!global->imported()) {
+          scanner.walk(global->init);
+        }
+      }
+      for (auto& seg : module->elementSegments) {
+        if (seg->offset) {
+          scanner.walk(seg->offset);
+        }
+        for (auto* item : seg->data) {
+          scanner.walk(item);
+        }
+      }
+      for (auto& seg : module->dataSegments) {
+        if (seg->offset) {
+          scanner.walk(seg->offset);
+        }
+      }
+      for (auto& ex : module->exports) {
+        if (ex->kind == ExternalKind::Global) {
+          allGlobalUses[*ex->getInternalName()]++;
+        }
+      }
+    }
+
     // Plan the loops first, so that the slots of other globals that they fill
     // are not filled on their own.
     struct Run {
       Index from, to;
       Shape shape;
+      StructNew* templateStructNew = nullptr;
     };
     std::unordered_map<Name, std::vector<Run>> runs;
+    std::unordered_map<Name, Index> constructedGlobalUses;
     for (auto& global : module->globals) {
       if (global->imported()) {
         continue;
@@ -859,6 +993,9 @@ private:
       if (!arrayNew || !containsSlot(arrayNew)) {
         continue;
       }
+      auto elementField = arrayNew->type.getHeapType().getArray().element;
+      bool canReplaceWithNull =
+        elementField.type.isNullable() && elementField.mutable_ == Mutable;
       std::vector<Shape> shapes;
       for (auto* value : arrayNew->values) {
         shapes.push_back(getShape(value));
@@ -870,17 +1007,63 @@ private:
           j++;
         }
         if (shapes[i].slot != Index(-1) && j - i >= 3) {
-          runs[global->name].push_back({i, j, shapes[i]});
-          for (Index k = i; k < j; k++) {
-            inLoop.insert(shapes[k].slot);
+          StructNew* templ = nullptr;
+          if (canReplaceWithNull && shapes[i].type.isStruct() &&
+              Type::isSubType(Type(shapes[i].type, NonNullable),
+                              elementField.type)) {
+            StructNew* firstSn = getStructNew(arrayNew->values[i]);
+            bool allSame = canConstructStruct(shapes[i], firstSn);
+            bool hasInline = false;
+            for (Index k = i; k < j && allSame; k++) {
+              if (arrayNew->values[k]->is<StructNew>()) {
+                hasInline = true;
+              }
+              if (!sameConstructedStruct(
+                    shapes[i], firstSn, getStructNew(arrayNew->values[k]))) {
+                allSame = false;
+              }
+            }
+            if (allSame && hasInline) {
+              templ = firstSn;
+              for (Index k = i; k < j; k++) {
+                if (auto* get = arrayNew->values[k]->dynCast<GlobalGet>()) {
+                  constructedGlobalUses[get->name]++;
+                }
+              }
+            }
           }
+          runs[global->name].push_back({i, j, shapes[i], templ});
         }
         i = j;
+      }
+    }
+    std::vector<Name> deadGlobalsToRemove;
+    std::unordered_set<Name> deadGlobalSet;
+    for (auto& [gName, gRuns] : runs) {
+      auto* arrayNew = module->getGlobal(gName)->init->cast<ArrayNewFixed>();
+      for (auto& run : gRuns) {
+        for (Index k = run.from; k < run.to; k++) {
+          auto slot = getShape(arrayNew->values[k]).slot;
+          if (!run.templateStructNew) {
+            inLoop.insert(slot);
+          } else if (auto* get = arrayNew->values[k]->dynCast<GlobalGet>()) {
+            if (constructedGlobalUses[get->name] == allGlobalUses[get->name]) {
+              inLoop.insert(slot);
+              if (deadGlobalSet.insert(get->name).second) {
+                deadGlobalsToRemove.push_back(get->name);
+              }
+            }
+          } else {
+            inLoop.insert(slot);
+          }
+        }
       }
     }
 
     // Emit, in module order.
     Index numLoops = 0;
+    std::vector<std::pair<ArrayNewFixed*, std::pair<Index, Index>>>
+      nullifiedRanges;
     for (auto& global : module->globals) {
       if (global->imported()) {
         continue;
@@ -910,7 +1093,23 @@ private:
           Name loopName("fill" + std::to_string(numLoops++));
           auto getI = [&]() { return builder.makeLocalGet(iLocal, i32); };
           Expression* set;
-          if (run.shape.type.isStruct()) {
+          if (run.templateStructNew) {
+            std::vector<Expression*> operands;
+            for (Index f = 0; f < run.templateStructNew->operands.size(); f++) {
+              if (f == run.shape.field) {
+                operands.push_back(next());
+              } else {
+                operands.push_back(ExpressionManipulator::copy(
+                  run.templateStructNew->operands[f], *module));
+              }
+            }
+            set = builder.makeArraySet(
+              makeRoot(),
+              getI(),
+              builder.makeStructNew(run.shape.type, operands),
+              MemoryOrder::Unordered);
+            nullifiedRanges.push_back({arrayNew, {run.from, run.to}});
+          } else if (run.shape.type.isStruct()) {
             Expression* element = builder.makeArrayGet(
               makeRoot(), getI(), MemoryOrder::Unordered, elementType);
             set = builder.makeStructSet(run.shape.field,
@@ -927,7 +1126,9 @@ private:
           Item item;
           for (Index k = run.from; k < run.to; k++) {
             auto slot = getShape(arrayNew->values[k]).slot;
-            filled[slot] = true;
+            if (inLoop.count(slot)) {
+              filled[slot] = true;
+            }
             item.contents.push_back(&strings[slots[slot].string].wtf16);
           }
           auto* loop = builder.makeLoop(
@@ -976,13 +1177,216 @@ private:
       auto heapType = (*slot.ptr)->type.getHeapType();
       *slot.ptr = builder.makeRefNull(heapType.getBottom());
     }
+    for (auto& [arrayNew, range] : nullifiedRanges) {
+      auto bottom =
+        arrayNew->type.getHeapType().getArray().element.type.getHeapType().getBottom();
+      for (Index k = range.first; k < range.second; k++) {
+        arrayNew->values[k] = builder.makeRefNull(bottom);
+      }
+    }
+    for (Name gName : deadGlobalsToRemove) {
+      module->removeGlobal(gName);
+    }
+    for (auto& global : module->globals) {
+      if (global->imported() || !global->init) {
+        continue;
+      }
+      if (auto* arrayNew = global->init->dynCast<ArrayNewFixed>()) {
+        if (!arrayNew->values.empty() &&
+            std::all_of(arrayNew->values.begin(),
+                        arrayNew->values.end(),
+                        [](Expression* v) { return v->is<RefNull>(); })) {
+          global->init = builder.makeArrayNew(
+            arrayNew->type.getHeapType(),
+            builder.makeConst(int32_t(arrayNew->values.size())));
+        }
+      }
+    }
 
-    // Order the items by content (stable, so the original order breaks ties).
+    // Order the items by statement shape first (so consecutive runs of
+    // identical-shape fills stay together for loop rolling and outlining), and
+    // by content within each shape group for the compressor.
     if (sort) {
+      std::function<void(Expression*, std::string&)> appendShapeKey =
+        [&](Expression* curr, std::string& out) {
+          if (curr->is<GlobalGet>()) {
+            out += "G;";
+            return;
+          }
+          if (curr->is<Const>()) {
+            out += "C;";
+            return;
+          }
+          if (auto* ss = curr->dynCast<StructSet>()) {
+            out += "SS:" + std::to_string(ss->ref->type.getHeapType().getID()) +
+                   ":" + std::to_string(ss->index) + "(";
+            appendShapeKey(ss->ref, out);
+            out += ");";
+            return;
+          }
+          if (auto* sg = curr->dynCast<StructGet>()) {
+            out += "SG:" + std::to_string(sg->ref->type.getHeapType().getID()) +
+                   ":" + std::to_string(sg->index) + "(";
+            appendShapeKey(sg->ref, out);
+            out += ");";
+            return;
+          }
+          if (auto* as = curr->dynCast<ArraySet>()) {
+            out += "AS:" + std::to_string(as->ref->type.getHeapType().getID()) +
+                   "(";
+            appendShapeKey(as->ref, out);
+            appendShapeKey(as->index, out);
+            out += ");";
+            return;
+          }
+          if (auto* ag = curr->dynCast<ArrayGet>()) {
+            out += "AG:" + std::to_string(ag->ref->type.getHeapType().getID()) +
+                   "(";
+            appendShapeKey(ag->ref, out);
+            appendShapeKey(ag->index, out);
+            out += ");";
+            return;
+          }
+          if (auto* rc = curr->dynCast<RefCast>()) {
+            out += "RC:" + std::to_string(rc->type.getHeapType().getID()) + "(";
+            appendShapeKey(rc->ref, out);
+            out += ");";
+            return;
+          }
+          out += std::to_string(curr->_id) + ";";
+        };
+      auto getItemShapeKey = [&](const Item& item) {
+        if (item.code.size() > 1) {
+          return std::string("0:loop");
+        }
+        std::string key = "1:";
+        appendShapeKey(item.code[0], key);
+        return key;
+      };
+      for (auto& item : items) {
+        item.shapeKey = getItemShapeKey(item);
+      }
       std::stable_sort(
-        items.begin(), items.end(), [](const Item& a, const Item& b) {
+        items.begin(), items.end(), [&](const Item& a, const Item& b) {
+          if (a.shapeKey != b.shapeKey) {
+            return a.shapeKey < b.shapeKey;
+          }
           return StringConsts::less(*a.contents[0], *b.contents[0]);
         });
+      // Roll runs of >= 4 identical-shape single-slot StructSet items over
+      // distinct globals into a direct counter-indexed loop over an array
+      // global, avoiding a separate index column in RollRepeatedCalls.
+      auto extractGlobalLeaf = [&](Expression* expr,
+                                   GlobalGet*& leafOut,
+                                   StructGet*& hopOut) -> StructSet* {
+        leafOut = nullptr;
+        hopOut = nullptr;
+        auto* ss = expr->dynCast<StructSet>();
+        if (!ss) {
+          return nullptr;
+        }
+        if (auto* gg = ss->ref->dynCast<GlobalGet>()) {
+          leafOut = gg;
+          return ss;
+        }
+        if (auto* sg = ss->ref->dynCast<StructGet>()) {
+          if (auto* gg = sg->ref->dynCast<GlobalGet>()) {
+            hopOut = sg;
+            leafOut = gg;
+            return ss;
+          }
+        }
+        return nullptr;
+      };
+      std::vector<Item> rolledItems;
+      for (Index i = 0; i < items.size();) {
+        if (items[i].code.size() != 1) {
+          rolledItems.push_back(std::move(items[i++]));
+          continue;
+        }
+        GlobalGet* firstLeaf = nullptr;
+        StructGet* firstHop = nullptr;
+        StructSet* firstSs =
+          extractGlobalLeaf(items[i].code[0], firstLeaf, firstHop);
+        if (!firstSs) {
+          rolledItems.push_back(std::move(items[i++]));
+          continue;
+        }
+        Type elemType = firstLeaf->type;
+        Index j = i + 1;
+        while (j < items.size() && items[j].code.size() == 1 &&
+               items[j].shapeKey == items[i].shapeKey) {
+          GlobalGet* leaf = nullptr;
+          StructGet* hop = nullptr;
+          if (!extractGlobalLeaf(items[j].code[0], leaf, hop) ||
+              leaf->type != elemType) {
+            break;
+          }
+          j++;
+        }
+        if (j - i >= 4) {
+          HeapType arrType(Array(Field(elemType, Immutable)));
+          Type arrGlobalType(arrType, NonNullable);
+          std::vector<Expression*> vals;
+          Item merged;
+          for (Index k = i; k < j; k++) {
+            GlobalGet* leaf = nullptr;
+            StructGet* hop = nullptr;
+            extractGlobalLeaf(items[k].code[0], leaf, hop);
+            vals.push_back(builder.makeGlobalGet(leaf->name, elemType));
+            merged.contents.insert(merged.contents.end(),
+                                   items[k].contents.begin(),
+                                   items[k].contents.end());
+          }
+          auto arrName =
+            Names::getValidGlobalName(*module, "string.consts$GroupTable");
+          module->addGlobal(
+            builder.makeGlobal(arrName,
+                               arrGlobalType,
+                               builder.makeArrayNewFixed(arrType, vals),
+                               Builder::Immutable));
+          Name loopName("fill" + std::to_string(numLoops++));
+          auto getI = [&]() { return builder.makeLocalGet(iLocal, i32); };
+          Expression* target =
+            builder.makeArrayGet(builder.makeGlobalGet(arrName, arrGlobalType),
+                                 getI(),
+                                 MemoryOrder::Unordered,
+                                 elemType);
+          if (firstHop) {
+            target = builder.makeStructGet(firstHop->index,
+                                           target,
+                                           MemoryOrder::Unordered,
+                                           firstHop->type);
+          }
+          auto* set = builder.makeStructSet(
+            firstSs->index, target, next(), MemoryOrder::Unordered);
+          auto* loop = builder.makeLoop(
+            loopName,
+            builder.makeBlock(
+              {set,
+               builder.makeBreak(
+                 loopName,
+                 nullptr,
+                 builder.makeBinary(
+                   LtUInt32,
+                   builder.makeLocalTee(
+                     iLocal,
+                     builder.makeBinary(
+                       AddInt32, getI(), builder.makeConst(int32_t(1))),
+                     i32),
+                   builder.makeConst(int32_t(j - i))))}));
+          merged.code.push_back(
+            builder.makeLocalSet(iLocal, builder.makeConst(int32_t(0))));
+          merged.code.push_back(loop);
+          rolledItems.push_back(std::move(merged));
+          i = j;
+        } else {
+          while (i < j) {
+            rolledItems.push_back(std::move(items[i++]));
+          }
+        }
+      }
+      items = std::move(rolledItems);
     }
     std::vector<std::string*> contents;
     for (auto& item : items) {
@@ -1141,7 +1545,6 @@ private:
                                          Builder::Mutable));
     decodeFuncName =
       Names::getValidFunctionName(*module, "string.consts$decode");
-    fillFuncName = Names::getValidFunctionName(*module, "string.consts$fill");
   }
 
   Name getFromCharCodeArray() {
@@ -1198,29 +1601,13 @@ private:
     return builder.makeRefAs(RefAsNonNull, get);
   }
 
-  // The shared table filler, which scans the units of a group for the
-  // terminators and builds a table of (start, end) pairs:
-  //
-  //   (func $fill (param $table (ref $table)) (param $p i32)
-  //     (local $i i32) (local $data (ref $i16))
-  //     (if (ref.is_null (global.get $data)) (then (call $decode)))
-  //     (local.set $data (ref.as_non_null (global.get $data)))
-  //     (loop $next
-  //       (array.set $table (local.get $table) (local.get $i) (local.get $p))
-  //       (loop $scan
-  //         (if (array.get_u $i16 (local.get $data) (local.get $p))
-  //           (then
-  //             (local.set $p (i32.add (local.get $p) (i32.const 1)))
-  //             (br $scan))))
-  //       (array.set $table (local.get $table)
-  //         (i32.or (local.get $i) (i32.const 1)) (local.get $p))
-  //       (local.set $p (i32.add (local.get $p) (i32.const 1)))
-  //       (br_if $next (i32.lt_u (local.tee $i (i32.add (local.get $i) 2))
-  //                              (array.len (local.get $table))))))
-  //
-  void makeFiller() {
+  // Builds the lazy offset-table initialization and fromCharCodeArray lookup
+  // expressions using locals k=0, i=1, p=2, data=3, t=4.
+  std::pair<Expression*, Expression*>
+  makeTableLookup(Index totalTableStrings) {
     Builder builder(*module);
-    Index table = 0, p = 1, i = 2, data = 3;
+    Index k = 0, i = 1, p = 2, data = 3, t = 4;
+    Type tableGlobalType(tableType, Nullable);
     Type tableRef(tableType, NonNullable);
     Type i16Ref(i16ArrayType, NonNullable);
     auto i32 = Type::i32;
@@ -1229,15 +1616,23 @@ private:
       return builder.makeLocalSet(
         p, builder.makeBinary(AddInt32, get(p), builder.makeConst(1)));
     };
-    auto* decode =
-      builder.makeIf(builder.makeRefIsNull(builder.makeGlobalGet(
-                       dataGlobalName, Type(i16ArrayType, Nullable))),
-                     builder.makeCall(decodeFuncName, {}, Type::none));
-    auto* setData = builder.makeLocalSet(data, getData(true));
-    auto* setStart = builder.makeArraySet(builder.makeLocalGet(table, tableRef),
-                                          get(i),
-                                          get(p),
-                                          MemoryOrder::Unordered);
+    std::vector<Expression*> initBody;
+    if (slots.empty()) {
+      initBody.push_back(
+        builder.makeIf(builder.makeRefIsNull(builder.makeGlobalGet(
+                         dataGlobalName, Type(i16ArrayType, Nullable))),
+                       builder.makeCall(decodeFuncName, {}, Type::none)));
+    }
+    initBody.push_back(builder.makeLocalSet(data, getData(true)));
+    initBody.push_back(builder.makeGlobalSet(
+      tableGlobalName,
+      builder.makeLocalTee(
+        t,
+        builder.makeArrayNew(
+          tableType, builder.makeConst(int32_t(2 * totalTableStrings))),
+        tableRef)));
+    auto* setStart = builder.makeArraySet(
+      builder.makeLocalGet(t, tableRef), get(i), get(p), MemoryOrder::Unordered);
     Name scanLabel("scan");
     auto* scan = builder.makeLoop(
       scanLabel,
@@ -1249,7 +1644,7 @@ private:
                              false),
         builder.makeBlock({incP(), builder.makeBreak(scanLabel)})));
     auto* setEnd = builder.makeArraySet(
-      builder.makeLocalGet(table, tableRef),
+      builder.makeLocalGet(t, tableRef),
       builder.makeBinary(OrInt32, get(i), builder.makeConst(1)),
       get(p),
       MemoryOrder::Unordered);
@@ -1261,114 +1656,98 @@ private:
         LtUInt32,
         builder.makeLocalTee(
           i, builder.makeBinary(AddInt32, get(i), builder.makeConst(2)), i32),
-        builder.makeArrayLen(builder.makeLocalGet(table, tableRef))));
-    auto* loop = builder.makeLoop(
-      label, builder.makeBlock({setStart, scan, setEnd, incP(), next}));
-    module->addFunction(
-      builder.makeFunction(fillFuncName,
-                           Signature({tableRef, i32}, Type::none),
-                           {i32, i16Ref},
-                           builder.makeBlock({decode, setData, loop})));
-  }
-
-  // Creates the table global for a group of strings and a helper that creates
-  // string k:
-  //
-  //   (func $helper (param $k i32) (result (ref extern))
-  //     (if (ref.is_null (global.get $table))
-  //       (then
-  //         (global.set $table
-  //           (local.tee $t (array.new_default $table (i32.const 2 * N))))
-  //         (call $fill (local.get $t) (i32.const stringsOffset))))
-  //     (call $fromCharCodeArray
-  //       (ref.as_non_null (global.get $data))
-  //       (array.get $table (global.get $table) (i32.shl (local.get $k) 1))
-  //       (array.get $table (global.get $table)
-  //         (i32.or (i32.shl (local.get $k) 1) 1))))
-  //
-  // With a cache, the result is stored in a mutable externref array and
-  // returned from there when present.
-  Name makeHelper(std::vector<std::string*>& contents, bool cached) {
-    Builder builder(*module);
-    auto i32 = Type::i32;
-    std::string baseName = std::string("string.consts$") +
-                           (cached ? "raw$" : "col$") +
-                           std::to_string(numHelpers++);
-    auto layout = addGroup(contents);
-
-    auto tableGlobalType = Type(tableType, Nullable);
-    auto tableRef = Type(tableType, NonNullable);
-    auto tableName = Names::getValidGlobalName(*module, baseName + "$table");
-    module->addGlobal(builder.makeGlobal(tableName,
-                                         tableGlobalType,
-                                         builder.makeRefNull(tableType),
-                                         Builder::Mutable));
-
-    Index k = 0, t = 1, s = 2;
+        builder.makeConst(int32_t(2 * totalTableStrings))));
+    initBody.push_back(builder.makeLoop(
+      label, builder.makeBlock({setStart, scan, setEnd, incP(), next})));
     auto* init = builder.makeIf(
-      builder.makeRefIsNull(builder.makeGlobalGet(tableName, tableGlobalType)),
-      builder.makeBlock(
-        {builder.makeGlobalSet(
-           tableName,
-           builder.makeLocalTee(
-             t,
-             builder.makeArrayNew(
-               tableType, builder.makeConst(int32_t(2 * contents.size()))),
-             tableRef)),
-         builder.makeCall(fillFuncName,
-                          {builder.makeLocalGet(t, tableRef),
-                           builder.makeConst(int32_t(layout.stringsOffset))},
-                          Type::none)}));
-    auto readTable = [&](bool end) {
-      Expression* index = builder.makeBinary(
-        ShlInt32, builder.makeLocalGet(k, i32), builder.makeConst(1));
-      if (end) {
-        index = builder.makeBinary(OrInt32, index, builder.makeConst(1));
-      }
+      builder.makeRefIsNull(
+        builder.makeGlobalGet(tableGlobalName, tableGlobalType)),
+      builder.makeBlock(initBody));
+    auto readTable = [&](Expression* index) {
       return builder.makeArrayGet(
-        builder.makeGlobalGet(tableName, tableGlobalType),
+        builder.makeGlobalGet(tableGlobalName, tableGlobalType),
         index,
         MemoryOrder::Unordered,
         i32,
         false);
     };
+    auto* startIdx = builder.makeLocalTee(
+      i, builder.makeBinary(ShlInt32, get(k), builder.makeConst(1)), i32);
+    auto* endIdx = builder.makeBinary(OrInt32, get(i), builder.makeConst(1));
     auto* make = builder.makeCall(
       fromCharCodeArray,
-      {getData(arrayParamNonNullable), readTable(false), readTable(true)},
+      {getData(arrayParamNonNullable), readTable(startIdx), readTable(endIdx)},
       refExtern);
-    std::vector<Type> vars = {tableRef};
-    Expression* body;
-    if (cached) {
-      auto cacheElementType = Type(HeapType::ext, Nullable);
-      HeapType cacheType(Array(Field(cacheElementType, Mutable)));
-      auto cacheGlobalType = Type(cacheType, NonNullable);
-      auto cacheName = Names::getValidGlobalName(*module, baseName + "$cache");
-      module->addGlobal(builder.makeGlobal(
-        cacheName,
-        cacheGlobalType,
-        builder.makeArrayNew(cacheType,
-                             builder.makeConst(int32_t(contents.size()))),
-        Builder::Immutable));
-      vars.push_back(refExtern);
-      Name label("cached");
-      auto* cacheGet =
-        builder.makeArrayGet(builder.makeGlobalGet(cacheName, cacheGlobalType),
-                             builder.makeLocalGet(k, i32),
-                             MemoryOrder::Unordered,
-                             cacheElementType);
-      auto* brOn = builder.makeBrOn(BrOnNonNull, label, cacheGet);
-      auto* cacheSet =
-        builder.makeArraySet(builder.makeGlobalGet(cacheName, cacheGlobalType),
-                             builder.makeLocalGet(k, i32),
-                             builder.makeLocalTee(s, make, refExtern),
-                             MemoryOrder::Unordered);
-      body = builder.makeBlock(
-        label,
-        {brOn, init, cacheSet, builder.makeLocalGet(s, refExtern)},
-        refExtern);
+    return {init, make};
+  }
+
+  void makeGetFunc(Index totalTableStrings) {
+    Builder builder(*module);
+    Type tableRef(tableType, NonNullable);
+    Type i16Ref(i16ArrayType, NonNullable);
+    auto [init, make] = makeTableLookup(totalTableStrings);
+    module->addFunction(
+      builder.makeFunction(getFuncName,
+                           Signature(Type::i32, refExtern),
+                           {Type::i32, Type::i32, i16Ref, tableRef},
+                           builder.makeBlock({init, make}, refExtern)));
+  }
+
+  Name makeRawHelper(Index count,
+                     Index base,
+                     bool needSharedGet,
+                     Index totalTableStrings) {
+    Builder builder(*module);
+    auto i32 = Type::i32;
+    std::string baseName =
+      std::string("string.consts$raw$") + std::to_string(numHelpers++);
+    auto cacheElementType = Type(HeapType::ext, Nullable);
+    HeapType cacheType(Array(Field(cacheElementType, Mutable)));
+    auto cacheGlobalType = Type(cacheType, NonNullable);
+    auto cacheName = Names::getValidGlobalName(*module, baseName + "$cache");
+    module->addGlobal(builder.makeGlobal(
+      cacheName,
+      cacheGlobalType,
+      builder.makeArrayNew(cacheType, builder.makeConst(int32_t(count))),
+      Builder::Immutable));
+    Index k = 0;
+    Name label("cached");
+    auto* cacheGet =
+      builder.makeArrayGet(builder.makeGlobalGet(cacheName, cacheGlobalType),
+                           builder.makeLocalGet(k, i32),
+                           MemoryOrder::Unordered,
+                           cacheElementType);
+    auto* brOn = builder.makeBrOn(BrOnNonNull, label, cacheGet);
+    std::vector<Type> vars;
+    std::vector<Expression*> blockList = {brOn};
+    Index sLocal;
+    Expression* make;
+    if (needSharedGet) {
+      sLocal = 1;
+      vars = {refExtern};
+      Expression* idx = builder.makeLocalGet(k, i32);
+      if (base != 0) {
+        idx = builder.makeBinary(AddInt32, idx, builder.makeConst(int32_t(base)));
+      }
+      make = builder.makeCall(getFuncName, {idx}, refExtern);
     } else {
-      body = builder.makeBlock({init, make}, refExtern);
+      assert(base == 0);
+      Type tableRef(tableType, NonNullable);
+      Type i16Ref(i16ArrayType, NonNullable);
+      sLocal = 5;
+      vars = {i32, i32, i16Ref, tableRef, refExtern};
+      auto [init, lookup] = makeTableLookup(totalTableStrings);
+      blockList.push_back(init);
+      make = lookup;
     }
+    auto* cacheSet =
+      builder.makeArraySet(builder.makeGlobalGet(cacheName, cacheGlobalType),
+                           builder.makeLocalGet(k, i32),
+                           builder.makeLocalTee(sLocal, make, refExtern),
+                           MemoryOrder::Unordered);
+    blockList.push_back(cacheSet);
+    blockList.push_back(builder.makeLocalGet(sLocal, refExtern));
+    auto* body = builder.makeBlock(label, blockList, refExtern);
     auto helperName = Names::getValidFunctionName(*module, baseName);
     module->addFunction(builder.makeFunction(
       helperName, Signature(i32, refExtern), std::move(vars), body));
