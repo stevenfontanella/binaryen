@@ -456,3 +456,259 @@
     (global.get $s1)
   )
 )
+
+;; Numeric i32 columns of sufficient size are narrowed into a passive data
+;; segment (lazily loaded on first cache miss), and repeated non-externref
+;; reference columns use a deduplicated palette global indexed by a u8 data
+;; column.
+(module
+  ;; CHECK:      (type $vt (struct (field i32)))
+  (type $vt (struct (field i32)))
+  ;; CHECK:      (type $enum (struct (field (ref $vt)) (field (mut i32)) (field i32) (field i32)))
+  (type $enum (struct (field (ref $vt)) (field (mut i32)) (field i32) (field i32)))
+
+  ;; CHECK:      (type $2 (array (mut i8)))
+
+  ;; CHECK:      (type $3 (array (mut (ref null $enum))))
+
+  ;; CHECK:      (type $4 (array (ref $vt)))
+
+  ;; CHECK:      (type $5 (array (mut i16)))
+
+  ;; CHECK:      (type $6 (func (result (ref $enum))))
+
+  ;; CHECK:      (type $7 (func (param i32) (result (ref $enum))))
+
+  ;; CHECK:      (global $vt0 (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 1)
+  ;; CHECK-NEXT: ))
+  (global $vt0 (ref $vt) (struct.new $vt (i32.const 1)))
+  ;; CHECK:      (global $vt1 (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 2)
+  ;; CHECK-NEXT: ))
+  (global $vt1 (ref $vt) (struct.new $vt (i32.const 2)))
+
+  (global $e0 (ref $enum) (struct.new $enum (global.get $vt0) (i32.const 0) (i32.const 10) (i32.const 300)))
+  (global $e1 (ref $enum) (struct.new $enum (global.get $vt1) (i32.const 0) (i32.const 12) (i32.const -300)))
+  (global $e2 (ref $enum) (struct.new $enum (global.get $vt0) (i32.const 0) (i32.const 14) (i32.const 300)))
+  (global $e3 (ref $enum) (struct.new $enum (global.get $vt1) (i32.const 0) (i32.const 16) (i32.const -300)))
+  (global $e4 (ref $enum) (struct.new $enum (global.get $vt0) (i32.const 0) (i32.const 18) (i32.const 300)))
+  (global $e5 (ref $enum) (struct.new $enum (global.get $vt1) (i32.const 0) (i32.const 20) (i32.const -300)))
+  (global $e6 (ref $enum) (struct.new $enum (global.get $vt0) (i32.const 0) (i32.const 22) (i32.const 300)))
+  (global $e7 (ref $enum) (struct.new $enum (global.get $vt1) (i32.const 0) (i32.const 24) (i32.const -300)))
+  (global $e8 (ref $enum) (struct.new $enum (global.get $vt0) (i32.const 0) (i32.const 26) (i32.const 300)))
+  (global $e9 (ref $enum) (struct.new $enum (global.get $vt1) (i32.const 0) (i32.const 28) (i32.const -300)))
+  (global $e10 (ref $enum) (struct.new $enum (global.get $vt0) (i32.const 0) (i32.const 10) (i32.const 300)))
+  (global $e11 (ref $enum) (struct.new $enum (global.get $vt1) (i32.const 0) (i32.const 12) (i32.const -300)))
+  (global $e12 (ref $enum) (struct.new $enum (global.get $vt0) (i32.const 0) (i32.const 14) (i32.const 300)))
+  (global $e13 (ref $enum) (struct.new $enum (global.get $vt1) (i32.const 0) (i32.const 16) (i32.const -300)))
+  (global $e14 (ref $enum) (struct.new $enum (global.get $vt0) (i32.const 0) (i32.const 18) (i32.const 300)))
+  (global $e15 (ref $enum) (struct.new $enum (global.get $vt1) (i32.const 0) (i32.const 20) (i32.const -300)))
+  (global $e16 (ref $enum) (struct.new $enum (global.get $vt0) (i32.const 0) (i32.const 22) (i32.const 300)))
+  (global $e17 (ref $enum) (struct.new $enum (global.get $vt1) (i32.const 0) (i32.const 24) (i32.const -300)))
+  (global $e18 (ref $enum) (struct.new $enum (global.get $vt0) (i32.const 0) (i32.const 26) (i32.const 300)))
+  (global $e19 (ref $enum) (struct.new $enum (global.get $vt1) (i32.const 0) (i32.const 28) (i32.const -300)))
+
+  ;; CHECK:      (global $defer$enum$cache (ref $3) (array.new_default $3
+  ;; CHECK-NEXT:  (i32.const 20)
+  ;; CHECK-NEXT: ))
+
+  ;; CHECK:      (global $defer$enum$palette$0 (ref $4) (array.new_fixed $4 2
+  ;; CHECK-NEXT:  (global.get $vt0)
+  ;; CHECK-NEXT:  (global.get $vt1)
+  ;; CHECK-NEXT: ))
+
+  ;; CHECK:      (global $defer$enum$table$0 (mut (ref null $2)) (ref.null none))
+
+  ;; CHECK:      (global $defer$enum$table$2 (mut (ref null $2)) (ref.null none))
+
+  ;; CHECK:      (global $defer$enum$table$3 (mut (ref null $5)) (ref.null none))
+
+  ;; CHECK:      (data $defer$data "\00\01\00\01\00\01\00\01\00\01\00\01\00\01\00\01\00\01\00\01\n\0c\0e\10\12\14\16\18\1a\1c\n\0c\0e\10\12\14\16\18\1a\1c,\01\d4\fe,\01\d4\fe,\01\d4\fe,\01\d4\fe,\01\d4\fe,\01\d4\fe,\01\d4\fe,\01\d4\fe,\01\d4\fe,\01\d4\fe")
+
+  ;; CHECK:      (export "use" (func $use))
+
+  ;; CHECK:      (func $use (type $6) (result (ref $enum))
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$enum
+  ;; CHECK-NEXT:    (i32.const 0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$enum
+  ;; CHECK-NEXT:    (i32.const 1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$enum
+  ;; CHECK-NEXT:    (i32.const 2)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$enum
+  ;; CHECK-NEXT:    (i32.const 3)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$enum
+  ;; CHECK-NEXT:    (i32.const 4)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$enum
+  ;; CHECK-NEXT:    (i32.const 5)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$enum
+  ;; CHECK-NEXT:    (i32.const 6)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$enum
+  ;; CHECK-NEXT:    (i32.const 7)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$enum
+  ;; CHECK-NEXT:    (i32.const 8)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$enum
+  ;; CHECK-NEXT:    (i32.const 9)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$enum
+  ;; CHECK-NEXT:    (i32.const 10)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$enum
+  ;; CHECK-NEXT:    (i32.const 11)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$enum
+  ;; CHECK-NEXT:    (i32.const 12)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$enum
+  ;; CHECK-NEXT:    (i32.const 13)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$enum
+  ;; CHECK-NEXT:    (i32.const 14)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$enum
+  ;; CHECK-NEXT:    (i32.const 15)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$enum
+  ;; CHECK-NEXT:    (i32.const 16)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$enum
+  ;; CHECK-NEXT:    (i32.const 17)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$enum
+  ;; CHECK-NEXT:    (i32.const 18)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (call $defer$enum
+  ;; CHECK-NEXT:   (i32.const 19)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $use (export "use") (result (ref $enum))
+    (drop (global.get $e0))
+    (drop (global.get $e1))
+    (drop (global.get $e2))
+    (drop (global.get $e3))
+    (drop (global.get $e4))
+    (drop (global.get $e5))
+    (drop (global.get $e6))
+    (drop (global.get $e7))
+    (drop (global.get $e8))
+    (drop (global.get $e9))
+    (drop (global.get $e10))
+    (drop (global.get $e11))
+    (drop (global.get $e12))
+    (drop (global.get $e13))
+    (drop (global.get $e14))
+    (drop (global.get $e15))
+    (drop (global.get $e16))
+    (drop (global.get $e17))
+    (drop (global.get $e18))
+    (global.get $e19)
+  )
+)
+;; CHECK:      (func $defer$enum (type $7) (param $0 i32) (result (ref $enum))
+;; CHECK-NEXT:  (local $1 (ref $enum))
+;; CHECK-NEXT:  (block $cached (result (ref $enum))
+;; CHECK-NEXT:   (br_on_non_null $cached
+;; CHECK-NEXT:    (array.get $3
+;; CHECK-NEXT:     (global.get $defer$enum$cache)
+;; CHECK-NEXT:     (local.get $0)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (if
+;; CHECK-NEXT:    (ref.is_null
+;; CHECK-NEXT:     (global.get $defer$enum$table$0)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:    (then
+;; CHECK-NEXT:     (global.set $defer$enum$table$0
+;; CHECK-NEXT:      (array.new_data $2 $defer$data
+;; CHECK-NEXT:       (i32.const 0)
+;; CHECK-NEXT:       (i32.const 20)
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:     (global.set $defer$enum$table$2
+;; CHECK-NEXT:      (array.new_data $2 $defer$data
+;; CHECK-NEXT:       (i32.const 20)
+;; CHECK-NEXT:       (i32.const 20)
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:     (global.set $defer$enum$table$3
+;; CHECK-NEXT:      (array.new_data $5 $defer$data
+;; CHECK-NEXT:       (i32.const 40)
+;; CHECK-NEXT:       (i32.const 20)
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (array.set $3
+;; CHECK-NEXT:    (global.get $defer$enum$cache)
+;; CHECK-NEXT:    (local.get $0)
+;; CHECK-NEXT:    (local.tee $1
+;; CHECK-NEXT:     (struct.new $enum
+;; CHECK-NEXT:      (array.get $4
+;; CHECK-NEXT:       (global.get $defer$enum$palette$0)
+;; CHECK-NEXT:       (array.get_u $2
+;; CHECK-NEXT:        (global.get $defer$enum$table$0)
+;; CHECK-NEXT:        (local.get $0)
+;; CHECK-NEXT:       )
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:      (i32.const 0)
+;; CHECK-NEXT:      (array.get_u $2
+;; CHECK-NEXT:       (global.get $defer$enum$table$2)
+;; CHECK-NEXT:       (local.get $0)
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:      (array.get_s $5
+;; CHECK-NEXT:       (global.get $defer$enum$table$3)
+;; CHECK-NEXT:       (local.get $0)
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (local.get $1)
+;; CHECK-NEXT:  )
+;; CHECK-NEXT: )

@@ -65,6 +65,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <limits>
 #include <string>
 #include <tuple>
 
@@ -138,12 +139,15 @@ struct DeferGlobalAllocations : public Pass {
   bool always = false;
   Index importBonus = 0;
   Index numFactories = 0;
+  Name segmentName;
+  std::vector<char> segmentData;
 
   void run(Module* module_) override {
     module = module_;
     if (!module->features.hasGC()) {
       return;
     }
+    segmentName = Names::getValidDataSegmentName(*module, "defer$data");
     includeAllocationOperands =
       !getArgumentOrDefault("defer-global-allocations-allocation-operands", "")
          .empty();
@@ -360,6 +364,10 @@ struct DeferGlobalAllocations : public Pass {
     for (auto& [name, _] : deferrals) {
       module->removeGlobal(name);
     }
+    if (!segmentData.empty()) {
+      module->addDataSegment(Builder::makeDataSegment(
+        segmentName, Name(), nullptr, segmentData.data(), segmentData.size()));
+    }
   }
 
 private:
@@ -503,6 +511,74 @@ private:
   }
 
   Index getSLEBSize(Index value) { return getLEBSize(S32LEB(int32_t(value))); }
+
+  static void appendLE(std::vector<char>& data, uint32_t value, Index width) {
+    for (Index i = 0; i < width; i++) {
+      data.push_back(char(uint8_t(value >> (8 * i))));
+    }
+  }
+
+  static bool sameRefLeaf(Expression* a, Expression* b) {
+    if (a->is<RefNull>() && b->is<RefNull>()) {
+      return true;
+    }
+    if (auto* ga = a->dynCast<GlobalGet>()) {
+      if (auto* gb = b->dynCast<GlobalGet>()) {
+        return ga->name == gb->name;
+      }
+      return false;
+    }
+    if (auto* fa = a->dynCast<RefFunc>()) {
+      if (auto* fb = b->dynCast<RefFunc>()) {
+        return fa->func == fb->func;
+      }
+      return false;
+    }
+    return ExpressionAnalyzer::equal(a, b);
+  }
+
+  static bool isPaletteCandidate(const Field& field) {
+    return field.type.isRef() &&
+           field.type.getHeapType().getBottom() != HeapType::noext;
+  }
+
+  static int64_t getPackedOrI32Value(const Field& field, int32_t raw) {
+    if (field.isPacked()) {
+      if (field.packedType == Field::i8) {
+        return int64_t(int8_t(uint8_t(raw)));
+      }
+      return int64_t(int16_t(uint16_t(raw)));
+    }
+    return int64_t(raw);
+  }
+
+  static void classifyI32Range(int64_t minVal,
+                               int64_t maxVal,
+                               Index& width,
+                               bool& signed_,
+                               HeapType& arrType) {
+    if (minVal >= 0 && maxVal <= 255) {
+      width = 1;
+      signed_ = false;
+      arrType = HeapTypes::getMutI8Array();
+    } else if (minVal >= -128 && maxVal <= 127) {
+      width = 1;
+      signed_ = true;
+      arrType = HeapTypes::getMutI8Array();
+    } else if (minVal >= 0 && maxVal <= 65535) {
+      width = 2;
+      signed_ = false;
+      arrType = HeapTypes::getMutI16Array();
+    } else if (minVal >= -32768 && maxVal <= 32767) {
+      width = 2;
+      signed_ = true;
+      arrType = HeapTypes::getMutI16Array();
+    } else {
+      width = 4;
+      signed_ = false;
+      arrType = HeapType(Array(Field(Type::i32, Mutable)));
+    }
+  }
 
   void processGroup(Group& group,
                     std::unordered_map<Name, Deferral>& deferrals) {
@@ -653,13 +729,204 @@ private:
     struct Column {
       Name global;
       Type globalType;
+      bool signed_ = false;
+      bool addIndex = false;
+      Index baseColumn = Index(-1);
+      Name paletteGlobal;
+      Type paletteGlobalType;
+    };
+    struct DataColumnInit {
+      Name global;
+      HeapType arrType;
+      Index offset;
+      Index count;
     };
     std::unordered_map<Index, Column> columns;
+    std::vector<DataColumnInit> dataInits;
+    std::vector<Index> prevI32Cols;
+    Index N = members.size();
+    bool canUseData = module->features.hasBulkMemory();
     for (auto i : varying) {
       auto& field = leafFields[i];
       HeapType tableType(Array(Field(field.type, Immutable)));
       if (field.isPacked()) {
         tableType = HeapType(Array(Field(field.packedType, Immutable)));
+      }
+      if (canUseData && N >= 10 && field.type == Type::i32 &&
+          std::all_of(members.begin(), members.end(), [&](Candidate* m) {
+            return m->leaves[i]->is<Const>();
+          })) {
+        auto evalResiduals = [&](auto getVal,
+                                 Index& w,
+                                 bool& s,
+                                 HeapType& ht,
+                                 Index& numDistinct) {
+          int64_t mn = std::numeric_limits<int64_t>::max();
+          int64_t mx = std::numeric_limits<int64_t>::min();
+          std::unordered_set<int32_t> dist;
+          for (Index k = 0; k < N; k++) {
+            int64_t v = getVal(k);
+            mn = std::min(mn, v);
+            mx = std::max(mx, v);
+            dist.insert(int32_t(v));
+          }
+          classifyI32Range(mn, mx, w, s, ht);
+          numDistinct = dist.size();
+        };
+        Index width = 4, bestDistinct = N;
+        bool signed_ = false;
+        HeapType arrType;
+        evalResiduals(
+          [&](Index k) {
+            int32_t raw = members[k]->leaves[i]->cast<Const>()->value.geti32();
+            return getPackedOrI32Value(field, raw);
+          },
+          width,
+          signed_,
+          arrType,
+          bestDistinct);
+        bool addIndex = false;
+        Index baseColumn = Index(-1);
+        if (!field.isPacked()) {
+          Index plainDistinct = bestDistinct;
+          Index wIdx = 4, dIdx = N;
+          bool sIdx = false;
+          HeapType htIdx;
+          evalResiduals(
+            [&](Index k) {
+              int32_t raw =
+                members[k]->leaves[i]->cast<Const>()->value.geti32();
+              return int64_t(int32_t(uint32_t(raw) - uint32_t(k)));
+            },
+            wIdx,
+            sIdx,
+            htIdx,
+            dIdx);
+          if (wIdx < width ||
+              (wIdx == width && dIdx * 2 <= plainDistinct &&
+               plainDistinct - dIdx >= 8)) {
+            width = wIdx;
+            signed_ = sIdx;
+            arrType = htIdx;
+            bestDistinct = dIdx;
+            addIndex = true;
+          }
+          for (Index prev : prevI32Cols) {
+            Index wCol = 4, dCol = N;
+            bool sCol = false;
+            HeapType htCol;
+            evalResiduals(
+              [&](Index k) {
+                int32_t raw =
+                  members[k]->leaves[i]->cast<Const>()->value.geti32();
+                int32_t baseRaw =
+                  members[k]->leaves[prev]->cast<Const>()->value.geti32();
+                return int64_t(int32_t(uint32_t(raw) - uint32_t(baseRaw)));
+              },
+              wCol,
+              sCol,
+              htCol,
+              dCol);
+            if (wCol < width ||
+                (wCol == width && dCol < bestDistinct &&
+                 dCol * 2 <= plainDistinct && plainDistinct - dCol >= 8)) {
+              width = wCol;
+              signed_ = sCol;
+              arrType = htCol;
+              bestDistinct = dCol;
+              addIndex = false;
+              baseColumn = prev;
+            }
+          }
+          prevI32Cols.push_back(i);
+        }
+        Index offset = segmentData.size();
+        for (Index k = 0; k < N; k++) {
+          uint32_t raw =
+            uint32_t(members[k]->leaves[i]->cast<Const>()->value.geti32());
+          if (addIndex) {
+            raw -= uint32_t(k);
+          } else if (baseColumn != Index(-1)) {
+            uint32_t baseRaw = uint32_t(
+              members[k]->leaves[baseColumn]->cast<Const>()->value.geti32());
+            raw -= baseRaw;
+          }
+          appendLE(segmentData, raw, width);
+        }
+        auto tableName = Names::getValidGlobalName(
+          *module, baseName + "$table$" + std::to_string(i));
+        auto tableGlobalType = Type(arrType, Nullable);
+        module->addGlobal(builder.makeGlobal(tableName,
+                                             tableGlobalType,
+                                             builder.makeRefNull(arrType),
+                                             Builder::Mutable));
+        dataInits.push_back({tableName, arrType, offset, N});
+        columns[i] = {tableName,
+                      tableGlobalType,
+                      signed_,
+                      addIndex,
+                      baseColumn,
+                      Name(),
+                      Type::none};
+        continue;
+      }
+      if (canUseData && isPaletteCandidate(field)) {
+        std::vector<Expression*> distinct;
+        std::vector<uint8_t> indices;
+        indices.reserve(N);
+        bool ok = true;
+        for (auto* member : members) {
+          auto* leaf = member->leaves[i];
+          Index idx = 0;
+          while (idx < distinct.size() && !sameRefLeaf(distinct[idx], leaf)) {
+            idx++;
+          }
+          if (idx == distinct.size()) {
+            if (distinct.size() == 256) {
+              ok = false;
+              break;
+            }
+            distinct.push_back(leaf);
+          }
+          indices.push_back(uint8_t(idx));
+        }
+        Index D = distinct.size();
+        if (ok && 9 + 3 * D + N + 25 < 9 + 3 * N) {
+          std::vector<Expression*> palValues;
+          palValues.reserve(D);
+          for (auto* expr : distinct) {
+            palValues.push_back(ExpressionManipulator::copy(expr, *module));
+          }
+          auto palName = Names::getValidGlobalName(
+            *module, baseName + "$palette$" + std::to_string(i));
+          auto palGlobalType = Type(tableType, NonNullable);
+          module->addGlobal(
+            builder.makeGlobal(palName,
+                               palGlobalType,
+                               builder.makeArrayNewFixed(tableType, palValues),
+                               Builder::Immutable));
+          Index offset = segmentData.size();
+          for (uint8_t idx : indices) {
+            segmentData.push_back(char(idx));
+          }
+          auto idxArrType = HeapTypes::getMutI8Array();
+          auto tableName = Names::getValidGlobalName(
+            *module, baseName + "$table$" + std::to_string(i));
+          auto tableGlobalType = Type(idxArrType, Nullable);
+          module->addGlobal(builder.makeGlobal(tableName,
+                                               tableGlobalType,
+                                               builder.makeRefNull(idxArrType),
+                                               Builder::Mutable));
+          dataInits.push_back({tableName, idxArrType, offset, N});
+          columns[i] = {tableName,
+                        tableGlobalType,
+                        false,
+                        false,
+                        Index(-1),
+                        palName,
+                        palGlobalType};
+          continue;
+        }
       }
       std::vector<Expression*> values;
       for (auto* member : members) {
@@ -674,7 +941,13 @@ private:
                            tableGlobalType,
                            builder.makeArrayNewFixed(tableType, values),
                            Builder::Immutable));
-      columns[i] = {tableName, tableGlobalType};
+      columns[i] = {tableName,
+                    tableGlobalType,
+                    false,
+                    false,
+                    Index(-1),
+                    Name(),
+                    Type::none};
     }
 
     // The factory.
@@ -690,6 +963,36 @@ private:
 
     // Rebuild the (nested) allocation from the first member, reading the
     // varying leaves from the tables.
+    std::function<Expression*(Index)> readColumn = [&](Index i) -> Expression* {
+      auto& col = columns.at(i);
+      if (col.paletteGlobal.is()) {
+        auto* idx = builder.makeArrayGet(
+          builder.makeGlobalGet(col.global, col.globalType),
+          builder.makeLocalGet(indexLocal, Type::i32),
+          MemoryOrder::Unordered,
+          Type::i32,
+          false);
+        return builder.makeArrayGet(
+          builder.makeGlobalGet(col.paletteGlobal, col.paletteGlobalType),
+          idx,
+          MemoryOrder::Unordered,
+          leafFields[i].type,
+          false);
+      }
+      Expression* val = builder.makeArrayGet(
+        builder.makeGlobalGet(col.global, col.globalType),
+        builder.makeLocalGet(indexLocal, Type::i32),
+        MemoryOrder::Unordered,
+        leafFields[i].type,
+        col.signed_);
+      if (col.addIndex) {
+        val = builder.makeBinary(
+          AddInt32, val, builder.makeLocalGet(indexLocal, Type::i32));
+      } else if (col.baseColumn != Index(-1)) {
+        val = builder.makeBinary(AddInt32, val, readColumn(col.baseColumn));
+      }
+      return val;
+    };
     Index leaf = 0;
     std::function<Expression*(StructNew*)> rebuild =
       [&](StructNew* templ) -> Expression* {
@@ -700,14 +1003,8 @@ private:
           continue;
         }
         Index i = leaf++;
-        if (auto iter = columns.find(i); iter != columns.end()) {
-          auto& col = iter->second;
-          operands.push_back(builder.makeArrayGet(
-            builder.makeGlobalGet(col.global, col.globalType),
-            builder.makeLocalGet(indexLocal, Type::i32),
-            MemoryOrder::Unordered,
-            leafFields[i].type,
-            false));
+        if (columns.count(i)) {
+          operands.push_back(readColumn(i));
         } else {
           operands.push_back(ExpressionManipulator::copy(operand, *module));
         }
@@ -722,10 +1019,27 @@ private:
                            builder.makeLocalGet(indexLocal, Type::i32),
                            tee,
                            MemoryOrder::Unordered);
-    auto* body = builder.makeBlock(
-      label,
-      {brOn, cacheSet, builder.makeLocalGet(objectLocal, resultType)},
-      resultType);
+    std::vector<Expression*> blockList = {brOn};
+    if (!dataInits.empty()) {
+      std::vector<Expression*> setStmts;
+      for (auto& dc : dataInits) {
+        setStmts.push_back(builder.makeGlobalSet(
+          dc.global,
+          builder.makeArrayNewData(dc.arrType,
+                                   segmentName,
+                                   builder.makeConst(int32_t(dc.offset)),
+                                   builder.makeConst(int32_t(dc.count)))));
+      }
+      Expression* initBody =
+        setStmts.size() == 1 ? setStmts[0] : builder.makeBlock(setStmts);
+      blockList.push_back(builder.makeIf(
+        builder.makeRefIsNull(builder.makeGlobalGet(
+          dataInits[0].global, Type(dataInits[0].arrType, Nullable))),
+        initBody));
+    }
+    blockList.push_back(cacheSet);
+    blockList.push_back(builder.makeLocalGet(objectLocal, resultType));
+    auto* body = builder.makeBlock(label, blockList, resultType);
     auto factoryName = Names::getValidFunctionName(*module, baseName);
     module->addFunction(builder.makeFunction(
       factoryName, Signature(Type::i32, resultType), {resultType}, body));
