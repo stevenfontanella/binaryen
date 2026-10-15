@@ -1988,3 +1988,182 @@
     (call $f (local.get $x))
   )
 )
+
+;; Contiguous statement slices inside larger blocks: outline a repeated
+;; 2-statement slice in the middle of different blocks, and unwrap a trailing
+;; local.set so the helper returns the value directly while the local.set stays
+;; at each call site.
+(module
+  ;; CHECK:      (type $A (struct (field i32)))
+  ;; SHRINK:      (type $A (struct (field i32)))
+  (type $A (struct (field i32)))
+
+  ;; CHECK:      (type $1 (func (param (ref null $A) i32)))
+
+  ;; CHECK:      (type $2 (func (param (ref null $A))))
+
+  ;; CHECK:      (type $3 (func (param i32) (result i32)))
+
+  ;; CHECK:      (type $4 (func (param i32)))
+
+  ;; CHECK:      (type $5 (func (param i32 (ref null $A))))
+
+  ;; CHECK:      (type $6 (func (param (ref null $A) i32) (result i32)))
+
+  ;; CHECK:      (func $f (type $2) (param $0 (ref null $A))
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (type $1 (func (param (ref null $A) i32)))
+
+  ;; SHRINK:      (type $2 (func (param (ref null $A))))
+
+  ;; SHRINK:      (type $3 (func (param i32) (result i32)))
+
+  ;; SHRINK:      (type $4 (func (param i32)))
+
+  ;; SHRINK:      (type $5 (func (param i32 (ref null $A))))
+
+  ;; SHRINK:      (type $6 (func (param (ref null $A) i32) (result i32)))
+
+  ;; SHRINK:      (func $f (type $2) (param $0 (ref null $A))
+  ;; SHRINK-NEXT: )
+  (func $f (param (ref null $A)))
+  ;; CHECK:      (func $g (type $3) (param $0 i32) (result i32)
+  ;; CHECK-NEXT:  (local.get $0)
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $g (type $3) (param $0 i32) (result i32)
+  ;; SHRINK-NEXT:  (local.get $0)
+  ;; SHRINK-NEXT: )
+  (func $g (param i32) (result i32)
+    (local.get 0)
+  )
+  ;; CHECK:      (func $h (type $4) (param $0 i32)
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $h (type $4) (param $0 i32)
+  ;; SHRINK-NEXT: )
+  (func $h (param i32))
+
+  ;; CHECK:      (func $slice-1 (type $1) (param $x (ref null $A)) (param $i i32)
+  ;; CHECK-NEXT:  (local $r i32)
+  ;; CHECK-NEXT:  (call $h
+  ;; CHECK-NEXT:   (i32.const 10)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $r
+  ;; CHECK-NEXT:   (call $outlined
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (local.get $i)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (call $h
+  ;; CHECK-NEXT:   (local.get $r)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $slice-1 (type $1) (param $x (ref null $A)) (param $i i32)
+  ;; SHRINK-NEXT:  (local $r i32)
+  ;; SHRINK-NEXT:  (call $h
+  ;; SHRINK-NEXT:   (i32.const 10)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (local.set $r
+  ;; SHRINK-NEXT:   (call $outlined
+  ;; SHRINK-NEXT:    (local.get $x)
+  ;; SHRINK-NEXT:    (local.get $i)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (call $h
+  ;; SHRINK-NEXT:   (local.get $r)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $slice-1 (param $x (ref null $A)) (param $i i32) (local $r i32)
+    (call $h (i32.const 10))
+    (call $f (local.get $x))
+    (local.set $r (call $g (i32.add (local.get $i) (i32.const 1000000))))
+    (call $h (local.get $r))
+  )
+
+  ;; CHECK:      (func $slice-2 (type $1) (param $x (ref null $A)) (param $i i32)
+  ;; CHECK-NEXT:  (local $s i32)
+  ;; CHECK-NEXT:  (call $h
+  ;; CHECK-NEXT:   (i32.const 20)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $s
+  ;; CHECK-NEXT:   (call $outlined
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (local.get $i)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (call $h
+  ;; CHECK-NEXT:   (i32.const 30)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $slice-2 (type $1) (param $x (ref null $A)) (param $i i32)
+  ;; SHRINK-NEXT:  (local $s i32)
+  ;; SHRINK-NEXT:  (call $h
+  ;; SHRINK-NEXT:   (i32.const 20)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (local.set $s
+  ;; SHRINK-NEXT:   (call $outlined
+  ;; SHRINK-NEXT:    (local.get $x)
+  ;; SHRINK-NEXT:    (local.get $i)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (call $h
+  ;; SHRINK-NEXT:   (i32.const 30)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $slice-2 (param $x (ref null $A)) (param $i i32) (local $s i32)
+    (call $h (i32.const 20))
+    (call $f (local.get $x))
+    (local.set $s (call $g (i32.add (local.get $i) (i32.const 1000000))))
+    (call $h (i32.const 30))
+  )
+
+  ;; CHECK:      (func $slice-3 (type $5) (param $i i32) (param $x (ref null $A))
+  ;; CHECK-NEXT:  (local.set $i
+  ;; CHECK-NEXT:   (call $outlined
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (local.get $i)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (call $h
+  ;; CHECK-NEXT:   (local.get $i)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $slice-3 (type $5) (param $i i32) (param $x (ref null $A))
+  ;; SHRINK-NEXT:  (local.set $i
+  ;; SHRINK-NEXT:   (call $outlined
+  ;; SHRINK-NEXT:    (local.get $x)
+  ;; SHRINK-NEXT:    (local.get $i)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (call $h
+  ;; SHRINK-NEXT:   (local.get $i)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $slice-3 (param $i i32) (param $x (ref null $A))
+    (call $f (local.get $x))
+    (local.set $i (call $g (i32.add (local.get $i) (i32.const 1000000))))
+    (call $h (local.get $i))
+  )
+)
+;; CHECK:      (func $outlined (type $6) (param $0 (ref null $A)) (param $1 i32) (result i32)
+;; CHECK-NEXT:  (call $f
+;; CHECK-NEXT:   (local.get $0)
+;; CHECK-NEXT:  )
+;; CHECK-NEXT:  (call $g
+;; CHECK-NEXT:   (i32.add
+;; CHECK-NEXT:    (local.get $1)
+;; CHECK-NEXT:    (i32.const 1000000)
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:  )
+;; CHECK-NEXT: )
+
+;; SHRINK:      (func $outlined (type $6) (param $0 (ref null $A)) (param $1 i32) (result i32)
+;; SHRINK-NEXT:  (call $f
+;; SHRINK-NEXT:   (local.get $0)
+;; SHRINK-NEXT:  )
+;; SHRINK-NEXT:  (call $g
+;; SHRINK-NEXT:   (i32.add
+;; SHRINK-NEXT:    (local.get $1)
+;; SHRINK-NEXT:    (i32.const 1000000)
+;; SHRINK-NEXT:   )
+;; SHRINK-NEXT:  )
+;; SHRINK-NEXT: )

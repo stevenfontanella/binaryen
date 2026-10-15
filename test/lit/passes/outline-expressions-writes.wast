@@ -16,21 +16,21 @@
   ;; the site becomes a local.set of the helper's result.
   ;; CHECK:      (func $pad (type $0) (param $w anyref) (param $i i32) (param $j i32)
   ;; CHECK-NEXT:  (local.set $i
-  ;; CHECK-NEXT:   (call $outlined_11
+  ;; CHECK-NEXT:   (call $outlined_12
   ;; CHECK-NEXT:    (local.get $i)
   ;; CHECK-NEXT:    (i32.const 3)
   ;; CHECK-NEXT:    (local.get $w)
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT:  (local.set $j
-  ;; CHECK-NEXT:   (call $outlined_11
+  ;; CHECK-NEXT:   (call $outlined_12
   ;; CHECK-NEXT:    (local.get $j)
   ;; CHECK-NEXT:    (i32.const 5)
   ;; CHECK-NEXT:    (local.get $w)
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT:  (local.set $i
-  ;; CHECK-NEXT:   (call $outlined_11
+  ;; CHECK-NEXT:   (call $outlined_12
   ;; CHECK-NEXT:    (local.get $i)
   ;; CHECK-NEXT:    (i32.const 7)
   ;; CHECK-NEXT:    (local.get $w)
@@ -215,13 +215,10 @@
   ;; CHECK-NEXT:     (i32.const 3)
   ;; CHECK-NEXT:    )
   ;; CHECK-NEXT:    (then
-  ;; CHECK-NEXT:     (call $f
-  ;; CHECK-NEXT:      (local.get $w)
-  ;; CHECK-NEXT:     )
   ;; CHECK-NEXT:     (local.set $i
-  ;; CHECK-NEXT:      (i32.add
+  ;; CHECK-NEXT:      (call $outlined_11
+  ;; CHECK-NEXT:       (local.get $w)
   ;; CHECK-NEXT:       (local.get $i)
-  ;; CHECK-NEXT:       (i32.const 1)
   ;; CHECK-NEXT:      )
   ;; CHECK-NEXT:     )
   ;; CHECK-NEXT:     (if
@@ -243,13 +240,10 @@
   ;; CHECK-NEXT:     (i32.const 3)
   ;; CHECK-NEXT:    )
   ;; CHECK-NEXT:    (then
-  ;; CHECK-NEXT:     (call $f
-  ;; CHECK-NEXT:      (local.get $w)
-  ;; CHECK-NEXT:     )
   ;; CHECK-NEXT:     (local.set $j
-  ;; CHECK-NEXT:      (i32.add
+  ;; CHECK-NEXT:      (call $outlined_11
+  ;; CHECK-NEXT:       (local.get $w)
   ;; CHECK-NEXT:       (local.get $j)
-  ;; CHECK-NEXT:       (i32.const 1)
   ;; CHECK-NEXT:      )
   ;; CHECK-NEXT:     )
   ;; CHECK-NEXT:     (if

@@ -90,6 +90,7 @@
 // helpers it creates hide information from passes that run later.
 //
 
+#include <algorithm>
 #include <deque>
 
 #include "ir/find_all.h"
@@ -266,10 +267,19 @@ struct KeyInfo {
   Index numVarying = 0;
 };
 
-// An expression tree in a function body that we may outline.
+// An expression tree (or contiguous block slice) in a function body that we may
+// outline.
 struct Site {
   Expression* expr;
   Function* func;
+  // If sliceLen > 0, this site is the contiguous slice
+  // expr->cast<Block>()->list[sliceOffset .. sliceOffset + sliceLen - 1]
+  // rather than expr itself.
+  Index sliceOffset = 0;
+  Index sliceLen = 0;
+  // If true, the last statement of the slice is a LocalSet whose value is
+  // returned by the helper while the LocalSet itself stays at the call site.
+  bool trailingSet = false;
   // A hash of the tree's shape, with holes abstracted away. Trees with equal
   // shapes can share a helper.
   size_t hash = 0;
@@ -278,23 +288,50 @@ struct Site {
   // The local the tree writes, if any. The tree then has type none, and the
   // helper returns the local's final value.
   std::optional<WrittenLocal> written;
-  // The nearest enclosing site, if any. Outlining that makes this site vanish.
+  // The nearest enclosing single-expression site, if any. Outlining that makes
+  // this site vanish.
   Site* parent = nullptr;
+  // Slice sites that enclose this site with no intermediate single-expression
+  // site in between.
+  SmallVector<Site*, 4> enclosingSlices;
+  // Higher-priority slice sites of the same Block that overlap this slice site.
+  SmallVector<Site*, 4> overlappingSlices;
   // The key this site belongs to.
   KeyInfo* key = nullptr;
   // Whether this site is the entire body of the function that we use as the
   // helper for its shape (either one we created earlier, or by coincidence).
   bool helperBody = false;
+  // Updated during the fixed-point decision loop.
+  bool killedByAncestor = false;
+  bool candidate = false;
+  bool replaced = false;
+  bool selectedForKey = false;
   // The holes, in evaluation order, computed when the key is prepared.
   std::vector<Hole> holes;
   // The estimated size of the constants at positions that are not fixed, which
   // the site must pass as arguments.
   Index varyingBytes = 0;
+
+  Expression* getSliceExpr(Index idx) const {
+    Expression* e = expr->cast<Block>()->list[sliceOffset + idx];
+    if (trailingSet && idx == sliceLen - 1) {
+      return e->cast<LocalSet>()->value;
+    }
+    return e;
+  }
+
+  Type getType() const {
+    if (sliceLen == 0) {
+      return expr->type;
+    }
+    return getSliceExpr(sliceLen - 1)->type;
+  }
 };
 
 // Information about a tree, computed bottom-up.
 struct NodeInfo {
   size_t hash = 0;
+  size_t setValueHash = 0;
   Index bytes = 0;
   // The distinct locals the tree reads, in order of first use.
   SmallVector<Index, 4> locals;
@@ -312,6 +349,9 @@ struct NodeInfo {
   bool interesting = false;
   // Whether the tree contains a once-function guard, see below.
   bool hasGuard = false;
+  // Whether this expression is a LocalSet whose value is movable and has no
+  // local writes or open labels.
+  bool hasCleanSetValue = false;
 };
 
 struct FunctionInfo {
@@ -372,10 +412,22 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
     if (auto* set = curr->dynCast<LocalSet>()) {
       // We compare the values of local.sets separately (see sameShape), which
       // only works if they do not branch out of themselves.
-      if (!stack.back().openLabels.empty()) {
+      auto& valInfo = stack.back();
+      if (!valInfo.openLabels.empty()) {
         node.movable = false;
       }
+      if (valInfo.movable && valInfo.openLabels.empty() &&
+          valInfo.written.empty() && set->value->type.isConcrete() &&
+          !set->value->type.isTuple()) {
+        node.hasCleanSetValue = true;
+        node.setValueHash = valInfo.hash;
+      }
       noteUnique(node.written, set->index);
+    }
+    bool recordedFullBlockSlice = false;
+    if (auto* block = curr->dynCast<Block>()) {
+      recordedFullBlockSlice =
+        scanBlockSlices(block, stack.size() - numChildren);
     }
     stack.resize(stack.size() - numChildren);
     if (auto* get = curr->dynCast<LocalGet>()) {
@@ -392,6 +444,98 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
       node.hasGuard = true;
     }
     stack.push_back(node);
+    if (!recordedFullBlockSlice) {
+      recordSite(curr, 0, 0, false, curr->type, node);
+    }
+  }
+
+  bool scanBlockSlices(Block* block, Index stackBase) {
+    bool recordedFull = false;
+    Index n = block->list.size();
+    for (Index k = 2; k <= 6; k++) {
+      if (n < k) {
+        continue;
+      }
+      for (Index i = n - k + 1; i > 0;) {
+        i--;
+        Expression* lastExpr = block->list[i + k - 1];
+        Type sliceType = lastExpr->type;
+        if (sliceType.isTuple()) {
+          continue;
+        }
+        if (i + k < n && sliceType != Type::none &&
+            sliceType != Type::unreachable) {
+          continue;
+        }
+        bool typesOk = true;
+        bool prefixWrites = false;
+        for (Index j = i; j < i + k - 1; j++) {
+          if (block->list[j]->type != Type::none) {
+            typesOk = false;
+            break;
+          }
+          if (!stack[stackBase + j].written.empty()) {
+            prefixWrites = true;
+          }
+        }
+        if (!typesOk) {
+          continue;
+        }
+        auto& lastChild = stack[stackBase + i + k - 1];
+        bool trailingSet = !prefixWrites && lastChild.hasCleanSetValue;
+        if (n == k && !trailingSet) {
+          continue;
+        }
+        if (trailingSet) {
+          sliceType = lastExpr->cast<LocalSet>()->value->type;
+        }
+        NodeInfo sliceNode;
+        sliceNode.hash = wasm::hash(0);
+        rehash(sliceNode.hash, Expression::Id(Expression::BlockId));
+        rehash(sliceNode.hash, sliceType.getID());
+        sliceNode.hasChildren = true;
+        sliceNode.trivialChildren = false;
+        for (Index j = i; j < i + k; j++) {
+          auto& child = stack[stackBase + j];
+          if (!child.movable || !child.openLabels.empty()) {
+            sliceNode.movable = false;
+            break;
+          }
+          if (trailingSet && j == i + k - 1) {
+            hash_combine(sliceNode.hash, child.setValueHash);
+            assert(child.bytes >= LocalSetBytes);
+            sliceNode.bytes += child.bytes - LocalSetBytes;
+          } else {
+            hash_combine(sliceNode.hash, child.hash);
+            sliceNode.bytes += child.bytes;
+            for (auto local : child.written) {
+              noteUnique(sliceNode.written, local);
+            }
+          }
+          for (auto local : child.locals) {
+            noteUnique(sliceNode.locals, local);
+          }
+          sliceNode.interesting = sliceNode.interesting || child.interesting;
+          sliceNode.hasGuard = sliceNode.hasGuard || child.hasGuard;
+        }
+        if (!sliceNode.movable) {
+          continue;
+        }
+        recordSite(block, i, k, trailingSet, sliceType, sliceNode);
+        if (n == k) {
+          recordedFull = true;
+        }
+      }
+    }
+    return recordedFull;
+  }
+
+  void recordSite(Expression* curr,
+                  Index sliceOffset,
+                  Index sliceLen,
+                  bool trailingSet,
+                  Type type,
+                  const NodeInfo& node) {
     if (!node.movable || !node.openLabels.empty()) {
       return;
     }
@@ -399,25 +543,25 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
     if (!node.written.empty()) {
       // We can only return the final value of a single local, and the site
       // must be able to read the local before the tree.
-      if (node.written.size() > 1 || curr->type != Type::none) {
+      if (node.written.size() > 1 || type != Type::none) {
         return;
       }
       Index index = node.written[0];
-      auto type = func->getLocalType(index);
-      if (!type.isDefaultable()) {
+      auto localType = func->getLocalType(index);
+      if (!localType.isDefaultable()) {
         return;
       }
       // A local.set itself is never worth outlining: its value is a better
       // tree (it does not need to pass and return the local).
-      if (curr->is<LocalSet>()) {
+      if (sliceLen == 0 && curr->is<LocalSet>()) {
         return;
       }
-      written = WrittenLocal{index, type};
+      written = WrittenLocal{index, localType};
     }
     // A single instruction with trivial operands, like a call with constant
     // arguments or a struct.get of a local.
-    bool single =
-      node.trivialChildren && !Properties::isControlFlowStructure(curr);
+    bool single = sliceLen == 0 && node.trivialChildren &&
+                  !Properties::isControlFlowStructure(curr);
     switch (mode) {
       case Mode::Calls:
         if (!node.interesting || node.hasGuard || single) {
@@ -447,7 +591,7 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
     }
     // A constant expression is better left for other passes to hoist (and for
     // allocations, OutlineAllocations handles them).
-    if (!node.interesting &&
+    if (sliceLen == 0 && !node.interesting &&
         Properties::isValidConstantExpression(wasm, curr)) {
       return;
     }
@@ -455,6 +599,9 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
     auto& site = info.sites.back();
     site.expr = curr;
     site.func = func;
+    site.sliceOffset = sliceOffset;
+    site.sliceLen = sliceLen;
+    site.trailingSet = trailingSet;
     site.hash = node.hash;
     site.bytes = node.bytes;
     site.written = written;
@@ -633,6 +780,18 @@ std::vector<Hole> getHoles(Module& wasm, Expression* expr, bool constHoles) {
   return std::move(finder.holes);
 }
 
+std::vector<Hole> getHoles(Module& wasm, const Site* site, bool constHoles) {
+  if (site->sliceLen == 0) {
+    return getHoles(wasm, site->expr, constHoles);
+  }
+  HoleFinder finder(wasm, constHoles);
+  for (Index i = 0; i < site->sliceLen; i++) {
+    Expression* elem = site->getSliceExpr(i);
+    finder.walk(elem);
+  }
+  return std::move(finder.holes);
+}
+
 // Information about a replacement of a site with a call to a helper.
 struct Replacement {
   Name helper;
@@ -640,6 +799,7 @@ struct Replacement {
 };
 
 using Replacements = std::unordered_map<Expression*, Replacement>;
+using SliceReplacements = std::unordered_map<Block*, std::vector<Replacement>>;
 
 struct Replacer : public WalkerPass<
                     PostWalker<Replacer, UnifiedExpressionVisitor<Replacer>>> {
@@ -648,20 +808,14 @@ struct Replacer : public WalkerPass<
   bool requiresNonNullableLocalFixups() override { return false; }
 
   std::unique_ptr<Pass> create() override {
-    return std::make_unique<Replacer>(replacements);
+    return std::make_unique<Replacer>(replacements, sliceReplacements);
   }
 
-  Replacer(const Replacements& replacements) : replacements(replacements) {}
+  Replacer(const Replacements& replacements,
+           const SliceReplacements& sliceReplacements)
+    : replacements(replacements), sliceReplacements(sliceReplacements) {}
 
-  // We do not replace a site inside another replaced site, so we can use a
-  // simple postorder walk here (the holes we pass to the helper are the
-  // original leaves, which no replacement of a child could touch).
-  void visitExpression(Expression* curr) {
-    auto iter = replacements.find(curr);
-    if (iter == replacements.end()) {
-      return;
-    }
-    auto& replacement = iter->second;
+  Expression* makeReplacementExpr(const Replacement& replacement, Type type) {
     auto* site = replacement.site;
     auto& fixed = site->key->fixed;
     Builder builder(*getModule());
@@ -672,22 +826,77 @@ struct Replacer : public WalkerPass<
       }
     }
     assert(args.size() == site->key->numLocals + site->key->numVarying);
-    if (curr->type == Type::unreachable) {
-      replaceCurrent(builder.makeSequence(
+    if (type == Type::unreachable) {
+      return builder.makeSequence(
         builder.makeCall(replacement.helper, args, Type::none),
-        builder.makeUnreachable()));
-    } else if (site->written) {
-      auto& written = *site->written;
-      replaceCurrent(builder.makeLocalSet(
-        written.index,
-        builder.makeCall(replacement.helper, args, written.type)));
-    } else {
-      replaceCurrent(builder.makeCall(replacement.helper, args, curr->type));
+        builder.makeUnreachable());
     }
+    if (site->written) {
+      auto& written = *site->written;
+      return builder.makeLocalSet(
+        written.index,
+        builder.makeCall(replacement.helper, args, written.type));
+    }
+    return builder.makeCall(replacement.helper, args, type);
+  }
+
+  // We do not replace a site inside another replaced site, so we can use a
+  // simple postorder walk here (the holes we pass to the helper are the
+  // original leaves, which no replacement of a child could touch).
+  void visitExpression(Expression* curr) {
+    if (auto* block = curr->dynCast<Block>()) {
+      if (auto sliceIter = sliceReplacements.find(block);
+          sliceIter != sliceReplacements.end()) {
+        auto sorted = sliceIter->second;
+        std::sort(sorted.begin(),
+                  sorted.end(),
+                  [](const Replacement& a, const Replacement& b) {
+                    return a.site->sliceOffset > b.site->sliceOffset;
+                  });
+        Builder builder(*getModule());
+        for (auto& replacement : sorted) {
+          auto* site = replacement.site;
+          Index offset = site->sliceOffset;
+          Index len = site->sliceLen;
+          assert(len >= 2 && offset + len <= block->list.size());
+          Type type = site->getType();
+          if (type == Type::unreachable) {
+            auto& fixed = site->key->fixed;
+            std::vector<Expression*> args;
+            for (Index i = 0; i < site->holes.size(); i++) {
+              if (!fixed[i]) {
+                args.push_back(site->holes[i].expr);
+              }
+            }
+            block->list[offset] =
+              builder.makeCall(replacement.helper, args, Type::none);
+            block->list[offset + 1] = builder.makeUnreachable();
+            block->list.erase(block->list.begin() + offset + 2,
+                              block->list.begin() + offset + len);
+          } else if (site->trailingSet) {
+            auto* set = block->list[offset + len - 1]->cast<LocalSet>();
+            set->value = makeReplacementExpr(replacement, type);
+            block->list[offset] = set;
+            block->list.erase(block->list.begin() + offset + 1,
+                              block->list.begin() + offset + len);
+          } else {
+            block->list[offset] = makeReplacementExpr(replacement, type);
+            block->list.erase(block->list.begin() + offset + 1,
+                              block->list.begin() + offset + len);
+          }
+        }
+      }
+    }
+    auto iter = replacements.find(curr);
+    if (iter == replacements.end()) {
+      return;
+    }
+    replaceCurrent(makeReplacementExpr(iter->second, curr->type));
   }
 
 private:
   const Replacements& replacements;
+  const SliceReplacements& sliceReplacements;
 };
 
 struct OutlineExpressions : public Pass {
@@ -764,7 +973,8 @@ struct OutlineExpressions : public Pass {
     // function can be the helper for its key depends on all the sites.
     for (auto& func : wasm->functions) {
       auto& info = analysis.map[func.get()];
-      if (!info.sites.empty() && info.sites.back().expr == func->body) {
+      if (!info.sites.empty() && info.sites.back().expr == func->body &&
+          info.sites.back().sliceLen == 0) {
         noteExistingHelper(func.get(), info.sites.back());
       }
     }
@@ -775,13 +985,14 @@ struct OutlineExpressions : public Pass {
     // Iterate to a fixed point (or just stop after a while, as any decision is
     // safe, just not optimal).
     for (Index i = 0; i < 10; i++) {
+      updateCandidates(analysis);
       bool changed = false;
       for (auto& info : keys) {
         bool outline = false;
         if (info.helper) {
           // The helper already exists, so any use of it is a win.
           for (auto* site : info.sites) {
-            if (isCandidate(site)) {
+            if (site->candidate) {
               outline = true;
               break;
             }
@@ -790,13 +1001,19 @@ struct OutlineExpressions : public Pass {
           // Each site shrinks to a call with the holes as arguments, and the
           // helper contains a copy of the tree plus overhead.
           prepareKey(info);
-          int64_t saved = 0;
           for (auto* site : info.sites) {
-            if (isCandidate(site)) {
-              saved += int64_t(site->bytes) - getCallBytes(site) -
-                       LocalGetBytes * int64_t(info.numLocals) -
-                       int64_t(site->varyingBytes);
+            site->selectedForKey = false;
+          }
+          int64_t saved = 0;
+          for (auto it = info.sites.rbegin(); it != info.sites.rend(); ++it) {
+            auto* site = *it;
+            if (!site->candidate || isShadowedWithinKey(site)) {
+              continue;
             }
+            site->selectedForKey = true;
+            saved += int64_t(site->bytes) - getCallBytes(site) -
+                     LocalGetBytes * int64_t(info.numLocals) -
+                     int64_t(site->varyingBytes);
           }
           auto* site = info.sites[0];
           int64_t cost = int64_t(site->bytes) - int64_t(site->varyingBytes) +
@@ -821,28 +1038,35 @@ struct OutlineExpressions : public Pass {
         break;
       }
     }
+    updateCandidates(analysis);
 
     // Create the helpers and gather the replacements.
     Replacements replacements;
+    SliceReplacements sliceReplacements;
     for (auto& info : keys) {
       if (!info.outline) {
         continue;
       }
       for (auto* site : info.sites) {
-        if (!isReplaced(site)) {
+        if (!site->replaced) {
           continue;
         }
         if (!info.helper) {
           info.helper = createHelper(site);
         }
-        replacements[site->expr] = Replacement{info.helper->name, site};
+        if (site->sliceLen == 0) {
+          replacements[site->expr] = Replacement{info.helper->name, site};
+        } else {
+          sliceReplacements[site->expr->cast<Block>()].push_back(
+            Replacement{info.helper->name, site});
+        }
       }
     }
-    if (replacements.empty()) {
+    if (replacements.empty() && sliceReplacements.empty()) {
       return false;
     }
 
-    Replacer(replacements).run(getPassRunner(), wasm);
+    Replacer(replacements, sliceReplacements).run(getPassRunner(), wasm);
     return true;
   }
 
@@ -870,26 +1094,78 @@ struct OutlineExpressions : public Pass {
             << " (expected calls, guards, trees, or all)";
   }
 
-  // Link each site to the nearest site that contains it.
+  // Link each site to the nearest single-expression site and slice sites that
+  // contain or dominate it.
   void noteParents(Expression* body, FunctionInfo& info) {
     if (info.sites.empty()) {
       return;
     }
     std::unordered_map<Expression*, Site*> siteMap;
+    std::unordered_map<Block*, SmallVector<Site*, 8>> sliceSitesByBlock;
     for (auto& site : info.sites) {
-      siteMap[site.expr] = &site;
+      if (site.sliceLen == 0) {
+        siteMap[site.expr] = &site;
+      } else {
+        sliceSitesByBlock[site.expr->cast<Block>()].push_back(&site);
+      }
     }
-    std::vector<std::pair<Expression*, Site*>> stack;
-    stack.emplace_back(body, nullptr);
+    struct StackEntry {
+      Expression* curr;
+      Site* parent;
+      SmallVector<Site*, 4> enclosingSlices;
+    };
+    std::vector<StackEntry> stack;
+    stack.push_back({body, nullptr, {}});
     while (!stack.empty()) {
-      auto [curr, parent] = stack.back();
+      auto [curr, parent, enclosingSlices] = std::move(stack.back());
       stack.pop_back();
       if (auto iter = siteMap.find(curr); iter != siteMap.end()) {
-        iter->second->parent = parent;
-        parent = iter->second;
+        auto* site = iter->second;
+        site->parent = parent;
+        site->enclosingSlices = std::move(enclosingSlices);
+        enclosingSlices.clear();
+        parent = site;
       }
-      for (auto* child : ChildIterator(curr)) {
-        stack.emplace_back(child, parent);
+      if (auto* block = curr->dynCast<Block>()) {
+        auto sliceIter = sliceSitesByBlock.find(block);
+        if (sliceIter != sliceSitesByBlock.end()) {
+          auto& slices = sliceIter->second;
+          for (auto* slice : slices) {
+            slice->parent = parent;
+            slice->enclosingSlices = enclosingSlices;
+            for (auto* other : slices) {
+              if (other == slice) {
+                continue;
+              }
+              bool overlaps =
+                other->sliceOffset < slice->sliceOffset + slice->sliceLen &&
+                slice->sliceOffset < other->sliceOffset + other->sliceLen;
+              bool higherPriority =
+                other->sliceLen > slice->sliceLen ||
+                (other->sliceLen == slice->sliceLen &&
+                 other->sliceOffset < slice->sliceOffset);
+              if (overlaps && higherPriority) {
+                slice->overlappingSlices.push_back(other);
+              }
+            }
+          }
+        }
+        for (Index j = 0; j < block->list.size(); j++) {
+          auto childSlices = enclosingSlices;
+          if (sliceIter != sliceSitesByBlock.end()) {
+            for (auto* slice : sliceIter->second) {
+              if (slice->sliceOffset <= j &&
+                  j < slice->sliceOffset + slice->sliceLen) {
+                childSlices.push_back(slice);
+              }
+            }
+          }
+          stack.push_back({block->list[j], parent, std::move(childSlices)});
+        }
+      } else {
+        for (auto* child : ChildIterator(curr)) {
+          stack.push_back({child, parent, enclosingSlices});
+        }
       }
     }
   }
@@ -957,6 +1233,42 @@ struct OutlineExpressions : public Pass {
       }
       return false;
     };
+    auto getSliceLen = [](Site* site, Index& len) -> bool {
+      if (site->sliceLen > 0) {
+        len = site->sliceLen;
+        return true;
+      }
+      if (auto* block = site->expr->dynCast<Block>()) {
+        if (!block->name.is()) {
+          len = block->list.size();
+          return true;
+        }
+      }
+      return false;
+    };
+    auto getSliceElem = [](Site* site, Index idx) -> Expression* {
+      if (site->sliceLen > 0) {
+        return site->getSliceExpr(idx);
+      }
+      return site->expr->cast<Block>()->list[idx];
+    };
+    Index leftLen = 0, rightLen = 0;
+    bool leftIsSlice = getSliceLen(leftSite, leftLen);
+    bool rightIsSlice = getSliceLen(rightSite, rightLen);
+    if (leftIsSlice || rightIsSlice) {
+      if (!leftIsSlice || !rightIsSlice || leftLen != rightLen ||
+          leftSite->getType() != rightSite->getType()) {
+        return false;
+      }
+      for (Index i = 0; i < leftLen; i++) {
+        if (!ExpressionAnalyzer::flexibleEqual(
+              getSliceElem(leftSite, i), getSliceElem(rightSite, i), comparer) ||
+            mismatch) {
+          return false;
+        }
+      }
+      return true;
+    }
     return ExpressionAnalyzer::flexibleEqual(
              leftSite->expr, rightSite->expr, comparer) &&
            !mismatch;
@@ -984,7 +1296,7 @@ struct OutlineExpressions : public Pass {
     }
     key.prepared = true;
     for (auto* site : key.sites) {
-      site->holes = getHoles(*wasm, site->expr, constHoles);
+      site->holes = getHoles(*wasm, site, constHoles);
     }
     auto& first = key.sites[0]->holes;
     key.fixed.resize(first.size());
@@ -1020,7 +1332,7 @@ struct OutlineExpressions : public Pass {
   // The bytes a site costs after outlining: a call, plus an unreachable if the
   // tree is unreachable, or a local.set if it writes a local.
   Index getCallBytes(Site* site) {
-    if (site->expr->type == Type::unreachable) {
+    if (site->getType() == Type::unreachable) {
       return CallBytes + 1;
     }
     if (site->written) {
@@ -1043,35 +1355,66 @@ struct OutlineExpressions : public Pass {
     return false;
   }
 
-  // Whether a site is eligible to be outlined, given the current decisions.
-  bool isEligible(Site* site) {
-    return !site->helperBody && site->key->outline;
-  }
-
-  // Whether a site could be replaced, given the current decisions for the
-  // other keys: it is not inside another site that will be replaced instead
-  // (which would make it vanish).
-  bool isCandidate(Site* site) {
-    if (site->helperBody) {
-      return false;
-    }
-    for (auto* parent = site->parent; parent; parent = parent->parent) {
-      if (isEligible(parent)) {
-        return false;
+  void updateCandidates(
+    ModuleUtils::ParallelFunctionAnalysis<FunctionInfo>& analysis) {
+    for (auto& func : wasm->functions) {
+      auto& fnInfo = analysis.map[func.get()];
+      for (auto it = fnInfo.sites.rbegin(); it != fnInfo.sites.rend(); ++it) {
+        Site& site = *it;
+        bool killed = false;
+        if (site.parent &&
+            (site.parent->replaced || site.parent->killedByAncestor)) {
+          killed = true;
+        }
+        if (!killed) {
+          for (auto* enc : site.enclosingSlices) {
+            if (enc->replaced) {
+              killed = true;
+              break;
+            }
+          }
+        }
+        site.killedByAncestor = killed;
+        bool cand = !site.helperBody && !killed;
+        if (cand) {
+          for (auto* ov : site.overlappingSlices) {
+            if (ov->replaced) {
+              cand = false;
+              break;
+            }
+          }
+        }
+        site.candidate = cand;
+        site.replaced = cand && site.key->outline;
       }
     }
-    return true;
   }
 
-  // Whether a site will be replaced, given the current decisions.
-  bool isReplaced(Site* site) { return isEligible(site) && isCandidate(site); }
+  bool isShadowedWithinKey(Site* site) {
+    for (auto* ov : site->overlappingSlices) {
+      if (ov->key == site->key && ov->selectedForKey) {
+        return true;
+      }
+    }
+    for (auto* curr = site; curr; curr = curr->parent) {
+      if (curr != site && curr->key == site->key && curr->selectedForKey) {
+        return true;
+      }
+      for (auto* enc : curr->enclosingSlices) {
+        if (enc->key == site->key && enc->selectedForKey) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
 
   Type getHelperResults(Site* site) {
     if (site->written) {
       return site->written->type;
     }
-    return site->expr->type == Type::unreachable ? Type::none
-                                                 : site->expr->type;
+    Type type = site->getType();
+    return type == Type::unreachable ? Type::none : type;
   }
 
   // If the function's body is just a tree whose holes are its params, in
@@ -1133,7 +1476,19 @@ struct OutlineExpressions : public Pass {
 
   Function* createHelper(Site* site) {
     auto& key = *site->key;
-    auto* body = ExpressionManipulator::copy(site->expr, *wasm);
+    Builder builder(*wasm);
+    Expression* body;
+    if (site->sliceLen == 0) {
+      body = ExpressionManipulator::copy(site->expr, *wasm);
+    } else {
+      std::vector<Expression*> copied;
+      copied.reserve(site->sliceLen);
+      for (Index i = 0; i < site->sliceLen; i++) {
+        copied.push_back(
+          ExpressionManipulator::copy(site->getSliceExpr(i), *wasm));
+      }
+      body = builder.makeBlock(copied, site->getType());
+    }
     auto holes = getHoles(*wasm, body, constHoles);
     assert(holes.size() == site->holes.size());
     std::vector<Type> params;
@@ -1167,9 +1522,14 @@ struct OutlineExpressions : public Pass {
         replacer.paramOfLocal[written.index] = index;
       }
       replacer.walk(body);
-      Builder builder(*wasm);
-      body = builder.makeBlock(
-        {body, builder.makeLocalGet(index, written.type)}, written.type);
+      if (site->sliceLen > 0) {
+        auto* block = body->cast<Block>();
+        block->list.push_back(builder.makeLocalGet(index, written.type));
+        block->type = written.type;
+      } else {
+        body = builder.makeBlock(
+          {body, builder.makeLocalGet(index, written.type)}, written.type);
+      }
     } else {
       replacer.walk(body);
     }
