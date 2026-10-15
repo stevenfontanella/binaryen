@@ -461,3 +461,229 @@
     )
   )
 )
+
+(module
+  (rec
+    ;; CHECK:      (rec
+    ;; CHECK-NEXT:  (type $Base (sub (struct (field (mut i32)))))
+    ;; NO_TNH:      (rec
+    ;; NO_TNH-NEXT:  (type $Base (sub (struct (field (mut i32)))))
+    (type $Base (sub (struct (field (mut i32)))))
+    ;; CHECK:       (type $Mid (sub $Base (struct (field (mut i32)) (field i64))))
+    ;; NO_TNH:       (type $Mid (sub $Base (struct (field (mut i32)) (field i64))))
+    (type $Mid (sub $Base (struct (field (mut i32)) (field i64))))
+    ;; CHECK:       (type $Holder (struct (field (ref $Base))))
+
+    ;; CHECK:       (type $3 (func (param (ref null $Base) (ref null $Base)) (result (ref $Base))))
+
+    ;; CHECK:       (type $4 (func (param (ref null $Mid) (ref null $Base)) (result i64)))
+
+    ;; CHECK:       (type $5 (func (param (ref null $Base)) (result i32)))
+
+    ;; CHECK:       (type $Sub (sub $Mid (struct (field (mut i32)) (field i64) (field f32))))
+    ;; NO_TNH:       (type $Sub (sub $Mid (struct (field (mut i32)) (field i64) (field f32))))
+    (type $Sub (sub $Mid (struct (field (mut i32)) (field i64) (field f32))))
+    ;; NO_TNH:       (type $Holder (struct (field (ref $Base))))
+    (type $Holder (struct (field (ref $Base))))
+  )
+
+  ;; Private signature parameter $p is only used for field 0 (defined on $Base),
+  ;; so $p widens from (ref $Sub) to (ref null $Base) and the struct.get
+  ;; canonicalizes to $Base.
+  ;; CHECK:       (type $7 (func (param (ref null $Base)) (result i32)))
+
+  ;; CHECK:      (func $read-base-field (type $7) (param $p (ref null $Base)) (result i32)
+  ;; CHECK-NEXT:  (struct.get $Base 0
+  ;; CHECK-NEXT:   (local.get $p)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; NO_TNH:      (type $4 (func (param (ref $Sub)) (result i32)))
+
+  ;; NO_TNH:      (type $5 (func (param (ref null $Base)) (result i32)))
+
+  ;; NO_TNH:      (type $6 (func (param (ref $Sub) (ref null $Mid)) (result i64)))
+
+  ;; NO_TNH:      (type $7 (func (param (ref null $Base) (ref null $Mid)) (result (ref $Base))))
+
+  ;; NO_TNH:      (func $read-base-field (type $4) (param $p (ref $Sub)) (result i32)
+  ;; NO_TNH-NEXT:  (struct.get $Sub 0
+  ;; NO_TNH-NEXT:   (local.get $p)
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT: )
+  (func $read-base-field (param $p (ref $Sub)) (result i32)
+    (struct.get $Sub 0
+      (local.get $p)
+    )
+  )
+
+  ;; Caller's ref.cast to $Sub is redundant once $read-base-field widens its
+  ;; parameter to (ref null $Base); body local $l also widens from (ref $Sub)
+  ;; to (ref null $Base).
+  ;; CHECK:      (func $bridge-caller (type $5) (param $x (ref null $Base)) (result i32)
+  ;; CHECK-NEXT:  (local $l (ref null $Base))
+  ;; CHECK-NEXT:  (local.set $l
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (call $read-base-field
+  ;; CHECK-NEXT:   (local.get $l)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; NO_TNH:      (func $bridge-caller (type $5) (param $x (ref null $Base)) (result i32)
+  ;; NO_TNH-NEXT:  (local $l (ref $Sub))
+  ;; NO_TNH-NEXT:  (local.set $l
+  ;; NO_TNH-NEXT:   (ref.cast (ref $Sub)
+  ;; NO_TNH-NEXT:    (local.get $x)
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT:  (call $read-base-field
+  ;; NO_TNH-NEXT:   (ref.cast (ref $Sub)
+  ;; NO_TNH-NEXT:    (local.get $l)
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT: )
+  (func $bridge-caller (param $x (ref null $Base)) (result i32)
+    (local $l (ref $Sub))
+    (local.set $l
+      (ref.cast (ref $Sub)
+        (local.get $x)
+      )
+    )
+    (call $read-base-field
+      (ref.cast (ref $Sub)
+        (local.get $l)
+      )
+    )
+  )
+
+  ;; Field 1 is introduced on $Mid, so $p widens from (ref $Sub) to
+  ;; (ref null $Mid) (not $Base), and a ref.cast from $Mid to $Sub is stripped.
+  ;; CHECK:      (func $write-mid-field (type $4) (param $p (ref null $Mid)) (param $m (ref null $Base)) (result i64)
+  ;; CHECK-NEXT:  (struct.set $Base 0
+  ;; CHECK-NEXT:   (local.get $m)
+  ;; CHECK-NEXT:   (i32.const 42)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (struct.get $Mid 1
+  ;; CHECK-NEXT:   (local.get $p)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; NO_TNH:      (func $write-mid-field (type $6) (param $p (ref $Sub)) (param $m (ref null $Mid)) (result i64)
+  ;; NO_TNH-NEXT:  (struct.set $Sub 0
+  ;; NO_TNH-NEXT:   (ref.cast (ref null $Sub)
+  ;; NO_TNH-NEXT:    (local.get $m)
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:   (i32.const 42)
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT:  (struct.get $Sub 1
+  ;; NO_TNH-NEXT:   (local.get $p)
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT: )
+  (func $write-mid-field (param $p (ref $Sub)) (param $m (ref null $Mid)) (result i64)
+    (struct.set $Sub 0
+      (ref.cast (ref null $Sub)
+        (local.get $m)
+      )
+      (i32.const 42)
+    )
+    (struct.get $Sub 1
+      (local.get $p)
+    )
+  )
+
+  ;; Non-nullable parent demand (struct.new $Holder expects (ref $Base)) strips
+  ;; ref.cast (ref $Sub) on a nullable $Base and replaces it with ref.as_non_null.
+  ;; Also strips redundant ref.cast in ref.is_null, ref.eq, drop, and return.
+  ;; CHECK:      (func $strip-casts (type $3) (param $x (ref null $Base)) (param $y (ref null $Base)) (result (ref $Base))
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (ref.is_null
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (ref.eq
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (local.get $y)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (struct.new $Holder
+  ;; CHECK-NEXT:    (ref.as_non_null
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (ref.as_non_null
+  ;; CHECK-NEXT:   (local.get $y)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; NO_TNH:      (func $strip-casts (type $7) (param $x (ref null $Base)) (param $y (ref null $Mid)) (result (ref $Base))
+  ;; NO_TNH-NEXT:  (drop
+  ;; NO_TNH-NEXT:   (ref.cast (ref null $Sub)
+  ;; NO_TNH-NEXT:    (local.get $x)
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT:  (drop
+  ;; NO_TNH-NEXT:   (ref.is_null
+  ;; NO_TNH-NEXT:    (ref.cast (ref null $Sub)
+  ;; NO_TNH-NEXT:     (local.get $x)
+  ;; NO_TNH-NEXT:    )
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT:  (drop
+  ;; NO_TNH-NEXT:   (ref.eq
+  ;; NO_TNH-NEXT:    (ref.cast (ref null $Sub)
+  ;; NO_TNH-NEXT:     (local.get $x)
+  ;; NO_TNH-NEXT:    )
+  ;; NO_TNH-NEXT:    (ref.cast (ref null $Sub)
+  ;; NO_TNH-NEXT:     (local.get $y)
+  ;; NO_TNH-NEXT:    )
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT:  (drop
+  ;; NO_TNH-NEXT:   (struct.new $Holder
+  ;; NO_TNH-NEXT:    (ref.cast (ref $Sub)
+  ;; NO_TNH-NEXT:     (local.get $x)
+  ;; NO_TNH-NEXT:    )
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT:  (ref.cast (ref $Sub)
+  ;; NO_TNH-NEXT:   (local.get $y)
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT: )
+  (func $strip-casts (param $x (ref null $Base)) (param $y (ref null $Mid)) (result (ref $Base))
+    (drop
+      (ref.cast (ref null $Sub)
+        (local.get $x)
+      )
+    )
+    (drop
+      (ref.is_null
+        (ref.cast (ref null $Sub)
+          (local.get $x)
+        )
+      )
+    )
+    (drop
+      (ref.eq
+        (ref.cast (ref null $Sub)
+          (local.get $x)
+        )
+        (ref.cast (ref null $Sub)
+          (local.get $y)
+        )
+      )
+    )
+    (drop
+      (struct.new $Holder
+        (ref.cast (ref $Sub)
+          (local.get $x)
+        )
+      )
+    )
+    (ref.cast (ref $Sub)
+      (local.get $y)
+    )
+  )
+)
