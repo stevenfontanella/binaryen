@@ -130,6 +130,11 @@ struct DeferGlobalAllocations : public Pass {
     Index absorbedIndex = Index(-1);
   };
 
+  struct SecondaryArrayInfo {
+    Name arrGlobal;
+    Index callIndexOffset = 0;
+  };
+
   struct Group {
     HeapType type;
     Type globalType;
@@ -139,6 +144,8 @@ struct DeferGlobalAllocations : public Pass {
     Name absorbedArrayGlobal;
     Index absorbedCount = 0;
     Name absorbedFactory;
+    std::vector<Name> secondaryArrays;
+    std::vector<SecondaryArrayInfo> secondaryArrayInfos;
   };
 
   struct Deferral {
@@ -194,9 +201,9 @@ struct DeferGlobalAllocations : public Pass {
       optimizeOnceGlobals(/*onlyArrays=*/true);
       segmentData.clear();
     }
-    runGroupDeferral();
-    if (!preserveThunkTypes && !onceOnly) {
-      runGroupDeferral();
+    runGroupDeferral(/*skipPreservedThunkGroups=*/false);
+    if (!onceOnly) {
+      runGroupDeferral(/*skipPreservedThunkGroups=*/true);
       nullifySoleUsePaletteElements();
     }
     if (!segmentData.empty()) {
@@ -206,7 +213,7 @@ struct DeferGlobalAllocations : public Pass {
     optimizeOnceGlobals(/*onlyArrays=*/false);
   }
 
-  void runGroupDeferral() {
+  void runGroupDeferral(bool skipPreservedThunkGroups = false) {
     computeIndexes();
 
     std::unordered_set<Expression*> onceGets;
@@ -237,6 +244,21 @@ struct DeferGlobalAllocations : public Pass {
       std::string shape;
       if (!flatten(init, candidate.leaves, leafFields, shape)) {
         continue;
+      }
+      if (skipPreservedThunkGroups && preserveThunkTypes) {
+        bool hasSig = hasImmutableSigField(Type(type, NonNullable));
+        if (!hasSig) {
+          for (auto& f : leafFields) {
+            if (f.mutable_ == Immutable && f.type.isRef() &&
+                f.type.getHeapType().isSignature()) {
+              hasSig = true;
+              break;
+            }
+          }
+        }
+        if (hasSig) {
+          continue;
+        }
       }
       candidate.global = global.get();
       candidate.init = init;
@@ -319,10 +341,11 @@ struct DeferGlobalAllocations : public Pass {
       }
     }
 
-    // Identify immutable array.new_fixed globals whose elements are single-use
-    // GlobalGets of distinct members of a single candidate Group.
+    // Identify immutable array.new_fixed globals whose elements are GlobalGets
+    // of members of a single candidate Group.
     std::unordered_map<Name, Group*> candidateArrays;
     std::vector<Name> candidateArrayOrder;
+    std::unordered_set<Name> allDistinctArrays;
     for (auto& global : module->globals) {
       if (global->imported() || global->mutable_ ||
           nonCodeUses.count(global->name)) {
@@ -334,14 +357,16 @@ struct DeferGlobalAllocations : public Pass {
       }
       Group* commonGroup = nullptr;
       bool valid = true;
+      bool allDistinct = true;
       std::unordered_set<Name> seenElems;
       for (auto* val : anf->values) {
         auto* gg = val->dynCast<GlobalGet>();
-        if (!gg || initGlobalUses[gg->name] != 1 ||
-            otherNonCodeUses.count(gg->name) ||
-            !seenElems.insert(gg->name).second) {
+        if (!gg || otherNonCodeUses.count(gg->name)) {
           valid = false;
           break;
+        }
+        if (!seenElems.insert(gg->name).second) {
+          allDistinct = false;
         }
         auto it = candidateMap.find(gg->name);
         if (it == candidateMap.end()) {
@@ -354,25 +379,38 @@ struct DeferGlobalAllocations : public Pass {
           valid = false;
           break;
         }
+        if (isPreservedThunkGroup(*commonGroup)) {
+          if (initGlobalUses[gg->name] != 1 || !allDistinct) {
+            valid = false;
+            break;
+          }
+        }
       }
       if (valid && commonGroup &&
-          (!preserveThunkTypes || !commonGroup->absorbedArrayGlobal.is())) {
+          (!isPreservedThunkGroup(*commonGroup) ||
+           !commonGroup->absorbedArrayGlobal.is())) {
         candidateArrays[global->name] = commonGroup;
         candidateArrayOrder.push_back(global->name);
+        if (allDistinct) {
+          allDistinctArrays.insert(global->name);
+        }
       }
     }
-    if (!preserveThunkTypes) {
-      std::stable_sort(candidateArrayOrder.begin(),
-                       candidateArrayOrder.end(),
-                       [&](Name a, Name b) {
-                         return module->getGlobal(a)
-                                  ->init->cast<ArrayNewFixed>()
-                                  ->values.size() >
-                                module->getGlobal(b)
-                                  ->init->cast<ArrayNewFixed>()
-                                  ->values.size();
-                       });
-    }
+    std::stable_sort(
+      candidateArrayOrder.begin(), candidateArrayOrder.end(), [&](Name a, Name b) {
+        Group* ga = candidateArrays[a];
+        Group* gb = candidateArrays[b];
+        if (ga == gb && isPreservedThunkGroup(*ga)) {
+          return false;
+        }
+        bool da = allDistinctArrays.count(a) > 0;
+        bool db = allDistinctArrays.count(b) > 0;
+        if (da != db) {
+          return da;
+        }
+        return module->getGlobal(a)->init->cast<ArrayNewFixed>()->values.size() >
+               module->getGlobal(b)->init->cast<ArrayNewFixed>()->values.size();
+      });
 
     // Count the uses in function code, in parallel.
     ModuleUtils::ParallelFunctionAnalysis<FunctionInfo> analysis(
@@ -381,24 +419,24 @@ struct DeferGlobalAllocations : public Pass {
           return;
         }
         struct Scanner : public PostWalker<Scanner> {
+          DeferGlobalAllocations& parent;
           Module& module;
           Function* func;
           FunctionInfo& info;
           const std::unordered_map<Name, std::pair<Group*, Index>>& candidates;
           const std::unordered_map<Name, Group*>& candidateArrays;
           const std::unordered_set<Expression*>& onceGets;
-          bool preserveThunkTypes;
-          Scanner(Module& module,
+          Scanner(DeferGlobalAllocations& parent,
+                  Module& module,
                   Function* func,
                   FunctionInfo& info,
                   const std::unordered_map<Name, std::pair<Group*, Index>>&
                     candidates,
                   const std::unordered_map<Name, Group*>& candidateArrays,
-                  const std::unordered_set<Expression*>& onceGets,
-                  bool preserveThunkTypes)
-            : module(module), func(func), info(info), candidates(candidates),
-              candidateArrays(candidateArrays), onceGets(onceGets),
-              preserveThunkTypes(preserveThunkTypes) {}
+                  const std::unordered_set<Expression*>& onceGets)
+            : parent(parent), module(module), func(func), info(info),
+              candidates(candidates), candidateArrays(candidateArrays),
+              onceGets(onceGets) {}
           static Expression* unwrapRef(Expression* expr) {
             while (true) {
               if (auto* ra = expr->dynCast<RefAs>()) {
@@ -439,8 +477,10 @@ struct DeferGlobalAllocations : public Pass {
             for (auto* operand : curr->operands) {
               Expression* base = unwrapRef(operand);
               if (auto* get = base->dynCast<GlobalGet>()) {
-                if (candidates.count(get->name) &&
-                    (preserveThunkTypes || !onceGets.count(get))) {
+                auto it = candidates.find(get->name);
+                if (it != candidates.end() &&
+                    (parent.isPreservedThunkGroup(*it->second.first) ||
+                     !onceGets.count(get))) {
                   info.allocOperandUses[get->name]++;
                 }
               } else if (auto* lg = base->dynCast<LocalGet>()) {
@@ -453,8 +493,10 @@ struct DeferGlobalAllocations : public Pass {
           void visitCall(Call* curr) {
             for (Index i = 0; i < curr->operands.size(); i++) {
               if (auto* get = unwrapRef(curr->operands[i])->dynCast<GlobalGet>()) {
-                if (candidates.count(get->name) &&
-                    (preserveThunkTypes || !onceGets.count(get))) {
+                auto it = candidates.find(get->name);
+                if (it != candidates.end() &&
+                    (parent.isPreservedThunkGroup(*it->second.first) ||
+                     !onceGets.count(get))) {
                   info.callArgCandidates.emplace_back(
                     curr->target, i, get->name);
                 }
@@ -462,13 +504,13 @@ struct DeferGlobalAllocations : public Pass {
             }
           }
         };
-        Scanner(*module,
+        Scanner(*this,
+                *module,
                 func,
                 info,
                 candidateMap,
                 candidateArrays,
-                onceGets,
-                preserveThunkTypes)
+                onceGets)
           .walk(func->body);
       });
 
@@ -534,46 +576,249 @@ struct DeferGlobalAllocations : public Pass {
     }
 
     // Absorb valid candidate array.new_fixed globals into their group.
+    std::unordered_map<Group*, std::vector<Name>> groupCandidateArrays;
     for (Name arrName : candidateArrayOrder) {
       Group* grp = candidateArrays[arrName];
-      if (grp->absorbedArrayGlobal.is()) {
-        continue;
-      }
       Index totalGets = totalArrayGlobalGets[arrName];
       auto& sites = allArrayGetSites[arrName];
       if (totalGets == 0 || totalGets != sites.size()) {
         continue;
       }
-      auto* anf = module->getGlobal(arrName)->init->cast<ArrayNewFixed>();
-      std::unordered_set<Name> inThisArray;
-      bool elementsUnusedInCode = true;
-      for (auto* val : anf->values) {
-        Name ename = val->cast<GlobalGet>()->name;
-        inThisArray.insert(ename);
-        auto& [_, idx] = candidateMap[ename];
-        if (grp->members[idx].uses != 0) {
-          elementsUnusedInCode = false;
+      if (!allDistinctArrays.count(arrName) &&
+          !module->features.hasBulkMemory()) {
+        continue;
+      }
+      groupCandidateArrays[grp].push_back(arrName);
+    }
+    for (auto& [key, group] : groups) {
+      Group* grp = &group;
+      auto it = groupCandidateArrays.find(grp);
+      if (it == groupCandidateArrays.end() || it->second.empty()) {
+        continue;
+      }
+      if (isPreservedThunkGroup(*grp)) {
+        for (Name arrName : it->second) {
+          if (grp->absorbedArrayGlobal.is()) {
+            break;
+          }
+          auto* anf = module->getGlobal(arrName)->init->cast<ArrayNewFixed>();
+          bool elementsUnusedInCode = true;
+          for (auto* val : anf->values) {
+            Name ename = val->cast<GlobalGet>()->name;
+            auto& [_, idx] = candidateMap[ename];
+            if (grp->members[idx].uses != 0) {
+              elementsUnusedInCode = false;
+            }
+          }
+          if (!elementsUnusedInCode) {
+            continue;
+          }
+          Index totalGets = totalArrayGlobalGets[arrName];
+          bool treatAsOnce = totalArrayGlobalOnceGets[arrName] == totalGets;
+          grp->absorbedArrayGlobal = arrName;
+          grp->absorbedCount = anf->values.size();
+          for (Index k = 0; k < anf->values.size(); k++) {
+            Name elemName = anf->values[k]->cast<GlobalGet>()->name;
+            nonCodeUses.erase(elemName);
+            auto& [_, idx] = candidateMap[elemName];
+            auto& cand = grp->members[idx];
+            cand.uses += 1;
+            cand.onceUses += treatAsOnce ? 1 : 0;
+            cand.absorbedIndex = k;
+            for (auto* leaf : cand.leaves) {
+              if (auto* lg = leaf->dynCast<GlobalGet>()) {
+                if (module->getGlobal(lg->name)->imported()) {
+                  importOtherUses[lg->name]--;
+                  importCandidateUses[lg->name]++;
+                }
+              }
+            }
+          }
+        }
+        continue;
+      }
+
+      std::vector<Name> validArrays = it->second;
+      while (!validArrays.empty()) {
+        std::unordered_map<Name, Index> arrayElemUses;
+        for (Name arrName : validArrays) {
+          auto* anf = module->getGlobal(arrName)->init->cast<ArrayNewFixed>();
+          for (auto* val : anf->values) {
+            arrayElemUses[val->cast<GlobalGet>()->name]++;
+          }
+        }
+        std::vector<Name> nextValid;
+        for (Name arrName : validArrays) {
+          auto* anf = module->getGlobal(arrName)->init->cast<ArrayNewFixed>();
+          bool ok = true;
+          for (auto* val : anf->values) {
+            Name ename = val->cast<GlobalGet>()->name;
+            if (initGlobalUses[ename] != arrayElemUses[ename]) {
+              ok = false;
+              break;
+            }
+          }
+          if (ok) {
+            nextValid.push_back(arrName);
+          }
+        }
+        if (nextValid.size() == validArrays.size()) {
+          break;
+        }
+        validArrays = std::move(nextValid);
+      }
+      if (validArrays.empty()) {
+        continue;
+      }
+
+      // Filter out connected components of validArrays whose elements have too
+      // many direct uses in code to be profitably deferred.
+      std::vector<Name> filteredArrays;
+      std::vector<bool> visitedArr(validArrays.size(), false);
+      for (Index i = 0; i < validArrays.size(); i++) {
+        if (visitedArr[i]) {
+          continue;
+        }
+        std::vector<Index> compArrIdxs = {i};
+        visitedArr[i] = true;
+        std::unordered_set<Name> compElems;
+        for (Index q = 0; q < compArrIdxs.size(); q++) {
+          Name aName = validArrays[compArrIdxs[q]];
+          auto* anf = module->getGlobal(aName)->init->cast<ArrayNewFixed>();
+          for (auto* val : anf->values) {
+            compElems.insert(val->cast<GlobalGet>()->name);
+          }
+          for (Index j = 0; j < validArrays.size(); j++) {
+            if (visitedArr[j]) {
+              continue;
+            }
+            auto* anfJ =
+              module->getGlobal(validArrays[j])->init->cast<ArrayNewFixed>();
+            bool shares = false;
+            for (auto* val : anfJ->values) {
+              if (compElems.count(val->cast<GlobalGet>()->name)) {
+                shares = true;
+                break;
+              }
+            }
+            if (shares) {
+              visitedArr[j] = true;
+              compArrIdxs.push_back(j);
+            }
+          }
+        }
+        int64_t compSaving = 0;
+        for (Name ename : compElems) {
+          auto& [_, idx] = candidateMap[ename];
+          auto& cand = grp->members[idx];
+          Index getBytes =
+            1 + getLEBSize(U32LEB(globalIndexes[cand.global->name]));
+          int64_t siteDelta = 5 - int64_t(getBytes);
+          int64_t elemBonus = cand.uses > 0 ? int64_t(getBytes) : 0;
+          compSaving += int64_t(cand.initBytes) + int64_t(cand.bonus) +
+                        elemBonus - 1 - int64_t(cand.uses) * siteDelta;
+        }
+        if (always || compSaving > 0) {
+          for (Index aIdx : compArrIdxs) {
+            filteredArrays.push_back(validArrays[aIdx]);
+          }
         }
       }
-      if (preserveThunkTypes && !elementsUnusedInCode) {
+      if (filteredArrays.empty()) {
         continue;
+      }
+
+      Name primaryArr;
+      std::vector<Name> secArrays;
+      std::unordered_set<Name> distinctAbsorbed;
+      std::vector<Name> absorbedOrder;
+      bool canUseData = module->features.hasBulkMemory();
+      for (Name arrName : filteredArrays) {
+        auto* anf = module->getGlobal(arrName)->init->cast<ArrayNewFixed>();
+        if (!primaryArr.is() && allDistinctArrays.count(arrName)) {
+          primaryArr = arrName;
+          for (auto* val : anf->values) {
+            Name ename = val->cast<GlobalGet>()->name;
+            if (distinctAbsorbed.insert(ename).second) {
+              absorbedOrder.push_back(ename);
+            }
+          }
+        } else if (canUseData) {
+          std::vector<Name> newElems;
+          for (auto* val : anf->values) {
+            Name ename = val->cast<GlobalGet>()->name;
+            if (!distinctAbsorbed.count(ename) &&
+                std::find(newElems.begin(), newElems.end(), ename) ==
+                  newElems.end()) {
+              newElems.push_back(ename);
+            }
+          }
+          if (distinctAbsorbed.size() + newElems.size() <= 256) {
+            secArrays.push_back(arrName);
+            for (Name ename : newElems) {
+              distinctAbsorbed.insert(ename);
+              absorbedOrder.push_back(ename);
+            }
+          }
+        }
+      }
+      if (absorbedOrder.empty()) {
+        continue;
+      }
+      // Verify that every absorbed element's initializer uses are accounted for
+      // by primaryArr + secArrays.
+      std::unordered_map<Name, Index> chosenArrElemUses;
+      if (primaryArr.is()) {
+        auto* anf = module->getGlobal(primaryArr)->init->cast<ArrayNewFixed>();
+        for (auto* val : anf->values) {
+          chosenArrElemUses[val->cast<GlobalGet>()->name]++;
+        }
+      }
+      for (Name sArr : secArrays) {
+        auto* anf = module->getGlobal(sArr)->init->cast<ArrayNewFixed>();
+        for (auto* val : anf->values) {
+          chosenArrElemUses[val->cast<GlobalGet>()->name]++;
+        }
+      }
+      bool allAccounted = true;
+      for (Name ename : absorbedOrder) {
+        if (initGlobalUses[ename] != chosenArrElemUses[ename]) {
+          allAccounted = false;
+          break;
+        }
+      }
+      if (!allAccounted) {
+        continue;
+      }
+
+      bool allArraysOnce = true;
+      if (primaryArr.is() &&
+          totalArrayGlobalOnceGets[primaryArr] !=
+            totalArrayGlobalGets[primaryArr]) {
+        allArraysOnce = false;
+      }
+      for (Name sArr : secArrays) {
+        if (totalArrayGlobalOnceGets[sArr] != totalArrayGlobalGets[sArr]) {
+          allArraysOnce = false;
+        }
       }
       bool hasOtherCodeMembers = false;
       bool allOtherCodeMembersOnce = true;
       for (auto& m : grp->members) {
-        if (!inThisArray.count(m.global->name) && m.uses > 0) {
+        if (!distinctAbsorbed.count(m.global->name) && m.uses > 0) {
           hasOtherCodeMembers = true;
           if (!(m.uses == 1 && m.onceUses == 1)) {
             allOtherCodeMembersOnce = false;
           }
         }
       }
-      bool treatAsOnce = (totalArrayGlobalOnceGets[arrName] == totalGets) ||
-                         (hasOtherCodeMembers && allOtherCodeMembersOnce);
-      grp->absorbedArrayGlobal = arrName;
-      grp->absorbedCount = anf->values.size();
-      for (Index k = 0; k < anf->values.size(); k++) {
-        Name elemName = anf->values[k]->cast<GlobalGet>()->name;
+      bool treatAsOnce =
+        allArraysOnce || (hasOtherCodeMembers && allOtherCodeMembersOnce);
+      grp->absorbedArrayGlobal = primaryArr;
+      grp->secondaryArrays = std::move(secArrays);
+      grp->absorbedCount = absorbedOrder.size();
+      for (Index k = 0; k < absorbedOrder.size(); k++) {
+        Name elemName = absorbedOrder[k];
         nonCodeUses.erase(elemName);
         auto& [_, idx] = candidateMap[elemName];
         auto& cand = grp->members[idx];
@@ -625,7 +870,7 @@ struct DeferGlobalAllocations : public Pass {
     // Decide what to defer, and build the factories.
     std::unordered_map<Name, Deferral> deferrals;
     for (auto& [key, group] : groups) {
-      processGroup(group, deferrals);
+      processGroup(group, deferrals, allArrayGetSites);
     }
     if (deferrals.empty()) {
       return;
@@ -649,13 +894,36 @@ struct DeferGlobalAllocations : public Pass {
       if (!group.absorbedFactory.is()) {
         continue;
       }
-      for (auto& [fn, site] : allArrayGetSites[group.absorbedArrayGlobal]) {
-        auto* ag = (*site)->cast<ArrayGet>();
-        *site = builder.makeCall(
-          group.absorbedFactory, {ag->index}, group.globalType);
-        refinalizeFuncs.insert(fn);
+      if (group.absorbedArrayGlobal.is()) {
+        for (auto& [fn, site] : allArrayGetSites[group.absorbedArrayGlobal]) {
+          auto* ag = (*site)->cast<ArrayGet>();
+          *site = builder.makeCall(
+            group.absorbedFactory, {ag->index}, group.globalType);
+          refinalizeFuncs.insert(fn);
+        }
+        module->removeGlobal(group.absorbedArrayGlobal);
       }
-      module->removeGlobal(group.absorbedArrayGlobal);
+      for (auto& secInfo : group.secondaryArrayInfos) {
+        for (auto& [fn, site] : allArrayGetSites[secInfo.arrGlobal]) {
+          auto* ag = (*site)->cast<ArrayGet>();
+          Expression* idx = ag->index;
+          if (secInfo.callIndexOffset != 0) {
+            if (auto* c = idx->dynCast<Const>()) {
+              idx = builder.makeConst(int32_t(uint32_t(c->value.geti32()) +
+                                              secInfo.callIndexOffset));
+            } else {
+              idx = builder.makeBinary(
+                AddInt32,
+                idx,
+                builder.makeConst(int32_t(secInfo.callIndexOffset)));
+            }
+          }
+          *site =
+            builder.makeCall(group.absorbedFactory, {idx}, group.globalType);
+          refinalizeFuncs.insert(fn);
+        }
+        module->removeGlobal(secInfo.arrGlobal);
+      }
     }
     for (auto* fn : refinalizeFuncs) {
       ReFinalize().walkFunctionInModule(fn, module);
@@ -875,8 +1143,191 @@ private:
     }
   }
 
-  void processGroup(Group& group,
-                    std::unordered_map<Name, Deferral>& deferrals) {
+  struct ColumnCosts {
+    std::unordered_map<const Candidate*, Index> memberTableBytes;
+    Index chunkColumnOverhead = 0;
+  };
+
+  ColumnCosts computeColumnCosts(const Group& group,
+                                 const std::vector<Candidate*>& members,
+                                 const std::vector<Index>& varying,
+                                 bool hasSecArrays) {
+    ColumnCosts costs;
+    Index N = members.size();
+    if (N == 0) {
+      return costs;
+    }
+    for (auto* m : members) {
+      costs.memberTableBytes[m] = 0;
+    }
+    if (isPreservedThunkGroup(group)) {
+      for (auto* m : members) {
+        Index tb = 0;
+        for (auto i : varying) {
+          tb += getOperandBytes(m->leaves[i]);
+        }
+        costs.memberTableBytes[m] = tb;
+      }
+      costs.chunkColumnOverhead = 20 * varying.size();
+      return costs;
+    }
+    auto& leafFields = group.leafFields;
+    bool canUseData = module->features.hasBulkMemory();
+    std::vector<Index> uniqueVarying;
+    std::vector<Index> prevI32Cols;
+    std::unordered_map<Index, Index> i32ColWidths;
+    bool hasW1Col = hasSecArrays;
+
+    for (auto i : varying) {
+      auto& field = leafFields[i];
+      Index dupOf = Index(-1);
+      for (Index prev : uniqueVarying) {
+        if (leafFields[prev].type == field.type &&
+            leafFields[prev].isPacked() == field.isPacked() &&
+            (!field.isPacked() ||
+             leafFields[prev].packedType == field.packedType)) {
+          bool allEq = true;
+          for (Index k = 0; k < N; k++) {
+            if (!ExpressionAnalyzer::equal(members[k]->leaves[prev],
+                                           members[k]->leaves[i])) {
+              allEq = false;
+              break;
+            }
+          }
+          if (allEq) {
+            dupOf = prev;
+            break;
+          }
+        }
+      }
+      if (dupOf != Index(-1)) {
+        continue;
+      }
+      uniqueVarying.push_back(i);
+      if (canUseData && N >= 7 && field.type == Type::i32 &&
+          std::all_of(members.begin(), members.end(), [&](Candidate* m) {
+            return m->leaves[i]->is<Const>();
+          })) {
+        auto evalWidth = [&](auto getVal) -> Index {
+          int64_t mn = std::numeric_limits<int64_t>::max();
+          int64_t mx = std::numeric_limits<int64_t>::min();
+          for (Index k = 0; k < N; k++) {
+            int64_t v = getVal(k);
+            mn = std::min(mn, v);
+            mx = std::max(mx, v);
+          }
+          Index w = 4;
+          bool s = false;
+          HeapType ht;
+          classifyI32Range(mn, mx, w, s, ht);
+          return w;
+        };
+        Index width = evalWidth([&](Index k) {
+          int32_t raw = members[k]->leaves[i]->cast<Const>()->value.geti32();
+          return getPackedOrI32Value(field, raw);
+        });
+        if (!field.isPacked()) {
+          width = std::min(width, evalWidth([&](Index k) {
+                             int32_t raw = members[k]
+                                             ->leaves[i]
+                                             ->cast<Const>()
+                                             ->value.geti32();
+                             return int64_t(
+                               int32_t(uint32_t(raw) - uint32_t(k)));
+                           }));
+          for (Index prev : prevI32Cols) {
+            width = std::min(width, evalWidth([&](Index k) {
+                               int32_t raw = members[k]
+                                               ->leaves[i]
+                                               ->cast<Const>()
+                                               ->value.geti32();
+                               int32_t baseRaw = members[k]
+                                                   ->leaves[prev]
+                                                   ->cast<Const>()
+                                                   ->value.geti32();
+                               return int64_t(
+                                 int32_t(uint32_t(raw) - uint32_t(baseRaw)));
+                             }));
+          }
+          prevI32Cols.push_back(i);
+        }
+        i32ColWidths[i] = width;
+        if (width == 1) {
+          hasW1Col = true;
+        }
+      }
+    }
+
+    Index dataWidthCols[5] = {0, 0, 0, 0, 0};
+    Index uncompressedCols = 0;
+    Index paletteOverhead = 0;
+    for (Index i : uniqueVarying) {
+      auto& field = leafFields[i];
+      if (auto it = i32ColWidths.find(i); it != i32ColWidths.end()) {
+        Index w = it->second;
+        for (auto* m : members) {
+          costs.memberTableBytes[m] += w;
+        }
+        dataWidthCols[w]++;
+        continue;
+      }
+      if (canUseData && isPaletteCandidate(field)) {
+        std::vector<Expression*> distinct;
+        bool ok = true;
+        for (auto* m : members) {
+          auto* leaf = m->leaves[i];
+          Index idx = 0;
+          while (idx < distinct.size() && !sameRefLeaf(distinct[idx], leaf)) {
+            idx++;
+          }
+          if (idx == distinct.size()) {
+            if (distinct.size() == 256) {
+              ok = false;
+              break;
+            }
+            distinct.push_back(leaf);
+          }
+        }
+        Index D = distinct.size();
+        Index w1Extra = hasW1Col ? 8 : 25;
+        if (ok && 9 + 3 * D + N + w1Extra < 9 + 3 * N) {
+          for (auto* m : members) {
+            costs.memberTableBytes[m] += 1;
+          }
+          Index palBytes = 9;
+          for (auto* expr : distinct) {
+            palBytes += getOperandBytes(expr);
+          }
+          paletteOverhead += palBytes + 6;
+          dataWidthCols[1]++;
+          hasW1Col = true;
+          continue;
+        }
+      }
+      for (auto* m : members) {
+        costs.memberTableBytes[m] += getOperandBytes(m->leaves[i]);
+      }
+      uncompressedCols++;
+    }
+    costs.chunkColumnOverhead = 20 * uncompressedCols + paletteOverhead;
+    for (Index w : {Index(1), Index(2), Index(4)}) {
+      Index c = dataWidthCols[w];
+      if (w == 1 && hasSecArrays) {
+        c++;
+      }
+      if (c > 0) {
+        costs.chunkColumnOverhead += 20 + 8 * (c - 1);
+      }
+    }
+    return costs;
+  }
+
+  void processGroup(
+    Group& group,
+    std::unordered_map<Name, Deferral>& deferrals,
+    const std::unordered_map<
+      Name,
+      std::vector<std::pair<Function*, Expression**>>>& allArrayGetSites) {
     auto& members = group.members;
     // Only globals that are used in code matter (unused ones are left to
     // other passes).
@@ -888,6 +1339,7 @@ private:
     if (members.empty()) {
       return;
     }
+    bool preservedThunk = isPreservedThunkGroup(group);
     if (!includeAllocationOperands) {
       Index uses = 0, allocOperandUses = 0;
       for (auto& member : members) {
@@ -895,7 +1347,7 @@ private:
         allocOperandUses += member.allocOperandUses;
       }
       if (onceOnly ? allocOperandUses > 0 : allocOperandUses * 2 > uses) {
-        if (preserveThunkTypes) {
+        if (preservedThunk) {
           return;
         }
         members.erase(std::remove_if(members.begin(),
@@ -937,18 +1389,60 @@ private:
       }
       return a->firstUse < b->firstUse;
     });
+
+    // Estimate column costs over viable members (excluding hot members that
+    // cannot be profitably deferred even with 0 tableBytes).
+    std::vector<Candidate*> viable;
+    for (auto* member : sorted) {
+      if (always || member->absorbedIndex != Index(-1)) {
+        viable.push_back(member);
+        continue;
+      }
+      Index getBytes =
+        1 + getLEBSize(U32LEB(globalIndexes[member->global->name]));
+      int64_t minSiteDelta = int64_t(callBytes + 2) - int64_t(getBytes);
+      int64_t maxSaving = int64_t(member->initBytes) + int64_t(member->bonus) -
+                          int64_t(member->uses) * minSiteDelta;
+      if (maxSaving > 0) {
+        viable.push_back(member);
+      }
+    }
+    if (viable.empty()) {
+      return;
+    }
+    std::vector<Candidate> viableCandidates;
+    viableCandidates.reserve(viable.size());
+    for (auto* m : viable) {
+      viableCandidates.push_back(*m);
+    }
+    auto viableVarying = getVaryingColumns(viableCandidates, numLeaves);
+    auto initialCosts = computeColumnCosts(
+      group, viable, viableVarying, !group.secondaryArrays.empty());
+
+    auto getMemberTableBytes = [&](const Candidate* m) -> Index {
+      auto it = initialCosts.memberTableBytes.find(m);
+      if (it != initialCosts.memberTableBytes.end()) {
+        return it->second;
+      }
+      Index tb = 0;
+      for (auto i : varying) {
+        tb += getOperandBytes(m->leaves[i]);
+      }
+      return tb;
+    };
+
     std::vector<Candidate*> chosen;
     int64_t saving = 0;
-    if (!preserveThunkTypes && group.absorbedArrayGlobal.is()) {
+    int64_t secArraysBonus = 0;
+    bool hasAbsorbedArrays =
+      group.absorbedArrayGlobal.is() || !group.secondaryArrays.empty();
+    if (!preservedThunk && hasAbsorbedArrays) {
       std::vector<Candidate*> absMembers;
       int64_t absSaving = 0;
       for (auto* member : sorted) {
         if (member->absorbedIndex != Index(-1)) {
           absMembers.push_back(member);
-          Index tableBytes = 0;
-          for (auto i : varying) {
-            tableBytes += getOperandBytes(member->leaves[i]);
-          }
+          Index tableBytes = getMemberTableBytes(member);
           Index index = member->absorbedIndex;
           Index directUses = member->uses - 1;
           Index getBytes =
@@ -961,6 +1455,14 @@ private:
                        int64_t(directUses) * siteDelta;
         }
       }
+      for (Name secArr : group.secondaryArrays) {
+        auto* anf = module->getGlobal(secArr)->init->cast<ArrayNewFixed>();
+        Index M = anf->values.size();
+        auto siteIt = allArrayGetSites.find(secArr);
+        Index numSites = siteIt != allArrayGetSites.end() ? siteIt->second.size() : 0;
+        secArraysBonus += int64_t(9 + 2 * M) - int64_t(2 * numSites) - 18;
+      }
+      absSaving += secArraysBonus;
       if (absMembers.size() == group.absorbedCount &&
           (always || absSaving > 0)) {
         for (auto* m : absMembers) {
@@ -969,17 +1471,16 @@ private:
         saving += absSaving;
       } else {
         group.absorbedArrayGlobal = Name();
+        group.secondaryArrays.clear();
         group.absorbedCount = 0;
+        secArraysBonus = 0;
       }
     }
     for (auto* member : sorted) {
-      if (!preserveThunkTypes && member->absorbedIndex != Index(-1)) {
+      if (!preservedThunk && member->absorbedIndex != Index(-1)) {
         continue;
       }
-      Index tableBytes = 0;
-      for (auto i : varying) {
-        tableBytes += getOperandBytes(member->leaves[i]);
-      }
+      Index tableBytes = getMemberTableBytes(member);
       Index index = chosen.size() % MaxChunkSize;
       int64_t siteDelta = 0;
       if (member->absorbedIndex == Index(-1)) {
@@ -996,7 +1497,7 @@ private:
         saving += memberSaving;
       }
     }
-    if (preserveThunkTypes && group.absorbedArrayGlobal.is()) {
+    if (preservedThunk && group.absorbedArrayGlobal.is()) {
       Index chosenAbsorbed = 0;
       for (auto* c : chosen) {
         if (c->absorbedIndex != Index(-1)) {
@@ -1017,15 +1518,43 @@ private:
     if (chosen.empty()) {
       return;
     }
-    // Recompute the columns over the chosen members only.
+    // Recompute the columns and exact savings over the chosen members only.
     std::vector<Candidate> chosenMembers;
     for (auto* member : chosen) {
       chosenMembers.push_back(*member);
     }
     varying = getVaryingColumns(chosenMembers, numLeaves);
+    auto finalCosts = computeColumnCosts(
+      group, chosen, varying, !group.secondaryArrays.empty());
+    if (!preservedThunk) {
+      saving = secArraysBonus;
+      for (Index idxInChosen = 0; idxInChosen < chosen.size(); idxInChosen++) {
+        auto* member = chosen[idxInChosen];
+        Index tableBytes = finalCosts.memberTableBytes[member];
+        Index getBytes =
+          1 + getLEBSize(U32LEB(globalIndexes[member->global->name]));
+        if (member->absorbedIndex != Index(-1) &&
+            (group.absorbedArrayGlobal.is() || !group.secondaryArrays.empty())) {
+          Index index = member->absorbedIndex;
+          Index directUses = member->uses - 1;
+          int64_t siteDelta =
+            int64_t(callBytes + 1 + getSLEBSize(index)) - int64_t(getBytes);
+          int64_t elemBonus = directUses > 0 ? int64_t(getBytes) : 0;
+          saving += int64_t(member->initBytes) + int64_t(member->bonus) +
+                    elemBonus - int64_t(tableBytes) -
+                    int64_t(directUses) * siteDelta;
+        } else {
+          Index index = idxInChosen % MaxChunkSize;
+          int64_t siteDelta =
+            int64_t(callBytes + 1 + getSLEBSize(index)) - int64_t(getBytes);
+          saving += int64_t(member->initBytes) + int64_t(member->bonus) -
+                    int64_t(tableBytes) - int64_t(member->uses) * siteDelta;
+        }
+      }
+    }
 
     bool allOnceSingleUse =
-      !preserveThunkTypes &&
+      !preservedThunk &&
       std::all_of(chosen.begin(), chosen.end(), [](Candidate* c) {
         return c->uses == 1 && c->onceUses == 1;
       });
@@ -1034,7 +1563,8 @@ private:
     // table column the global, its type, and the read in the factory.
     Index numChunks = (chosen.size() + MaxChunkSize - 1) / MaxChunkSize;
     Index baseFixed = allOnceSingleUse ? 25 : 70;
-    Index overhead = numChunks * (baseFixed + 20 * varying.size());
+    Index overhead =
+      numChunks * (baseFixed + finalCosts.chunkColumnOverhead);
     if (!always && saving <= int64_t(overhead)) {
       return;
     }
@@ -1058,12 +1588,14 @@ private:
       std::vector<Candidate*> chunkMembers(chosen.begin() + begin,
                                            chosen.begin() + end);
       bool cacheless =
-        !preserveThunkTypes &&
+        !preservedThunk &&
         std::all_of(chunkMembers.begin(), chunkMembers.end(), [](Candidate* c) {
           return c->uses == 1 && c->onceUses == 1;
         });
-      auto factory = makeFactory(group, chunkMembers, varying, cacheless);
-      if (chunk == 0 && group.absorbedArrayGlobal.is()) {
+      auto factory =
+        makeFactory(group, chunkMembers, varying, cacheless, chunk == 0);
+      if (chunk == 0 &&
+          (group.absorbedArrayGlobal.is() || !group.secondaryArrays.empty())) {
         group.absorbedFactory = factory;
       }
       for (Index i = 0; i < chunkMembers.size(); i++) {
@@ -1090,11 +1622,13 @@ private:
   Name makeFactory(Group& group,
                    std::vector<Candidate*>& members,
                    std::vector<Index>& varying,
-                   bool cacheless) {
+                   bool cacheless,
+                   bool isFirstChunk) {
     Builder builder(*module);
     auto type = group.type;
     auto resultType = group.globalType;
     auto& leafFields = group.leafFields;
+    bool preservedThunk = isPreservedThunkGroup(group);
     std::string typeName;
     if (auto iter = module->typeNames.find(type);
         iter != module->typeNames.end()) {
@@ -1163,12 +1697,40 @@ private:
     std::vector<Index> uniqueVarying;
     Index N = members.size();
     bool canUseData = module->features.hasBulkMemory();
+    bool hasSecArrays = isFirstChunk && !group.secondaryArrays.empty();
+    bool willHaveW1Col = hasSecArrays;
+    if (canUseData && N >= 7) {
+      for (auto i : varying) {
+        auto& field = leafFields[i];
+        if (field.type == Type::i32 &&
+            std::all_of(members.begin(), members.end(), [&](Candidate* m) {
+              return m->leaves[i]->is<Const>();
+            })) {
+          int64_t mn = std::numeric_limits<int64_t>::max();
+          int64_t mx = std::numeric_limits<int64_t>::min();
+          for (Index k = 0; k < N; k++) {
+            int64_t v = getPackedOrI32Value(
+              field, members[k]->leaves[i]->cast<Const>()->value.geti32());
+            mn = std::min(mn, v);
+            mx = std::max(mx, v);
+          }
+          Index w = 4;
+          bool s = false;
+          HeapType ht;
+          classifyI32Range(mn, mx, w, s, ht);
+          if (w == 1) {
+            willHaveW1Col = true;
+            break;
+          }
+        }
+      }
+    }
     auto findOrAddArrayFixedGlobal = [&](const std::string& hint,
                                          Type globalType,
                                          HeapType arrType,
                                          const std::vector<Expression*>& vals) {
       auto* newInit = builder.makeArrayNewFixed(arrType, vals);
-      if (!preserveThunkTypes) {
+      if (!preservedThunk) {
         for (auto& g : module->globals) {
           if (!g->imported() && !g->mutable_ && g->type == globalType &&
               ExpressionAnalyzer::equal(g->init, newInit)) {
@@ -1184,7 +1746,7 @@ private:
     for (auto i : varying) {
       auto& field = leafFields[i];
       Index dupOf = Index(-1);
-      if (!preserveThunkTypes) {
+      if (!preservedThunk) {
         for (Index prev : uniqueVarying) {
           if (leafFields[prev].type == field.type &&
               leafFields[prev].isPacked() == field.isPacked() &&
@@ -1214,7 +1776,7 @@ private:
       if (field.isPacked()) {
         tableType = HeapType(Array(Field(field.packedType, Immutable)));
       }
-      if (canUseData && N >= 10 && field.type == Type::i32 &&
+      if (canUseData && N >= 7 && field.type == Type::i32 &&
           std::all_of(members.begin(), members.end(), [&](Candidate* m) {
             return m->leaves[i]->is<Const>();
           })) {
@@ -1316,6 +1878,9 @@ private:
           }
           appendLE(colBytes, raw, width);
         }
+        if (width == 1) {
+          willHaveW1Col = true;
+        }
         pendingDataCols.push_back({i, width, arrType, std::move(colBytes)});
         columns[i] = {Name(),
                       Type(arrType, Nullable),
@@ -1348,7 +1913,9 @@ private:
           indices.push_back(uint8_t(idx));
         }
         Index D = distinct.size();
-        if (ok && 9 + 3 * D + N + 25 < 9 + 3 * N) {
+        Index w1Extra = willHaveW1Col ? 8 : 25;
+        if (ok && 9 + 3 * D + N + w1Extra < 9 + 3 * N) {
+          willHaveW1Col = true;
           std::vector<Expression*> palValues;
           palValues.reserve(D);
           for (auto* expr : distinct) {
@@ -1401,6 +1968,9 @@ private:
 
     // Group pending data columns by element width (1, 2, 4) so same-width
     // columns share a single mutable array global and a single array.new_data.
+    Name secTableGlobal;
+    Type secTableGlobalType = Type::none;
+    Index secSubOffset = 0;
     for (Index w : {Index(1), Index(2), Index(4)}) {
       std::vector<PendingDataCol*> groupCols;
       for (auto& pdc : pendingDataCols) {
@@ -1408,12 +1978,14 @@ private:
           groupCols.push_back(&pdc);
         }
       }
-      if (groupCols.empty()) {
+      bool packSecHere = (w == 1 && hasSecArrays);
+      if (groupCols.empty() && !packSecHere) {
         continue;
       }
-      HeapType arrType = groupCols[0]->arrType;
+      HeapType arrType =
+        !groupCols.empty() ? groupCols[0]->arrType : HeapTypes::getMutI8Array();
       std::string suffix =
-        groupCols.size() == 1
+        (groupCols.size() == 1 && !packSecHere)
           ? std::to_string(groupCols[0]->leafIndex)
           : ("w" + std::to_string(w));
       auto tableName =
@@ -1433,8 +2005,30 @@ private:
         col.globalType = tableGlobalType;
         col.elemOffset = c * N;
       }
-      dataInits.push_back(
-        {tableName, arrType, startOffset, Index(groupCols.size() * N)});
+      Index totalElems = groupCols.size() * N;
+      if (packSecHere) {
+        secTableGlobal = tableName;
+        secTableGlobalType = tableGlobalType;
+        secSubOffset = groupCols.empty() ? N : 0;
+        std::unordered_map<Name, Index> memberIdxMap;
+        for (Index k = 0; k < N; k++) {
+          memberIdxMap[members[k]->global->name] = k;
+        }
+        for (Name secArr : group.secondaryArrays) {
+          auto* anf = module->getGlobal(secArr)->init->cast<ArrayNewFixed>();
+          Index secOffset = totalElems;
+          for (auto* val : anf->values) {
+            Name ename = val->cast<GlobalGet>()->name;
+            Index targetIdx = memberIdxMap.at(ename);
+            assert(targetIdx < 256);
+            segmentData.push_back(char(uint8_t(targetIdx)));
+          }
+          totalElems += anf->values.size();
+          group.secondaryArrayInfos.push_back(
+            {secArr, secOffset + secSubOffset});
+        }
+      }
+      dataInits.push_back({tableName, arrType, startOffset, totalElems});
     }
 
     // The factory.
@@ -1584,12 +2178,38 @@ private:
         initBody);
     }
 
+    Expression* secRemapCheck = nullptr;
+    if (secTableGlobal.is()) {
+      Expression* tableIdx = builder.makeLocalGet(indexLocal, Type::i32);
+      if (secSubOffset != 0) {
+        tableIdx = builder.makeBinary(
+          SubInt32, tableIdx, builder.makeConst(int32_t(secSubOffset)));
+      }
+      auto* remapped = builder.makeArrayGet(
+        builder.makeGlobalGet(secTableGlobal, secTableGlobalType),
+        tableIdx,
+        MemoryOrder::Unordered,
+        Type::i32,
+        false);
+      secRemapCheck = builder.makeIf(
+        builder.makeBinary(GeUInt32,
+                           builder.makeLocalGet(indexLocal, Type::i32),
+                           builder.makeConst(int32_t(N))),
+        builder.makeLocalSet(indexLocal, remapped));
+    }
+
     auto factoryName = Names::getValidFunctionName(*module, baseName);
     if (cacheless) {
+      std::vector<Expression*> stmts;
+      if (dataInitCheck) {
+        stmts.push_back(dataInitCheck);
+      }
+      if (secRemapCheck) {
+        stmts.push_back(secRemapCheck);
+      }
+      stmts.push_back(structNew);
       Expression* body =
-        dataInitCheck
-          ? builder.makeBlock({dataInitCheck, structNew}, resultType)
-          : structNew;
+        stmts.size() == 1 ? stmts[0] : builder.makeBlock(stmts, resultType);
       module->addFunction(builder.makeFunction(
         factoryName, Signature(Type::i32, resultType), std::move(vars), body));
       return factoryName;
@@ -1616,12 +2236,21 @@ private:
             tee,
             MemoryOrder::Unordered));
     std::vector<Expression*> blockList = {brOn};
-    if (dataInitCheck) {
+    if (dataInitCheck && !secRemapCheck) {
       blockList.push_back(dataInitCheck);
     }
     blockList.push_back(cacheSet);
     blockList.push_back(builder.makeLocalGet(objectLocal, resultType));
-    auto* body = builder.makeBlock(label, blockList, resultType);
+    Expression* body = builder.makeBlock(label, blockList, resultType);
+    if (secRemapCheck) {
+      std::vector<Expression*> outerList;
+      if (dataInitCheck) {
+        outerList.push_back(dataInitCheck);
+      }
+      outerList.push_back(secRemapCheck);
+      outerList.push_back(body);
+      body = builder.makeBlock(outerList, resultType);
+    }
     module->addFunction(builder.makeFunction(
       factoryName, Signature(Type::i32, resultType), std::move(vars), body));
     return factoryName;
@@ -1634,6 +2263,26 @@ private:
     for (auto& field : t.getHeapType().getStruct().fields) {
       if (field.mutable_ == Immutable && field.type.isRef() &&
           field.type.getHeapType().isSignature()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool isPreservedThunkType(HeapType ht) const {
+    return preserveThunkTypes && hasImmutableSigField(Type(ht, NonNullable));
+  }
+
+  bool isPreservedThunkGroup(const Group& g) const {
+    if (!preserveThunkTypes) {
+      return false;
+    }
+    if (hasImmutableSigField(Type(g.type, NonNullable))) {
+      return true;
+    }
+    for (auto& f : g.leafFields) {
+      if (f.mutable_ == Immutable && f.type.isRef() &&
+          f.type.getHeapType().isSignature()) {
         return true;
       }
     }
@@ -2157,6 +2806,7 @@ private:
     struct CodeScanInfo {
       std::unordered_map<Name, Index> gets;
       std::unordered_map<Name, std::vector<Expression**>> arrayGets;
+      std::unordered_map<Name, std::vector<Name>> palCallTargets;
     };
     ModuleUtils::ParallelFunctionAnalysis<CodeScanInfo> codeScan(
       *module, [&](Function* func, CodeScanInfo& info) {
@@ -2175,6 +2825,13 @@ private:
               info.arrayGets[gg->name].push_back(getCurrentPointer());
             }
           }
+          void visitCall(Call* curr) {
+            if (curr->operands.size() == 2) {
+              if (auto* gg = curr->operands[0]->dynCast<GlobalGet>()) {
+                info.palCallTargets[gg->name].push_back(curr->target);
+              }
+            }
+          }
         };
         Walker(info).walk(func->body);
       });
@@ -2182,6 +2839,7 @@ private:
     std::unordered_map<Name, Index> codeGlobalGets;
     std::unordered_map<Name, std::vector<std::pair<Function*, Expression**>>>
       arrayGetSites;
+    std::unordered_map<Name, std::vector<Name>> allPalCallTargets;
     for (auto& func : module->functions) {
       if (func->imported()) {
         continue;
@@ -2195,6 +2853,10 @@ private:
           arrayGetSites[name].push_back({func.get(), site});
         }
       }
+      for (auto& [name, targets] : info.palCallTargets) {
+        auto& dst = allPalCallTargets[name];
+        dst.insert(dst.end(), targets.begin(), targets.end());
+      }
     }
 
     computeIndexes();
@@ -2205,8 +2867,10 @@ private:
       Index slotIdx;
       Name elemGlobalName;
       StructNew* sn;
+      Name existingHelper;
     };
     InsertOrderedMap<HeapType, std::vector<SoleSlot>> byStructType;
+    std::unordered_map<HeapType, std::pair<Name, StructNew*>> existingPalHelpers;
     for (auto& g : module->globals) {
       if (g->imported() || g->mutable_ || nonCodeUses.count(g->name) ||
           initGlobalUses[g->name] > 0) {
@@ -2217,7 +2881,7 @@ private:
         continue;
       }
       Index totalGets = codeGlobalGets[g->name];
-      if (totalGets == 0 || totalGets != arrayGetSites[g->name].size()) {
+      if (totalGets == 0) {
         continue;
       }
       if (!g->type.isRef() || g->type.isNullable() || g->type.isExact()) {
@@ -2228,27 +2892,81 @@ private:
         continue;
       }
       Field elemField = arrHt.getArray().element;
-      if (!elemField.type.isRef() || elemField.type.isNullable() ||
-          elemField.type.isExact()) {
+      if (!elemField.type.isRef() || elemField.type.isExact()) {
         continue;
       }
       HeapType structHt = elemField.type.getHeapType();
-      if (!structHt.isStruct() || structHt.isShared()) {
+      if (!structHt.isStruct() || structHt.isShared() ||
+          isPreservedThunkType(structHt)) {
         continue;
       }
-      bool allNonNullGlobalGets = true;
-      for (auto* val : anf->values) {
-        if (!val->is<GlobalGet>()) {
-          allNonNullGlobalGets = false;
-          break;
+      Name existingHelper;
+      StructNew* existingTempl = nullptr;
+      if (!elemField.type.isNullable() && elemField.mutable_ == Immutable) {
+        if (totalGets != arrayGetSites[g->name].size()) {
+          continue;
         }
-      }
-      if (!allNonNullGlobalGets) {
+        bool allNonNullGlobalGets = true;
+        for (auto* val : anf->values) {
+          if (!val->is<GlobalGet>()) {
+            allNonNullGlobalGets = false;
+            break;
+          }
+        }
+        if (!allNonNullGlobalGets) {
+          continue;
+        }
+      } else if (elemField.type.isNullable() && elemField.mutable_ == Mutable) {
+        auto& targets = allPalCallTargets[g->name];
+        if (targets.size() != totalGets) {
+          continue;
+        }
+        Name commonTarget = targets[0];
+        if (!commonTarget.startsWith("defer$pal$")) {
+          continue;
+        }
+        bool sameTarget = true;
+        for (Name t : targets) {
+          if (t != commonTarget) {
+            sameTarget = false;
+            break;
+          }
+        }
+        if (!sameTarget) {
+          continue;
+        }
+        auto* helperFn = module->getFunctionOrNull(commonTarget);
+        if (!helperFn || helperFn->imported()) {
+          continue;
+        }
+        FindAll<StructNew> sns(helperFn->body);
+        if (sns.list.size() != 1 || !sns.list[0]->type.isRef() ||
+            sns.list[0]->type.getHeapType() != structHt) {
+          continue;
+        }
+        bool validVals = true;
+        for (auto* val : anf->values) {
+          if (!val->is<GlobalGet>() && !val->is<RefNull>()) {
+            validVals = false;
+            break;
+          }
+        }
+        if (!validVals) {
+          continue;
+        }
+        existingHelper = commonTarget;
+        existingTempl = sns.list[0];
+        existingPalHelpers[structHt] = {existingHelper, existingTempl};
+      } else {
         continue;
       }
       for (Index k = 0; k < anf->values.size(); k++) {
-        Name ename = anf->values[k]->cast<GlobalGet>()->name;
-        if (initGlobalUses[ename] != 1 || codeGlobalGets[ename] != 0 ||
+        auto* gg = anf->values[k]->dynCast<GlobalGet>();
+        if (!gg) {
+          continue;
+        }
+        Name ename = gg->name;
+        if (initGlobalUses[ename] == 0 || codeGlobalGets[ename] != 0 ||
             nonCodeUses.count(ename)) {
           continue;
         }
@@ -2263,6 +2981,9 @@ private:
             sn->operands.size() != structHt.getStruct().fields.size()) {
           continue;
         }
+        if (existingTempl && !ExpressionAnalyzer::equal(existingTempl, sn)) {
+          continue;
+        }
         bool validOps = true;
         for (auto* op : sn->operands) {
           if (!isValidLeaf(op)) {
@@ -2271,25 +2992,24 @@ private:
           }
         }
         if (validOps) {
-          byStructType[structHt].push_back({g.get(), anf, k, ename, sn});
+          byStructType[structHt].push_back(
+            {g.get(), anf, k, ename, sn, existingHelper});
         }
       }
-    }
-
-    if (byStructType.empty()) {
-      return;
     }
 
     Builder builder(*module);
     std::unordered_set<Function*> refinalizeFuncs;
     std::vector<Name> globalsToRemove;
+    std::unordered_set<Name> globalsToRemoveSet;
 
     for (auto& [structHt, slots] : byStructType) {
-      // Find the largest group of identical StructNew initializers for structHt.
-      std::vector<std::vector<SoleSlot>> groups;
+      // Group slots by identical StructNew initializers for structHt, keeping
+      // only elements whose initializer uses are all within that group.
+      std::vector<std::vector<SoleSlot>> rawGroups;
       for (auto& slot : slots) {
         bool placed = false;
-        for (auto& grp : groups) {
+        for (auto& grp : rawGroups) {
           if (ExpressionAnalyzer::equal(grp[0].sn, slot.sn)) {
             grp.push_back(slot);
             placed = true;
@@ -2297,8 +3017,28 @@ private:
           }
         }
         if (!placed) {
-          groups.push_back({slot});
+          rawGroups.push_back({slot});
         }
+      }
+      std::vector<std::vector<SoleSlot>> groups;
+      for (auto& grp : rawGroups) {
+        std::unordered_map<Name, Index> grpElemUses;
+        for (auto& slot : grp) {
+          grpElemUses[slot.elemGlobalName]++;
+        }
+        std::vector<SoleSlot> validGrp;
+        for (auto& slot : grp) {
+          if (grpElemUses[slot.elemGlobalName] ==
+              initGlobalUses[slot.elemGlobalName]) {
+            validGrp.push_back(slot);
+          }
+        }
+        if (!validGrp.empty()) {
+          groups.push_back(std::move(validGrp));
+        }
+      }
+      if (groups.empty()) {
+        continue;
       }
       auto bestIt = std::max_element(
         groups.begin(),
@@ -2308,16 +3048,33 @@ private:
         });
       auto& bestGroup = *bestIt;
       StructNew* templ = bestGroup[0].sn;
-      Index entrySavings = getGlobalEntryBytes(templ) + 1;
-      if (!always && bestGroup.size() * entrySavings <= 45) {
-        continue;
-      }
 
       // Ensure no operand of templ references any global being removed.
       std::unordered_set<Name> removingSet;
+      bool hasNewArray = false;
+      Name reusedHelper;
       for (auto& slot : bestGroup) {
         removingSet.insert(slot.elemGlobalName);
+        if (slot.existingHelper.is()) {
+          reusedHelper = slot.existingHelper;
+        } else {
+          hasNewArray = true;
+        }
       }
+      if (!reusedHelper.is()) {
+        auto exIt = existingPalHelpers.find(structHt);
+        if (exIt != existingPalHelpers.end() &&
+            ExpressionAnalyzer::equal(exIt->second.second, templ)) {
+          reusedHelper = exIt->second.first;
+        }
+      }
+      Index totalSavings =
+        removingSet.size() * getGlobalEntryBytes(templ) + bestGroup.size();
+      Index helperCost = reusedHelper.is() ? 0 : 45;
+      if (!always && totalSavings <= helperCost) {
+        continue;
+      }
+
       bool selfRef = false;
       for (auto* op : templ->operands) {
         if (auto* gg = op->dynCast<GlobalGet>()) {
@@ -2336,50 +3093,57 @@ private:
       HeapType mutArrHt(Array(Field(nullStructType, Mutable)));
       Type mutArrRefType(mutArrHt, NonNullable);
 
-      std::string typeName;
-      if (auto iter = module->typeNames.find(structHt);
-          iter != module->typeNames.end()) {
-        typeName = iter->second.name.toString();
-      } else {
-        typeName = std::to_string(numFactories);
+      Name helperName = reusedHelper;
+      if (!helperName.is() && hasNewArray) {
+        std::string typeName;
+        if (auto iter = module->typeNames.find(structHt);
+            iter != module->typeNames.end()) {
+          typeName = iter->second.name.toString();
+        } else {
+          typeName = std::to_string(numFactories);
+        }
+        numFactories++;
+        helperName =
+          Names::getValidFunctionName(*module, "defer$pal$" + typeName);
+        Name label("cached");
+        auto* cacheGet =
+          builder.makeArrayGet(builder.makeLocalGet(0, mutArrRefType),
+                               builder.makeLocalGet(1, Type::i32),
+                               MemoryOrder::Unordered,
+                               nullStructType);
+        auto* brOn = builder.makeBrOn(BrOnNonNull, label, cacheGet);
+        auto* tee = builder.makeLocalTee(
+          2, ExpressionManipulator::copy(templ, *module), nonNullStructType);
+        auto* cacheSet =
+          builder.makeArraySet(builder.makeLocalGet(0, mutArrRefType),
+                               builder.makeLocalGet(1, Type::i32),
+                               tee,
+                               MemoryOrder::Unordered);
+        auto* body = builder.makeBlock(
+          label,
+          {brOn, cacheSet, builder.makeLocalGet(2, nonNullStructType)},
+          nonNullStructType);
+        module->addFunction(builder.makeFunction(
+          helperName,
+          Signature({mutArrRefType, Type::i32}, nonNullStructType),
+          {nonNullStructType},
+          body));
       }
-      numFactories++;
-      auto helperName =
-        Names::getValidFunctionName(*module, "defer$pal$" + typeName);
-      Name label("cached");
-      auto* cacheGet =
-        builder.makeArrayGet(builder.makeLocalGet(0, mutArrRefType),
-                             builder.makeLocalGet(1, Type::i32),
-                             MemoryOrder::Unordered,
-                             nullStructType);
-      auto* brOn = builder.makeBrOn(BrOnNonNull, label, cacheGet);
-      auto* tee = builder.makeLocalTee(
-        2, ExpressionManipulator::copy(templ, *module), nonNullStructType);
-      auto* cacheSet =
-        builder.makeArraySet(builder.makeLocalGet(0, mutArrRefType),
-                             builder.makeLocalGet(1, Type::i32),
-                             tee,
-                             MemoryOrder::Unordered);
-      auto* body = builder.makeBlock(
-        label,
-        {brOn, cacheSet, builder.makeLocalGet(2, nonNullStructType)},
-        nonNullStructType);
-      module->addFunction(builder.makeFunction(
-        helperName,
-        Signature({mutArrRefType, Type::i32}, nonNullStructType),
-        {nonNullStructType},
-        body));
 
-      std::unordered_set<Global*> touchedArrays;
+      std::unordered_set<Global*> touchedNewArrays;
       for (auto& slot : bestGroup) {
         slot.anf->values[slot.slotIdx] = builder.makeRefNull(HeapTypes::none);
-        touchedArrays.insert(slot.arrGlobal);
-        globalsToRemove.push_back(slot.elemGlobalName);
+        if (!slot.existingHelper.is()) {
+          touchedNewArrays.insert(slot.arrGlobal);
+        }
+        if (globalsToRemoveSet.insert(slot.elemGlobalName).second) {
+          globalsToRemove.push_back(slot.elemGlobalName);
+        }
       }
-      for (auto* arrG : touchedArrays) {
+      for (auto* arrG : touchedNewArrays) {
         arrG->type = mutArrRefType;
         auto* anf = arrG->init->cast<ArrayNewFixed>();
-        anf->type = mutArrRefType;
+        anf->type = Type(mutArrHt, NonNullable, Exact);
         anf->finalize();
         for (auto& [fn, site] : arrayGetSites[arrG->name]) {
           auto* ag = (*site)->cast<ArrayGet>();
@@ -2396,6 +3160,25 @@ private:
     }
     for (Name gname : globalsToRemove) {
       module->removeGlobal(gname);
+    }
+
+    // Convert any array.new_fixed global initializer whose elements are all
+    // ref.null into array.new_default.
+    for (auto& g : module->globals) {
+      if (g->imported() || !g->init) {
+        continue;
+      }
+      auto* anf = g->init->dynCast<ArrayNewFixed>();
+      if (!anf || anf->values.empty() || !anf->type.isRef()) {
+        continue;
+      }
+      if (std::all_of(anf->values.begin(),
+                      anf->values.end(),
+                      [](Expression* v) { return v->is<RefNull>(); })) {
+        g->init =
+          builder.makeArrayNew(anf->type.getHeapType(),
+                               builder.makeConst(int32_t(anf->values.size())));
+      }
     }
   }
 
