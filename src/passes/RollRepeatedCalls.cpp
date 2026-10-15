@@ -288,17 +288,26 @@ struct HolePlan {
   std::vector<uint8_t> data;
   // Assigned when the function's arrays are laid out.
   Index offset = 0;
+  // Offset added to column values when 0 is reserved for switch gaps.
+  Index gapOffset = 0;
   // Table: the index of the table in the function state.
   Index table = 0;
   std::vector<Name> newGlobals;
 };
 
 struct RunPlan {
-  Block* block;
-  Index start;
-  Index size;
+  Block* block = nullptr;
+  Index start = 0;
+  Index size = 0;
   Statement first;
   std::vector<HolePlan> holes;
+  // For switch ladders:
+  Expression** switchPtr = nullptr;
+  Expression* switchCond = nullptr;
+  // 0: Stmt, 1: Return, 2: BrVal
+  int switchKind = -1;
+  Name switchExitLabel = Name();
+  bool hasGaps = false;
   // The expression that replaced the run.
   Expression* replacement = nullptr;
 };
@@ -337,13 +346,22 @@ struct RollRepeatedCalls : public Pass {
     if (!module->features.hasGC() || !module->features.hasBulkMemory()) {
       return;
     }
-    segmentName = Names::getValidDataSegmentName(*module, "roll");
+    DataSegment* existingSegment = module->getDataSegmentOrNull("roll");
+    if (existingSegment && existingSegment->isPassive()) {
+      segmentName = existingSegment->name;
+      segmentData = std::move(existingSegment->data);
+    } else {
+      existingSegment = nullptr;
+      segmentName = Names::getValidDataSegmentName(*module, "roll");
+    }
     for (auto& func : module->functions) {
       if (!func->imported()) {
         processFunction(func.get());
       }
     }
-    if (!segmentData.empty()) {
+    if (existingSegment) {
+      existingSegment->data = std::move(segmentData);
+    } else if (!segmentData.empty()) {
       module->addDataSegment(Builder::makeDataSegment(
         segmentName, Name(), nullptr, segmentData.data(), segmentData.size()));
     }
@@ -376,6 +394,28 @@ struct RollRepeatedCalls : public Pass {
       stmt.strictKey.push_back(strict);
     }
 
+    bool getConstI32(Expression* expr, Literal& out, Index& bytes) {
+      if (auto* c = expr->dynCast<Const>()) {
+        if (c->type == Type::i32) {
+          out = c->value;
+          bytes = getConstBytes(c->value);
+          return true;
+        }
+      } else if (auto* get = expr->dynCast<GlobalGet>()) {
+        auto* global = wasm.getGlobal(get->name);
+        if (!global->mutable_ && !global->imported()) {
+          if (auto* c = global->init->dynCast<Const>()) {
+            if (c->type == Type::i32) {
+              out = c->value;
+              bytes = GlobalGetBytes;
+              return true;
+            }
+          }
+        }
+      }
+      return false;
+    }
+
     bool scan(Expression** ptr, Index depth) {
       auto* curr = *ptr;
       if (depth > MaxDepth || curr->type == Type::unreachable) {
@@ -402,6 +442,22 @@ struct RollRepeatedCalls : public Pass {
                                  c->type,
                                  getConstBytes(c->value)});
           return true;
+        }
+        case Expression::RefNullId: {
+          if (curr->type.getHeapType().getBottom() == HeapType::none) {
+            size_t digest = hash(Expression::GlobalGetId);
+            rehash(digest, size_t(2));
+            pushRefLeaf(digest);
+            stmt.leaves.push_back({ptr,
+                                   LeafKind::Global,
+                                   Literal(),
+                                   Name(),
+                                   Name(),
+                                   curr->type,
+                                   2});
+            return true;
+          }
+          break;
         }
         case Expression::GlobalGetId: {
           auto* get = curr->cast<GlobalGet>();
@@ -489,20 +545,20 @@ struct RollRepeatedCalls : public Pass {
             return true;
           }
           if (call->operands.size() == 1 && call->type.isRef()) {
-            if (auto* c = call->operands[0]->dynCast<Const>()) {
-              if (c->type == Type::i32) {
-                size_t digest = hash(curr->_id);
-                rehash(digest, call->target);
-                pushRefLeaf(digest);
-                stmt.leaves.push_back({ptr,
-                                       LeafKind::IndexedCall,
-                                       c->value,
-                                       Name(),
-                                       call->target,
-                                       call->type,
-                                       CallBytes + getConstBytes(c->value)});
-                return true;
-              }
+            Literal val;
+            Index argBytes = 0;
+            if (getConstI32(call->operands[0], val, argBytes)) {
+              size_t digest = hash(curr->_id);
+              rehash(digest, call->target);
+              pushRefLeaf(digest);
+              stmt.leaves.push_back({ptr,
+                                     LeafKind::IndexedCall,
+                                     val,
+                                     Name(),
+                                     call->target,
+                                     call->type,
+                                     CallBytes + argBytes});
+              return true;
             }
           }
           break;
@@ -578,6 +634,7 @@ struct RollRepeatedCalls : public Pass {
     for (auto* block : FindAll<Block>(func->body).list) {
       planBlock(state, block);
     }
+    planSwitchLadders(state);
     if (state.plans.empty()) {
       return;
     }
@@ -871,7 +928,9 @@ struct RollRepeatedCalls : public Pass {
   }
 
   // Plans a varying constant leaf. Returns false if it cannot be handled.
-  bool planConst(HolePlan& plan, const std::vector<Literal>& values) {
+  bool planConst(HolePlan& plan,
+                 const std::vector<Literal>& values,
+                 bool allowDelta = true) {
     auto type = values[0].type;
     Index size = values.size();
     if (type == Type::i32) {
@@ -903,7 +962,7 @@ struct RollRepeatedCalls : public Pass {
       } else if (min >= -128 && max <= 127) {
         plan.column = ColumnKind::I8;
         plan.signed_ = true;
-      } else if (planDelta(plan, values)) {
+      } else if (allowDelta && planDelta(plan, values)) {
         return true;
       } else if (min >= 0 && max <= 65535) {
         plan.column = ColumnKind::I16;
@@ -939,6 +998,518 @@ struct RollRepeatedCalls : public Pass {
       return false;
     }
     return true;
+  }
+
+  struct ChildPtrFinder
+    : public PostWalker<ChildPtrFinder,
+                        UnifiedExpressionVisitor<ChildPtrFinder>> {
+    std::unordered_map<Expression*, Expression*> parents;
+    std::unordered_map<Expression*, Expression**> parentPtrs;
+    void visitExpression(Expression* curr) {
+      ChildIterator children(curr);
+      for (Index i = 0; i < children.getNumChildren(); i++) {
+        Expression** ptr = children.children[i];
+        parents[*ptr] = curr;
+        parentPtrs[*ptr] = ptr;
+      }
+    }
+  };
+
+  void planSwitchLadders(FuncState& state) {
+    auto switches = FindAll<Switch>(state.func->body).list;
+    if (switches.empty()) {
+      return;
+    }
+    ChildPtrFinder finder;
+    finder.parentPtrs[state.func->body] = &state.func->body;
+    finder.walk(state.func->body);
+    for (auto* sw : switches) {
+      planSwitch(state, sw, finder);
+    }
+  }
+
+  void planSwitch(FuncState& state, Switch* sw, ChildPtrFinder& finder) {
+    if (sw->value || !sw->default_.is() ||
+        sw->condition->type == Type::unreachable ||
+        sw->targets.size() < MinRun) {
+      return;
+    }
+    std::vector<Block*> chain;
+    std::set<Name> chainNames;
+    Expression* curr = sw;
+    Block* bDef = nullptr;
+    while (true) {
+      auto it = finder.parents.find(curr);
+      if (it == finder.parents.end()) {
+        break;
+      }
+      auto* block = it->second->dynCast<Block>();
+      if (!block || block->list.empty() || block->list[0] != curr ||
+          block->type != Type::none) {
+        break;
+      }
+      chain.push_back(block);
+      if (block->name.is()) {
+        chainNames.insert(block->name);
+      }
+      if (block->name == sw->default_) {
+        bDef = block;
+        break;
+      }
+      curr = block;
+    }
+    if (!bDef || chain.size() < 2) {
+      return;
+    }
+    auto ptrIt = finder.parentPtrs.find(bDef);
+    if (ptrIt == finder.parentPtrs.end()) {
+      return;
+    }
+    std::reverse(chain.begin(), chain.end());
+    if (chain.back()->list.size() != 1) {
+      return;
+    }
+    bool condBranchesToChain = false;
+    BranchUtils::operateOnScopeNameUses(sw->condition, [&](Name& name) {
+      if (chainNames.count(name)) {
+        condBranchesToChain = true;
+      }
+    });
+    if (condBranchesToChain) {
+      return;
+    }
+
+    std::unordered_map<Name, Index> nameToIdx;
+    for (Index k = 0; k < chain.size(); k++) {
+      if (chain[k]->name.is()) {
+        nameToIdx[chain[k]->name] = k;
+      }
+    }
+    Index M = sw->targets.size();
+    std::vector<Index> targetEffK(M);
+    std::vector<Index> distinctEffKs;
+    std::unordered_map<Index, Index> effKToArmIdx;
+    bool hasGaps = false;
+    for (Index i = 0; i < M; i++) {
+      auto it = nameToIdx.find(sw->targets[i]);
+      if (it == nameToIdx.end()) {
+        return;
+      }
+      Index effK = it->second;
+      while (effK >= 1 && chain[effK - 1]->list.size() == 1) {
+        effK--;
+      }
+      targetEffK[i] = effK;
+      if (effK == 0) {
+        hasGaps = true;
+      } else if (!effKToArmIdx.count(effK)) {
+        effKToArmIdx[effK] = distinctEffKs.size();
+        distinctEffKs.push_back(effK);
+      }
+    }
+    if (distinctEffKs.size() < MinRun) {
+      return;
+    }
+    for (Index k = 1; k < chain.size(); k++) {
+      if (chain[k - 1]->list.size() > 1 && !effKToArmIdx.count(k)) {
+        return;
+      }
+    }
+
+    int switchKind = -1;
+    Name switchExitLabel;
+    std::vector<Statement> armStmts;
+    armStmts.reserve(distinctEffKs.size());
+    bool committed = false;
+    auto cleanup = [&]() {
+      if (!committed) {
+        for (auto& s : armStmts) {
+          for (auto& [ptr, original] : s.inlined) {
+            *ptr = original;
+          }
+        }
+      }
+    };
+
+    for (Index d = 0; d < distinctEffKs.size(); d++) {
+      Index effK = distinctEffKs[d];
+      Block* armBlock = chain[effK - 1];
+      int armKind = -1;
+      Name armExit;
+      Index armFixed = 0;
+      Expression** valPtr = nullptr;
+      if (armBlock->list.size() == 2) {
+        if (auto* ret = armBlock->list[1]->dynCast<Return>()) {
+          if (ret->value) {
+            armKind = 1;
+            armFixed = 1;
+            valPtr = &ret->value;
+          }
+        } else if (auto* br = armBlock->list[1]->dynCast<Break>()) {
+          if (!br->condition && br->value && !chainNames.count(br->name)) {
+            armKind = 2;
+            armExit = br->name;
+            armFixed = 2;
+            valPtr = &br->value;
+          }
+        } else if (effK == 1 && armBlock->list[1]->type == Type::none) {
+          armKind = 0;
+          armExit = bDef->name;
+          armFixed = 0;
+          valPtr = &armBlock->list[1];
+        }
+      } else if (armBlock->list.size() == 3 &&
+                 armBlock->list[1]->type == Type::none) {
+        if (auto* br = armBlock->list[2]->dynCast<Break>()) {
+          if (!br->condition && !br->value &&
+              (br->name == bDef->name || !chainNames.count(br->name))) {
+            armKind = 0;
+            armExit = br->name;
+            armFixed = 2;
+            valPtr = &armBlock->list[1];
+          }
+        }
+      }
+      if (armKind < 0) {
+        cleanup();
+        return;
+      }
+      if (d == 0) {
+        switchKind = armKind;
+        switchExitLabel = armExit;
+      } else if (armKind != switchKind || armExit != switchExitLabel) {
+        cleanup();
+        return;
+      }
+      Statement stmt;
+      stmt.fixedBytes = armFixed;
+      Scanner scanner(*module, stmt, *this, state.func);
+      stmt.valid = scanner.scan(valPtr, 0);
+      stmt.expr = *valPtr;
+      armStmts.push_back(std::move(stmt));
+      if (!armStmts.back().valid || armStmts.back().key != armStmts[0].key ||
+          armStmts.back().leaves.size() != armStmts[0].leaves.size()) {
+        cleanup();
+        return;
+      }
+    }
+
+    auto& first = armStmts[0];
+    Index numLeaves = first.leaves.size();
+    std::vector<HolePlan> holes(numLeaves);
+    int oldBytes = int(3 * chain.size() + 3 + M);
+    for (auto& s : armStmts) {
+      oldBytes += int(s.fixedBytes) + s.inlinedAdjust;
+      for (auto& leaf : s.leaves) {
+        if (!leaf.inlined) {
+          oldBytes += int(leaf.bytes);
+        }
+      }
+    }
+    Index rolledFixedBytes = first.fixedBytes;
+    if (switchKind == 0 && switchExitLabel == bDef->name &&
+        rolledFixedBytes >= 2) {
+      rolledFixedBytes -= 2;
+    }
+    int newBytes = 8 + int(getConstBytes(Literal(int32_t(M)))) +
+                   int(rolledFixedBytes) + (hasGaps ? 10 : 0);
+    std::set<ColumnKind> newKinds;
+    std::unordered_map<Type, Index> newTables;
+    std::vector<Table> tempTables = state.tables;
+
+    auto getTable = [&](Type lub) {
+      auto iter = state.tablesByType.find(lub);
+      if (iter != state.tablesByType.end()) {
+        return iter->second;
+      }
+      auto newIter = newTables.find(lub);
+      if (newIter != newTables.end()) {
+        return newIter->second;
+      }
+      Index tableIndex = tempTables.size();
+      tempTables.push_back(Table{lub, {}, {}, Name()});
+      newTables[lub] = tableIndex;
+      newBytes += TableBytes;
+      return tableIndex;
+    };
+    auto getTableIndex = [&](Table& table, HolePlan& plan, Name name) {
+      auto indexIter = table.indexes.find(name);
+      if (indexIter == table.indexes.end()) {
+        indexIter =
+          table.indexes.insert({name, Index(table.globals.size())}).first;
+        table.globals.push_back(name);
+        plan.newGlobals.push_back(name);
+        newBytes += TableEntryBytes;
+      }
+      return indexIter->second;
+    };
+    auto useColumn = [&](HolePlan& plan) {
+      if (!state.arrayLocals.count(plan.column)) {
+        newKinds.insert(plan.column);
+      }
+      newBytes += plan.data.size() + getReadBytes(plan);
+    };
+
+    Index numVaryingHoles = 0;
+    for (Index h = 0; h < numLeaves; h++) {
+      auto& plan = holes[h];
+      auto& leaf = first.leaves[h];
+      bool varies = false;
+      bool hasGlobal = false;
+      bool hasCall = false;
+      Name callee;
+      for (auto& s : armStmts) {
+        auto& other = s.leaves[h];
+        if (other.kind == LeafKind::Const) {
+          if (leaf.kind != LeafKind::Const ||
+              other.value.type != leaf.value.type) {
+            cleanup();
+            return;
+          }
+          if (other.value != leaf.value) {
+            varies = true;
+          }
+        } else if (other.kind == LeafKind::Global) {
+          if (leaf.kind == LeafKind::Const) {
+            cleanup();
+            return;
+          }
+          hasGlobal = true;
+          if (other.kind != leaf.kind || other.global != leaf.global) {
+            varies = true;
+          }
+        } else {
+          if (leaf.kind == LeafKind::Const) {
+            cleanup();
+            return;
+          }
+          if (!hasCall) {
+            callee = other.callee;
+          } else if (other.callee != callee) {
+            cleanup();
+            return;
+          }
+          hasCall = true;
+          if (other.kind != leaf.kind || other.value != leaf.value) {
+            varies = true;
+          }
+        }
+      }
+      if (!varies) {
+        plan.kind = HolePlan::Fixed;
+        newBytes += leaf.bytes;
+        continue;
+      }
+      numVaryingHoles++;
+      if (hasGaps && numVaryingHoles > 1) {
+        cleanup();
+        return;
+      }
+      if (leaf.kind == LeafKind::Const || (hasCall && !hasGlobal)) {
+        if (!hasGaps) {
+          std::vector<Literal> values;
+          values.reserve(M);
+          for (Index i = 0; i < M; i++) {
+            values.push_back(
+              armStmts[effKToArmIdx[targetEffK[i]]].leaves[h].value);
+          }
+          if (!planConst(plan, values, false)) {
+            cleanup();
+            return;
+          }
+        } else {
+          if (leaf.value.type != Type::i32) {
+            cleanup();
+            return;
+          }
+          int32_t min = armStmts[0].leaves[h].value.geti32();
+          int32_t max = min;
+          for (auto& s : armStmts) {
+            int32_t v = s.leaves[h].value.geti32();
+            min = std::min(min, v);
+            max = std::max(max, v);
+          }
+          plan.kind = HolePlan::Column;
+          if (min >= 1 && max <= 255) {
+            plan.column = ColumnKind::I8;
+            plan.gapOffset = 0;
+          } else if (min >= 0 && max <= 254) {
+            plan.column = ColumnKind::I8;
+            plan.gapOffset = 1;
+          } else if (min >= 1 && max <= 65535) {
+            plan.column = ColumnKind::I16;
+            plan.gapOffset = 0;
+          } else if (min >= 0 && max <= 65534) {
+            plan.column = ColumnKind::I16;
+            plan.gapOffset = 1;
+          } else {
+            cleanup();
+            return;
+          }
+          for (Index i = 0; i < M; i++) {
+            uint32_t v =
+              targetEffK[i] == 0
+                ? 0
+                : uint32_t(armStmts[effKToArmIdx[targetEffK[i]]]
+                             .leaves[h]
+                             .value.geti32()) +
+                    plan.gapOffset;
+            appendLE(plan.data, v, getColumnWidth(plan.column));
+          }
+        }
+        if (hasCall) {
+          plan.callee = callee;
+          newBytes += CallBytes;
+        }
+        if (plan.kind == HolePlan::Column) {
+          useColumn(plan);
+        } else {
+          newBytes += getReadBytes(plan);
+        }
+        continue;
+      }
+
+      Type lub = Type::none;
+      for (auto& s : armStmts) {
+        auto& other = s.leaves[h];
+        if (other.kind != LeafKind::Global) {
+          continue;
+        }
+        lub = lub == Type::none ? other.type
+                                : Type::getLeastUpperBound(lub, other.type);
+        if (lub == Type::none) {
+          cleanup();
+          return;
+        }
+      }
+      Index tableIndex = getTable(lub);
+      auto& table = tempTables[tableIndex];
+      if (!hasCall) {
+        for (auto& s : armStmts) {
+          getTableIndex(table, plan, s.leaves[h].global);
+        }
+        plan.gapOffset = hasGaps ? 1 : 0;
+        if (table.globals.size() + plan.gapOffset > 65536) {
+          cleanup();
+          return;
+        }
+        std::vector<uint32_t> indexes;
+        indexes.reserve(M);
+        uint32_t maxIndex = 0;
+        for (Index i = 0; i < M; i++) {
+          uint32_t idx =
+            targetEffK[i] == 0
+              ? 0
+              : table.indexes[armStmts[effKToArmIdx[targetEffK[i]]]
+                                .leaves[h]
+                                .global] +
+                  plan.gapOffset;
+          maxIndex = std::max(maxIndex, idx);
+          indexes.push_back(idx);
+        }
+        plan.kind = HolePlan::Table;
+        plan.table = tableIndex;
+        plan.column = maxIndex <= 255 ? ColumnKind::I8 : ColumnKind::I16;
+        for (auto index : indexes) {
+          appendLE(plan.data, index, getColumnWidth(plan.column));
+        }
+        useColumn(plan);
+        continue;
+      }
+      Type callType = Type::none;
+      for (auto& s : armStmts) {
+        auto& other = s.leaves[h];
+        if (other.kind == LeafKind::Global) {
+          getTableIndex(table, plan, other.global);
+        } else {
+          callType = other.type;
+        }
+      }
+      Type mixedType = Type::getLeastUpperBound(lub, callType);
+      plan.gapOffset = hasGaps ? 1 : 0;
+      if (mixedType == Type::none ||
+          table.globals.size() + plan.gapOffset > 65536) {
+        cleanup();
+        return;
+      }
+      Index tableSize = table.globals.size();
+      std::vector<uint32_t> indexes;
+      indexes.reserve(M);
+      uint32_t maxIndex = 0;
+      for (Index i = 0; i < M; i++) {
+        uint32_t index = 0;
+        if (targetEffK[i] != 0) {
+          auto& other = armStmts[effKToArmIdx[targetEffK[i]]].leaves[h];
+          if (other.kind == LeafKind::Global) {
+            index = table.indexes[other.global] + plan.gapOffset;
+          } else {
+            int32_t arg = other.value.geti32();
+            if (arg < 0 ||
+                uint32_t(arg) >
+                  uint32_t(0x7fffffff) - (tableSize + plan.gapOffset)) {
+              cleanup();
+              return;
+            }
+            index = tableSize + plan.gapOffset + uint32_t(arg);
+          }
+        }
+        maxIndex = std::max(maxIndex, index);
+        indexes.push_back(index);
+      }
+      plan.kind = HolePlan::Mixed;
+      plan.table = tableIndex;
+      plan.tableSize = tableSize;
+      plan.callee = callee;
+      plan.mixedType = mixedType;
+      plan.column = maxIndex <= 255     ? ColumnKind::I8
+                    : maxIndex <= 65535 ? ColumnKind::I16
+                                        : ColumnKind::I32;
+      for (auto index : indexes) {
+        appendLE(plan.data, index, getColumnWidth(plan.column));
+      }
+      useColumn(plan);
+    }
+    if (hasGaps && numVaryingHoles != 1) {
+      cleanup();
+      return;
+    }
+    newBytes += newKinds.size() * ArraySetupBytes;
+    if (newBytes >= oldBytes) {
+      cleanup();
+      return;
+    }
+
+    committed = true;
+    state.tables = std::move(tempTables);
+    for (auto& [type, index] : newTables) {
+      state.tablesByType[type] = index;
+    }
+    for (auto kind : newKinds) {
+      state.arrayLocals[kind] =
+        Builder::addVar(state.func, Type(getColumnHeapType(kind), NonNullable));
+    }
+    for (auto& plan : holes) {
+      if (plan.kind == HolePlan::Column || plan.kind == HolePlan::Table ||
+          plan.kind == HolePlan::Mixed) {
+        auto& data = state.arrayData[plan.column];
+        plan.offset = state.arrayCounts[plan.column];
+        state.arrayCounts[plan.column] += M;
+        data.insert(data.end(), plan.data.begin(), plan.data.end());
+      }
+    }
+    Name effectiveExitLabel =
+      (switchKind == 0 && switchExitLabel == bDef->name) ? Name()
+                                                         : switchExitLabel;
+    state.plans.push_back(RunPlan{nullptr,
+                                  0,
+                                  M,
+                                  std::move(first),
+                                  std::move(holes),
+                                  ptrIt->second,
+                                  sw->condition,
+                                  switchKind,
+                                  effectiveExitLabel,
+                                  hasGaps});
   }
 
   // Plans a column of byte differences, if the values are close to their
@@ -1049,8 +1620,13 @@ struct RollRepeatedCalls : public Pass {
       HeapType arrayType(Array(Field(table.elemType, Immutable)));
       std::vector<Expression*> gets;
       for (auto name : table.globals) {
-        gets.push_back(
-          builder.makeGlobalGet(name, module->getGlobal(name)->type));
+        if (name.is()) {
+          gets.push_back(
+            builder.makeGlobalGet(name, module->getGlobal(name)->type));
+        } else {
+          gets.push_back(
+            builder.makeRefNull(table.elemType.getHeapType().getBottom()));
+        }
       }
       table.globalName = Names::getValidGlobalName(*module, "roll$table");
       module->addGlobal(
@@ -1064,6 +1640,11 @@ struct RollRepeatedCalls : public Pass {
     Index loopCounter = 0;
     for (auto it = state.plans.rbegin(); it != state.plans.rend(); ++it) {
       auto& plan = *it;
+      for (auto& leaf : plan.first.leaves) {
+        if (*leaf.ptr == plan.first.expr) {
+          leaf.ptr = &plan.first.expr;
+        }
+      }
       auto i32 = Type::i32;
       Index counter = Builder::addVar(func, i32);
       auto getCounter = [&]() { return builder.makeLocalGet(counter, i32); };
@@ -1084,9 +1665,6 @@ struct RollRepeatedCalls : public Pass {
           getColumnValueType(hole.column),
           hole.signed_);
       };
-      // Statements before the loop: the counter and the accumulators.
-      std::vector<Expression*> inits = {
-        builder.makeLocalSet(counter, builder.makeConst(int32_t(0)))};
       auto readTable = [&](const HolePlan& hole, Expression* index) {
         auto& table = state.tables[hole.table];
         HeapType arrayType(Array(Field(table.elemType, Immutable)));
@@ -1096,6 +1674,75 @@ struct RollRepeatedCalls : public Pass {
           MemoryOrder::Unordered,
           table.elemType);
       };
+      if (plan.switchPtr && plan.hasGaps) {
+        Index gapTemp = Builder::addVar(func, i32);
+        Expression* gapRead = nullptr;
+        for (Index h = 0; h < plan.holes.size(); h++) {
+          auto& hole = plan.holes[h];
+          auto& leaf = plan.first.leaves[h];
+          if (hole.kind == HolePlan::Fixed) {
+            continue;
+          }
+          gapRead = readColumn(hole);
+          auto getRaw = [&]() { return builder.makeLocalGet(gapTemp, i32); };
+          auto getAdj = [&]() -> Expression* {
+            if (hole.gapOffset == 0) {
+              return getRaw();
+            }
+            return builder.makeBinary(
+              SubInt32, getRaw(), builder.makeConst(int32_t(hole.gapOffset)));
+          };
+          Expression* value = nullptr;
+          if (hole.kind == HolePlan::Column) {
+            value = getAdj();
+            if (hole.callee.is()) {
+              value = builder.makeCall(
+                hole.callee,
+                {value},
+                module->getFunction(hole.callee)->getResults());
+            }
+          } else if (hole.kind == HolePlan::Table) {
+            value = readTable(hole, getAdj());
+          } else if (hole.kind == HolePlan::Mixed) {
+            Index bound = hole.tableSize + hole.gapOffset;
+            value = builder.makeIf(
+              builder.makeBinary(
+                LtUInt32, getRaw(), builder.makeConst(int32_t(bound))),
+              readTable(hole, getAdj()),
+              builder.makeCall(
+                hole.callee,
+                {builder.makeBinary(
+                  SubInt32, getRaw(), builder.makeConst(int32_t(bound)))},
+                module->getFunction(hole.callee)->getResults()),
+              hole.mixedType);
+          } else {
+            WASM_UNREACHABLE("unexpected gap hole kind");
+          }
+          *leaf.ptr = value;
+        }
+        Expression* armBody = plan.first.expr;
+        if (plan.switchKind == 1) {
+          armBody = builder.makeReturn(armBody);
+        } else if (plan.switchKind == 2) {
+          armBody = builder.makeBreak(plan.switchExitLabel, armBody);
+        } else if (plan.switchExitLabel.is()) {
+          armBody = builder.makeSequence(
+            armBody, builder.makeBreak(plan.switchExitLabel));
+        }
+        armBody = builder.makeIf(
+          builder.makeLocalTee(gapTemp, gapRead, i32), armBody);
+        plan.replacement = builder.makeIf(
+          builder.makeBinary(
+            LtUInt32,
+            builder.makeLocalTee(counter, plan.switchCond, i32),
+            builder.makeConst(int32_t(plan.size))),
+          armBody);
+        *plan.switchPtr = plan.replacement;
+        continue;
+      }
+      // Statements before the loop: the counter and the accumulators.
+      std::vector<Expression*> inits = {
+        builder.makeLocalSet(counter, builder.makeConst(int32_t(0)))};
       for (Index h = 0; h < plan.holes.size(); h++) {
         auto& hole = plan.holes[h];
         auto& leaf = plan.first.leaves[h];
@@ -1161,6 +1808,25 @@ struct RollRepeatedCalls : public Pass {
         }
         *leaf.ptr = value;
       }
+      if (plan.switchPtr) {
+        Expression* armBody = plan.first.expr;
+        if (plan.switchKind == 1) {
+          armBody = builder.makeReturn(armBody);
+        } else if (plan.switchKind == 2) {
+          armBody = builder.makeBreak(plan.switchExitLabel, armBody);
+        } else if (plan.switchExitLabel.is()) {
+          armBody = builder.makeSequence(
+            armBody, builder.makeBreak(plan.switchExitLabel));
+        }
+        plan.replacement = builder.makeIf(
+          builder.makeBinary(
+            LtUInt32,
+            builder.makeLocalTee(counter, plan.switchCond, i32),
+            builder.makeConst(int32_t(plan.size))),
+          armBody);
+        *plan.switchPtr = plan.replacement;
+        continue;
+      }
       Name loopName = Names::getValidName(
         "roll",
         [&](Name name) { return !state.scopeNames.count(name); },
@@ -1220,8 +1886,7 @@ struct RollRepeatedCalls : public Pass {
     std::vector<Chain> chains;
     for (auto& plan : state.plans) {
       Chain chain;
-      chain.push_back({plan.block, plan.replacement});
-      Expression* curr = plan.block;
+      Expression* curr = plan.replacement;
       while (true) {
         auto iter = parents.parents.find(curr);
         if (iter == parents.parents.end()) {

@@ -770,3 +770,270 @@
     (call $use (call $factory2 (i32.const 5202)))
   )
 )
+
+;; Uniform br_table switch ladders: rolled into bounds-checked arithmetic
+;; progressions, mixed table/factory lookups (including ref.null and hoisted
+;; i32 constant globals), or gap-aware column lookups.
+(module
+  ;; CHECK:      (type $str (struct (field i32)))
+  (type $str (struct (field i32)))
+
+  ;; CHECK:      (type $1 (array (mut i8)))
+
+  ;; CHECK:      (type $2 (array (ref null $str)))
+
+  ;; CHECK:      (type $3 (func (param i32)))
+
+  ;; CHECK:      (type $4 (func (param i32) (result (ref null $str))))
+
+  ;; CHECK:      (type $5 (func (param i32) (result (ref $str))))
+
+  ;; CHECK:      (import "env" "use" (func $use (type $3) (param i32)))
+  (import "env" "use" (func $use (param i32)))
+
+  ;; CHECK:      (global $a (ref $str) (struct.new $str
+  ;; CHECK-NEXT:  (i32.const 1)
+  ;; CHECK-NEXT: ))
+  (global $a (ref $str) (struct.new $str (i32.const 1)))
+  ;; CHECK:      (global $b (ref $str) (struct.new $str
+  ;; CHECK-NEXT:  (i32.const 2)
+  ;; CHECK-NEXT: ))
+  (global $b (ref $str) (struct.new $str (i32.const 2)))
+  ;; CHECK:      (global $c10 i32 (i32.const 10))
+  (global $c10 i32 (i32.const 10))
+
+  ;; CHECK:      (global $roll$table (ref $2) (array.new_fixed $2 3
+  ;; CHECK-NEXT:  (global.get $a)
+  ;; CHECK-NEXT:  (ref.null none)
+  ;; CHECK-NEXT:  (global.get $b)
+  ;; CHECK-NEXT: ))
+
+  ;; CHECK:      (data $roll "\00\08\01\02\r\00\12\02\01\17\00\1c\n\00\14\00\1e*2\00<FP")
+
+  ;; CHECK:      (func $factory (type $5) (param $i i32) (result (ref $str))
+  ;; CHECK-NEXT:  (struct.new $str
+  ;; CHECK-NEXT:   (local.get $i)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $factory (param $i i32) (result (ref $str))
+    (struct.new $str (local.get $i))
+  )
+
+  ;; CHECK:      (func $switch-ap (type $4) (param $x i32) (result (ref null $str))
+  ;; CHECK-NEXT:  (local $1 i32)
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (i32.lt_u
+  ;; CHECK-NEXT:    (local.tee $1
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.const 6)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (return
+  ;; CHECK-NEXT:     (call $factory
+  ;; CHECK-NEXT:      (i32.add
+  ;; CHECK-NEXT:       (local.get $1)
+  ;; CHECK-NEXT:       (i32.const 100)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (ref.null none)
+  ;; CHECK-NEXT: )
+  (func $switch-ap (param $x i32) (result (ref null $str))
+    (block $def
+      (block $b5
+        (block $b4
+          (block $b3
+            (block $b2
+              (block $b1
+                (block $b0
+                  (br_table $b0 $b1 $b2 $b3 $b4 $b5 $def (local.get $x))
+                )
+                (return (call $factory (i32.const 100)))
+              )
+              (return (call $factory (i32.const 101)))
+            )
+            (return (call $factory (i32.const 102)))
+          )
+          (return (call $factory (i32.const 103)))
+        )
+        (return (call $factory (i32.const 104)))
+      )
+      (return (call $factory (i32.const 105)))
+    )
+    (ref.null none)
+  )
+
+  ;; CHECK:      (func $switch-mixed (type $4) (param $x i32) (result (ref null $str))
+  ;; CHECK-NEXT:  (local $1 (ref $1))
+  ;; CHECK-NEXT:  (local $2 i32)
+  ;; CHECK-NEXT:  (local $3 i32)
+  ;; CHECK-NEXT:  (block $out (result (ref null $str))
+  ;; CHECK-NEXT:   (local.set $1
+  ;; CHECK-NEXT:    (array.new_data $1 $roll
+  ;; CHECK-NEXT:     (i32.const 0)
+  ;; CHECK-NEXT:     (i32.const 12)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (if
+  ;; CHECK-NEXT:    (i32.lt_u
+  ;; CHECK-NEXT:     (local.tee $2
+  ;; CHECK-NEXT:      (local.get $x)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.const 12)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (then
+  ;; CHECK-NEXT:     (br $out
+  ;; CHECK-NEXT:      (if (result (ref null $str))
+  ;; CHECK-NEXT:       (i32.lt_u
+  ;; CHECK-NEXT:        (local.tee $3
+  ;; CHECK-NEXT:         (array.get_u $1
+  ;; CHECK-NEXT:          (local.get $1)
+  ;; CHECK-NEXT:          (local.get $2)
+  ;; CHECK-NEXT:         )
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:        (i32.const 3)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:       (then
+  ;; CHECK-NEXT:        (array.get $2
+  ;; CHECK-NEXT:         (global.get $roll$table)
+  ;; CHECK-NEXT:         (local.get $3)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:       (else
+  ;; CHECK-NEXT:        (call $factory
+  ;; CHECK-NEXT:         (i32.sub
+  ;; CHECK-NEXT:          (local.get $3)
+  ;; CHECK-NEXT:          (i32.const 3)
+  ;; CHECK-NEXT:         )
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (unreachable)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $switch-mixed (param $x i32) (result (ref null $str))
+    (block $out (result (ref null $str))
+      (block $def
+        (block $b11
+          (block $b10
+            (block $b9
+              (block $b8
+                (block $b7
+                  (block $b6
+                    (block $b5
+                      (block $b4
+                        (block $b3
+                          (block $b2
+                            (block $b1
+                              (block $b0
+                                (br_table $b0 $b1 $b2 $b3 $b4 $b5 $b6 $b7 $b8 $b9 $b10 $b11 $def (local.get $x))
+                              )
+                              (br $out (global.get $a))
+                            )
+                            (br $out (call $factory (i32.const 5)))
+                          )
+                          (br $out (ref.null none))
+                        )
+                        (br $out (global.get $b))
+                      )
+                      (br $out (call $factory (global.get $c10)))
+                    )
+                    (br $out (global.get $a))
+                  )
+                  (br $out (call $factory (i32.const 15)))
+                )
+                (br $out (global.get $b))
+              )
+              (br $out (ref.null none))
+            )
+            (br $out (call $factory (i32.const 20)))
+          )
+          (br $out (global.get $a))
+        )
+        (br $out (call $factory (i32.const 25)))
+      )
+      (unreachable)
+    )
+  )
+
+  ;; CHECK:      (func $switch-gaps (type $3) (param $x i32)
+  ;; CHECK-NEXT:  (local $1 (ref $1))
+  ;; CHECK-NEXT:  (local $2 i32)
+  ;; CHECK-NEXT:  (local $3 i32)
+  ;; CHECK-NEXT:  (local.set $1
+  ;; CHECK-NEXT:   (array.new_data $1 $roll
+  ;; CHECK-NEXT:    (i32.const 12)
+  ;; CHECK-NEXT:    (i32.const 11)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (i32.lt_u
+  ;; CHECK-NEXT:    (local.tee $2
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.const 11)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (if
+  ;; CHECK-NEXT:     (local.tee $3
+  ;; CHECK-NEXT:      (array.get_u $1
+  ;; CHECK-NEXT:       (local.get $1)
+  ;; CHECK-NEXT:       (local.get $2)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (then
+  ;; CHECK-NEXT:      (call $use
+  ;; CHECK-NEXT:       (local.get $3)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (call $use
+  ;; CHECK-NEXT:   (i32.const 99)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $switch-gaps (param $x i32)
+    (block $def
+      (block $b7
+        (block $b6
+          (block $b5
+            (block $b4
+              (block $b3
+                (block $b2
+                  (block $b1
+                    (block $b0
+                      (br_table $b0 $def $b1 $def $b2 $b3 $b4 $def $b5 $b6 $b7 $def (local.get $x))
+                    )
+                    (call $use (i32.const 10))
+                    (br $def)
+                  )
+                  (call $use (i32.const 20))
+                  (br $def)
+                )
+                (call $use (i32.const 30))
+                (br $def)
+              )
+              (call $use (i32.const 42))
+              (br $def)
+            )
+            (call $use (i32.const 50))
+            (br $def)
+          )
+          (call $use (i32.const 60))
+          (br $def)
+        )
+        (call $use (i32.const 70))
+        (br $def)
+      )
+      (call $use (i32.const 80))
+    )
+    (call $use (i32.const 99))
+  )
+)
