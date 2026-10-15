@@ -915,6 +915,17 @@
     (global.get $m9)
   )
 )
+
+;; Per-member allocOperandUses == 0 filtering, duplicate varying-column local
+;; teeing, and second-pass palette absorption with cached-factory onceGets:
+;; - $v0..$v9 have allocOperandUses == 0 and are deferred even though $v_hot0
+;;   and $v_hot1 (same struct type $vt) have multiple struct.new operand uses.
+;; - Fields 0 and 1 of $v0..$v9 are identical varying columns, so field 0 tees
+;;   a local that field 1 reuses without emitting a second data column.
+;; - Field 2 of $v0..$v9 references $s0..$s9 (identical sole-use $sub structs),
+;;   whose palette array is absorbed in the second pass into an uncached
+;;   factory $defer$sub because the read inside $defer$vt's cached factory block
+;;   is recognized as a once-get.
 ;; CHECK:      (func $defer$msg (type $4) (param $0 i32) (result (ref $msg))
 ;; CHECK-NEXT:  (local $1 (ref $msg))
 ;; CHECK-NEXT:  (local $2 i32)
@@ -980,5 +991,281 @@
 ;; CHECK-NEXT:    )
 ;; CHECK-NEXT:   )
 ;; CHECK-NEXT:   (local.get $1)
+;; CHECK-NEXT:  )
+;; CHECK-NEXT: )
+(module
+  ;; CHECK:      (type $sub (struct (field i32) (field i32)))
+  (type $sub (struct (field i32) (field i32)))
+  ;; CHECK:      (type $vt (struct (field i32) (field i32) (field (ref $sub)) (field i32) (field i32) (field i32) (field i32) (field i32)))
+  (type $vt (struct (field i32) (field i32) (field (ref $sub)) (field i32) (field i32) (field i32) (field i32) (field i32)))
+  ;; CHECK:      (type $obj (struct (field (ref $vt))))
+  (type $obj (struct (field (ref $vt))))
+
+  (global $s0 (ref $sub) (struct.new $sub (i32.const 7) (i32.const 9)))
+  (global $s1 (ref $sub) (struct.new $sub (i32.const 7) (i32.const 9)))
+  (global $s2 (ref $sub) (struct.new $sub (i32.const 7) (i32.const 9)))
+  (global $s3 (ref $sub) (struct.new $sub (i32.const 7) (i32.const 9)))
+  (global $s4 (ref $sub) (struct.new $sub (i32.const 7) (i32.const 9)))
+  (global $s5 (ref $sub) (struct.new $sub (i32.const 7) (i32.const 9)))
+  (global $s6 (ref $sub) (struct.new $sub (i32.const 7) (i32.const 9)))
+  (global $s7 (ref $sub) (struct.new $sub (i32.const 7) (i32.const 9)))
+  (global $s8 (ref $sub) (struct.new $sub (i32.const 7) (i32.const 9)))
+  (global $s9 (ref $sub) (struct.new $sub (i32.const 7) (i32.const 9)))
+  ;; CHECK:      (type $3 (array (mut (ref null $vt))))
+
+  ;; CHECK:      (type $4 (array (mut i8)))
+
+  ;; CHECK:      (type $5 (func (result (ref $vt))))
+
+  ;; CHECK:      (type $6 (func (result (ref $obj))))
+
+  ;; CHECK:      (type $7 (func (param i32) (result (ref $vt))))
+
+  ;; CHECK:      (type $8 (func (param i32) (result (ref $sub))))
+
+  ;; CHECK:      (global $s_hot (ref $sub) (struct.new $sub
+  ;; CHECK-NEXT:  (i32.const 7)
+  ;; CHECK-NEXT:  (i32.const 9)
+  ;; CHECK-NEXT: ))
+  (global $s_hot (ref $sub) (struct.new $sub (i32.const 7) (i32.const 9)))
+
+  (global $v0 (ref $vt) (struct.new $vt (i32.const 11) (i32.const 11) (global.get $s0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+  (global $v1 (ref $vt) (struct.new $vt (i32.const 21) (i32.const 21) (global.get $s1) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+  (global $v2 (ref $vt) (struct.new $vt (i32.const 31) (i32.const 31) (global.get $s2) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+  (global $v3 (ref $vt) (struct.new $vt (i32.const 41) (i32.const 41) (global.get $s3) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+  (global $v4 (ref $vt) (struct.new $vt (i32.const 51) (i32.const 51) (global.get $s4) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+  (global $v5 (ref $vt) (struct.new $vt (i32.const 61) (i32.const 61) (global.get $s5) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+  (global $v6 (ref $vt) (struct.new $vt (i32.const 71) (i32.const 71) (global.get $s6) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+  (global $v7 (ref $vt) (struct.new $vt (i32.const 81) (i32.const 81) (global.get $s7) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+  (global $v8 (ref $vt) (struct.new $vt (i32.const 91) (i32.const 91) (global.get $s8) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+  (global $v9 (ref $vt) (struct.new $vt (i32.const 101) (i32.const 101) (global.get $s9) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+
+  ;; CHECK:      (global $v_hot0 (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 111)
+  ;; CHECK-NEXT:  (i32.const 111)
+  ;; CHECK-NEXT:  (global.get $s_hot)
+  ;; CHECK-NEXT:  (i32.const 0)
+  ;; CHECK-NEXT:  (i32.const 0)
+  ;; CHECK-NEXT:  (i32.const 0)
+  ;; CHECK-NEXT:  (i32.const 0)
+  ;; CHECK-NEXT:  (i32.const 0)
+  ;; CHECK-NEXT: ))
+  (global $v_hot0 (ref $vt) (struct.new $vt (i32.const 111) (i32.const 111) (global.get $s_hot) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+  ;; CHECK:      (global $v_hot1 (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 121)
+  ;; CHECK-NEXT:  (i32.const 121)
+  ;; CHECK-NEXT:  (global.get $s_hot)
+  ;; CHECK-NEXT:  (i32.const 0)
+  ;; CHECK-NEXT:  (i32.const 0)
+  ;; CHECK-NEXT:  (i32.const 0)
+  ;; CHECK-NEXT:  (i32.const 0)
+  ;; CHECK-NEXT:  (i32.const 0)
+  ;; CHECK-NEXT: ))
+  (global $v_hot1 (ref $vt) (struct.new $vt (i32.const 121) (i32.const 121) (global.get $s_hot) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+
+  ;; CHECK:      (global $defer$vt$cache (ref $3) (array.new_default $3
+  ;; CHECK-NEXT:  (i32.const 10)
+  ;; CHECK-NEXT: ))
+
+  ;; CHECK:      (global $defer$vt$table$0 (mut (ref null $4)) (ref.null none))
+
+  ;; CHECK:      (data $defer$data "\0b\15\1f)
+
+  ;; CHECK:      (export "use_vt" (func $use_vt))
+
+  ;; CHECK:      (export "use_hot" (func $use_hot))
+
+  ;; CHECK:      (func $use_vt (type $5) (result (ref $vt))
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$vt
+  ;; CHECK-NEXT:    (i32.const 0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$vt
+  ;; CHECK-NEXT:    (i32.const 1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$vt
+  ;; CHECK-NEXT:    (i32.const 2)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$vt
+  ;; CHECK-NEXT:    (i32.const 3)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$vt
+  ;; CHECK-NEXT:    (i32.const 4)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$vt
+  ;; CHECK-NEXT:    (i32.const 5)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$vt
+  ;; CHECK-NEXT:    (i32.const 6)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$vt
+  ;; CHECK-NEXT:    (i32.const 7)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$vt
+  ;; CHECK-NEXT:    (i32.const 8)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (call $defer$vt
+  ;; CHECK-NEXT:   (i32.const 9)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $use_vt (export "use_vt") (result (ref $vt))
+    (drop (global.get $v0))
+    (drop (global.get $v1))
+    (drop (global.get $v2))
+    (drop (global.get $v3))
+    (drop (global.get $v4))
+    (drop (global.get $v5))
+    (drop (global.get $v6))
+    (drop (global.get $v7))
+    (drop (global.get $v8))
+    (global.get $v9)
+  )
+
+  ;; CHECK:      (func $use_hot (type $6) (result (ref $obj))
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (struct.new $obj
+  ;; CHECK-NEXT:    (global.get $v_hot0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (struct.new $obj
+  ;; CHECK-NEXT:    (global.get $v_hot0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (struct.new $obj
+  ;; CHECK-NEXT:    (global.get $v_hot0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (struct.new $obj
+  ;; CHECK-NEXT:    (global.get $v_hot0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (struct.new $obj
+  ;; CHECK-NEXT:    (global.get $v_hot0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (struct.new $obj
+  ;; CHECK-NEXT:    (global.get $v_hot0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (struct.new $obj
+  ;; CHECK-NEXT:    (global.get $v_hot1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (struct.new $obj
+  ;; CHECK-NEXT:    (global.get $v_hot1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (struct.new $obj
+  ;; CHECK-NEXT:    (global.get $v_hot1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (struct.new $obj
+  ;; CHECK-NEXT:    (global.get $v_hot1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (struct.new $obj
+  ;; CHECK-NEXT:    (global.get $v_hot1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (struct.new $obj
+  ;; CHECK-NEXT:   (global.get $v_hot1)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $use_hot (export "use_hot") (result (ref $obj))
+    (drop (struct.new $obj (global.get $v_hot0)))
+    (drop (struct.new $obj (global.get $v_hot0)))
+    (drop (struct.new $obj (global.get $v_hot0)))
+    (drop (struct.new $obj (global.get $v_hot0)))
+    (drop (struct.new $obj (global.get $v_hot0)))
+    (drop (struct.new $obj (global.get $v_hot0)))
+    (drop (struct.new $obj (global.get $v_hot1)))
+    (drop (struct.new $obj (global.get $v_hot1)))
+    (drop (struct.new $obj (global.get $v_hot1)))
+    (drop (struct.new $obj (global.get $v_hot1)))
+    (drop (struct.new $obj (global.get $v_hot1)))
+    (struct.new $obj (global.get $v_hot1))
+  )
+)
+;; CHECK:      (func $defer$vt (type $7) (param $0 i32) (result (ref $vt))
+;; CHECK-NEXT:  (local $1 (ref $vt))
+;; CHECK-NEXT:  (local $2 i32)
+;; CHECK-NEXT:  (block $cached (result (ref $vt))
+;; CHECK-NEXT:   (br_on_non_null $cached
+;; CHECK-NEXT:    (array.get $3
+;; CHECK-NEXT:     (global.get $defer$vt$cache)
+;; CHECK-NEXT:     (local.get $0)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (if
+;; CHECK-NEXT:    (ref.is_null
+;; CHECK-NEXT:     (global.get $defer$vt$table$0)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:    (then
+;; CHECK-NEXT:     (global.set $defer$vt$table$0
+;; CHECK-NEXT:      (array.new_data $4 $defer$data
+;; CHECK-NEXT:       (i32.const 0)
+;; CHECK-NEXT:       (i32.const 10)
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (array.set $3
+;; CHECK-NEXT:    (global.get $defer$vt$cache)
+;; CHECK-NEXT:    (local.get $0)
+;; CHECK-NEXT:    (local.tee $1
+;; CHECK-NEXT:     (struct.new $vt
+;; CHECK-NEXT:      (local.tee $2
+;; CHECK-NEXT:       (array.get_u $4
+;; CHECK-NEXT:        (global.get $defer$vt$table$0)
+;; CHECK-NEXT:        (local.get $0)
+;; CHECK-NEXT:       )
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:      (local.get $2)
+;; CHECK-NEXT:      (call $defer$sub
+;; CHECK-NEXT:       (local.get $0)
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:      (i32.const 0)
+;; CHECK-NEXT:      (i32.const 0)
+;; CHECK-NEXT:      (i32.const 0)
+;; CHECK-NEXT:      (i32.const 0)
+;; CHECK-NEXT:      (i32.const 0)
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (local.get $1)
+;; CHECK-NEXT:  )
+;; CHECK-NEXT: )
+
+;; CHECK:      (func $defer$sub (type $8) (param $0 i32) (result (ref $sub))
+;; CHECK-NEXT:  (struct.new $sub
+;; CHECK-NEXT:   (i32.const 7)
+;; CHECK-NEXT:   (i32.const 9)
 ;; CHECK-NEXT:  )
 ;; CHECK-NEXT: )
