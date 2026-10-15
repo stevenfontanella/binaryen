@@ -687,3 +687,181 @@
     )
   )
 )
+
+(module
+  (rec
+    ;; CHECK:      (rec
+    ;; CHECK-NEXT:  (type $Base (sub (struct (field i32))))
+    ;; NO_TNH:      (rec
+    ;; NO_TNH-NEXT:  (type $Base (sub (struct (field i32))))
+    (type $Base (sub (struct (field i32))))
+    ;; CHECK:       (type $Mid (sub $Base (struct (field i32) (field i64))))
+    ;; NO_TNH:       (type $Mid (sub $Base (struct (field i32) (field i64))))
+    (type $Mid (sub $Base (struct (field i32) (field i64))))
+    ;; CHECK:       (type $Sub (sub $Mid (struct (field i32) (field i64) (field i32))))
+    ;; NO_TNH:       (type $Sub (sub $Mid (struct (field i32) (field i64) (field i32))))
+    (type $Sub (sub $Mid (struct (field i32) (field i64) (field i32))))
+    ;; CHECK:       (type $shared-sig (func (param (ref $Sub)) (result i32)))
+    ;; NO_TNH:       (type $shared-sig (func (param (ref $Sub)) (result i32)))
+    (type $shared-sig (func (param (ref $Sub)) (result i32)))
+  )
+
+  ;; Shares $shared-sig with $wide-func, but requires $Sub for field 2.
+  ;; CHECK:      (type $4 (func (param (ref null $Base)) (result i32)))
+
+  ;; CHECK:      (rec
+  ;; CHECK-NEXT:  (type $5 (func (param (ref null $Base)) (result (ref null $Base))))
+
+  ;; CHECK:       (type $6 (func (param (ref null $Sub)) (result i32)))
+
+  ;; CHECK:      (export "run" (func $unalias-and-call))
+
+  ;; CHECK:      (func $tight-func (type $4) (param $p (ref null $Base)) (result i32)
+  ;; CHECK-NEXT:  (struct.get $Sub 2
+  ;; CHECK-NEXT:   (ref.cast (ref null $Sub)
+  ;; CHECK-NEXT:    (local.get $p)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; NO_TNH:      (type $4 (func (param (ref null $Base)) (result (ref $Sub))))
+
+  ;; NO_TNH:      (type $5 (func (param (ref null $Base)) (result i32)))
+
+  ;; NO_TNH:      (export "run" (func $unalias-and-call))
+
+  ;; NO_TNH:      (func $tight-func (type $shared-sig) (param $p (ref $Sub)) (result i32)
+  ;; NO_TNH-NEXT:  (struct.get $Sub 2
+  ;; NO_TNH-NEXT:   (local.get $p)
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT: )
+  (func $tight-func (type $shared-sig) (param $p (ref $Sub)) (result i32)
+    (struct.get $Sub 2
+      (local.get $p)
+    )
+  )
+
+  ;; Shares $shared-sig initially, but only reads field 0 on $Base, so its
+  ;; parameter widens per-function to (ref null $Base).
+  ;; CHECK:      (func $wide-func (type $4) (param $p (ref null $Base)) (result i32)
+  ;; CHECK-NEXT:  (struct.get $Base 0
+  ;; CHECK-NEXT:   (local.get $p)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; NO_TNH:      (func $wide-func (type $shared-sig) (param $p (ref $Sub)) (result i32)
+  ;; NO_TNH-NEXT:  (struct.get $Sub 0
+  ;; NO_TNH-NEXT:   (local.get $p)
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT: )
+  (func $wide-func (type $shared-sig) (param $p (ref $Sub)) (result i32)
+    (struct.get $Sub 0
+      (local.get $p)
+    )
+  )
+
+  ;; Non-escaped callee whose caller only needs (ref null $Base): its return
+  ;; type relaxes and widens from (ref $Sub) to (ref null $Base), stripping the
+  ;; trailing ref.cast.
+  ;; CHECK:      (func $ret-callee (type $5) (param $x (ref null $Base)) (result (ref null $Base))
+  ;; CHECK-NEXT:  (local.get $x)
+  ;; CHECK-NEXT: )
+  ;; NO_TNH:      (func $ret-callee (type $4) (param $x (ref null $Base)) (result (ref $Sub))
+  ;; NO_TNH-NEXT:  (ref.cast (ref $Sub)
+  ;; NO_TNH-NEXT:   (local.get $x)
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT: )
+  (func $ret-callee (param $x (ref null $Base)) (result (ref $Sub))
+    (ref.cast (ref $Sub)
+      (local.get $x)
+    )
+  )
+
+  ;; Cast-alias local $s has one wide consumer ($wide-func, which only needs
+  ;; $Base) and one narrow consumer (struct.get $Sub 2). The wide consumer is
+  ;; redirected to $x and the ref.cast is folded into the single narrow read.
+  ;; CHECK:      (func $unalias-and-call (type $4) (param $x (ref null $Base)) (result i32)
+  ;; CHECK-NEXT:  (local $s (ref null $Sub))
+  ;; CHECK-NEXT:  (nop)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (call $wide-func
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (struct.get $Sub 2
+  ;; CHECK-NEXT:     (ref.cast (ref null $Sub)
+  ;; CHECK-NEXT:      (local.get $x)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (call $tight-func
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (struct.get $Base 0
+  ;; CHECK-NEXT:     (call $ret-callee
+  ;; CHECK-NEXT:      (local.get $x)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; NO_TNH:      (func $unalias-and-call (type $5) (param $x (ref null $Base)) (result i32)
+  ;; NO_TNH-NEXT:  (local $s (ref $Sub))
+  ;; NO_TNH-NEXT:  (local.set $s
+  ;; NO_TNH-NEXT:   (ref.cast (ref $Sub)
+  ;; NO_TNH-NEXT:    (local.get $x)
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT:  (i32.add
+  ;; NO_TNH-NEXT:   (i32.add
+  ;; NO_TNH-NEXT:    (call $wide-func
+  ;; NO_TNH-NEXT:     (local.get $s)
+  ;; NO_TNH-NEXT:    )
+  ;; NO_TNH-NEXT:    (struct.get $Sub 2
+  ;; NO_TNH-NEXT:     (local.get $s)
+  ;; NO_TNH-NEXT:    )
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:   (i32.add
+  ;; NO_TNH-NEXT:    (call $tight-func
+  ;; NO_TNH-NEXT:     (ref.cast (ref $Sub)
+  ;; NO_TNH-NEXT:      (local.get $x)
+  ;; NO_TNH-NEXT:     )
+  ;; NO_TNH-NEXT:    )
+  ;; NO_TNH-NEXT:    (struct.get $Sub 0
+  ;; NO_TNH-NEXT:     (call $ret-callee
+  ;; NO_TNH-NEXT:      (local.get $x)
+  ;; NO_TNH-NEXT:     )
+  ;; NO_TNH-NEXT:    )
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT: )
+  (func $unalias-and-call (export "run") (param $x (ref null $Base)) (result i32)
+    (local $s (ref $Sub))
+    (local.set $s
+      (ref.cast (ref $Sub)
+        (local.get $x)
+      )
+    )
+    (i32.add
+      (i32.add
+        (call $wide-func
+          (local.get $s)
+        )
+        (struct.get $Sub 2
+          (local.get $s)
+        )
+      )
+      (i32.add
+        (call $tight-func
+          (ref.cast (ref $Sub)
+            (local.get $x)
+          )
+        )
+        (struct.get $Sub 0
+          (call $ret-callee
+            (local.get $x)
+          )
+        )
+      )
+    )
+  )
+)
