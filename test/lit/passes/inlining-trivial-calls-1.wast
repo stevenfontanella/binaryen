@@ -17,10 +17,14 @@
 (module
  ;; CHECK:      (type $0 (func (param i32 i32 i32 i32 i32 i32)))
  (type $0 (func (param i32 i32 i32 i32 i32 i32)))
+ ;; CHECK:      (type $2 (func (param i32 i32 i32 i32 i32 i32) (result i32)))
+
  ;; CHECK:      (type $1 (func))
  (type $1 (func))
  ;; CHECK:      (import "env" "foo" (func $imported-foo (type $0) (param i32 i32 i32 i32 i32 i32)))
  (import "env" "foo" (func $imported-foo (type $0) (param i32 i32 i32 i32 i32 i32)))
+ ;; CHECK:      (import "env" "bar" (func $imported-bar (type $2) (param i32 i32 i32 i32 i32 i32) (result i32)))
+ (import "env" "bar" (func $imported-bar (param i32 i32 i32 i32 i32 i32) (result i32)))
  (func $call-foo (type $0) (param $p1 i32) (param $p2 i32) (param $p3 i32) (param $p4 i32) (param $p5 i32) (param $p6 i32)
   (call $imported-foo
    (local.get $p1)
@@ -29,6 +33,18 @@
    (local.get $p4)
    (local.get $p5)
    (local.get $p6)
+  )
+ )
+ (func $drop-call-bar (type $0) (param $p1 i32) (param $p2 i32) (param $p3 i32) (param $p4 i32) (param $p5 i32) (param $p6 i32)
+  (drop
+   (call $imported-bar
+    (local.get $p1)
+    (local.get $p2)
+    (local.get $p3)
+    (local.get $p4)
+    (local.get $p5)
+    (local.get $p6)
+   )
   )
  )
  ;; CHECK:      (func $main (type $1)
@@ -50,6 +66,18 @@
  ;; CHECK-NEXT:  (local $15 i32)
  ;; CHECK-NEXT:  (local $16 i32)
  ;; CHECK-NEXT:  (local $17 i32)
+ ;; CHECK-NEXT:  (local $18 i32)
+ ;; CHECK-NEXT:  (local $19 i32)
+ ;; CHECK-NEXT:  (local $20 i32)
+ ;; CHECK-NEXT:  (local $21 i32)
+ ;; CHECK-NEXT:  (local $22 i32)
+ ;; CHECK-NEXT:  (local $23 i32)
+ ;; CHECK-NEXT:  (local $24 i32)
+ ;; CHECK-NEXT:  (local $25 i32)
+ ;; CHECK-NEXT:  (local $26 i32)
+ ;; CHECK-NEXT:  (local $27 i32)
+ ;; CHECK-NEXT:  (local $28 i32)
+ ;; CHECK-NEXT:  (local $29 i32)
  ;; CHECK-NEXT:  (block $__inlined_func$call-foo
  ;; CHECK-NEXT:   (local.set $0
  ;; CHECK-NEXT:    (i32.const 1)
@@ -134,6 +162,66 @@
  ;; CHECK-NEXT:    (local.get $17)
  ;; CHECK-NEXT:   )
  ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (block $__inlined_func$drop-call-bar$3
+ ;; CHECK-NEXT:   (local.set $18
+ ;; CHECK-NEXT:    (i32.const 1)
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (local.set $19
+ ;; CHECK-NEXT:    (i32.const 2)
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (local.set $20
+ ;; CHECK-NEXT:    (i32.const 3)
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (local.set $21
+ ;; CHECK-NEXT:    (i32.const 4)
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (local.set $22
+ ;; CHECK-NEXT:    (i32.const 5)
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (local.set $23
+ ;; CHECK-NEXT:    (i32.const 6)
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (drop
+ ;; CHECK-NEXT:    (call $imported-bar
+ ;; CHECK-NEXT:     (local.get $18)
+ ;; CHECK-NEXT:     (local.get $19)
+ ;; CHECK-NEXT:     (local.get $20)
+ ;; CHECK-NEXT:     (local.get $21)
+ ;; CHECK-NEXT:     (local.get $22)
+ ;; CHECK-NEXT:     (local.get $23)
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (block $__inlined_func$drop-call-bar$4
+ ;; CHECK-NEXT:   (local.set $24
+ ;; CHECK-NEXT:    (i32.const 7)
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (local.set $25
+ ;; CHECK-NEXT:    (i32.const 8)
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (local.set $26
+ ;; CHECK-NEXT:    (i32.const 9)
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (local.set $27
+ ;; CHECK-NEXT:    (i32.const 10)
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (local.set $28
+ ;; CHECK-NEXT:    (i32.const 11)
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (local.set $29
+ ;; CHECK-NEXT:    (i32.const 12)
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (drop
+ ;; CHECK-NEXT:    (call $imported-bar
+ ;; CHECK-NEXT:     (local.get $24)
+ ;; CHECK-NEXT:     (local.get $25)
+ ;; CHECK-NEXT:     (local.get $26)
+ ;; CHECK-NEXT:     (local.get $27)
+ ;; CHECK-NEXT:     (local.get $28)
+ ;; CHECK-NEXT:     (local.get $29)
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:  )
  ;; CHECK-NEXT: )
  (func $main (type $1)
   (call $call-foo
@@ -159,6 +247,22 @@
    (i32.const 16)
    (i32.const 17)
    (i32.const 18)
+  )
+  (call $drop-call-bar
+   (i32.const 1)
+   (i32.const 2)
+   (i32.const 3)
+   (i32.const 4)
+   (i32.const 5)
+   (i32.const 6)
+  )
+  (call $drop-call-bar
+   (i32.const 7)
+   (i32.const 8)
+   (i32.const 9)
+   (i32.const 10)
+   (i32.const 11)
+   (i32.const 12)
   )
  )
 )

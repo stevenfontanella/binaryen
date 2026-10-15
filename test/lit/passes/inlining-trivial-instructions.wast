@@ -19,8 +19,12 @@
  (type $1 (func (param i32) (result i32)))
  ;; optimize3:      (type $2 (func (param i32)))
  (type $2 (func (param i32)))
+ ;; shrink0:      (type $4 (func (param i32 i32 i32 i32)))
+
  ;; shrink0:      (type $3 (func))
  ;; shrink1:      (type $3 (func))
+ ;; optimize3:      (type $4 (func (param i32 i32 i32 i32)))
+
  ;; optimize3:      (type $3 (func))
  (type $3 (func))
  ;; shrink0:      (import "env" "foo" (func $drop-import (type $2) (param i32)))
@@ -80,6 +84,50 @@
  (func $trivial-unary-instruction (type $1) (param $p1 i32) (result i32)
   (i32.eqz
    (local.get $p1)
+  )
+ )
+ ;; A non-escaped 2-caller call wrapper reading all parameters once in order
+ ;; shrinks total module size when inlined and deleted under --shrink-level.
+ ;; shrink0:      (func $two-caller-call-wrapper (type $4) (param $p1 i32) (param $p2 i32) (param $p3 i32) (param $p4 i32)
+ ;; shrink0-NEXT:  (call $drop-import
+ ;; shrink0-NEXT:   (i32.add
+ ;; shrink0-NEXT:    (local.get $p1)
+ ;; shrink0-NEXT:    (i32.add
+ ;; shrink0-NEXT:     (local.get $p2)
+ ;; shrink0-NEXT:     (i32.add
+ ;; shrink0-NEXT:      (local.get $p3)
+ ;; shrink0-NEXT:      (local.get $p4)
+ ;; shrink0-NEXT:     )
+ ;; shrink0-NEXT:    )
+ ;; shrink0-NEXT:   )
+ ;; shrink0-NEXT:  )
+ ;; shrink0-NEXT: )
+ ;; optimize3:      (func $two-caller-call-wrapper (type $4) (param $p1 i32) (param $p2 i32) (param $p3 i32) (param $p4 i32)
+ ;; optimize3-NEXT:  (call $drop-import
+ ;; optimize3-NEXT:   (i32.add
+ ;; optimize3-NEXT:    (local.get $p1)
+ ;; optimize3-NEXT:    (i32.add
+ ;; optimize3-NEXT:     (local.get $p2)
+ ;; optimize3-NEXT:     (i32.add
+ ;; optimize3-NEXT:      (local.get $p3)
+ ;; optimize3-NEXT:      (local.get $p4)
+ ;; optimize3-NEXT:     )
+ ;; optimize3-NEXT:    )
+ ;; optimize3-NEXT:   )
+ ;; optimize3-NEXT:  )
+ ;; optimize3-NEXT: )
+ (func $two-caller-call-wrapper (param $p1 i32) (param $p2 i32) (param $p3 i32) (param $p4 i32)
+  (call $drop-import
+   (i32.add
+    (local.get $p1)
+    (i32.add
+     (local.get $p2)
+     (i32.add
+      (local.get $p3)
+      (local.get $p4)
+     )
+    )
+   )
   )
  )
  ;; Note: we need more than one caller for each function to test inlining based
@@ -161,6 +209,18 @@
  ;; shrink0-NEXT:    )
  ;; shrink0-NEXT:   )
  ;; shrink0-NEXT:  )
+ ;; shrink0-NEXT:  (call $two-caller-call-wrapper
+ ;; shrink0-NEXT:   (i32.const 1)
+ ;; shrink0-NEXT:   (i32.const 2)
+ ;; shrink0-NEXT:   (i32.const 3)
+ ;; shrink0-NEXT:   (i32.const 4)
+ ;; shrink0-NEXT:  )
+ ;; shrink0-NEXT:  (call $two-caller-call-wrapper
+ ;; shrink0-NEXT:   (i32.const 5)
+ ;; shrink0-NEXT:   (i32.const 6)
+ ;; shrink0-NEXT:   (i32.const 7)
+ ;; shrink0-NEXT:   (i32.const 8)
+ ;; shrink0-NEXT:  )
  ;; shrink0-NEXT: )
  ;; shrink1:      (func $main (type $3)
  ;; shrink1-NEXT:  (local $0 i32)
@@ -169,6 +229,14 @@
  ;; shrink1-NEXT:  (local $3 i32)
  ;; shrink1-NEXT:  (local $4 i32)
  ;; shrink1-NEXT:  (local $5 i32)
+ ;; shrink1-NEXT:  (local $6 i32)
+ ;; shrink1-NEXT:  (local $7 i32)
+ ;; shrink1-NEXT:  (local $8 i32)
+ ;; shrink1-NEXT:  (local $9 i32)
+ ;; shrink1-NEXT:  (local $10 i32)
+ ;; shrink1-NEXT:  (local $11 i32)
+ ;; shrink1-NEXT:  (local $12 i32)
+ ;; shrink1-NEXT:  (local $13 i32)
  ;; shrink1-NEXT:  (call $drop-import
  ;; shrink1-NEXT:   (block $__inlined_func$trivial-binary-instruction-small (result i32)
  ;; shrink1-NEXT:    (local.set $0
@@ -236,6 +304,58 @@
  ;; shrink1-NEXT:    )
  ;; shrink1-NEXT:    (i32.eqz
  ;; shrink1-NEXT:     (local.get $5)
+ ;; shrink1-NEXT:    )
+ ;; shrink1-NEXT:   )
+ ;; shrink1-NEXT:  )
+ ;; shrink1-NEXT:  (block $__inlined_func$two-caller-call-wrapper$4
+ ;; shrink1-NEXT:   (local.set $6
+ ;; shrink1-NEXT:    (i32.const 1)
+ ;; shrink1-NEXT:   )
+ ;; shrink1-NEXT:   (local.set $7
+ ;; shrink1-NEXT:    (i32.const 2)
+ ;; shrink1-NEXT:   )
+ ;; shrink1-NEXT:   (local.set $8
+ ;; shrink1-NEXT:    (i32.const 3)
+ ;; shrink1-NEXT:   )
+ ;; shrink1-NEXT:   (local.set $9
+ ;; shrink1-NEXT:    (i32.const 4)
+ ;; shrink1-NEXT:   )
+ ;; shrink1-NEXT:   (call $drop-import
+ ;; shrink1-NEXT:    (i32.add
+ ;; shrink1-NEXT:     (local.get $6)
+ ;; shrink1-NEXT:     (i32.add
+ ;; shrink1-NEXT:      (local.get $7)
+ ;; shrink1-NEXT:      (i32.add
+ ;; shrink1-NEXT:       (local.get $8)
+ ;; shrink1-NEXT:       (local.get $9)
+ ;; shrink1-NEXT:      )
+ ;; shrink1-NEXT:     )
+ ;; shrink1-NEXT:    )
+ ;; shrink1-NEXT:   )
+ ;; shrink1-NEXT:  )
+ ;; shrink1-NEXT:  (block $__inlined_func$two-caller-call-wrapper$5
+ ;; shrink1-NEXT:   (local.set $10
+ ;; shrink1-NEXT:    (i32.const 5)
+ ;; shrink1-NEXT:   )
+ ;; shrink1-NEXT:   (local.set $11
+ ;; shrink1-NEXT:    (i32.const 6)
+ ;; shrink1-NEXT:   )
+ ;; shrink1-NEXT:   (local.set $12
+ ;; shrink1-NEXT:    (i32.const 7)
+ ;; shrink1-NEXT:   )
+ ;; shrink1-NEXT:   (local.set $13
+ ;; shrink1-NEXT:    (i32.const 8)
+ ;; shrink1-NEXT:   )
+ ;; shrink1-NEXT:   (call $drop-import
+ ;; shrink1-NEXT:    (i32.add
+ ;; shrink1-NEXT:     (local.get $10)
+ ;; shrink1-NEXT:     (i32.add
+ ;; shrink1-NEXT:      (local.get $11)
+ ;; shrink1-NEXT:      (i32.add
+ ;; shrink1-NEXT:       (local.get $12)
+ ;; shrink1-NEXT:       (local.get $13)
+ ;; shrink1-NEXT:      )
+ ;; shrink1-NEXT:     )
  ;; shrink1-NEXT:    )
  ;; shrink1-NEXT:   )
  ;; shrink1-NEXT:  )
@@ -351,6 +471,18 @@
  ;; optimize3-NEXT:    )
  ;; optimize3-NEXT:   )
  ;; optimize3-NEXT:  )
+ ;; optimize3-NEXT:  (call $two-caller-call-wrapper
+ ;; optimize3-NEXT:   (i32.const 1)
+ ;; optimize3-NEXT:   (i32.const 2)
+ ;; optimize3-NEXT:   (i32.const 3)
+ ;; optimize3-NEXT:   (i32.const 4)
+ ;; optimize3-NEXT:  )
+ ;; optimize3-NEXT:  (call $two-caller-call-wrapper
+ ;; optimize3-NEXT:   (i32.const 5)
+ ;; optimize3-NEXT:   (i32.const 6)
+ ;; optimize3-NEXT:   (i32.const 7)
+ ;; optimize3-NEXT:   (i32.const 8)
+ ;; optimize3-NEXT:  )
  ;; optimize3-NEXT: )
  (func $main (type $3)
   (call $drop-import
@@ -396,6 +528,18 @@
    (call $trivial-unary-instruction
     (i32.const 12)
    )
+  )
+  (call $two-caller-call-wrapper
+   (i32.const 1)
+   (i32.const 2)
+   (i32.const 3)
+   (i32.const 4)
+  )
+  (call $two-caller-call-wrapper
+   (i32.const 5)
+   (i32.const 6)
+   (i32.const 7)
+   (i32.const 8)
   )
  )
 )

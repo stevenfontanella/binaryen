@@ -107,6 +107,8 @@ enum class TrivialInstruction {
 struct FunctionInfo {
   std::atomic<Index> refs;
   Index size;
+  Index nonParamBodyBytes;
+  Index numParamGets;
   bool hasCalls;
   bool hasLoops;
   bool hasTryDelegate;
@@ -118,6 +120,7 @@ struct FunctionInfo {
   // constant arguments is likely to let that control flow be folded away after
   // inlining.
   bool hasParamDependentBranch;
+  bool paramsUsedOnceInOrder;
   TrivialInstruction trivialInstruction;
   InliningMode inliningMode;
   std::optional<uint8_t> toolchainInlineHint;
@@ -127,11 +130,14 @@ struct FunctionInfo {
   void clear() {
     refs = 0;
     size = 0;
+    nonParamBodyBytes = 0;
+    numParamGets = 0;
     hasCalls = false;
     hasLoops = false;
     hasTryDelegate = false;
     usedGlobally = false;
     hasParamDependentBranch = false;
+    paramsUsedOnceInOrder = false;
     trivialInstruction = TrivialInstruction::NotTrivial;
     inliningMode = InliningMode::Unknown;
     toolchainInlineHint = std::nullopt;
@@ -141,11 +147,14 @@ struct FunctionInfo {
   FunctionInfo& operator=(const FunctionInfo& other) {
     refs = other.refs.load();
     size = other.size;
+    nonParamBodyBytes = other.nonParamBodyBytes;
+    numParamGets = other.numParamGets;
     hasCalls = other.hasCalls;
     hasLoops = other.hasLoops;
     hasTryDelegate = other.hasTryDelegate;
     usedGlobally = other.usedGlobally;
     hasParamDependentBranch = other.hasParamDependentBranch;
+    paramsUsedOnceInOrder = other.paramsUsedOnceInOrder;
     trivialInstruction = other.trivialInstruction;
     inliningMode = other.inliningMode;
     toolchainInlineHint = other.toolchainInlineHint;
@@ -180,6 +189,19 @@ struct FunctionInfo {
     // inlined, inline it in all optimization and shrink modes.
     if (trivialInstruction == TrivialInstruction::Shrinks) {
       return true;
+    }
+    // When every parameter is read once in evaluation order with no local
+    // variables, writes, loops, or branches, each parameter local.get vanishes
+    // when replaced by the caller's argument expression. Inline into all
+    // callers if eliminating the function saves more bytes than the duplicated
+    // non-parameter body costs.
+    if (!usedGlobally && !hasLoops && paramsUsedOnceInOrder && refs >= 2 &&
+        options.shrinkLevel > 0 &&
+        (hasCalls || trivialInstruction != TrivialInstruction::MayNotShrink)) {
+      if ((refs - 1) * nonParamBodyBytes <
+          3 * refs + 2 * numParamGets + 5) {
+        return true;
+      }
     }
     // If it's so big that we have no flexible options that could allow it,
     // do not inline.
@@ -272,6 +294,7 @@ struct FunctionInfoScanner
   void visitRefFunc(RefFunc* curr) {
     assert(infos.contains(curr->func));
     infos[curr->func].refs++;
+    infos[curr->func].usedGlobally = true;
   }
 
   // Note control flow that depends on a parameter. (We do not check that the
@@ -309,10 +332,175 @@ struct FunctionInfoScanner
 
   void visitBrOn(BrOn* curr) { noteCondition(curr->ref); }
 
+  static int getSLEBSize(int64_t value) {
+    int size = 0;
+    while (true) {
+      uint8_t byte = value & 0x7f;
+      value >>= 7;
+      size++;
+      if ((value == 0 && !(byte & 0x40)) || (value == -1 && (byte & 0x40))) {
+        return size;
+      }
+    }
+  }
+
+  static Index getShallowBytes(Expression* curr) {
+    switch (curr->_id) {
+      case Expression::BlockId:
+        return curr->cast<Block>()->name.is() ? 3 : 0;
+      case Expression::IfId:
+        return curr->cast<If>()->ifFalse ? 4 : 3;
+      case Expression::LoopId:
+        return 3;
+      case Expression::BreakId:
+        return 2;
+      case Expression::CallId:
+      case Expression::CallRefId:
+      case Expression::GlobalGetId:
+      case Expression::GlobalSetId:
+      case Expression::RefFuncId:
+      case Expression::StringConstId:
+        return 3;
+      case Expression::CallIndirectId:
+        return 4;
+      case Expression::LocalGetId:
+      case Expression::LocalSetId:
+        return 2;
+      case Expression::LoadId:
+      case Expression::StoreId:
+        return 3;
+      case Expression::ConstId: {
+        auto* c = curr->cast<Const>();
+        switch (c->type.getBasic()) {
+          case Type::i32:
+            return 1 + getSLEBSize(c->value.geti32());
+          case Type::i64:
+            return 1 + getSLEBSize(c->value.geti64());
+          case Type::f32:
+            return 5;
+          case Type::f64:
+            return 9;
+          case Type::v128:
+            return 18;
+          default:
+            WASM_UNREACHABLE("unexpected const type");
+        }
+      }
+      case Expression::UnaryId:
+      case Expression::BinaryId:
+      case Expression::DropId:
+      case Expression::ReturnId:
+      case Expression::NopId:
+      case Expression::UnreachableId:
+      case Expression::RefIsNullId:
+      case Expression::RefEqId:
+      case Expression::RefAsId:
+        return 1;
+      case Expression::SelectId:
+        return curr->type.isRef() ? 3 : 1;
+      case Expression::ThrowId:
+      case Expression::RefNullId:
+      case Expression::RefI31Id:
+      case Expression::I31GetId:
+      case Expression::ArrayLenId:
+        return 2;
+      case Expression::StructNewId:
+      case Expression::StructGetId:
+      case Expression::StructSetId:
+      case Expression::ArrayNewId:
+      case Expression::ArrayGetId:
+      case Expression::ArraySetId:
+      case Expression::ArrayFillId:
+      case Expression::RefCastId:
+      case Expression::RefTestId:
+        return 4;
+      case Expression::ArrayNewFixedId:
+        return 5;
+      case Expression::ArrayNewDataId:
+      case Expression::ArrayNewElemId:
+      case Expression::ArrayCopyId:
+      case Expression::ArrayInitDataId:
+      case Expression::ArrayInitElemId:
+        return 6;
+      default:
+        return 2;
+    }
+  }
+
   void visitFunction(Function* curr) {
     auto& info = infos[curr->name];
 
-    info.size = Measurer::measure(curr->body);
+    struct BodyScanner
+      : public PostWalker<BodyScanner, UnifiedExpressionVisitor<BodyScanner>> {
+      Name funcName;
+      Index size = 0;
+      Index nonParamBodyBytes = 0;
+      Index nextParamIndex = 0;
+      bool canInlineByBytes = true;
+
+      void visitExpression(Expression* curr) {
+        size++;
+        if (!canInlineByBytes) {
+          return;
+        }
+        if (auto* get = curr->dynCast<LocalGet>()) {
+          if (get->index == nextParamIndex) {
+            nextParamIndex++;
+          } else {
+            canInlineByBytes = false;
+          }
+          return;
+        }
+        switch (curr->_id) {
+          case Expression::LoopId:
+          case Expression::TryId:
+          case Expression::TryTableId:
+          case Expression::ReturnId:
+          case Expression::LocalSetId:
+          case Expression::BreakId:
+          case Expression::SwitchId:
+          case Expression::BrOnId:
+          case Expression::PopId:
+            canInlineByBytes = false;
+            return;
+          case Expression::CallId: {
+            auto* call = curr->cast<Call>();
+            if (call->isReturn || call->target == funcName) {
+              canInlineByBytes = false;
+              return;
+            }
+            break;
+          }
+          case Expression::CallIndirectId:
+            if (curr->cast<CallIndirect>()->isReturn) {
+              canInlineByBytes = false;
+              return;
+            }
+            break;
+          case Expression::CallRefId:
+            if (curr->cast<CallRef>()->isReturn) {
+              canInlineByBytes = false;
+              return;
+            }
+            break;
+          default:
+            break;
+        }
+        nonParamBodyBytes += getShallowBytes(curr);
+      }
+    } scanner;
+
+    scanner.funcName = curr->name;
+    scanner.canInlineByBytes = curr->vars.empty();
+    scanner.walk(curr->body);
+
+    info.size = scanner.size;
+    if (scanner.canInlineByBytes &&
+        scanner.nextParamIndex == curr->getNumParams()) {
+      info.paramsUsedOnceInOrder = true;
+      info.numParamGets = scanner.nextParamIndex;
+      info.nonParamBodyBytes = scanner.nonParamBodyBytes;
+    }
     info.toolchainInlineHint = curr->funcAnnotations.toolchainInline;
 
     // If the body is a simple instruction with roughly the same encoded size as
@@ -325,6 +513,11 @@ struct FunctionInfoScanner
     // TODO: Consider allowing drops, as at least in traps-never-happen mode
     //       they can usually be removed.
     auto* body = curr->body;
+    if (auto* drop = body->dynCast<Drop>()) {
+      if (drop->value->is<Call>()) {
+        body = drop->value;
+      }
+    }
     // Skip control flow as those can be substantially larger (middle and end
     // bytes in an If), or no situation exists where we can optimize them (a
     // Block with only LocalGets would have been removed by other passes).
@@ -345,7 +538,7 @@ struct FunctionInfoScanner
         }
       }
 
-      if (shrinks) {
+      if (shrinks && nextLocalGetIndex == curr->getNumParams()) {
         info.trivialInstruction = TrivialInstruction::Shrinks;
         return;
       }
@@ -353,7 +546,7 @@ struct FunctionInfoScanner
       // If the operands are trivial (size 1) like LocalGet or Const, we still
       // consider this as trivial instruction, but the size may not shrink when
       // inlined.
-      uint32_t numOperands = ChildIterator(body).children.size();
+      uint32_t numOperands = ChildIterator(curr->body).children.size();
       if (info.size == numOperands + 1) {
         info.trivialInstruction = TrivialInstruction::MayNotShrink;
       }
@@ -1230,6 +1423,7 @@ private:
     // return true. And it is a practical estimation to avoid extra future work.
     info = origin;
     info.size = sizeEstimate;
+    info.paramsUsedOnceInOrder = false;
     return info.worthFullInlining(options);
   }
 
