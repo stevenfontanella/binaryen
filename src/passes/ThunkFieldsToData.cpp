@@ -261,6 +261,7 @@ struct ThunkFieldsToData : public Pass {
   std::unordered_map<Name, Index> funcUses;
   std::unordered_map<Name, Index> globalUses;
   std::unordered_map<Name, Index> globalCodeUses;
+  std::unordered_map<Name, Index> thunkBodyGlobalUses;
   std::unordered_map<Name, Index> globalIndexes;
   std::unordered_map<Name, Index> functionIndexes;
 
@@ -398,6 +399,14 @@ struct ThunkFieldsToData : public Pass {
     }
     for (auto type : codeInfo.news) {
       unoptimizableTypes.insert(type);
+    }
+    for (auto& func : module->functions) {
+      if (func->imported() || !funcUses[func->name]) {
+        continue;
+      }
+      if (auto* gg = func->body->dynCast<GlobalGet>()) {
+        thunkBodyGlobalUses[gg->name]++;
+      }
     }
 
     // Collect the struct.news in global initializers.
@@ -770,7 +779,7 @@ private:
       }
       auto* get = constant->dynCast<GlobalGet>();
       if (!get || !resultType.isRef() || siteUses[site.thunk->name] != 1 ||
-          funcUses[site.thunk->name] != 1 || globalUses[get->name] != 1) {
+          funcUses[site.thunk->name] != 1) {
         continue;
       }
       auto* global = module->getGlobal(get->name);
@@ -779,6 +788,19 @@ private:
         continue;
       }
       auto* init = global->init->cast<StructNew>();
+      if (globalUses[get->name] != 1) {
+        if (!site.globalSite->isImmutableGlobalInit ||
+            globalUses[get->name] != globalCodeUses[get->name] ||
+            thunkBodyGlobalUses[get->name] != 1) {
+          continue;
+        }
+        Index extraCodeUses = globalCodeUses[get->name] - 1;
+        if (!always &&
+            extraCodeUses * 4 + 2 >=
+              getGlobalEntryBytes(init) + FunctionOverheadBytes) {
+          continue;
+        }
+      }
       bool found = false;
       for (auto& [templ, indexes] : templates) {
         if (ExpressionAnalyzer::equal(templ, init)) {
@@ -843,7 +865,7 @@ private:
           auto* global = module->getGlobal(get->name);
           benefit += getGlobalEntryBytes(global->init->cast<StructNew>());
           benefit += refFuncBytes;
-          cost += 2;
+          cost += 2 + (globalCodeUses[get->name] - 1) * 4;
           deadThunkUses[site.thunk->name]++;
           break;
         }
@@ -1199,6 +1221,14 @@ private:
     };
     std::vector<SharedIndexedHelper> sharedIndexedHelpers;
 
+    struct LazyGlobalRedirect {
+      Name helper;
+      Name keyGlobal;
+      Type resultType;
+    };
+    std::unordered_map<Name, LazyGlobalRedirect> lazyGlobalRedirects;
+    std::unordered_set<Name> deadLazyThunks;
+
     for (auto& decision : decisions) {
       for (auto sub : subTypes.getSubTypes(decision.type)) {
         decisionMap[FieldKey{sub, decision.index}] = &decision;
@@ -1268,6 +1298,16 @@ private:
         decision.fixedOperands.assign(decision.shape.size(), nullptr);
       } else if (decision.lazy) {
         decision.helper = makeHelper(decision, exceptions);
+        for (auto& site : decision.sites) {
+          if (site.mode == SiteMode::Lazy) {
+            deadLazyThunks.insert(site.thunk->name);
+            auto* get = site.thunk->body->cast<GlobalGet>();
+            if (globalCodeUses[get->name] > 1) {
+              lazyGlobalRedirects[get->name] = {
+                decision.helper, site.globalSite->global, decision.resultType};
+            }
+          }
+        }
       }
     }
 
@@ -1275,12 +1315,50 @@ private:
     struct Replacer : public WalkerPass<PostWalker<Replacer>> {
       bool isFunctionParallel() override { return true; }
       std::unique_ptr<Pass> create() override {
-        return std::make_unique<Replacer>(decisionMap);
+        return std::make_unique<Replacer>(
+          decisionMap, lazyGlobalRedirects, deadLazyThunks);
       }
       const std::unordered_map<FieldKey, Decision*, FieldKeyHash>& decisionMap;
+      const std::unordered_map<Name, LazyGlobalRedirect>& lazyGlobalRedirects;
+      const std::unordered_set<Name>& deadLazyThunks;
       Replacer(const std::unordered_map<FieldKey, Decision*, FieldKeyHash>&
-                 decisionMap)
-        : decisionMap(decisionMap) {}
+                 decisionMap,
+               const std::unordered_map<Name, LazyGlobalRedirect>&
+                 lazyGlobalRedirects,
+               const std::unordered_set<Name>& deadLazyThunks)
+        : decisionMap(decisionMap), lazyGlobalRedirects(lazyGlobalRedirects),
+          deadLazyThunks(deadLazyThunks) {}
+
+      void doWalkFunction(Function* func) {
+        if (deadLazyThunks.count(func->name)) {
+          return;
+        }
+        Super::doWalkFunction(func);
+      }
+
+      void visitGlobalGet(GlobalGet* curr) {
+        auto it = lazyGlobalRedirects.find(curr->name);
+        if (it == lazyGlobalRedirects.end()) {
+          return;
+        }
+        auto& redirect = it->second;
+        auto& wasm = *getModule();
+        Builder builder(wasm);
+        auto* keyGlob = wasm.getGlobal(redirect.keyGlobal);
+        Expression* call =
+          builder.makeCall(redirect.helper,
+                           {builder.makeGlobalGet(keyGlob->name, keyGlob->type)},
+                           redirect.resultType);
+        if (!Type::isSubType(call->type, curr->type)) {
+          if (call->type.getHeapType() == curr->type.getHeapType() &&
+              !curr->type.isExact()) {
+            call = builder.makeRefAs(RefAsNonNull, call);
+          } else {
+            call = builder.makeRefCast(call, curr->type);
+          }
+        }
+        replaceCurrent(call);
+      }
 
       void visitCallRef(CallRef* curr) {
         std::vector<StructGet*> gets;
@@ -1404,7 +1482,8 @@ private:
         return builder.makeBlock(prelude, call->type);
       }
     };
-    Replacer(decisionMap).run(getPassRunner(), module);
+    Replacer(decisionMap, lazyGlobalRedirects, deadLazyThunks)
+      .run(getPassRunner(), module);
 
     // Update the types.
     class TypeRewriter : public GlobalTypeRewriter {

@@ -43,6 +43,10 @@
   ;; CHECK-NEXT: ))
   (global $class.shared (ref $Class) (struct.new $Class (i32.const 0)))
 
+  ;; CHECK:      (global $vt.a (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (ref.null none)
+  ;; CHECK-NEXT: ))
+  (global $vt.a (ref $vt) (struct.new $vt (ref.func $thunk.a)))
   ;; CHECK:      (global $vt.array (ref $vt) (struct.new $vt
   ;; CHECK-NEXT:  (ref.null none)
   ;; CHECK-NEXT: ))
@@ -51,10 +55,6 @@
   ;; CHECK-NEXT:  (ref.null none)
   ;; CHECK-NEXT: ))
 
-  ;; CHECK:      (global $vt.a (ref $vt) (struct.new $vt
-  ;; CHECK-NEXT:  (ref.null none)
-  ;; CHECK-NEXT: ))
-  (global $vt.a (ref $vt) (struct.new $vt (ref.func $thunk.a)))
   ;; CHECK:      (global $vt.b (ref $vt.sub) (struct.new $vt.sub
   ;; CHECK-NEXT:  (ref.null none)
   ;; CHECK-NEXT:  (i32.const 1)
@@ -168,6 +168,13 @@
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (global.get $vt.null)
   ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (ref.as_non_null
+  ;; CHECK-NEXT:    (call $lazy$vt$0
+  ;; CHECK-NEXT:     (global.get $vt.a)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
   (func $keep (export "keep")
     (drop (global.get $vt.a))
@@ -177,6 +184,7 @@
     (drop (global.get $vt.shared2))
     (drop (global.get $vt.array))
     (drop (global.get $vt.null))
+    (drop (global.get $class.a))
   )
 )
 

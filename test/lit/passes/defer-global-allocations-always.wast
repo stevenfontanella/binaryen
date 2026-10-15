@@ -250,9 +250,7 @@
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: ))
 
-  ;; CHECK:      (global $defer$obj$cache_9 (ref $3) (array.new_default $3
-  ;; CHECK-NEXT:  (i32.const 1)
-  ;; CHECK-NEXT: ))
+  ;; CHECK:      (global $defer$obj$cache_9 (mut (ref null $obj)) (ref.null none))
 
   ;; CHECK:      (export "use" (func $use))
 
@@ -322,14 +320,9 @@
 ;; CHECK-NEXT:  (local $1 (ref $obj))
 ;; CHECK-NEXT:  (block $cached (result (ref $obj))
 ;; CHECK-NEXT:   (br_on_non_null $cached
-;; CHECK-NEXT:    (array.get $3
-;; CHECK-NEXT:     (global.get $defer$obj$cache_9)
-;; CHECK-NEXT:     (local.get $0)
-;; CHECK-NEXT:    )
-;; CHECK-NEXT:   )
-;; CHECK-NEXT:   (array.set $3
 ;; CHECK-NEXT:    (global.get $defer$obj$cache_9)
-;; CHECK-NEXT:    (local.get $0)
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (global.set $defer$obj$cache_9
 ;; CHECK-NEXT:    (local.tee $1
 ;; CHECK-NEXT:     (struct.new $obj
 ;; CHECK-NEXT:      (global.get $vt)
