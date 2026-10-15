@@ -19,6 +19,7 @@
 // optimizations by other passes.
 //
 
+#include "ir/find_all.h"
 #include "ir/global-utils.h"
 #include "ir/utils.h"
 #include "opt-utils.h"
@@ -39,6 +40,14 @@ using TrivialFunctionMap = std::unordered_map<Name, Expression*>;
 
 bool isOnceFunction(Name name) { return name.hasSubstring("_<once>_"); }
 bool isOnceFunction(Function* func) { return isOnceFunction(func->name); }
+
+Name getEnclosingClass(Name name) {
+  auto pos = name.view().find_last_of('@');
+  if (pos == std::string_view::npos) {
+    return Name();
+  }
+  return Name(name.view().substr(pos));
+}
 
 // Returns the function body if it is a trivial function, null otherwise.
 Expression* getTrivialFunctionBody(Function* func) {
@@ -80,6 +89,258 @@ void cleanupFunction(Module* module, Function* func) {
   runner.add("remove-unused-brs");
   runner.setIsNested(true);
   runner.runOnFunction(func);
+}
+
+// Extract the GlobalSet* from a lazy null-guarded initialization pattern:
+//   (if (ref.is_null (global.get $g)) (then (global.set $g V)))
+// allowing unnamed single-element Block wrappers around the GlobalSet.
+GlobalSet* getLazyNullGuardSet(If* iff) {
+  if (!iff || iff->ifFalse) {
+    return nullptr;
+  }
+  auto* isNull = iff->condition->dynCast<RefIsNull>();
+  if (!isNull) {
+    return nullptr;
+  }
+  auto* condGet = isNull->value->dynCast<GlobalGet>();
+  if (!condGet) {
+    return nullptr;
+  }
+  Expression* thenBody = iff->ifTrue;
+  while (auto* block = thenBody->dynCast<Block>()) {
+    if (!block->name.is() && block->list.size() == 1) {
+      thenBody = block->list[0];
+    } else {
+      break;
+    }
+  }
+  auto* set = thenBody->dynCast<GlobalSet>();
+  if (!set || set->name != condGet->name) {
+    return nullptr;
+  }
+  return set;
+}
+
+int hoistLazyNullGlobals(Module* module,
+                         PassRunner* passRunner,
+                         AssignmentCountMap& assignmentCounts,
+                         TrivialFunctionMap& trivialFunctionMap) {
+  bool hasCfp = false;
+  bool hasTypeMerging = false;
+  bool hasDeferGlobals = false;
+  if (passRunner) {
+    for (auto& pass : passRunner->passes) {
+      if (pass->name == "cfp" || pass->name == "cfp-reftest") {
+        hasCfp = true;
+      } else if (pass->name == "type-merging") {
+        hasTypeMerging = true;
+      } else if (pass->name == "defer-global-allocations") {
+        hasDeferGlobals = true;
+      }
+    }
+  }
+  bool onlyRefFunc = hasCfp && !hasDeferGlobals;
+  if (onlyRefFunc && !hasTypeMerging) {
+    return 0;
+  }
+
+  std::unordered_set<Name> exportedGlobals;
+  for (auto& ex : module->exports) {
+    if (ex->kind == ExternalKind::Global) {
+      exportedGlobals.insert(*ex->getInternalName());
+    }
+  }
+
+  std::unordered_set<Name> candidates;
+  for (auto& global : module->globals) {
+    if (!global->imported() && global->mutable_ &&
+        !exportedGlobals.contains(global->name) &&
+        !global->name.startsWith("$class-initialized@") &&
+        global->type.isRef() && global->type.isNullable() && global->init &&
+        global->init->is<RefNull>()) {
+      candidates.insert(global->name);
+    }
+  }
+  if (candidates.empty()) {
+    return 0;
+  }
+
+  struct CandidateInfo {
+    Index totalSets = 0;
+    std::vector<std::pair<Function*, If*>> guardIfs;
+    std::vector<std::pair<Function*, GlobalSet*>> onceNullSets;
+    std::vector<Function*> readerFuncs;
+    Expression* initValue = nullptr;
+    bool disqualified = false;
+  };
+  std::unordered_map<Name, CandidateInfo> infos;
+
+  struct Scanner : public ExpressionStackWalker<Scanner> {
+    const std::unordered_set<Name>& candidates;
+    std::unordered_map<Name, CandidateInfo>& infos;
+
+    Scanner(const std::unordered_set<Name>& candidates,
+            std::unordered_map<Name, CandidateInfo>& infos)
+      : candidates(candidates), infos(infos) {}
+
+    void visitGlobalSet(GlobalSet* curr) {
+      if (!candidates.contains(curr->name)) {
+        return;
+      }
+      auto& info = infos[curr->name];
+      info.totalSets++;
+      if (curr->value->is<RefNull>()) {
+        if (auto* func = getFunction()) {
+          if (isOnceFunction(func)) {
+            Name funcClass = getEnclosingClass(func->name);
+            if (funcClass.is() && funcClass == getEnclosingClass(curr->name)) {
+              bool isTopLevel =
+                expressionStack.size() == 1 ||
+                (expressionStack.size() == 2 &&
+                 expressionStack[0] == func->body && func->body->is<Block>());
+              if (isTopLevel) {
+                info.onceNullSets.emplace_back(func, curr);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    void visitGlobalGet(GlobalGet* curr) {
+      if (!candidates.contains(curr->name)) {
+        return;
+      }
+      auto& info = infos[curr->name];
+      if (auto* func = getFunction()) {
+        if (info.readerFuncs.empty() || info.readerFuncs.back() != func) {
+          info.readerFuncs.push_back(func);
+        }
+      } else {
+        info.disqualified = true;
+        return;
+      }
+      if (expressionStack.size() >= 2) {
+        auto* parent = expressionStack[expressionStack.size() - 2];
+        if (parent->is<RefIsNull>()) {
+          bool isGuardCond = false;
+          if (expressionStack.size() >= 3) {
+            if (auto* iff =
+                  expressionStack[expressionStack.size() - 3]->dynCast<If>()) {
+              if (iff->condition == parent) {
+                if (auto* set = getLazyNullGuardSet(iff)) {
+                  isGuardCond = (set->name == curr->name);
+                }
+              }
+            }
+          }
+          if (!isGuardCond) {
+            info.disqualified = true;
+          }
+        } else if (parent->is<RefEq>() || parent->is<BrOn>() ||
+                   parent->is<RefTest>()) {
+          info.disqualified = true;
+        }
+      }
+    }
+
+    void visitIf(If* curr) {
+      auto* set = getLazyNullGuardSet(curr);
+      if (!set || !candidates.contains(set->name)) {
+        return;
+      }
+      auto& info = infos[set->name];
+      info.guardIfs.emplace_back(getFunction(), curr);
+      auto* val = set->value;
+      if (!val->type.isRef() || !val->type.isNonNullable() ||
+          !GlobalUtils::canInitializeGlobal(*getModule(), val)) {
+        info.disqualified = true;
+        return;
+      }
+      if (!info.initValue) {
+        info.initValue = val;
+      } else if (!ExpressionAnalyzer::equal(val, info.initValue)) {
+        info.disqualified = true;
+      }
+    }
+  };
+
+  Scanner scanner(candidates, infos);
+  scanner.walkModule(module);
+
+  std::unordered_set<Name> promoted;
+  std::unordered_set<Function*> funcsWithNoppedGuards;
+  std::unordered_set<Function*> funcsToUpdate;
+
+  for (auto& global : module->globals) {
+    auto it = infos.find(global->name);
+    if (it == infos.end()) {
+      continue;
+    }
+    auto& info = it->second;
+    if (info.disqualified || info.guardIfs.empty() ||
+        info.totalSets != info.guardIfs.size() + info.onceNullSets.size() ||
+        !info.initValue) {
+      continue;
+    }
+    if (onlyRefFunc && FindAll<RefFunc>(info.initValue).list.empty()) {
+      continue;
+    }
+    global->init = ExpressionManipulator::copy(info.initValue, *module);
+    global->mutable_ = false;
+    global->type = global->init->type;
+    assignmentCounts[global->name] = 1;
+    promoted.insert(global->name);
+    for (auto& [func, iff] : info.guardIfs) {
+      ExpressionManipulator::nop(iff);
+      if (func) {
+        funcsWithNoppedGuards.insert(func);
+        funcsToUpdate.insert(func);
+      }
+    }
+    for (auto& [func, set] : info.onceNullSets) {
+      ExpressionManipulator::nop(set);
+      if (func) {
+        funcsWithNoppedGuards.insert(func);
+        funcsToUpdate.insert(func);
+      }
+    }
+    for (auto* func : info.readerFuncs) {
+      funcsToUpdate.insert(func);
+    }
+  }
+
+  if (promoted.empty()) {
+    return 0;
+  }
+
+  struct GetUpdater : public PostWalker<GetUpdater> {
+    Module& wasm;
+    const std::unordered_set<Name>& promoted;
+    GetUpdater(Module& wasm, const std::unordered_set<Name>& promoted)
+      : wasm(wasm), promoted(promoted) {}
+    void visitGlobalGet(GlobalGet* curr) {
+      if (promoted.contains(curr->name)) {
+        curr->type = wasm.getGlobal(curr->name)->type;
+      }
+    }
+  } updater(*module, promoted);
+
+  for (auto& func : module->functions) {
+    if (!funcsToUpdate.contains(func.get())) {
+      continue;
+    }
+    updater.walkFunctionInModule(func.get(), module);
+    ReFinalize().walkFunctionInModule(func.get(), module);
+    if (funcsWithNoppedGuards.contains(func.get())) {
+      cleanupFunction(module, func.get());
+      if (isOnceFunction(func.get())) {
+        maybeCollectTrivialFunction(func.get(), trivialFunctionMap);
+      }
+    }
+  }
+
+  return promoted.size();
 }
 
 // A visitor to count the number of GlobalSets of each global so we can later
@@ -196,10 +457,6 @@ private:
     optimized++;
   }
 
-  Name getEnclosingClass(Name name) {
-    return Name(name.view().substr(name.view().find_last_of('@')));
-  }
-
   AssignmentCountMap& assignmentCounts;
   TrivialFunctionMap& trivialFunctionMap;
 };
@@ -291,6 +548,8 @@ struct J2CLOpts : public Pass {
       ConstantHoister hoister(assignmentCounts, trivialFunctionMap);
       hoister.run(getPassRunner(), module);
       int optimized = hoister.optimized;
+      optimized += hoistLazyNullGlobals(
+        module, getPassRunner(), assignmentCounts, trivialFunctionMap);
 
       InlineTrivialOnceFunctions inliner(trivialFunctionMap);
       inliner.run(getPassRunner(), module);

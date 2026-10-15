@@ -358,3 +358,186 @@
   (import "a" "b" (global $a.b (ref func)))
 )
 
+;; Lazy null-guarded singleton globals outside _<once>_ functions are hoisted,
+;; unlocking dependent _<once>_ globals, while unsafe candidates are not.
+(module
+  ;; CHECK:      (type $A (struct (field i32)))
+  (type $A (struct (field i32)))
+
+  ;; CHECK:      (type $1 (func (result (ref null $A))))
+
+  ;; CHECK:      (type $2 (func (result i32)))
+
+  ;; CHECK:      (type $3 (func))
+
+  ;; CHECK:      (global $mismatch@Bad (mut (ref null $A)) (ref.null none))
+
+  ;; CHECK:      (global $extraSet@Bad (mut (ref null $A)) (ref.null none))
+
+  ;; CHECK:      (global $nullChecked@Bad (mut (ref null $A)) (ref.null none))
+
+  ;; CHECK:      (global $DEFAULT_INSTANCE@Foo (ref (exact $A)) (struct.new $A
+  ;; CHECK-NEXT:  (i32.const 7)
+  ;; CHECK-NEXT: ))
+  (global $DEFAULT_INSTANCE@Foo (mut (ref null $A)) (ref.null none))
+  ;; CHECK:      (global $instance@Bar (ref (exact $A)) (struct.new $A
+  ;; CHECK-NEXT:  (i32.const 9)
+  ;; CHECK-NEXT: ))
+  (global $instance@Bar (mut (ref null $A)) (ref.null none))
+  ;; CHECK:      (global $dependent@Baz (ref null $A) (global.get $DEFAULT_INSTANCE@Foo))
+  (global $dependent@Baz (mut (ref null $A)) (ref.null none))
+  (global $mismatch@Bad (mut (ref null $A)) (ref.null none))
+  (global $extraSet@Bad (mut (ref null $A)) (ref.null none))
+  (global $nullChecked@Bad (mut (ref null $A)) (ref.null none))
+
+  ;; CHECK:      (func $getDefault@Foo (type $1) (result (ref null $A))
+  ;; CHECK-NEXT:  (global.get $DEFAULT_INSTANCE@Foo)
+  ;; CHECK-NEXT: )
+  (func $getDefault@Foo (result (ref null $A))
+    (if
+      (ref.is_null (global.get $DEFAULT_INSTANCE@Foo))
+      (then
+        (global.set $DEFAULT_INSTANCE@Foo (struct.new $A (i32.const 7)))
+      )
+    )
+    (global.get $DEFAULT_INSTANCE@Foo)
+  )
+
+  ;; CHECK:      (func $getField@Foo (type $2) (result i32)
+  ;; CHECK-NEXT:  (i32.const 7)
+  ;; CHECK-NEXT: )
+  (func $getField@Foo (result i32)
+    (if
+      (ref.is_null (global.get $DEFAULT_INSTANCE@Foo))
+      (then
+        (global.set $DEFAULT_INSTANCE@Foo (struct.new $A (i32.const 7)))
+      )
+    )
+    (struct.get $A 0 (global.get $DEFAULT_INSTANCE@Foo))
+  )
+
+  ;; CHECK:      (func $clinit_<once>_@Bar (type $3)
+  ;; CHECK-NEXT:  (nop)
+  ;; CHECK-NEXT: )
+  (func $clinit_<once>_@Bar
+    (global.set $instance@Bar (ref.null none))
+  )
+
+  ;; CHECK:      (func $getInstance@Bar (type $1) (result (ref null $A))
+  ;; CHECK-NEXT:  (global.get $instance@Bar)
+  ;; CHECK-NEXT: )
+  (func $getInstance@Bar (result (ref null $A))
+    (if
+      (ref.is_null (global.get $instance@Bar))
+      (then
+        (global.set $instance@Bar (struct.new $A (i32.const 9)))
+      )
+    )
+    (global.get $instance@Bar)
+  )
+
+  ;; CHECK:      (func $clinit_<once>_@Baz (type $3)
+  ;; CHECK-NEXT:  (nop)
+  ;; CHECK-NEXT: )
+  (func $clinit_<once>_@Baz
+    (if
+      (ref.is_null (global.get $DEFAULT_INSTANCE@Foo))
+      (then
+        (global.set $DEFAULT_INSTANCE@Foo (struct.new $A (i32.const 7)))
+      )
+    )
+    (global.set $dependent@Baz (global.get $DEFAULT_INSTANCE@Foo))
+  )
+
+  ;; CHECK:      (func $badCases (type $2) (result i32)
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (ref.is_null
+  ;; CHECK-NEXT:    (global.get $mismatch@Bad)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (global.set $mismatch@Bad
+  ;; CHECK-NEXT:     (struct.new $A
+  ;; CHECK-NEXT:      (i32.const 1)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (ref.is_null
+  ;; CHECK-NEXT:    (global.get $mismatch@Bad)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (global.set $mismatch@Bad
+  ;; CHECK-NEXT:     (struct.new $A
+  ;; CHECK-NEXT:      (i32.const 2)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (ref.is_null
+  ;; CHECK-NEXT:    (global.get $extraSet@Bad)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (global.set $extraSet@Bad
+  ;; CHECK-NEXT:     (struct.new $A
+  ;; CHECK-NEXT:      (i32.const 3)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (global.set $extraSet@Bad
+  ;; CHECK-NEXT:   (struct.new $A
+  ;; CHECK-NEXT:    (i32.const 3)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (ref.is_null
+  ;; CHECK-NEXT:    (global.get $nullChecked@Bad)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (global.set $nullChecked@Bad
+  ;; CHECK-NEXT:     (struct.new $A
+  ;; CHECK-NEXT:      (i32.const 4)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (ref.is_null
+  ;; CHECK-NEXT:   (global.get $nullChecked@Bad)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $badCases (result i32)
+    ;; Mismatched initializers: not hoisted.
+    (if
+      (ref.is_null (global.get $mismatch@Bad))
+      (then
+        (global.set $mismatch@Bad (struct.new $A (i32.const 1)))
+      )
+    )
+    (if
+      (ref.is_null (global.get $mismatch@Bad))
+      (then
+        (global.set $mismatch@Bad (struct.new $A (i32.const 2)))
+      )
+    )
+    ;; Extra unguarded set: not hoisted.
+    (if
+      (ref.is_null (global.get $extraSet@Bad))
+      (then
+        (global.set $extraSet@Bad (struct.new $A (i32.const 3)))
+      )
+    )
+    (global.set $extraSet@Bad (struct.new $A (i32.const 3)))
+    ;; External ref.is_null check: not hoisted.
+    (if
+      (ref.is_null (global.get $nullChecked@Bad))
+      (then
+        (global.set $nullChecked@Bad (struct.new $A (i32.const 4)))
+      )
+    )
+    (ref.is_null (global.get $nullChecked@Bad))
+  )
+)
+
+
