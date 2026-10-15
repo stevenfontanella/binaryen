@@ -91,8 +91,11 @@
 //
 
 #include <algorithm>
+#include <cctype>
 #include <deque>
+#include <map>
 
+#include "ir/effects.h"
 #include "ir/find_all.h"
 #include "ir/iteration.h"
 #include "ir/manipulation.h"
@@ -122,6 +125,9 @@ const Index LocalSetBytes = 2;
 // Function section entry, code size, local declarations, end opcode, and a
 // share of a type section entry.
 const Index HelperOverheadBytes = 6;
+// Maximum number of live-out locals a site may write (1 returned on the Wasm
+// stack, up to 3 returned via module-level scratch globals).
+const Index MaxWrittenLocals = 4;
 
 // The number of bytes used to encode a value as a signed LEB128.
 int getSLEBSize(int64_t value) {
@@ -236,17 +242,27 @@ bool isConstHole(Module& wasm, Expression* curr) {
 }
 
 // A leaf of a tree that may become a parameter of the helper: a local.get (the
-// same local read several times is a single hole), or, in a round with
-// constants as holes, a constant.
+// same local read several times is a single hole), a passthrough live-out
+// written local (expr == nullptr), or, in a round with constants as holes, a
+// constant.
 struct Hole {
-  Expression* expr;
-  bool isLocal;
+  Expression* expr = nullptr;
+  Index localIndex = 0;
+  Type type = Type::none;
+  bool isLocal = false;
 };
 
-// The local a tree writes, if any.
+// A live-out local a tree writes.
 struct WrittenLocal {
   Index index;
   Type type;
+};
+
+// Read and write counts for a local inside a subtree or block slice.
+struct LocalCount {
+  Index index;
+  Index reads = 0;
+  Index writes = 0;
 };
 
 // A group of sites with the same shape.
@@ -254,6 +270,9 @@ struct KeyInfo {
   std::vector<struct Site*> sites;
   // The function that performs this tree, if we found or created one.
   Function* helper = nullptr;
+  // For multi-write helpers (written.size() >= 2), the module-level scratch
+  // globals used to pass written[1 .. k-1] back to the caller.
+  SmallVector<Name, 3> scratchGlobals;
   // Whether we decided to outline the sites with this key.
   bool outline = false;
   // Whether the fields below have been computed.
@@ -285,9 +304,23 @@ struct Site {
   size_t hash = 0;
   // The estimated binary size of the tree.
   Index bytes = 0;
-  // The local the tree writes, if any. The tree then has type none, and the
-  // helper returns the local's final value.
-  std::optional<WrittenLocal> written;
+  // The live-out locals the tree writes, if any. The tree then has type none,
+  // and the helper returns written[0]'s final value on the stack and writes
+  // written[1..] into module-level scratch globals.
+  SmallVector<WrittenLocal, 4> written;
+  // Defaultable non-parameter locals whose reads and writes in the entire
+  // function occur 100% inside this site. Allocated as local vars in the helper
+  // with 0 call-site overhead.
+  SmallVector<Index, 2> internalLocals;
+  // Live-out written locals that are read inside the site only after being
+  // unconditionally written on all paths. Allocated as local vars in the helper
+  // rather than passed as input parameters.
+  SmallVector<Index, 2> overwriteLocals;
+  // Live-out written locals that are not read in the site, are not
+  // unconditionally written on all paths through the site, and may hold a
+  // non-default value before the site. Passed as trailing input parameters so
+  // their incoming values are preserved on untaken paths.
+  SmallVector<Index, 2> passthroughLocals;
   // The nearest enclosing single-expression site, if any. Outlining that makes
   // this site vanish.
   Site* parent = nullptr;
@@ -312,6 +345,33 @@ struct Site {
   // the site must pass as arguments.
   Index varyingBytes = 0;
 
+  bool isInternalLocal(Index idx) const {
+    for (Index internalIdx : internalLocals) {
+      if (internalIdx == idx) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool isOverwriteLocal(Index idx) const {
+    for (Index overIdx : overwriteLocals) {
+      if (overIdx == idx) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool isPassthroughLocal(Index idx) const {
+    for (Index passIdx : passthroughLocals) {
+      if (passIdx == idx) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   Expression* getSliceExpr(Index idx) const {
     Expression* e = expr->cast<Block>()->list[sliceOffset + idx];
     if (trailingSet && idx == sliceLen - 1) {
@@ -333,10 +393,16 @@ struct NodeInfo {
   size_t hash = 0;
   size_t setValueHash = 0;
   Index bytes = 0;
+  // Per-local read and write counts within this subtree.
+  SmallVector<LocalCount, 4> localCounts;
   // The distinct locals the tree reads, in order of first use.
   SmallVector<Index, 4> locals;
   // The distinct locals the tree writes.
   SmallVector<Index, 2> written;
+  // Locals unconditionally written on every normal-exit path of this subtree.
+  SmallVector<Index, 2> mustWrite;
+  // Locals that may be read before being written in this subtree.
+  SmallVector<Index, 4> readBeforeWrite;
   // The labels of branches in the tree that no block or loop in the tree
   // defines.
   SmallVector<Name, 2> openLabels;
@@ -359,6 +425,18 @@ struct FunctionInfo {
   std::deque<Site> sites;
 };
 
+// Counts total reads and writes per local across an entire function body.
+struct LocalUseCounter : public PostWalker<LocalUseCounter> {
+  std::vector<Index> reads;
+  std::vector<Index> writes;
+
+  LocalUseCounter(Index numLocals)
+    : reads(numLocals, 0), writes(numLocals, 0) {}
+
+  void visitLocalGet(LocalGet* curr) { reads[curr->index]++; }
+  void visitLocalSet(LocalSet* curr) { writes[curr->index]++; }
+};
+
 // What to outline, see the top of the file.
 enum class Mode { Calls, Guards, Trees, All };
 
@@ -369,6 +447,9 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
   Mode mode;
   // Whether constants are holes in this round.
   bool constHoles;
+  std::vector<Index> totalReads;
+  std::vector<Index> totalWrites;
+  Index loopDepth = 0;
 
   // Infos of the already-visited children of the expressions we are in the
   // middle of visiting.
@@ -379,16 +460,33 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
           FunctionInfo& info,
           Mode mode,
           bool constHoles)
-    : wasm(wasm), func(func), info(info), mode(mode), constHoles(constHoles) {}
+    : wasm(wasm), func(func), info(info), mode(mode), constHoles(constHoles) {
+    LocalUseCounter counter(func->getNumLocals());
+    counter.walk(func->body);
+    totalReads = std::move(counter.reads);
+    totalWrites = std::move(counter.writes);
+  }
+
+  static void scan(Scanner* self, Expression** currp) {
+    PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>>::scan(self, currp);
+    if ((*currp)->is<Loop>()) {
+      self->loopDepth++;
+    }
+  }
 
   void visitExpression(Expression* curr) {
+    if (curr->is<Loop>()) {
+      assert(loopDepth > 0);
+      loopDepth--;
+    }
     NodeInfo node;
     node.hash = getShallowHash(curr);
     node.bytes = getShallowBytes(curr);
     Index numChildren = ChildIterator(curr).getNumChildren();
     assert(stack.size() >= numChildren);
+    Index stackBase = stack.size() - numChildren;
     node.hasChildren = numChildren > 0;
-    for (Index i = stack.size() - numChildren; i < stack.size(); i++) {
+    for (Index i = stackBase; i < stack.size(); i++) {
       auto& child = stack[i];
       if (child.hasChildren) {
         node.trivialChildren = false;
@@ -396,6 +494,7 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
       hash_combine(node.hash, child.hash);
 
       node.bytes += child.bytes;
+      addLocalCounts(node.localCounts, child.localCounts);
       for (auto local : child.locals) {
         noteUnique(node.locals, local);
       }
@@ -408,6 +507,58 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
       node.movable = node.movable && child.movable;
       node.interesting = node.interesting || child.interesting;
       node.hasGuard = node.hasGuard || child.hasGuard;
+    }
+    if (auto* iff = curr->dynCast<If>()) {
+      auto& condInfo = stack[stackBase];
+      node.readBeforeWrite = condInfo.readBeforeWrite;
+      if (condInfo.openLabels.empty()) {
+        node.mustWrite = condInfo.mustWrite;
+      }
+      auto& trueInfo = stack[stackBase + 1];
+      for (Index x : trueInfo.readBeforeWrite) {
+        if (!contains(node.mustWrite, x)) {
+          noteUnique(node.readBeforeWrite, x);
+        }
+      }
+      if (iff->ifFalse) {
+        auto& falseInfo = stack[stackBase + 2];
+        for (Index x : falseInfo.readBeforeWrite) {
+          if (!contains(node.mustWrite, x)) {
+            noteUnique(node.readBeforeWrite, x);
+          }
+        }
+        if (condInfo.openLabels.empty() && trueInfo.openLabels.empty() &&
+            falseInfo.openLabels.empty()) {
+          for (Index x : trueInfo.mustWrite) {
+            if (contains(falseInfo.mustWrite, x)) {
+              noteUnique(node.mustWrite, x);
+            }
+          }
+        }
+      }
+    } else if (curr->is<Loop>()) {
+      auto& bodyInfo = stack[stackBase];
+      node.readBeforeWrite = bodyInfo.readBeforeWrite;
+      if (bodyInfo.openLabels.empty()) {
+        node.mustWrite = bodyInfo.mustWrite;
+      }
+    } else {
+      bool seenBranch = false;
+      for (Index i = stackBase; i < stack.size(); i++) {
+        auto& child = stack[i];
+        for (Index x : child.readBeforeWrite) {
+          if (!contains(node.mustWrite, x)) {
+            noteUnique(node.readBeforeWrite, x);
+          }
+        }
+        if (!seenBranch && child.openLabels.empty()) {
+          for (Index x : child.mustWrite) {
+            noteUnique(node.mustWrite, x);
+          }
+        } else {
+          seenBranch = true;
+        }
+      }
     }
     if (auto* set = curr->dynCast<LocalSet>()) {
       // We compare the values of local.sets separately (see sameShape), which
@@ -422,16 +573,21 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
         node.hasCleanSetValue = true;
         node.setValueHash = valInfo.hash;
       }
+      addLocalWrite(node.localCounts, set->index, 1);
       noteUnique(node.written, set->index);
+      if (valInfo.openLabels.empty()) {
+        noteUnique(node.mustWrite, set->index);
+      }
     }
     bool recordedFullBlockSlice = false;
     if (auto* block = curr->dynCast<Block>()) {
-      recordedFullBlockSlice =
-        scanBlockSlices(block, stack.size() - numChildren);
+      recordedFullBlockSlice = scanBlockSlices(block, stackBase);
     }
-    stack.resize(stack.size() - numChildren);
+    stack.resize(stackBase);
     if (auto* get = curr->dynCast<LocalGet>()) {
+      addLocalRead(node.localCounts, get->index, 1);
       noteUnique(node.locals, get->index);
+      noteUnique(node.readBeforeWrite, get->index);
     }
     noteLabels(curr, node);
     if (!isMovable(curr)) {
@@ -449,6 +605,15 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
     }
   }
 
+  static bool isScratchGlobalReadStmt(Expression* e) {
+    if (auto* set = e->dynCast<LocalSet>()) {
+      if (auto* gget = set->value->dynCast<GlobalGet>()) {
+        return gget->name.startsWith("oe$out_");
+      }
+    }
+    return false;
+  }
+
   bool scanBlockSlices(Block* block, Index stackBase) {
     bool recordedFull = false;
     Index n = block->list.size();
@@ -458,6 +623,10 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
       }
       for (Index i = n - k + 1; i > 0;) {
         i--;
+        if (isScratchGlobalReadStmt(block->list[i]) ||
+            (i + k < n && isScratchGlobalReadStmt(block->list[i + k]))) {
+          continue;
+        }
         Expression* lastExpr = block->list[i + k - 1];
         Type sliceType = lastExpr->type;
         if (sliceType.isTuple()) {
@@ -501,11 +670,27 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
             sliceNode.movable = false;
             break;
           }
+          addLocalCounts(sliceNode.localCounts, child.localCounts);
+          for (Index x : child.readBeforeWrite) {
+            if (!contains(sliceNode.mustWrite, x)) {
+              noteUnique(sliceNode.readBeforeWrite, x);
+            }
+          }
           if (trailingSet && j == i + k - 1) {
+            auto* set = lastExpr->cast<LocalSet>();
+            subLocalWrite(sliceNode.localCounts, set->index, 1);
+            for (Index x : child.mustWrite) {
+              if (x != set->index) {
+                noteUnique(sliceNode.mustWrite, x);
+              }
+            }
             hash_combine(sliceNode.hash, child.setValueHash);
             assert(child.bytes >= LocalSetBytes);
             sliceNode.bytes += child.bytes - LocalSetBytes;
           } else {
+            for (Index x : child.mustWrite) {
+              noteUnique(sliceNode.mustWrite, x);
+            }
             hash_combine(sliceNode.hash, child.hash);
             sliceNode.bytes += child.bytes;
             for (auto local : child.written) {
@@ -530,6 +715,30 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
     return recordedFull;
   }
 
+  static bool isBareMultiWriteCallSite(Expression* curr,
+                                       Index sliceOffset,
+                                       Index sliceLen) {
+    auto* block = curr->dynCast<Block>();
+    if (!block) {
+      return false;
+    }
+    Index offset = sliceLen > 0 ? sliceOffset : 0;
+    Index len = sliceLen > 0 ? sliceLen : block->list.size();
+    if (len < 2 || !isScratchGlobalReadStmt(block->list[offset + 1])) {
+      return false;
+    }
+    auto* firstSet = block->list[offset]->dynCast<LocalSet>();
+    if (!firstSet || !firstSet->value->is<Call>()) {
+      return false;
+    }
+    for (Index j = 2; j < len; j++) {
+      if (!isScratchGlobalReadStmt(block->list[offset + j])) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   void recordSite(Expression* curr,
                   Index sliceOffset,
                   Index sliceLen,
@@ -539,24 +748,13 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
     if (!node.movable || !node.openLabels.empty()) {
       return;
     }
-    std::optional<WrittenLocal> written;
-    if (!node.written.empty()) {
-      // We can only return the final value of a single local, and the site
-      // must be able to read the local before the tree.
-      if (node.written.size() > 1 || type != Type::none) {
-        return;
-      }
-      Index index = node.written[0];
-      auto localType = func->getLocalType(index);
-      if (!localType.isDefaultable()) {
-        return;
-      }
-      // A local.set itself is never worth outlining: its value is a better
-      // tree (it does not need to pass and return the local).
-      if (sliceLen == 0 && curr->is<LocalSet>()) {
-        return;
-      }
-      written = WrittenLocal{index, localType};
+    // A local.set itself is never worth outlining: its value is a better
+    // tree (it does not need to pass and return the local).
+    if (sliceLen == 0 && curr->is<LocalSet>()) {
+      return;
+    }
+    if (isBareMultiWriteCallSite(curr, sliceOffset, sliceLen)) {
+      return;
     }
     // A single instruction with trivial operands, like a call with constant
     // arguments or a struct.get of a local.
@@ -581,10 +779,62 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
       case Mode::All:
         break;
     }
+    // Identify function-internal scratch locals whose reads and writes in the
+    // enclosing function occur 100% inside this candidate (and cannot carry
+    // state across an enclosing loop).
+    SmallVector<Index, 2> internalLocals;
+    for (auto& lc : node.localCounts) {
+      if (func->isVar(lc.index) &&
+          func->getLocalType(lc.index).isDefaultable() &&
+          lc.reads == totalReads[lc.index] &&
+          lc.writes == totalWrites[lc.index] &&
+          (loopDepth == 0 || !contains(node.readBeforeWrite, lc.index))) {
+        internalLocals.push_back(lc.index);
+      }
+    }
+    SmallVector<WrittenLocal, 4> written;
+    for (Index index : node.written) {
+      if (contains(internalLocals, index)) {
+        continue;
+      }
+      if (type != Type::none || written.size() >= MaxWrittenLocals) {
+        return;
+      }
+      auto localType = func->getLocalType(index);
+      if (!localType.isDefaultable()) {
+        return;
+      }
+      written.push_back({index, localType});
+    }
+    SmallVector<Index, 2> overwriteLocals;
+    Index numInputLocals = 0;
+    for (Index index : node.locals) {
+      if (contains(internalLocals, index)) {
+        continue;
+      }
+      if (!contains(node.readBeforeWrite, index) &&
+          contains(node.mustWrite, index)) {
+        overwriteLocals.push_back(index);
+        continue;
+      }
+      numInputLocals++;
+    }
+    SmallVector<Index, 2> passthroughLocals;
+    for (auto& w : written) {
+      if (!contains(node.locals, w.index) &&
+          !contains(node.mustWrite, w.index)) {
+        auto lc = getLocalCount(node.localCounts, w.index);
+        if (func->isParam(w.index) || lc.writes < totalWrites[w.index] ||
+            loopDepth > 0) {
+          passthroughLocals.push_back(w.index);
+          numInputLocals++;
+        }
+      }
+    }
     // Nothing to gain without saving at least a byte per site.
-    Index siteBytes = LocalGetBytes * node.locals.size() + CallBytes;
-    if (written) {
-      siteBytes += LocalSetBytes;
+    Index siteBytes = LocalGetBytes * numInputLocals + CallBytes;
+    if (!written.empty()) {
+      siteBytes += LocalSetBytes + 4 * (written.size() - 1);
     }
     if (node.bytes <= siteBytes) {
       return;
@@ -595,6 +845,11 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
         Properties::isValidConstantExpression(wasm, curr)) {
       return;
     }
+    size_t siteHash = node.hash;
+    rehash(siteHash, written.size());
+    rehash(siteHash, internalLocals.size());
+    rehash(siteHash, passthroughLocals.size());
+
     info.sites.emplace_back();
     auto& site = info.sites.back();
     site.expr = curr;
@@ -602,18 +857,89 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
     site.sliceOffset = sliceOffset;
     site.sliceLen = sliceLen;
     site.trailingSet = trailingSet;
-    site.hash = node.hash;
+    site.hash = siteHash;
     site.bytes = node.bytes;
-    site.written = written;
+    site.written = std::move(written);
+    site.internalLocals = std::move(internalLocals);
+    site.overwriteLocals = std::move(overwriteLocals);
+    site.passthroughLocals = std::move(passthroughLocals);
+  }
+
+  template<typename T, typename V> bool contains(const T& vec, V value) {
+    for (auto other : vec) {
+      if (other == value) {
+        return true;
+      }
+    }
+    return false;
   }
 
   template<typename T, typename V> void noteUnique(T& vec, V value) {
-    for (auto other : vec) {
-      if (other == value) {
+    if (!contains(vec, value)) {
+      vec.push_back(value);
+    }
+  }
+
+  void addLocalRead(SmallVector<LocalCount, 4>& counts, Index index, Index n) {
+    for (auto& lc : counts) {
+      if (lc.index == index) {
+        lc.reads += n;
         return;
       }
     }
-    vec.push_back(value);
+    counts.push_back({index, n, 0});
+  }
+
+  void addLocalWrite(SmallVector<LocalCount, 4>& counts, Index index, Index n) {
+    for (auto& lc : counts) {
+      if (lc.index == index) {
+        lc.writes += n;
+        return;
+      }
+    }
+    counts.push_back({index, 0, n});
+  }
+
+  void subLocalWrite(SmallVector<LocalCount, 4>& counts, Index index, Index n) {
+    for (Index i = 0; i < counts.size(); i++) {
+      if (counts[i].index == index) {
+        assert(counts[i].writes >= n);
+        counts[i].writes -= n;
+        if (counts[i].reads == 0 && counts[i].writes == 0) {
+          counts.erase(counts.begin() + i, counts.begin() + i + 1);
+        }
+        return;
+      }
+    }
+    WASM_UNREACHABLE("missing local count");
+  }
+
+  void addLocalCounts(SmallVector<LocalCount, 4>& dst,
+                      const SmallVector<LocalCount, 4>& src) {
+    for (auto& lc : src) {
+      bool found = false;
+      for (auto& d : dst) {
+        if (d.index == lc.index) {
+          d.reads += lc.reads;
+          d.writes += lc.writes;
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        dst.push_back(lc);
+      }
+    }
+  }
+
+  LocalCount getLocalCount(const SmallVector<LocalCount, 4>& counts,
+                           Index index) {
+    for (auto& lc : counts) {
+      if (lc.index == index) {
+        return lc;
+      }
+    }
+    return {index, 0, 0};
   }
 
   // Notes the labels a branch uses, and removes the one a block or loop
@@ -707,6 +1033,8 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
         return !curr->cast<CallIndirect>()->isReturn;
       case Expression::CallRefId:
         return !curr->cast<CallRef>()->isReturn;
+      case Expression::GlobalSetId:
+        return !curr->cast<GlobalSet>()->name.startsWith("oe$out_");
       default:
         return true;
     }
@@ -748,47 +1076,62 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
   }
 };
 
-// Finds the holes of a tree, in evaluation order: the distinct locals it reads
-// (with the first local.get of each) and, if constants are holes, each
-// constant.
+// Finds the holes of a tree, in evaluation order: the distinct non-internal
+// locals it reads (with the first local.get of each), any passthrough written
+// locals, and, if constants are holes, each constant.
 struct HoleFinder
   : public PostWalker<HoleFinder, UnifiedExpressionVisitor<HoleFinder>> {
   Module& wasm;
+  const Site* site;
   bool constHoles;
   std::vector<Hole> holes;
 
-  HoleFinder(Module& wasm, bool constHoles)
-    : wasm(wasm), constHoles(constHoles) {}
+  HoleFinder(Module& wasm, const Site* site, bool constHoles)
+    : wasm(wasm), site(site), constHoles(constHoles) {}
 
   void visitExpression(Expression* curr) {
     if (auto* get = curr->dynCast<LocalGet>()) {
+      if (site->isInternalLocal(get->index) ||
+          site->isOverwriteLocal(get->index)) {
+        return;
+      }
       for (auto& hole : holes) {
-        if (hole.isLocal && hole.expr->cast<LocalGet>()->index == get->index) {
+        if (hole.isLocal && hole.localIndex == get->index) {
           return;
         }
       }
-      holes.push_back({curr, true});
+      holes.push_back({curr, get->index, get->type, true});
     } else if (constHoles && isConstHole(wasm, curr)) {
-      holes.push_back({curr, false});
+      holes.push_back({curr, 0, curr->type, false});
     }
   }
 };
 
-std::vector<Hole> getHoles(Module& wasm, Expression* expr, bool constHoles) {
-  HoleFinder finder(wasm, constHoles);
+void appendPassthroughHoles(const Site* site, std::vector<Hole>& holes) {
+  for (Index passIdx : site->passthroughLocals) {
+    holes.push_back(
+      {nullptr, passIdx, site->func->getLocalType(passIdx), true});
+  }
+}
+
+std::vector<Hole>
+getHoles(Module& wasm, Expression* expr, const Site* site, bool constHoles) {
+  HoleFinder finder(wasm, site, constHoles);
   finder.walk(expr);
+  appendPassthroughHoles(site, finder.holes);
   return std::move(finder.holes);
 }
 
 std::vector<Hole> getHoles(Module& wasm, const Site* site, bool constHoles) {
   if (site->sliceLen == 0) {
-    return getHoles(wasm, site->expr, constHoles);
+    return getHoles(wasm, site->expr, site, constHoles);
   }
-  HoleFinder finder(wasm, constHoles);
+  HoleFinder finder(wasm, site, constHoles);
   for (Index i = 0; i < site->sliceLen; i++) {
     Expression* elem = site->getSliceExpr(i);
     finder.walk(elem);
   }
+  appendPassthroughHoles(site, finder.holes);
   return std::move(finder.holes);
 }
 
@@ -822,7 +1165,10 @@ struct Replacer : public WalkerPass<
     std::vector<Expression*> args;
     for (Index i = 0; i < site->holes.size(); i++) {
       if (!fixed[i]) {
-        args.push_back(site->holes[i].expr);
+        auto& hole = site->holes[i];
+        args.push_back(hole.expr
+                         ? hole.expr
+                         : builder.makeLocalGet(hole.localIndex, hole.type));
       }
     }
     assert(args.size() == site->key->numLocals + site->key->numVarying);
@@ -831,11 +1177,25 @@ struct Replacer : public WalkerPass<
         builder.makeCall(replacement.helper, args, Type::none),
         builder.makeUnreachable());
     }
-    if (site->written) {
-      auto& written = *site->written;
-      return builder.makeLocalSet(
-        written.index,
-        builder.makeCall(replacement.helper, args, written.type));
+    if (!site->written.empty()) {
+      auto& firstWritten = site->written[0];
+      Expression* firstSet = builder.makeLocalSet(
+        firstWritten.index,
+        builder.makeCall(replacement.helper, args, firstWritten.type));
+      if (site->written.size() == 1) {
+        return firstSet;
+      }
+      assert(site->key->scratchGlobals.size() == site->written.size() - 1);
+      std::vector<Expression*> stmts;
+      stmts.reserve(site->written.size());
+      stmts.push_back(firstSet);
+      for (Index j = 1; j < site->written.size(); j++) {
+        auto& w = site->written[j];
+        stmts.push_back(builder.makeLocalSet(
+          w.index,
+          builder.makeGlobalGet(site->key->scratchGlobals[j - 1], w.type)));
+      }
+      return builder.makeBlock(stmts, Type::none);
     }
     return builder.makeCall(replacement.helper, args, type);
   }
@@ -865,7 +1225,10 @@ struct Replacer : public WalkerPass<
             std::vector<Expression*> args;
             for (Index i = 0; i < site->holes.size(); i++) {
               if (!fixed[i]) {
-                args.push_back(site->holes[i].expr);
+                auto& hole = site->holes[i];
+                args.push_back(
+                  hole.expr ? hole.expr
+                            : builder.makeLocalGet(hole.localIndex, hole.type));
               }
             }
             block->list[offset] =
@@ -900,8 +1263,8 @@ private:
 };
 
 struct OutlineExpressions : public Pass {
-  // The helpers perform exactly the code they replace, so the effects of
-  // existing functions do not change.
+  // The helpers perform the code they replace; any multi-write scratch globals
+  // we introduce are added to existing function effect summaries in run().
   bool addsEffects() override { return false; }
 
   bool requiresNonNullableLocalFixups() override { return false; }
@@ -914,6 +1277,9 @@ struct OutlineExpressions : public Pass {
   // Sites with the same hash usually have the same shape, but we verify that,
   // so a hash may map to several keys.
   std::unordered_map<size_t, std::vector<KeyInfo*>> keysByHash;
+  // Module-level mutable scratch globals created/reused for multi-write helpers
+  // keyed by (Type, per-type rank).
+  std::unordered_map<std::pair<Type, Index>, Name> scratchGlobals;
 
   // The helpers we create may themselves contain duplicated trees (two
   // different helpers can share a sub-tree, which can also appear on its own
@@ -929,6 +1295,7 @@ struct OutlineExpressions : public Pass {
 
   void run(Module* module) override {
     wasm = module;
+    scratchGlobals.clear();
 
     auto mode = getMode();
 
@@ -942,6 +1309,28 @@ struct OutlineExpressions : public Pass {
     for (Index round = 0; round < MaxConstRounds; round++) {
       if (!runRound(mode)) {
         break;
+      }
+    }
+
+    if (!scratchGlobals.empty()) {
+      for (auto& func : wasm->functions) {
+        if (func->effects) {
+          auto* mutableEffects =
+            const_cast<EffectAnalyzer*>(func->effects.get());
+          for (auto& [_, gName] : scratchGlobals) {
+            mutableEffects->mutableGlobalsRead.insert(gName);
+            mutableEffects->globalsWritten.insert(gName);
+          }
+        }
+      }
+      for (auto& [_, effects] : wasm->indirectCallEffects) {
+        if (effects) {
+          auto* mutableEffects = const_cast<EffectAnalyzer*>(effects.get());
+          for (auto& [_, gName] : scratchGlobals) {
+            mutableEffects->mutableGlobalsRead.insert(gName);
+            mutableEffects->globalsWritten.insert(gName);
+          }
+        }
       }
     }
   }
@@ -1018,13 +1407,17 @@ struct OutlineExpressions : public Pass {
           auto* site = info.sites[0];
           int64_t cost = int64_t(site->bytes) - int64_t(site->varyingBytes) +
                          LocalGetBytes * int64_t(info.numVarying) +
-                         HelperOverheadBytes;
-          if (site->written) {
-            // The helper returns the local's final value, and may need to
-            // declare the local.
-            cost += LocalSetBytes;
-            if (!isWrittenParam(site)) {
-              cost += LocalSetBytes;
+                         HelperOverheadBytes +
+                         LocalSetBytes * int64_t(site->internalLocals.size());
+          if (!site->written.empty()) {
+            // The helper returns written[0]'s final value, writes written[1..]
+            // into scratch globals, and declares any written locals that are
+            // not parameters.
+            cost += LocalSetBytes + 4 * int64_t(site->written.size() - 1);
+            for (auto& w : site->written) {
+              if (!isWrittenParam(site, w.index)) {
+                cost += LocalSetBytes;
+              }
             }
           }
           outline = saved > cost;
@@ -1092,6 +1485,7 @@ struct OutlineExpressions : public Pass {
     }
     Fatal() << "unknown outline-expressions-mode: " << name
             << " (expected calls, guards, trees, or all)";
+    WASM_UNREACHABLE("unknown mode");
   }
 
   // Link each site to the nearest single-expression site and slice sites that
@@ -1143,7 +1537,7 @@ struct OutlineExpressions : public Pass {
               bool higherPriority =
                 other->sliceLen > slice->sliceLen ||
                 (other->sliceLen == slice->sliceLen &&
-                 other->sliceOffset < slice->sliceOffset);
+                  other->sliceOffset < slice->sliceOffset);
               if (overlaps && higherPriority) {
                 slice->overlappingSlices.push_back(other);
               }
@@ -1175,6 +1569,12 @@ struct OutlineExpressions : public Pass {
   // places in both trees (and, with constants as holes, apart from the
   // constants, which must have the same type).
   bool sameShape(Site* leftSite, Site* rightSite) {
+    if (leftSite->written.size() != rightSite->written.size() ||
+        leftSite->internalLocals.size() != rightSite->internalLocals.size() ||
+        leftSite->passthroughLocals.size() !=
+          rightSite->passthroughLocals.size()) {
+      return false;
+    }
     std::unordered_map<Index, Index> leftToRight, rightToLeft;
     bool mismatch = false;
     auto mapLocals = [&](Index leftIndex, Index rightIndex) {
@@ -1182,6 +1582,15 @@ struct OutlineExpressions : public Pass {
       auto [r, rInserted] = rightToLeft.try_emplace(rightIndex, leftIndex);
       if (l->second != rightIndex || r->second != leftIndex) {
         mismatch = true;
+        return;
+      }
+      if (lInserted) {
+        if (leftSite->isInternalLocal(leftIndex) !=
+              rightSite->isInternalLocal(rightIndex) ||
+            leftSite->isPassthroughLocal(leftIndex) !=
+              rightSite->isPassthroughLocal(rightIndex)) {
+          mismatch = true;
+        }
       }
     };
     ExpressionAnalyzer::ExprComparer comparer = [&](Expression* left,
@@ -1214,7 +1623,7 @@ struct OutlineExpressions : public Pass {
         if (!rightSet) {
           return false;
         }
-        // The local's type matters as the helper returns it.
+        // The local's type matters as the helper returns or declares it.
         if (leftSet->type != rightSet->type ||
             leftSite->func->getLocalType(leftSet->index) !=
               rightSite->func->getLocalType(rightSet->index)) {
@@ -1330,25 +1739,22 @@ struct OutlineExpressions : public Pass {
   }
 
   // The bytes a site costs after outlining: a call, plus an unreachable if the
-  // tree is unreachable, or a local.set if it writes a local.
+  // tree is unreachable, or local.sets (+ global.gets) if it writes locals.
   Index getCallBytes(Site* site) {
     if (site->getType() == Type::unreachable) {
       return CallBytes + 1;
     }
-    if (site->written) {
-      return CallBytes + LocalSetBytes;
+    if (!site->written.empty()) {
+      return CallBytes + LocalSetBytes + 4 * (site->written.size() - 1);
     }
     return CallBytes;
   }
 
-  // Whether the local a site writes is also read in the tree, so that its
-  // incoming value must be a parameter of the helper. (The holes contain the
-  // locals the tree reads, so this needs the key to be prepared.)
-  bool isWrittenParam(Site* site) {
-    assert(site->written);
+  // Whether a local the site writes is also a parameter of the helper (either
+  // read in the tree or passed through to preserve its value on untaken paths).
+  bool isWrittenParam(Site* site, Index writtenIndex) {
     for (auto& hole : site->holes) {
-      if (hole.isLocal &&
-          hole.expr->cast<LocalGet>()->index == site->written->index) {
+      if (hole.isLocal && hole.localIndex == writtenIndex) {
         return true;
       }
     }
@@ -1410,8 +1816,8 @@ struct OutlineExpressions : public Pass {
   }
 
   Type getHelperResults(Site* site) {
-    if (site->written) {
-      return site->written->type;
+    if (!site->written.empty()) {
+      return site->written[0].type;
     }
     Type type = site->getType();
     return type == Type::unreachable ? Type::none : type;
@@ -1423,7 +1829,8 @@ struct OutlineExpressions : public Pass {
   // baked in. (The helpers of trees that write a local are blocks that end in
   // a read of the local, which we do not try to recognize.)
   void noteExistingHelper(Function* func, Site& site) {
-    if (site.written || func->getResults() != getHelperResults(&site)) {
+    if (!site.written.empty() || !site.internalLocals.empty() ||
+        func->getResults() != getHelperResults(&site)) {
       return;
     }
     auto& key = *site.key;
@@ -1436,8 +1843,7 @@ struct OutlineExpressions : public Pass {
       if (!hole.isLocal) {
         continue;
       }
-      auto* get = hole.expr->cast<LocalGet>();
-      if (get->index != i || get->type != func->getLocalType(i)) {
+      if (hole.localIndex != i || hole.type != func->getLocalType(i)) {
         return;
       }
       i++;
@@ -1452,8 +1858,8 @@ struct OutlineExpressions : public Pass {
   }
 
   // Turns the non-fixed holes of a copied tree into local.gets of the params,
-  // and local.sets of the written local into local.sets of the helper's local
-  // for it.
+  // and local.sets of the written/internal locals into local.sets of the
+  // helper's locals for them.
   struct HoleReplacer
     : public PostWalker<HoleReplacer, UnifiedExpressionVisitor<HoleReplacer>> {
     Module& wasm;
@@ -1474,6 +1880,38 @@ struct OutlineExpressions : public Pass {
     }
   };
 
+  Name getScratchGlobal(Type type, Index rank) {
+    auto key = std::make_pair(type, rank);
+    if (auto iter = scratchGlobals.find(key); iter != scratchGlobals.end()) {
+      return iter->second;
+    }
+    std::string base =
+      "oe$out_" + type.toString() + "_" + std::to_string(rank + 1);
+    for (char& c : base) {
+      if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' &&
+          c != '$') {
+        c = '_';
+      }
+    }
+    Name candidate(base);
+    if (auto* existing = wasm->getGlobalOrNull(candidate)) {
+      if (existing->mutable_ && existing->type == type &&
+          !existing->imported()) {
+        scratchGlobals[key] = candidate;
+        return candidate;
+      }
+    }
+    Name name = Names::getValidGlobalName(*wasm, base);
+    Builder builder(*wasm);
+    wasm->addGlobal(builder.makeGlobal(
+      name,
+      type,
+      builder.makeConstantExpression(Literal::makeZero(type)),
+      Builder::Mutable));
+    scratchGlobals[key] = name;
+    return name;
+  }
+
   Function* createHelper(Site* site) {
     auto& key = *site->key;
     Builder builder(*wasm);
@@ -1489,7 +1927,7 @@ struct OutlineExpressions : public Pass {
       }
       body = builder.makeBlock(copied, site->getType());
     }
-    auto holes = getHoles(*wasm, body, constHoles);
+    auto holes = getHoles(*wasm, body, site, constHoles);
     assert(holes.size() == site->holes.size());
     std::vector<Type> params;
     HoleReplacer replacer(*wasm);
@@ -1499,36 +1937,67 @@ struct OutlineExpressions : public Pass {
       }
       auto& hole = holes[i];
       if (hole.isLocal) {
-        replacer.paramOfLocal[hole.expr->cast<LocalGet>()->index] =
-          params.size();
+        replacer.paramOfLocal[hole.localIndex] = params.size();
       } else {
         replacer.paramOfConst[hole.expr] = params.size();
       }
-      params.push_back(hole.expr->type);
+      params.push_back(hole.type);
     }
     assert(params.size() == key.numLocals + key.numVarying);
     std::vector<Type> vars;
-    if (site->written) {
-      // Return the final value of the written local, which is a param if the
-      // tree reads it, and otherwise a local of the helper.
-      auto& written = *site->written;
-      auto iter = replacer.paramOfLocal.find(written.index);
-      Index index;
-      if (iter != replacer.paramOfLocal.end()) {
-        index = iter->second;
-      } else {
-        index = params.size();
-        vars.push_back(written.type);
-        replacer.paramOfLocal[written.index] = index;
+    for (Index internalIdx : site->internalLocals) {
+      Index helperIdx = params.size() + vars.size();
+      vars.push_back(site->func->getLocalType(internalIdx));
+      replacer.paramOfLocal[internalIdx] = helperIdx;
+    }
+    if (!site->written.empty()) {
+      SmallVector<Index, 4> writtenHelperIndices;
+      for (auto& w : site->written) {
+        auto iter = replacer.paramOfLocal.find(w.index);
+        Index index;
+        if (iter != replacer.paramOfLocal.end()) {
+          index = iter->second;
+        } else {
+          index = params.size() + vars.size();
+          vars.push_back(w.type);
+          replacer.paramOfLocal[w.index] = index;
+        }
+        writtenHelperIndices.push_back(index);
+      }
+      if (site->written.size() >= 2) {
+        std::unordered_map<Type, Index> typeCounts;
+        for (Index j = 1; j < site->written.size(); j++) {
+          Type t = site->written[j].type;
+          Index rank = typeCounts[t]++;
+          key.scratchGlobals.push_back(getScratchGlobal(t, rank));
+        }
       }
       replacer.walk(body);
+      auto& firstWritten = site->written[0];
       if (site->sliceLen > 0) {
         auto* block = body->cast<Block>();
-        block->list.push_back(builder.makeLocalGet(index, written.type));
-        block->type = written.type;
+        for (Index j = 1; j < site->written.size(); j++) {
+          block->list.push_back(builder.makeGlobalSet(
+            key.scratchGlobals[j - 1],
+            builder.makeLocalGet(writtenHelperIndices[j],
+                                 site->written[j].type)));
+        }
+        block->list.push_back(
+          builder.makeLocalGet(writtenHelperIndices[0], firstWritten.type));
+        block->type = firstWritten.type;
       } else {
-        body = builder.makeBlock(
-          {body, builder.makeLocalGet(index, written.type)}, written.type);
+        std::vector<Expression*> list;
+        list.reserve(site->written.size() + 1);
+        list.push_back(body);
+        for (Index j = 1; j < site->written.size(); j++) {
+          list.push_back(builder.makeGlobalSet(
+            key.scratchGlobals[j - 1],
+            builder.makeLocalGet(writtenHelperIndices[j],
+                                 site->written[j].type)));
+        }
+        list.push_back(
+          builder.makeLocalGet(writtenHelperIndices[0], firstWritten.type));
+        body = builder.makeBlock(list, firstWritten.type);
       }
     } else {
       replacer.walk(body);
