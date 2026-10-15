@@ -626,7 +626,7 @@
   ;; CHECK:      (type $str (struct (field i32)))
   (type $str (struct (field i32)))
 
-  ;; CHECK:      (type $1 (array (mut i8)))
+  ;; CHECK:      (type $1 (array (mut i16)))
 
   ;; CHECK:      (type $2 (func (param i32) (result (ref $str))))
 
@@ -637,7 +637,7 @@
   ;; CHECK:      (import "env" "use" (func $use (type $3) (param (ref $str))))
   (import "env" "use" (func $use (param (ref $str))))
 
-  ;; CHECK:      (data $roll "\00\03\04\00\03\n\nd\01E\01\01\00\03\04\00\03\n\nd\01E\01\01")
+  ;; CHECK:      (data $roll "\e8\03\eb\03\ef\03\ef\03\f2\03\fc\03\06\04j\04k\04\b0\04\b1\04\b2\04;\18>\18B\18B\18E\18O\18Y\18\bd\18\be\18\03\19\04\19\05\19")
 
   ;; CHECK:      (func $factory (type $2) (param $i i32) (result (ref $str))
   ;; CHECK-NEXT:  (struct.new $str
@@ -663,8 +663,6 @@
   ;; CHECK-NEXT:  (local $0 (ref $1))
   ;; CHECK-NEXT:  (local $1 i32)
   ;; CHECK-NEXT:  (local $2 i32)
-  ;; CHECK-NEXT:  (local $3 i32)
-  ;; CHECK-NEXT:  (local $4 i32)
   ;; CHECK-NEXT:  (local.set $0
   ;; CHECK-NEXT:   (array.new_data $1 $roll
   ;; CHECK-NEXT:    (i32.const 0)
@@ -672,58 +670,31 @@
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT:  (block
-  ;; CHECK-NEXT:   (local.set $3
-  ;; CHECK-NEXT:    (i32.const 0)
-  ;; CHECK-NEXT:   )
-  ;; CHECK-NEXT:   (local.set $4
-  ;; CHECK-NEXT:    (i32.const 1000)
-  ;; CHECK-NEXT:   )
-  ;; CHECK-NEXT:   (loop $roll_1
-  ;; CHECK-NEXT:    (call $use
-  ;; CHECK-NEXT:     (call $factory
-  ;; CHECK-NEXT:      (local.tee $4
-  ;; CHECK-NEXT:       (i32.add
-  ;; CHECK-NEXT:        (local.get $4)
-  ;; CHECK-NEXT:        (array.get_u $1
-  ;; CHECK-NEXT:         (local.get $0)
-  ;; CHECK-NEXT:         (local.get $3)
-  ;; CHECK-NEXT:        )
-  ;; CHECK-NEXT:       )
-  ;; CHECK-NEXT:      )
-  ;; CHECK-NEXT:     )
-  ;; CHECK-NEXT:    )
-  ;; CHECK-NEXT:    (br_if $roll_1
-  ;; CHECK-NEXT:     (i32.lt_u
-  ;; CHECK-NEXT:      (local.tee $3
-  ;; CHECK-NEXT:       (i32.add
-  ;; CHECK-NEXT:        (local.get $3)
-  ;; CHECK-NEXT:        (i32.const 1)
-  ;; CHECK-NEXT:       )
-  ;; CHECK-NEXT:      )
-  ;; CHECK-NEXT:      (i32.const 12)
-  ;; CHECK-NEXT:     )
-  ;; CHECK-NEXT:    )
-  ;; CHECK-NEXT:   )
-  ;; CHECK-NEXT:  )
-  ;; CHECK-NEXT:  (block
   ;; CHECK-NEXT:   (local.set $1
   ;; CHECK-NEXT:    (i32.const 0)
   ;; CHECK-NEXT:   )
-  ;; CHECK-NEXT:   (local.set $2
-  ;; CHECK-NEXT:    (i32.const 5000)
-  ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:   (loop $roll
   ;; CHECK-NEXT:    (call $use
-  ;; CHECK-NEXT:     (call $factory2
-  ;; CHECK-NEXT:      (local.tee $2
-  ;; CHECK-NEXT:       (i32.add
-  ;; CHECK-NEXT:        (local.get $2)
+  ;; CHECK-NEXT:     (if (result (ref $str))
+  ;; CHECK-NEXT:      (i32.lt_u
+  ;; CHECK-NEXT:       (local.tee $2
   ;; CHECK-NEXT:        (array.get_u $1
   ;; CHECK-NEXT:         (local.get $0)
-  ;; CHECK-NEXT:         (i32.add
-  ;; CHECK-NEXT:          (local.get $1)
-  ;; CHECK-NEXT:          (i32.const 12)
-  ;; CHECK-NEXT:         )
+  ;; CHECK-NEXT:         (local.get $1)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:       (i32.const 1203)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (then
+  ;; CHECK-NEXT:       (call $factory
+  ;; CHECK-NEXT:        (local.get $2)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (else
+  ;; CHECK-NEXT:       (call $factory2
+  ;; CHECK-NEXT:        (i32.sub
+  ;; CHECK-NEXT:         (local.get $2)
+  ;; CHECK-NEXT:         (i32.const 1203)
   ;; CHECK-NEXT:        )
   ;; CHECK-NEXT:       )
   ;; CHECK-NEXT:      )
@@ -737,7 +708,7 @@
   ;; CHECK-NEXT:        (i32.const 1)
   ;; CHECK-NEXT:       )
   ;; CHECK-NEXT:      )
-  ;; CHECK-NEXT:      (i32.const 12)
+  ;; CHECK-NEXT:      (i32.const 24)
   ;; CHECK-NEXT:     )
   ;; CHECK-NEXT:    )
   ;; CHECK-NEXT:   )
@@ -1035,5 +1006,352 @@
       (call $use (i32.const 80))
     )
     (call $use (i32.const 99))
+  )
+)
+
+;; Multi-factory reference holes (in statement runs and switch ladders) and
+;; multi-hole switch ladders with default gaps.
+(module
+  ;; CHECK:      (type $0 (array (mut i8)))
+
+  ;; CHECK:      (type $str (struct (field i32)))
+  (type $str (struct (field i32)))
+  ;; CHECK:      (type $2 (func (param i32) (result (ref $str))))
+
+  ;; CHECK:      (type $3 (func))
+
+  ;; CHECK:      (type $4 (func (param (ref $str))))
+
+  ;; CHECK:      (type $5 (func (param i32 (ref $str))))
+
+  ;; CHECK:      (type $6 (func (param i32) (result (ref null $str))))
+
+  ;; CHECK:      (type $7 (func (param i32)))
+
+  ;; CHECK:      (import "env" "use" (func $use (type $4) (param (ref $str))))
+  (import "env" "use" (func $use (param (ref $str))))
+  ;; CHECK:      (import "env" "use2" (func $use2 (type $5) (param i32 (ref $str))))
+  (import "env" "use2" (func $use2 (param i32 (ref $str))))
+
+  ;; CHECK:      (data $roll "\00\03\04\00\03\n\nd\01E\01\01\01\15\05\17\t\19\0c\1b\0f\1d\12\1f\03\r\07\10\t\12\0b\14\n\00\14\1e\00*2<\01\00\08\03\00\n\05\0c")
+
+  ;; CHECK:      (func $factory1 (type $2) (param $i i32) (result (ref $str))
+  ;; CHECK-NEXT:  (struct.new $str
+  ;; CHECK-NEXT:   (local.get $i)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $factory1 (param $i i32) (result (ref $str))
+    (struct.new $str (local.get $i))
+  )
+  ;; CHECK:      (func $factory2 (type $2) (param $i i32) (result (ref $str))
+  ;; CHECK-NEXT:  (struct.new $str
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (local.get $i)
+  ;; CHECK-NEXT:    (i32.const 100)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $factory2 (param $i i32) (result (ref $str))
+    (struct.new $str (i32.add (local.get $i) (i32.const 100)))
+  )
+
+  ;; CHECK:      (func $run-delta (type $3)
+  ;; CHECK-NEXT:  (local $0 (ref $0))
+  ;; CHECK-NEXT:  (local $1 i32)
+  ;; CHECK-NEXT:  (local $2 i32)
+  ;; CHECK-NEXT:  (local.set $0
+  ;; CHECK-NEXT:   (array.new_data $0 $roll
+  ;; CHECK-NEXT:    (i32.const 0)
+  ;; CHECK-NEXT:    (i32.const 12)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (block
+  ;; CHECK-NEXT:   (local.set $1
+  ;; CHECK-NEXT:    (i32.const 0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.set $2
+  ;; CHECK-NEXT:    (i32.const 1000)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (loop $roll
+  ;; CHECK-NEXT:    (call $use
+  ;; CHECK-NEXT:     (call $factory1
+  ;; CHECK-NEXT:      (local.tee $2
+  ;; CHECK-NEXT:       (i32.add
+  ;; CHECK-NEXT:        (local.get $2)
+  ;; CHECK-NEXT:        (array.get_u $0
+  ;; CHECK-NEXT:         (local.get $0)
+  ;; CHECK-NEXT:         (local.get $1)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (br_if $roll
+  ;; CHECK-NEXT:     (i32.lt_u
+  ;; CHECK-NEXT:      (local.tee $1
+  ;; CHECK-NEXT:       (i32.add
+  ;; CHECK-NEXT:        (local.get $1)
+  ;; CHECK-NEXT:        (i32.const 1)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (i32.const 12)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $run-delta
+    (call $use (call $factory1 (i32.const 1000)))
+    (call $use (call $factory1 (i32.const 1003)))
+    (call $use (call $factory1 (i32.const 1007)))
+    (call $use (call $factory1 (i32.const 1007)))
+    (call $use (call $factory1 (i32.const 1010)))
+    (call $use (call $factory1 (i32.const 1020)))
+    (call $use (call $factory1 (i32.const 1030)))
+    (call $use (call $factory1 (i32.const 1130)))
+    (call $use (call $factory1 (i32.const 1131)))
+    (call $use (call $factory1 (i32.const 1200)))
+    (call $use (call $factory1 (i32.const 1201)))
+    (call $use (call $factory1 (i32.const 1202)))
+  )
+
+  ;; CHECK:      (func $run-multi-factory (type $3)
+  ;; CHECK-NEXT:  (local $0 (ref $0))
+  ;; CHECK-NEXT:  (local $1 i32)
+  ;; CHECK-NEXT:  (local $2 i32)
+  ;; CHECK-NEXT:  (local.set $0
+  ;; CHECK-NEXT:   (array.new_data $0 $roll
+  ;; CHECK-NEXT:    (i32.const 12)
+  ;; CHECK-NEXT:    (i32.const 12)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (block
+  ;; CHECK-NEXT:   (local.set $1
+  ;; CHECK-NEXT:    (i32.const 0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (loop $roll
+  ;; CHECK-NEXT:    (call $use
+  ;; CHECK-NEXT:     (if (result (ref $str))
+  ;; CHECK-NEXT:      (i32.lt_u
+  ;; CHECK-NEXT:       (local.tee $2
+  ;; CHECK-NEXT:        (array.get_u $0
+  ;; CHECK-NEXT:         (local.get $0)
+  ;; CHECK-NEXT:         (local.get $1)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:       (i32.const 19)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (then
+  ;; CHECK-NEXT:       (call $factory1
+  ;; CHECK-NEXT:        (local.get $2)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (else
+  ;; CHECK-NEXT:       (call $factory2
+  ;; CHECK-NEXT:        (i32.sub
+  ;; CHECK-NEXT:         (local.get $2)
+  ;; CHECK-NEXT:         (i32.const 19)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (br_if $roll
+  ;; CHECK-NEXT:     (i32.lt_u
+  ;; CHECK-NEXT:      (local.tee $1
+  ;; CHECK-NEXT:       (i32.add
+  ;; CHECK-NEXT:        (local.get $1)
+  ;; CHECK-NEXT:        (i32.const 1)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (i32.const 12)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $run-multi-factory
+    (call $use (call $factory1 (i32.const 1)))
+    (call $use (call $factory2 (i32.const 2)))
+    (call $use (call $factory1 (i32.const 5)))
+    (call $use (call $factory2 (i32.const 4)))
+    (call $use (call $factory1 (i32.const 9)))
+    (call $use (call $factory2 (i32.const 6)))
+    (call $use (call $factory1 (i32.const 12)))
+    (call $use (call $factory2 (i32.const 8)))
+    (call $use (call $factory1 (i32.const 15)))
+    (call $use (call $factory2 (i32.const 10)))
+    (call $use (call $factory1 (i32.const 18)))
+    (call $use (call $factory2 (i32.const 12)))
+  )
+
+  ;; CHECK:      (func $switch-multi-factory (type $6) (param $x i32) (result (ref null $str))
+  ;; CHECK-NEXT:  (local $1 (ref $0))
+  ;; CHECK-NEXT:  (local $2 i32)
+  ;; CHECK-NEXT:  (local $3 i32)
+  ;; CHECK-NEXT:  (local.set $1
+  ;; CHECK-NEXT:   (array.new_data $0 $roll
+  ;; CHECK-NEXT:    (i32.const 24)
+  ;; CHECK-NEXT:    (i32.const 8)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (i32.lt_u
+  ;; CHECK-NEXT:    (local.tee $2
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.const 8)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (return
+  ;; CHECK-NEXT:     (if (result (ref $str))
+  ;; CHECK-NEXT:      (i32.lt_u
+  ;; CHECK-NEXT:       (local.tee $3
+  ;; CHECK-NEXT:        (array.get_u $0
+  ;; CHECK-NEXT:         (local.get $1)
+  ;; CHECK-NEXT:         (local.get $2)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:       (i32.const 12)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (then
+  ;; CHECK-NEXT:       (call $factory1
+  ;; CHECK-NEXT:        (local.get $3)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (else
+  ;; CHECK-NEXT:       (call $factory2
+  ;; CHECK-NEXT:        (i32.sub
+  ;; CHECK-NEXT:         (local.get $3)
+  ;; CHECK-NEXT:         (i32.const 12)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (ref.null none)
+  ;; CHECK-NEXT: )
+  (func $switch-multi-factory (param $x i32) (result (ref null $str))
+    (block $def
+      (block $b7
+        (block $b6
+          (block $b5
+            (block $b4
+              (block $b3
+                (block $b2
+                  (block $b1
+                    (block $b0
+                      (br_table $b0 $b1 $b2 $b3 $b4 $b5 $b6 $b7 $def (local.get $x))
+                    )
+                    (return (call $factory1 (i32.const 3)))
+                  )
+                  (return (call $factory2 (i32.const 1)))
+                )
+                (return (call $factory1 (i32.const 7)))
+              )
+              (return (call $factory2 (i32.const 4)))
+            )
+            (return (call $factory1 (i32.const 9)))
+          )
+          (return (call $factory2 (i32.const 6)))
+        )
+        (return (call $factory1 (i32.const 11)))
+      )
+      (return (call $factory2 (i32.const 8)))
+    )
+    (ref.null none)
+  )
+
+  ;; CHECK:      (func $switch-gaps-two-holes (type $7) (param $x i32)
+  ;; CHECK-NEXT:  (local $1 (ref $0))
+  ;; CHECK-NEXT:  (local $2 i32)
+  ;; CHECK-NEXT:  (local $3 i32)
+  ;; CHECK-NEXT:  (local $4 i32)
+  ;; CHECK-NEXT:  (local.set $1
+  ;; CHECK-NEXT:   (array.new_data $0 $roll
+  ;; CHECK-NEXT:    (i32.const 32)
+  ;; CHECK-NEXT:    (i32.const 16)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (i32.lt_u
+  ;; CHECK-NEXT:    (local.tee $2
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.const 8)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (if
+  ;; CHECK-NEXT:     (local.tee $3
+  ;; CHECK-NEXT:      (array.get_u $0
+  ;; CHECK-NEXT:       (local.get $1)
+  ;; CHECK-NEXT:       (local.get $2)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (then
+  ;; CHECK-NEXT:      (call $use2
+  ;; CHECK-NEXT:       (local.get $3)
+  ;; CHECK-NEXT:       (if (result (ref $str))
+  ;; CHECK-NEXT:        (i32.lt_u
+  ;; CHECK-NEXT:         (local.tee $4
+  ;; CHECK-NEXT:          (array.get_u $0
+  ;; CHECK-NEXT:           (local.get $1)
+  ;; CHECK-NEXT:           (i32.add
+  ;; CHECK-NEXT:            (local.get $2)
+  ;; CHECK-NEXT:            (i32.const 8)
+  ;; CHECK-NEXT:           )
+  ;; CHECK-NEXT:          )
+  ;; CHECK-NEXT:         )
+  ;; CHECK-NEXT:         (i32.const 6)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:        (then
+  ;; CHECK-NEXT:         (call $factory1
+  ;; CHECK-NEXT:          (local.get $4)
+  ;; CHECK-NEXT:         )
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:        (else
+  ;; CHECK-NEXT:         (call $factory2
+  ;; CHECK-NEXT:          (i32.sub
+  ;; CHECK-NEXT:           (local.get $4)
+  ;; CHECK-NEXT:           (i32.const 6)
+  ;; CHECK-NEXT:          )
+  ;; CHECK-NEXT:         )
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $switch-gaps-two-holes (param $x i32)
+    (block $def
+      (block $b5
+        (block $b4
+          (block $b3
+            (block $b2
+              (block $b1
+                (block $b0
+                  (br_table $b0 $def $b1 $b2 $def $b3 $b4 $b5 $def (local.get $x))
+                )
+                (call $use2 (i32.const 10) (call $factory1 (i32.const 1)))
+                (br $def)
+              )
+              (call $use2 (i32.const 20) (call $factory2 (i32.const 2)))
+              (br $def)
+            )
+            (call $use2 (i32.const 30) (call $factory1 (i32.const 3)))
+            (br $def)
+          )
+          (call $use2 (i32.const 42) (call $factory2 (i32.const 4)))
+          (br $def)
+        )
+        (call $use2 (i32.const 50) (call $factory1 (i32.const 5)))
+        (br $def)
+      )
+      (call $use2 (i32.const 60) (call $factory2 (i32.const 6)))
+    )
   )
 )
