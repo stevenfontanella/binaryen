@@ -647,25 +647,25 @@
 ;; spilled to locals in the original order. Slot 1: the constant comes first,
 ;; and the thunks ignore their parameter, so the argument is not passed on (it
 ;; is still evaluated, as it has side effects). Slot 2 mixes two callees and is
-;; not optimized.
+;; dispatched via a helper using complement-encoded constants.
 (module
   (rec
+    ;; CHECK:      (type $0 (func (param i32) (result i32)))
+
     ;; CHECK:      (rec
-    ;; CHECK-NEXT:  (type $0 (func (param i32) (result (ref $vt))))
+    ;; CHECK-NEXT:  (type $1 (func (param i32) (result (ref $vt))))
 
     ;; CHECK:       (type $nullary (func (result i32)))
 
     ;; CHECK:       (type $unary (func (param (ref $vt)) (result i32)))
 
-    ;; CHECK:       (type $3 (func (param (ref $vt) i32) (result i32)))
+    ;; CHECK:       (type $4 (func (param (ref $vt) i32) (result i32)))
 
-    ;; CHECK:       (type $vt (sub (struct (field i32) (field i32) (field (ref $nullary)))))
+    ;; CHECK:       (type $vt (sub (struct (field i32) (field i32) (field i32))))
     (type $vt (sub (struct (field (ref $unary)) (field (ref $unary)) (field (ref $nullary)))))
     (type $unary (func (param (ref $vt)) (result i32)))
     (type $nullary (func (result i32)))
   )
-
-  ;; CHECK:      (type $5 (func (param i32) (result i32)))
 
   ;; CHECK:      (type $6 (func (param anyref anyref) (result i32)))
 
@@ -674,13 +674,13 @@
   ;; CHECK:      (global $vt.a (ref $vt) (struct.new $vt
   ;; CHECK-NEXT:  (i32.const 1)
   ;; CHECK-NEXT:  (i32.const 10)
-  ;; CHECK-NEXT:  (ref.func $f.1)
+  ;; CHECK-NEXT:  (i32.const 1)
   ;; CHECK-NEXT: ))
   (global $vt.a (ref $vt) (struct.new $vt (ref.func $after.1) (ref.func $ignore.1) (ref.func $f.1)))
   ;; CHECK:      (global $vt.b (ref $vt) (struct.new $vt
   ;; CHECK-NEXT:  (i32.const 2)
   ;; CHECK-NEXT:  (i32.const 20)
-  ;; CHECK-NEXT:  (ref.func $h.2)
+  ;; CHECK-NEXT:  (i32.const -3)
   ;; CHECK-NEXT: ))
   (global $vt.b (ref $vt) (struct.new $vt (ref.func $after.2) (ref.func $ignore.2) (ref.func $h.2)))
 
@@ -692,19 +692,19 @@
 
   ;; CHECK:      (export "get-mixed" (func $get-mixed))
 
-  ;; CHECK:      (func $f (type $5) (param $index i32) (result i32)
+  ;; CHECK:      (func $f (type $0) (param $index i32) (result i32)
   ;; CHECK-NEXT:  (local.get $index)
   ;; CHECK-NEXT: )
   (func $f (param $index i32) (result i32)
     (local.get $index)
   )
-  ;; CHECK:      (func $g (type $3) (param $vt (ref $vt)) (param $index i32) (result i32)
+  ;; CHECK:      (func $g (type $4) (param $vt (ref $vt)) (param $index i32) (result i32)
   ;; CHECK-NEXT:  (local.get $index)
   ;; CHECK-NEXT: )
   (func $g (param $vt (ref $vt)) (param $index i32) (result i32)
     (local.get $index)
   )
-  ;; CHECK:      (func $h (type $5) (param $index i32) (result i32)
+  ;; CHECK:      (func $h (type $0) (param $index i32) (result i32)
   ;; CHECK-NEXT:  (i32.add
   ;; CHECK-NEXT:   (local.get $index)
   ;; CHECK-NEXT:   (i32.const 1)
@@ -728,24 +728,14 @@
     (call $f (i32.const 20))
   )
 
-  ;; CHECK:      (func $f.1 (type $nullary) (result i32)
-  ;; CHECK-NEXT:  (call $f
-  ;; CHECK-NEXT:   (i32.const 1)
-  ;; CHECK-NEXT:  )
-  ;; CHECK-NEXT: )
   (func $f.1 (type $nullary) (result i32)
     (call $f (i32.const 1))
   )
-  ;; CHECK:      (func $h.2 (type $nullary) (result i32)
-  ;; CHECK-NEXT:  (call $h
-  ;; CHECK-NEXT:   (i32.const 2)
-  ;; CHECK-NEXT:  )
-  ;; CHECK-NEXT: )
   (func $h.2 (type $nullary) (result i32)
     (call $h (i32.const 2))
   )
 
-  ;; CHECK:      (func $pick (type $0) (param $i i32) (result (ref $vt))
+  ;; CHECK:      (func $pick (type $1) (param $i i32) (result (ref $vt))
   ;; CHECK-NEXT:  (if (result (ref $vt))
   ;; CHECK-NEXT:   (local.get $i)
   ;; CHECK-NEXT:   (then
@@ -787,7 +777,7 @@
     )
   )
 
-  ;; CHECK:      (func $get-effects (type $5) (param $i i32) (result i32)
+  ;; CHECK:      (func $get-effects (type $0) (param $i i32) (result i32)
   ;; CHECK-NEXT:  (local $1 (ref $vt))
   ;; CHECK-NEXT:  (local $2 (ref $vt))
   ;; CHECK-NEXT:  (local.set $1
@@ -816,7 +806,7 @@
     )
   )
 
-  ;; CHECK:      (func $get-ignored (type $5) (param $i i32) (result i32)
+  ;; CHECK:      (func $get-ignored (type $0) (param $i i32) (result i32)
   ;; CHECK-NEXT:  (local $1 (ref $vt))
   ;; CHECK-NEXT:  (local $2 (ref $vt))
   ;; CHECK-NEXT:  (local.set $1
@@ -845,7 +835,7 @@
   )
 
   ;; CHECK:      (func $get-mixed (type $7) (param $vt anyref) (result i32)
-  ;; CHECK-NEXT:  (call_ref $nullary
+  ;; CHECK-NEXT:  (call $indexed$vt$2
   ;; CHECK-NEXT:   (struct.get $vt 2
   ;; CHECK-NEXT:    (ref.cast (ref $vt)
   ;; CHECK-NEXT:     (local.get $vt)
@@ -863,3 +853,427 @@
     )
   )
 )
+
+;; If/Select call_ref target unwrapping, permuted parameters with fixed
+;; constants, and 3-callee indexed tagging.
+;; CHECK:      (func $indexed$vt$2 (type $0) (param $0 i32) (result i32)
+;; CHECK-NEXT:  (if (result i32)
+;; CHECK-NEXT:   (i32.lt_s
+;; CHECK-NEXT:    (local.get $0)
+;; CHECK-NEXT:    (i32.const 0)
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (then
+;; CHECK-NEXT:    (call $h
+;; CHECK-NEXT:     (i32.xor
+;; CHECK-NEXT:      (local.get $0)
+;; CHECK-NEXT:      (i32.const -1)
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (else
+;; CHECK-NEXT:    (call $f
+;; CHECK-NEXT:     (local.get $0)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:  )
+;; CHECK-NEXT: )
+(module
+  (rec
+    ;; CHECK:      (rec
+    ;; CHECK-NEXT:  (type $bin (func (param i32 i32) (result i32)))
+
+    ;; CHECK:       (type $nullary (func (result i32)))
+    (type $nullary (func (result i32)))
+    (type $bin (func (param i32 i32) (result i32)))
+    ;; CHECK:       (type $2 (func (param i32 i32 i32) (result i32)))
+
+    ;; CHECK:       (type $3 (func (param i32 i32 i32 i32) (result i32)))
+
+    ;; CHECK:       (type $4 (func (param i32) (result i32)))
+
+    ;; CHECK:       (type $vt (sub (struct (field i32) (field i32) (field (ref $nullary)) (field (ref $nullary)) (field i32) (field i32))))
+    (type $vt (sub (struct
+      (field (ref $nullary))
+      (field (ref $nullary))
+      (field (ref $nullary))
+      (field (ref $nullary))
+      (field (ref $bin))
+      (field (ref $bin))
+    )))
+  )
+
+  ;; CHECK:      (type $6 (func (param anyref i32) (result i32)))
+
+  ;; CHECK:      (type $7 (func (param anyref i32 i32) (result i32)))
+
+  ;; CHECK:      (type $8 (func))
+
+  ;; CHECK:      (global $fixed i32 (i32.const 99))
+  (global $fixed i32 (i32.const 99))
+
+  ;; CHECK:      (global $vt.a (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 10)
+  ;; CHECK-NEXT:  (i32.const 20)
+  ;; CHECK-NEXT:  (ref.func $f.10)
+  ;; CHECK-NEXT:  (ref.func $h.30)
+  ;; CHECK-NEXT:  (i32.const 5)
+  ;; CHECK-NEXT:  (i32.const 401)
+  ;; CHECK-NEXT: ))
+  (global $vt.a (ref $vt) (struct.new $vt
+    (ref.func $f.10)
+    (ref.func $f.20)
+    (ref.func $f.10)
+    (ref.func $h.30)
+    (ref.func $perm.1)
+    (ref.func $tri.a)
+  ))
+  ;; CHECK:      (global $vt.b (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 11)
+  ;; CHECK-NEXT:  (i32.const 21)
+  ;; CHECK-NEXT:  (ref.func $f.11)
+  ;; CHECK-NEXT:  (ref.func $h.31)
+  ;; CHECK-NEXT:  (i32.const 6)
+  ;; CHECK-NEXT:  (i32.const 800)
+  ;; CHECK-NEXT: ))
+  (global $vt.b (ref $vt) (struct.new $vt
+    (ref.func $f.11)
+    (ref.func $f.21)
+    (ref.func $f.11)
+    (ref.func $h.31)
+    (ref.func $perm.2)
+    (ref.func $tri.b)
+  ))
+  ;; CHECK:      (global $vt.c (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 12)
+  ;; CHECK-NEXT:  (i32.const 22)
+  ;; CHECK-NEXT:  (ref.func $f.12)
+  ;; CHECK-NEXT:  (ref.func $h.32)
+  ;; CHECK-NEXT:  (i32.const 7)
+  ;; CHECK-NEXT:  (i32.const 1202)
+  ;; CHECK-NEXT: ))
+  (global $vt.c (ref $vt) (struct.new $vt
+    (ref.func $f.12)
+    (ref.func $f.22)
+    (ref.func $f.12)
+    (ref.func $h.32)
+    (ref.func $perm.3)
+    (ref.func $tri.c)
+  ))
+
+  ;; CHECK:      (export "get-if-compat" (func $get-if-compat))
+
+  ;; CHECK:      (export "get-select-compat" (func $get-select-compat))
+
+  ;; CHECK:      (export "get-if-incompat" (func $get-if-incompat))
+
+  ;; CHECK:      (export "get-perm" (func $get-perm))
+
+  ;; CHECK:      (export "get-tri" (func $get-tri))
+
+  ;; CHECK:      (export "keep" (func $keep))
+
+  ;; CHECK:      (func $f (type $4) (param $k i32) (result i32)
+  ;; CHECK-NEXT:  (local.get $k)
+  ;; CHECK-NEXT: )
+  (func $f (param $k i32) (result i32)
+    (local.get $k)
+  )
+  ;; CHECK:      (func $h (type $4) (param $k i32) (result i32)
+  ;; CHECK-NEXT:  (i32.sub
+  ;; CHECK-NEXT:   (i32.const 0)
+  ;; CHECK-NEXT:   (local.get $k)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $h (param $k i32) (result i32)
+    (i32.sub (i32.const 0) (local.get $k))
+  )
+  ;; CHECK:      (func $callee4 (type $3) (param $k i32) (param $b i32) (param $c i32) (param $a i32) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (local.get $k)
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (local.get $b)
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (local.get $c)
+  ;; CHECK-NEXT:     (local.get $a)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $callee4 (param $k i32) (param $b i32) (param $c i32) (param $a i32) (result i32)
+    (i32.add (local.get $k) (i32.add (local.get $b) (i32.add (local.get $c) (local.get $a))))
+  )
+  ;; CHECK:      (func $callee3 (type $2) (param $k i32) (param $a i32) (param $b i32) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (local.get $k)
+  ;; CHECK-NEXT:   (i32.sub
+  ;; CHECK-NEXT:    (local.get $a)
+  ;; CHECK-NEXT:    (local.get $b)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $callee3 (param $k i32) (param $a i32) (param $b i32) (result i32)
+    (i32.add (local.get $k) (i32.sub (local.get $a) (local.get $b)))
+  )
+
+  ;; CHECK:      (func $f.10 (type $nullary) (result i32)
+  ;; CHECK-NEXT:  (call $f
+  ;; CHECK-NEXT:   (i32.const 10)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $f.10 (type $nullary) (result i32) (call $f (i32.const 10)))
+  ;; CHECK:      (func $f.11 (type $nullary) (result i32)
+  ;; CHECK-NEXT:  (call $f
+  ;; CHECK-NEXT:   (i32.const 11)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $f.11 (type $nullary) (result i32) (call $f (i32.const 11)))
+  ;; CHECK:      (func $f.12 (type $nullary) (result i32)
+  ;; CHECK-NEXT:  (call $f
+  ;; CHECK-NEXT:   (i32.const 12)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $f.12 (type $nullary) (result i32) (call $f (i32.const 12)))
+
+  (func $f.20 (type $nullary) (result i32) (call $f (i32.const 20)))
+  (func $f.21 (type $nullary) (result i32) (call $f (i32.const 21)))
+  (func $f.22 (type $nullary) (result i32) (call $f (i32.const 22)))
+
+  ;; CHECK:      (func $h.30 (type $nullary) (result i32)
+  ;; CHECK-NEXT:  (call $h
+  ;; CHECK-NEXT:   (i32.const 30)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $h.30 (type $nullary) (result i32) (call $h (i32.const 30)))
+  ;; CHECK:      (func $h.31 (type $nullary) (result i32)
+  ;; CHECK-NEXT:  (call $h
+  ;; CHECK-NEXT:   (i32.const 31)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $h.31 (type $nullary) (result i32) (call $h (i32.const 31)))
+  ;; CHECK:      (func $h.32 (type $nullary) (result i32)
+  ;; CHECK-NEXT:  (call $h
+  ;; CHECK-NEXT:   (i32.const 32)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $h.32 (type $nullary) (result i32) (call $h (i32.const 32)))
+
+  ;; Slot 4: permuted params ($1, $0) + fixed global.get and fixed i32.const.
+  (func $perm.1 (type $bin) (param $0 i32) (param $1 i32) (result i32)
+    (call $callee4 (i32.const 5) (local.get $1) (global.get $fixed) (local.get $0))
+  )
+  (func $perm.2 (type $bin) (param $0 i32) (param $1 i32) (result i32)
+    (call $callee4 (i32.const 6) (local.get $1) (global.get $fixed) (local.get $0))
+  )
+  (func $perm.3 (type $bin) (param $0 i32) (param $1 i32) (result i32)
+    (call $callee4 (i32.const 7) (local.get $1) (global.get $fixed) (local.get $0))
+  )
+
+  ;; Slot 5: 3 distinct templates (2 fixed-const variants of $callee4 + $callee3).
+  (func $tri.a (type $bin) (param $0 i32) (param $1 i32) (result i32)
+    (call $callee4 (i32.const 100) (local.get $1) (i32.const 500) (local.get $0))
+  )
+  (func $tri.b (type $bin) (param $0 i32) (param $1 i32) (result i32)
+    (call $callee4 (i32.const 200) (local.get $0) (i32.const 501) (local.get $1))
+  )
+  (func $tri.c (type $bin) (param $0 i32) (param $1 i32) (result i32)
+    (call $callee3 (i32.const 300) (local.get $0) (local.get $1))
+  )
+
+  ;; Slots 0 and 1 are read together in an if and a select, and both call $f,
+  ;; so both are converted to i32.
+  ;; CHECK:      (func $get-if-compat (type $6) (param $vt anyref) (param $c i32) (result i32)
+  ;; CHECK-NEXT:  (call $f
+  ;; CHECK-NEXT:   (if (result i32)
+  ;; CHECK-NEXT:    (local.get $c)
+  ;; CHECK-NEXT:    (then
+  ;; CHECK-NEXT:     (struct.get $vt 0
+  ;; CHECK-NEXT:      (ref.cast (ref $vt)
+  ;; CHECK-NEXT:       (local.get $vt)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (else
+  ;; CHECK-NEXT:     (struct.get $vt 1
+  ;; CHECK-NEXT:      (ref.cast (ref $vt)
+  ;; CHECK-NEXT:       (local.get $vt)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $get-if-compat (export "get-if-compat") (param $vt anyref) (param $c i32) (result i32)
+    (call_ref $nullary
+      (if (result (ref $nullary))
+        (local.get $c)
+        (then (struct.get $vt 0 (ref.cast (ref $vt) (local.get $vt))))
+        (else (struct.get $vt 1 (ref.cast (ref $vt) (local.get $vt))))
+      )
+    )
+  )
+
+  ;; CHECK:      (func $get-select-compat (type $6) (param $vt anyref) (param $c i32) (result i32)
+  ;; CHECK-NEXT:  (call $f
+  ;; CHECK-NEXT:   (select
+  ;; CHECK-NEXT:    (struct.get $vt 0
+  ;; CHECK-NEXT:     (ref.cast (ref $vt)
+  ;; CHECK-NEXT:      (local.get $vt)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (struct.get $vt 1
+  ;; CHECK-NEXT:     (ref.cast (ref $vt)
+  ;; CHECK-NEXT:      (local.get $vt)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (local.get $c)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $get-select-compat (export "get-select-compat") (param $vt anyref) (param $c i32) (result i32)
+    (call_ref $nullary
+      (select (result (ref $nullary))
+        (struct.get $vt 0 (ref.cast (ref $vt) (local.get $vt)))
+        (struct.get $vt 1 (ref.cast (ref $vt) (local.get $vt)))
+        (local.get $c)
+      )
+    )
+  )
+
+  ;; Slots 2 and 3 are read together in an if, but call different functions ($f
+  ;; vs $h), so neither is converted.
+  ;; CHECK:      (func $get-if-incompat (type $6) (param $vt anyref) (param $c i32) (result i32)
+  ;; CHECK-NEXT:  (call_ref $nullary
+  ;; CHECK-NEXT:   (if (result (ref $nullary))
+  ;; CHECK-NEXT:    (local.get $c)
+  ;; CHECK-NEXT:    (then
+  ;; CHECK-NEXT:     (struct.get $vt 2
+  ;; CHECK-NEXT:      (ref.cast (ref $vt)
+  ;; CHECK-NEXT:       (local.get $vt)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (else
+  ;; CHECK-NEXT:     (struct.get $vt 3
+  ;; CHECK-NEXT:      (ref.cast (ref $vt)
+  ;; CHECK-NEXT:       (local.get $vt)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $get-if-incompat (export "get-if-incompat") (param $vt anyref) (param $c i32) (result i32)
+    (call_ref $nullary
+      (if (result (ref $nullary))
+        (local.get $c)
+        (then (struct.get $vt 2 (ref.cast (ref $vt) (local.get $vt))))
+        (else (struct.get $vt 3 (ref.cast (ref $vt) (local.get $vt))))
+      )
+    )
+  )
+
+  ;; CHECK:      (func $get-perm (type $7) (param $vt anyref) (param $a i32) (param $b i32) (result i32)
+  ;; CHECK-NEXT:  (call $callee4
+  ;; CHECK-NEXT:   (struct.get $vt 4
+  ;; CHECK-NEXT:    (ref.cast (ref $vt)
+  ;; CHECK-NEXT:     (local.get $vt)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.get $b)
+  ;; CHECK-NEXT:   (global.get $fixed)
+  ;; CHECK-NEXT:   (local.get $a)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $get-perm (export "get-perm") (param $vt anyref) (param $a i32) (param $b i32) (result i32)
+    (call_ref $bin
+      (local.get $a)
+      (local.get $b)
+      (struct.get $vt 4 (ref.cast (ref $vt) (local.get $vt)))
+    )
+  )
+
+  ;; CHECK:      (func $get-tri (type $7) (param $vt anyref) (param $a i32) (param $b i32) (result i32)
+  ;; CHECK-NEXT:  (call $indexed$vt$5
+  ;; CHECK-NEXT:   (struct.get $vt 5
+  ;; CHECK-NEXT:    (ref.cast (ref $vt)
+  ;; CHECK-NEXT:     (local.get $vt)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.get $a)
+  ;; CHECK-NEXT:   (local.get $b)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $get-tri (export "get-tri") (param $vt anyref) (param $a i32) (param $b i32) (result i32)
+    (call_ref $bin
+      (local.get $a)
+      (local.get $b)
+      (struct.get $vt 5 (ref.cast (ref $vt) (local.get $vt)))
+    )
+  )
+
+  ;; CHECK:      (func $keep (type $8)
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $vt.a)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $vt.b)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $vt.c)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $keep (export "keep")
+    (drop (global.get $vt.a))
+    (drop (global.get $vt.b))
+    (drop (global.get $vt.c))
+  )
+)
+;; CHECK:      (func $indexed$vt$5 (type $2) (param $0 i32) (param $1 i32) (param $2 i32) (result i32)
+;; CHECK-NEXT:  (local $3 i32)
+;; CHECK-NEXT:  (local.set $3
+;; CHECK-NEXT:   (i32.and
+;; CHECK-NEXT:    (local.get $0)
+;; CHECK-NEXT:    (i32.const 3)
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:  )
+;; CHECK-NEXT:  (local.set $0
+;; CHECK-NEXT:   (i32.shr_s
+;; CHECK-NEXT:    (local.get $0)
+;; CHECK-NEXT:    (i32.const 2)
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:  )
+;; CHECK-NEXT:  (if (result i32)
+;; CHECK-NEXT:   (i32.eq
+;; CHECK-NEXT:    (local.get $3)
+;; CHECK-NEXT:    (i32.const 2)
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (then
+;; CHECK-NEXT:    (call $callee3
+;; CHECK-NEXT:     (local.get $0)
+;; CHECK-NEXT:     (local.get $1)
+;; CHECK-NEXT:     (local.get $2)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (else
+;; CHECK-NEXT:    (if (result i32)
+;; CHECK-NEXT:     (local.get $3)
+;; CHECK-NEXT:     (then
+;; CHECK-NEXT:      (call $callee4
+;; CHECK-NEXT:       (local.get $0)
+;; CHECK-NEXT:       (local.get $2)
+;; CHECK-NEXT:       (i32.const 500)
+;; CHECK-NEXT:       (local.get $1)
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:     (else
+;; CHECK-NEXT:      (call $callee4
+;; CHECK-NEXT:       (local.get $0)
+;; CHECK-NEXT:       (local.get $1)
+;; CHECK-NEXT:       (i32.const 501)
+;; CHECK-NEXT:       (local.get $2)
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:  )
+;; CHECK-NEXT: )

@@ -119,6 +119,11 @@ struct FieldKeyHash {
 struct ThunkFieldsToData : public Pass {
   // The identity chain in a lazy helper is linear, so keep it short.
   static constexpr Index MaxExceptions = 16;
+  // Maximum distinct call templates in a multi-callee indexed field.
+  static constexpr Index MaxIndexedTemplates = 4;
+
+  static constexpr Index ConstOperand = Index(-1);
+  static constexpr Index FixedOperand = Index(-2);
 
   // Approximate byte costs.
   // A function entry (function section, size, locals, end) beyond its body.
@@ -135,8 +140,12 @@ struct ThunkFieldsToData : public Pass {
 
   struct FunctionInfo {
     std::unordered_map<FieldKey, Index, FieldKeyHash> reads;
-    // Reads that are directly the target of a call_ref without operands.
+    // Reads that are directly the target of a call_ref (possibly through
+    // if/select arms).
     std::unordered_map<FieldKey, Index, FieldKeyHash> callReads;
+    // Groups of fields read together in the arms of an if/select call_ref
+    // target.
+    std::vector<std::vector<FieldKey>> coupledCallReads;
     std::unordered_set<HeapType> news;
     std::unordered_map<Name, Index> funcUses;
     std::unordered_map<Name, Index> globalUses;
@@ -156,8 +165,30 @@ struct ThunkFieldsToData : public Pass {
     GlobalSite* globalSite;
     Function* thunk;
     SiteMode mode;
-    // Indexed mode: the constant the thunk passes to the callee.
-    Const* constant = nullptr;
+    // Indexed mode: the constant value the field holds for this site.
+    Literal constant = {};
+  };
+
+  struct IndexedTemplate {
+    Name callee;
+    std::vector<Index> shape;
+    std::vector<Expression*> fixedOperands;
+    Type constType;
+
+    bool equals(const IndexedTemplate& other) const {
+      if (callee != other.callee || constType != other.constType ||
+          shape != other.shape) {
+        return false;
+      }
+      for (Index i = 0; i < shape.size(); i++) {
+        if (shape[i] == FixedOperand &&
+            !ExpressionAnalyzer::equal(fixedOperands[i],
+                                       other.fixedOperands[i])) {
+          return false;
+        }
+      }
+      return true;
+    }
   };
 
   struct Decision {
@@ -173,20 +204,57 @@ struct ThunkFieldsToData : public Pass {
     StructNew* lazyTemplate = nullptr;
     Name helper;
     // Indexed mode: the callee and its operand shape (ConstOperand for the
-    // constant, otherwise the index of the thunk parameter).
+    // varying constant, FixedOperand for a fixed constant, otherwise the index
+    // of the thunk parameter), or multiple templates dispatched by a helper.
     bool indexed = false;
+    bool useComplement = false;
     Name callee;
     std::vector<Index> shape;
+    std::vector<Expression*> fixedOperands;
+    std::vector<IndexedTemplate> templates;
   };
 
-  static constexpr Index ConstOperand = Index(-1);
+  static bool collectCallRefTargetGets(Expression* target,
+                                       std::vector<StructGet*>& gets) {
+    if (auto* get = target->dynCast<StructGet>()) {
+      if (get->type == Type::unreachable ||
+          get->order != MemoryOrder::Unordered) {
+        return false;
+      }
+      auto type = get->ref->type;
+      if (!type.isRef() || !type.getHeapType().isStruct()) {
+        return false;
+      }
+      gets.push_back(get);
+      return true;
+    }
+    if (auto* iff = target->dynCast<If>()) {
+      if (!iff->ifFalse || iff->type == Type::unreachable) {
+        return false;
+      }
+      return collectCallRefTargetGets(iff->ifTrue, gets) &&
+             collectCallRefTargetGets(iff->ifFalse, gets);
+    }
+    if (auto* sel = target->dynCast<Select>()) {
+      if (sel->type == Type::unreachable) {
+        return false;
+      }
+      return collectCallRefTargetGets(sel->ifTrue, gets) &&
+             collectCallRefTargetGets(sel->ifFalse, gets);
+    }
+    return false;
+  }
 
-  // The classification of a thunk in indexed mode.
-  struct IndexedThunk {
-    Name callee;
-    std::vector<Index> shape;
-    Const* constant;
-  };
+  static void updateTargetTypes(Expression* target, Type fieldType) {
+    target->type = fieldType;
+    if (auto* iff = target->dynCast<If>()) {
+      updateTargetTypes(iff->ifTrue, fieldType);
+      updateTargetTypes(iff->ifFalse, fieldType);
+    } else if (auto* sel = target->dynCast<Select>()) {
+      updateTargetTypes(sel->ifTrue, fieldType);
+      updateTargetTypes(sel->ifFalse, fieldType);
+    }
+  }
 
   Module* module;
   bool always = false;
@@ -224,18 +292,26 @@ struct ThunkFieldsToData : public Pass {
             }
             info.reads[FieldKey{type.getHeapType(), curr->index}]++;
           }
-          // Reads that are directly the target of a call_ref.
+          // Reads that are directly the target of a call_ref (possibly through
+          // if/select arms).
           void visitCallRef(CallRef* curr) {
-            auto* get = curr->target->dynCast<StructGet>();
-            if (!get || get->type == Type::unreachable ||
-                get->order != MemoryOrder::Unordered) {
+            std::vector<StructGet*> gets;
+            if (!collectCallRefTargetGets(curr->target, gets)) {
               return;
             }
-            auto type = get->ref->type;
-            if (!type.isRef() || !type.getHeapType().isStruct()) {
-              return;
+            for (auto* get : gets) {
+              auto type = get->ref->type;
+              info.callReads[FieldKey{type.getHeapType(), get->index}]++;
             }
-            info.callReads[FieldKey{type.getHeapType(), get->index}]++;
+            if (gets.size() > 1) {
+              std::vector<FieldKey> group;
+              group.reserve(gets.size());
+              for (auto* get : gets) {
+                group.push_back(
+                  FieldKey{get->ref->type.getHeapType(), get->index});
+              }
+              info.coupledCallReads.push_back(std::move(group));
+            }
           }
           void visitStructNew(StructNew* curr) {
             if (curr->type.isRef()) {
@@ -259,6 +335,9 @@ struct ThunkFieldsToData : public Pass {
       }
       for (auto& [key, count] : info.callReads) {
         codeInfo.callReads[key] += count;
+      }
+      for (auto& group : info.coupledCallReads) {
+        codeInfo.coupledCallReads.push_back(group);
       }
       for (auto type : info.news) {
         codeInfo.news.insert(type);
@@ -386,6 +465,60 @@ struct ThunkFieldsToData : public Pass {
         }
       }
     }
+    if (!codeInfo.coupledCallReads.empty() && !decisions.empty()) {
+      bool changed = true;
+      while (changed) {
+        changed = false;
+        std::unordered_map<FieldKey, Index, FieldKeyHash> keyToDecision;
+        for (Index i = 0; i < decisions.size(); i++) {
+          for (auto sub : subTypes.getSubTypes(decisions[i].type)) {
+            keyToDecision[FieldKey{sub, decisions[i].index}] = i;
+          }
+        }
+        std::vector<bool> drop(decisions.size(), false);
+        for (auto& group : codeInfo.coupledCallReads) {
+          std::optional<Index> firstIdx;
+          bool valid = true;
+          for (auto& key : group) {
+            auto iter = keyToDecision.find(key);
+            if (iter == keyToDecision.end()) {
+              valid = false;
+              break;
+            }
+            if (!firstIdx) {
+              firstIdx = iter->second;
+              if (!areCoupledDecisionsCompatible(decisions[*firstIdx],
+                                                 decisions[*firstIdx])) {
+                valid = false;
+                break;
+              }
+            } else if (!areCoupledDecisionsCompatible(decisions[*firstIdx],
+                                                      decisions[iter->second])) {
+              valid = false;
+              break;
+            }
+          }
+          if (!valid) {
+            for (auto& key : group) {
+              auto iter = keyToDecision.find(key);
+              if (iter != keyToDecision.end() && !drop[iter->second]) {
+                drop[iter->second] = true;
+                changed = true;
+              }
+            }
+          }
+        }
+        if (changed) {
+          std::vector<Decision> kept;
+          for (Index i = 0; i < decisions.size(); i++) {
+            if (!drop[i]) {
+              kept.push_back(std::move(decisions[i]));
+            }
+          }
+          decisions = std::move(kept);
+        }
+      }
+    }
     if (decisions.empty()) {
       return;
     }
@@ -394,6 +527,28 @@ struct ThunkFieldsToData : public Pass {
   }
 
 private:
+  bool areCoupledDecisionsCompatible(const Decision& d1, const Decision& d2) {
+    if (d1.lazy || d2.lazy) {
+      return false;
+    }
+    if (d1.indexed != d2.indexed || d1.fieldType != d2.fieldType ||
+        d1.resultType != d2.resultType) {
+      return false;
+    }
+    if (!d1.indexed) {
+      return true;
+    }
+    if (d1.useComplement != d2.useComplement ||
+        d1.templates.size() != d2.templates.size()) {
+      return false;
+    }
+    for (Index i = 0; i < d1.templates.size(); i++) {
+      if (!d1.templates[i].equals(d2.templates[i])) {
+        return false;
+      }
+    }
+    return true;
+  }
   void computeIndexes() {
     Index importedGlobals = 0;
     for (auto& global : module->globals) {
@@ -426,20 +581,24 @@ private:
     return buffer.size();
   }
 
+  Index getConstBytes(Literal value) {
+    auto type = value.type;
+    if (type == Type::i32) {
+      return 1 + getLEBSize(S32LEB(value.geti32()));
+    } else if (type == Type::i64) {
+      return 1 + getLEBSize(S64LEB(value.geti64()));
+    } else if (type == Type::f32) {
+      return 5;
+    } else if (type == Type::f64) {
+      return 9;
+    }
+    return 17;
+  }
+
   // The estimated number of bytes for a constant expression.
   Index getOperandBytes(Expression* curr) {
     if (auto* c = curr->dynCast<Const>()) {
-      auto type = c->type;
-      if (type == Type::i32) {
-        return 1 + getLEBSize(S32LEB(c->value.geti32()));
-      } else if (type == Type::i64) {
-        return 1 + getLEBSize(S64LEB(c->value.geti64()));
-      } else if (type == Type::f32) {
-        return 5;
-      } else if (type == Type::f64) {
-        return 9;
-      }
-      return 17;
+      return getConstBytes(c->value);
     }
     if (auto* null = curr->dynCast<RefNull>()) {
       return null->type.getHeapType().isBasic() ? 2 : 3;
@@ -531,45 +690,6 @@ private:
       }
     }
     return nullptr;
-  }
-
-  // Classifies a thunk whose body is a call of another function with the
-  // thunk's parameters (in order, each at most once) and exactly one constant
-  // as operands.
-  std::optional<IndexedThunk> getIndexedThunk(Function* func) {
-    if (func->imported()) {
-      return {};
-    }
-    auto* call = func->body->dynCast<Call>();
-    if (!call || call->target == func->name) {
-      return {};
-    }
-    IndexedThunk info;
-    info.callee = call->target;
-    info.constant = nullptr;
-    Index nextParam = 0;
-    Index numParams = func->getNumParams();
-    for (auto* operand : call->operands) {
-      if (auto* c = operand->dynCast<Const>()) {
-        if (info.constant || !c->type.isNumber()) {
-          return {};
-        }
-        info.constant = c;
-        info.shape.push_back(ConstOperand);
-      } else if (auto* get = operand->dynCast<LocalGet>()) {
-        if (get->index < nextParam || get->index >= numParams) {
-          return {};
-        }
-        nextParam = get->index + 1;
-        info.shape.push_back(get->index);
-      } else {
-        return {};
-      }
-    }
-    if (!info.constant) {
-      return {};
-    }
-    return info;
   }
 
   std::optional<Decision>
@@ -777,34 +897,247 @@ private:
     return decision;
   }
 
-  // Indexed mode: every thunk calls the same function with the same operand
-  // shape. The field then holds the constant.
+  // Indexed mode: every thunk calls a function with the thunk's parameters
+  // (each used at most once, in any order), optional fixed constants, and
+  // exactly one varying numeric constant. Up to MaxIndexedTemplates distinct
+  // templates are allowed per field.
   std::optional<Decision> analyzeIndexed(Decision decision, Index reads) {
+    struct LayoutKey {
+      Name callee;
+      std::vector<Index> localPositions;
+      bool operator==(const LayoutKey& other) const {
+        return callee == other.callee && localPositions == other.localPositions;
+      }
+    };
+    struct LayoutKeyHash {
+      size_t operator()(const LayoutKey& key) const {
+        size_t h = std::hash<Name>{}(key.callee);
+        for (auto pos : key.localPositions) {
+          h ^= (size_t(pos) + 0x9e3779b9 + (h << 6) + (h >> 2));
+        }
+        return h;
+      }
+    };
+
+    std::unordered_map<LayoutKey, std::vector<Index>, LayoutKeyHash>
+      layoutGroups;
+    for (Index s = 0; s < decision.sites.size(); s++) {
+      auto* func = decision.sites[s].thunk;
+      if (func->imported()) {
+        return {};
+      }
+      auto* call = func->body->dynCast<Call>();
+      if (!call || call->target == func->name) {
+        return {};
+      }
+      Index numParams = func->getNumParams();
+      std::vector<bool> usedParam(numParams, false);
+      LayoutKey key;
+      key.callee = call->target;
+      key.localPositions.reserve(call->operands.size());
+      bool hasNumericConst = false;
+      for (auto* operand : call->operands) {
+        if (auto* get = operand->dynCast<LocalGet>()) {
+          if (get->index >= numParams || usedParam[get->index]) {
+            return {};
+          }
+          usedParam[get->index] = true;
+          key.localPositions.push_back(get->index);
+        } else if (isValidConstant(operand)) {
+          key.localPositions.push_back(Index(-1));
+          if (auto* c = operand->dynCast<Const>()) {
+            if (c->type.isNumber()) {
+              hasNumericConst = true;
+            }
+          }
+        } else {
+          return {};
+        }
+      }
+      if (!hasNumericConst) {
+        return {};
+      }
+      layoutGroups[std::move(key)].push_back(s);
+    }
+
+    std::vector<IndexedTemplate> siteTemplates(decision.sites.size());
+    for (auto& [layout, siteIdxs] : layoutGroups) {
+      Index numOps = layout.localPositions.size();
+      std::vector<Index> candidateConstPositions;
+      for (Index p = 0; p < numOps; p++) {
+        if (layout.localPositions[p] != Index(-1)) {
+          continue;
+        }
+        Type commonType = Type::none;
+        bool allNumericConst = true;
+        for (auto s : siteIdxs) {
+          auto* call = decision.sites[s].thunk->body->cast<Call>();
+          auto* c = call->operands[p]->dynCast<Const>();
+          if (!c || !c->type.isNumber()) {
+            allNumericConst = false;
+            break;
+          }
+          if (commonType == Type::none) {
+            commonType = c->type;
+          } else if (c->type != commonType) {
+            allNumericConst = false;
+            break;
+          }
+        }
+        if (allNumericConst) {
+          candidateConstPositions.push_back(p);
+        }
+      }
+      if (candidateConstPositions.empty()) {
+        return {};
+      }
+
+      Index bestConstPos = candidateConstPositions[0];
+      if (candidateConstPositions.size() > 1) {
+        Index bestTemplateCount = Index(-1);
+        for (auto candPos : candidateConstPositions) {
+          std::vector<Index> uniqueReps;
+          for (auto s : siteIdxs) {
+            auto* callS = decision.sites[s].thunk->body->cast<Call>();
+            bool found = false;
+            for (auto rep : uniqueReps) {
+              auto* callRep = decision.sites[rep].thunk->body->cast<Call>();
+              bool sameFixed = true;
+              for (Index q = 0; q < numOps; q++) {
+                if (q == candPos || layout.localPositions[q] != Index(-1)) {
+                  continue;
+                }
+                if (!ExpressionAnalyzer::equal(callS->operands[q],
+                                               callRep->operands[q])) {
+                  sameFixed = false;
+                  break;
+                }
+              }
+              if (sameFixed) {
+                found = true;
+                break;
+              }
+            }
+            if (!found) {
+              uniqueReps.push_back(s);
+              if (uniqueReps.size() >= bestTemplateCount) {
+                break;
+              }
+            }
+          }
+          if (uniqueReps.size() < bestTemplateCount) {
+            bestTemplateCount = uniqueReps.size();
+            bestConstPos = candPos;
+          }
+        }
+      }
+
+      for (auto s : siteIdxs) {
+        auto* call = decision.sites[s].thunk->body->cast<Call>();
+        auto* c = call->operands[bestConstPos]->cast<Const>();
+        decision.sites[s].constant = c->value;
+        IndexedTemplate templ;
+        templ.callee = layout.callee;
+        templ.constType = c->type;
+        templ.shape.resize(numOps);
+        templ.fixedOperands.assign(numOps, nullptr);
+        for (Index q = 0; q < numOps; q++) {
+          if (q == bestConstPos) {
+            templ.shape[q] = ConstOperand;
+          } else if (layout.localPositions[q] != Index(-1)) {
+            templ.shape[q] = layout.localPositions[q];
+          } else {
+            templ.shape[q] = FixedOperand;
+            templ.fixedOperands[q] = call->operands[q];
+          }
+        }
+        siteTemplates[s] = std::move(templ);
+      }
+    }
+
+    std::vector<IndexedTemplate> templates;
+    for (auto& templ : siteTemplates) {
+      bool found = false;
+      for (auto& existing : templates) {
+        if (existing.equals(templ)) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        templates.push_back(templ);
+        if (templates.size() > MaxIndexedTemplates) {
+          return {};
+        }
+      }
+    }
+    if (templates.empty()) {
+      return {};
+    }
+
+    if (templates.size() > 1) {
+      for (auto& templ : templates) {
+        if (templ.constType != Type::i32) {
+          return {};
+        }
+      }
+      std::sort(templates.begin(),
+                templates.end(),
+                [&](const IndexedTemplate& a, const IndexedTemplate& b) {
+                  if (a.callee != b.callee) {
+                    return functionIndexes[a.callee] <
+                           functionIndexes[b.callee];
+                  }
+                  return a.shape < b.shape;
+                });
+      bool allNonNegative = true;
+      for (auto& site : decision.sites) {
+        if (site.constant.geti32() < 0) {
+          allNonNegative = false;
+          break;
+        }
+      }
+      decision.useComplement = (templates.size() == 2 && allNonNegative);
+      Index shift = templates.size() == 2 ? 1 : 2;
+      for (Index s = 0; s < decision.sites.size(); s++) {
+        Index tag = 0;
+        for (Index t = 0; t < templates.size(); t++) {
+          if (templates[t].equals(siteTemplates[s])) {
+            tag = t;
+            break;
+          }
+        }
+        int32_t kVal = decision.sites[s].constant.geti32();
+        if (decision.useComplement) {
+          decision.sites[s].constant = Literal(tag == 0 ? kVal : ~kVal);
+        } else {
+          int32_t shifted = int32_t(uint32_t(kVal) << shift);
+          if ((shifted >> shift) != kVal) {
+            return {};
+          }
+          decision.sites[s].constant =
+            Literal(int32_t(uint32_t(shifted) | uint32_t(tag)));
+        }
+      }
+    }
+
+    decision.indexed = true;
+    decision.fieldType = templates[0].constType;
+    decision.templates = std::move(templates);
+    if (decision.templates.size() == 1) {
+      decision.callee = decision.templates[0].callee;
+      decision.shape = decision.templates[0].shape;
+      decision.fixedOperands = decision.templates[0].fixedOperands;
+    }
+
     auto k = decision.index;
     std::unordered_map<Name, Index> deadThunkUses;
     int64_t benefit = 0, cost = 0;
-    bool first = true;
     for (auto& site : decision.sites) {
-      auto info = getIndexedThunk(site.thunk);
-      if (!info) {
-        return {};
-      }
-      if (first) {
-        decision.callee = info->callee;
-        decision.shape = info->shape;
-        decision.fieldType = info->constant->type;
-        first = false;
-      } else if (info->callee != decision.callee ||
-                 info->shape != decision.shape ||
-                 info->constant->type != decision.fieldType) {
-        return {};
-      }
-      site.constant = info->constant;
       deadThunkUses[site.thunk->name]++;
       benefit += getOperandBytes(site.globalSite->structNew->operands[k]);
-      cost += getOperandBytes(site.constant);
+      cost += getConstBytes(site.constant);
     }
-    decision.indexed = true;
     for (auto& [name, uses] : deadThunkUses) {
       if (funcUses[name] == uses) {
         auto* func = module->getFunction(name);
@@ -812,12 +1145,38 @@ private:
         benefit += FunctionOverheadBytes + 1 +
                    getLEBSize(U32LEB(functionIndexes[call->target]));
         for (auto* operand : call->operands) {
-          benefit += operand->is<Const>() ? getOperandBytes(operand) : 2;
+          benefit += operand->is<LocalGet>() ? 2 : getOperandBytes(operand);
         }
       }
     }
     // call_ref with a type index becomes a call with a function index.
     cost += reads;
+    if (decision.templates.size() == 1) {
+      for (Index i = 0; i < decision.shape.size(); i++) {
+        if (decision.shape[i] == FixedOperand) {
+          cost += reads * getOperandBytes(decision.fixedOperands[i]);
+        }
+      }
+    } else {
+      cost += FunctionOverheadBytes;
+      if (decision.templates.size() > 2) {
+        cost += 14;
+      }
+      for (Index t = 0; t < decision.templates.size(); t++) {
+        auto& templ = decision.templates[t];
+        cost += 1 + getLEBSize(U32LEB(functionIndexes[templ.callee]));
+        for (Index i = 0; i < templ.shape.size(); i++) {
+          if (templ.shape[i] == FixedOperand) {
+            cost += getOperandBytes(templ.fixedOperands[i]);
+          } else {
+            cost += 2;
+          }
+        }
+        if (t > 0) {
+          cost += 8;
+        }
+      }
+    }
     if (!always && benefit <= cost) {
       return {};
     }
@@ -832,6 +1191,14 @@ private:
     // Update the operands, and build the helpers.
     std::unordered_map<FieldKey, Decision*, FieldKeyHash> decisionMap;
     SubTypes subTypes(*module);
+    struct SharedIndexedHelper {
+      Signature sig;
+      bool useComplement;
+      std::vector<IndexedTemplate> templates;
+      Name helper;
+    };
+    std::vector<SharedIndexedHelper> sharedIndexedHelpers;
+
     for (auto& decision : decisions) {
       for (auto sub : subTypes.getSubTypes(decision.type)) {
         decisionMap[FieldKey{sub, decision.index}] = &decision;
@@ -841,7 +1208,7 @@ private:
       for (auto& site : decision.sites) {
         auto& operand = site.globalSite->structNew->operands[k];
         if (decision.indexed) {
-          operand = ExpressionManipulator::copy(site.constant, *module);
+          operand = builder.makeConst(site.constant);
           continue;
         }
         switch (site.mode) {
@@ -865,7 +1232,41 @@ private:
             {getKeyGlobal(*site.globalSite, addedGlobals), site.thunk->name});
         }
       }
-      if (decision.lazy) {
+      if (decision.indexed && decision.templates.size() > 1) {
+        auto sig =
+          decision.type.getStruct().fields[k].type.getHeapType().getSignature();
+        Name helper;
+        for (auto& shared : sharedIndexedHelpers) {
+          if (shared.sig == sig &&
+              shared.useComplement == decision.useComplement &&
+              shared.templates.size() == decision.templates.size()) {
+            bool same = true;
+            for (Index i = 0; i < shared.templates.size(); i++) {
+              if (!shared.templates[i].equals(decision.templates[i])) {
+                same = false;
+                break;
+              }
+            }
+            if (same) {
+              helper = shared.helper;
+              break;
+            }
+          }
+        }
+        if (!helper.is()) {
+          helper = makeIndexedHelper(decision, sig);
+          sharedIndexedHelpers.push_back(
+            {sig, decision.useComplement, decision.templates, helper});
+        }
+        decision.callee = helper;
+        decision.shape.clear();
+        decision.shape.push_back(ConstOperand);
+        Index numParams = sig.params.size();
+        for (Index p = 0; p < numParams; p++) {
+          decision.shape.push_back(p);
+        }
+        decision.fixedOperands.assign(decision.shape.size(), nullptr);
+      } else if (decision.lazy) {
         decision.helper = makeHelper(decision, exceptions);
       }
     }
@@ -882,12 +1283,13 @@ private:
         : decisionMap(decisionMap) {}
 
       void visitCallRef(CallRef* curr) {
-        auto* get = curr->target->dynCast<StructGet>();
-        if (!get || get->type == Type::unreachable) {
+        std::vector<StructGet*> gets;
+        if (!collectCallRefTargetGets(curr->target, gets)) {
           return;
         }
-        auto type = get->ref->type;
-        auto iter = decisionMap.find(FieldKey{type.getHeapType(), get->index});
+        auto type = gets[0]->ref->type;
+        auto iter =
+          decisionMap.find(FieldKey{type.getHeapType(), gets[0]->index});
         if (iter == decisionMap.end()) {
           return;
         }
@@ -895,15 +1297,16 @@ private:
         Builder builder(*getModule());
         Expression* replacement;
         if (decision.indexed) {
-          replacement = makeIndexedCall(curr, get, decision);
+          replacement = makeIndexedCall(curr, decision);
         } else if (decision.lazy) {
+          auto* get = curr->target->cast<StructGet>();
           replacement = builder.makeCall(
             decision.helper, {get->ref}, decision.resultType, curr->isReturn);
         } else {
-          get->type = decision.resultType;
-          replacement = get;
+          updateTargetTypes(curr->target, decision.resultType);
+          replacement = curr->target;
           if (curr->isReturn) {
-            replacement = builder.makeReturn(get);
+            replacement = builder.makeReturn(replacement);
           }
         }
         replaceCurrent(replacement);
@@ -913,12 +1316,11 @@ private:
       // read in the constant's place)). The receiver is evaluated first in the
       // original; if moving things around could change the behavior, spill
       // the receiver and the arguments to locals in the original order.
-      Expression*
-      makeIndexedCall(CallRef* curr, StructGet* get, Decision& decision) {
+      Expression* makeIndexedCall(CallRef* curr, Decision& decision) {
         Builder builder(*getModule());
         auto& options = getPassOptions();
         auto& wasm = *getModule();
-        get->type = decision.fieldType;
+        updateTargetTypes(curr->target, decision.fieldType);
         std::vector<Expression*> prelude;
         auto spill = [&](Expression*& value) {
           if (value->type == Type::unreachable) {
@@ -936,17 +1338,30 @@ private:
         bool needsSpill = false;
         std::vector<bool> used(curr->operands.size(), false);
         bool beforeConst = true;
+        std::vector<Index> usedOrder;
         for (auto index : decision.shape) {
           if (index == ConstOperand) {
             beforeConst = false;
             continue;
           }
+          if (index == FixedOperand) {
+            continue;
+          }
           assert(index < curr->operands.size());
           used[index] = true;
-          if (beforeConst && !EffectAnalyzer::canReorder(
-                               options, wasm, get, curr->operands[index])) {
+          if (beforeConst &&
+              !EffectAnalyzer::canReorder(
+                options, wasm, curr->target, curr->operands[index])) {
             needsSpill = true;
           }
+          for (auto prevIndex : usedOrder) {
+            if (prevIndex > index &&
+                !EffectAnalyzer::canReorder(
+                  options, wasm, curr->operands[index], curr->operands[prevIndex])) {
+              needsSpill = true;
+            }
+          }
+          usedOrder.push_back(index);
         }
         for (Index i = 0; i < curr->operands.size(); i++) {
           if (!used[i] && EffectAnalyzer(options, wasm, curr->operands[i])
@@ -955,7 +1370,11 @@ private:
           }
         }
         if (needsSpill) {
-          spill(get->ref);
+          if (auto* get = curr->target->dynCast<StructGet>()) {
+            spill(get->ref);
+          } else {
+            spill(curr->target);
+          }
           for (auto& operand : curr->operands) {
             spill(operand);
           }
@@ -963,9 +1382,13 @@ private:
         // Arguments the thunk ignores vanish: they are side effect free, or
         // have been spilled.
         std::vector<Expression*> operands;
-        for (auto index : decision.shape) {
+        for (Index i = 0; i < decision.shape.size(); i++) {
+          auto index = decision.shape[i];
           if (index == ConstOperand) {
-            operands.push_back(get);
+            operands.push_back(curr->target);
+          } else if (index == FixedOperand) {
+            operands.push_back(
+              ExpressionManipulator::copy(decision.fixedOperands[i], wasm));
           } else {
             assert(index < curr->operands.size());
             operands.push_back(curr->operands[index]);
@@ -1089,6 +1512,112 @@ private:
     auto* body = builder.makeBlock(label, list, resultType);
     module->addFunction(builder.makeFunction(
       name, Signature(paramType, resultType), {objType}, body));
+    return name;
+  }
+
+  Name makeIndexedHelper(Decision& decision, Signature thunkSig) {
+    Builder builder(*module);
+    auto type = decision.type;
+    auto k = decision.index;
+    auto resultType = decision.resultType;
+    std::string typeName;
+    if (auto iter = module->typeNames.find(type);
+        iter != module->typeNames.end()) {
+      typeName = iter->second.name.toString();
+    } else {
+      typeName = std::to_string(functionIndexes.size());
+    }
+    auto name = Names::getValidFunctionName(
+      *module, "indexed$" + typeName + "$" + std::to_string(k));
+
+    std::vector<Type> paramTypes;
+    paramTypes.push_back(Type::i32);
+    for (auto paramType : thunkSig.params) {
+      paramTypes.push_back(paramType);
+    }
+
+    Index numTemplates = decision.templates.size();
+    auto makeKeyExpr = [&](Index t) -> Expression* {
+      if (decision.useComplement) {
+        if (t == 0) {
+          return builder.makeLocalGet(0, Type::i32);
+        }
+        return builder.makeBinary(XorInt32,
+                                  builder.makeLocalGet(0, Type::i32),
+                                  builder.makeConst(Literal(int32_t(-1))));
+      }
+      if (numTemplates == 2) {
+        return builder.makeBinary(ShrSInt32,
+                                  builder.makeLocalGet(0, Type::i32),
+                                  builder.makeConst(Literal(int32_t(1))));
+      }
+      return builder.makeLocalGet(0, Type::i32);
+    };
+
+    auto makeTemplateCall = [&](Index t) -> Expression* {
+      auto& templ = decision.templates[t];
+      std::vector<Expression*> operands;
+      operands.reserve(templ.shape.size());
+      for (Index i = 0; i < templ.shape.size(); i++) {
+        auto idx = templ.shape[i];
+        if (idx == ConstOperand) {
+          operands.push_back(makeKeyExpr(t));
+        } else if (idx == FixedOperand) {
+          operands.push_back(
+            ExpressionManipulator::copy(templ.fixedOperands[i], *module));
+        } else {
+          operands.push_back(builder.makeLocalGet(1 + idx, paramTypes[1 + idx]));
+        }
+      }
+      auto* callee = module->getFunction(templ.callee);
+      return builder.makeCall(templ.callee, operands, callee->getResults());
+    };
+
+    std::vector<Type> vars;
+    Expression* body = nullptr;
+    if (numTemplates == 2) {
+      Expression* cond;
+      if (decision.useComplement) {
+        cond = builder.makeBinary(LtSInt32,
+                                  builder.makeLocalGet(0, Type::i32),
+                                  builder.makeConst(Literal(int32_t(0))));
+      } else {
+        cond = builder.makeBinary(AndInt32,
+                                  builder.makeLocalGet(0, Type::i32),
+                                  builder.makeConst(Literal(int32_t(1))));
+      }
+      body = builder.makeIf(
+        cond, makeTemplateCall(1), makeTemplateCall(0), resultType);
+    } else {
+      Index tagLocal = paramTypes.size();
+      vars.push_back(Type::i32);
+      std::vector<Expression*> list;
+      list.push_back(builder.makeLocalSet(
+        tagLocal,
+        builder.makeBinary(AndInt32,
+                           builder.makeLocalGet(0, Type::i32),
+                           builder.makeConst(Literal(int32_t(3))))));
+      list.push_back(builder.makeLocalSet(
+        0,
+        builder.makeBinary(ShrSInt32,
+                           builder.makeLocalGet(0, Type::i32),
+                           builder.makeConst(Literal(int32_t(2))))));
+      Expression* dispatch = makeTemplateCall(0);
+      for (Index t = 1; t < numTemplates; t++) {
+        Expression* cond = builder.makeLocalGet(tagLocal, Type::i32);
+        if (t > 1) {
+          cond = builder.makeBinary(
+            EqInt32, cond, builder.makeConst(Literal(int32_t(t))));
+        }
+        dispatch =
+          builder.makeIf(cond, makeTemplateCall(t), dispatch, resultType);
+      }
+      list.push_back(dispatch);
+      body = builder.makeBlock(list, resultType);
+    }
+
+    module->addFunction(builder.makeFunction(
+      name, Signature(Type(paramTypes), resultType), std::move(vars), body));
     return name;
   }
 };
