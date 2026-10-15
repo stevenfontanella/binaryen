@@ -5,7 +5,7 @@
 
 (module
   ;; Regression test in which we need to calculate a proper LUB.
-  ;; CHECK:      (func $selectify-fresh-lub (type $4) (param $x i32) (result anyref)
+  ;; CHECK:      (func $selectify-fresh-lub (type $5) (param $x i32) (result anyref)
   ;; CHECK-NEXT:  (select (result i31ref)
   ;; CHECK-NEXT:   (ref.null none)
   ;; CHECK-NEXT:   (ref.i31
@@ -340,7 +340,7 @@
     )
   )
 
-  ;; CHECK:      (func $restructure-br_if-constant-branch-1 (type $3) (param $x i32)
+  ;; CHECK:      (func $restructure-br_if-constant-branch-1 (type $4) (param $x i32)
   ;; CHECK-NEXT:  (local $1 i32)
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (block $x (result i32)
@@ -398,7 +398,7 @@
       )
     )
   )
-  ;; CHECK:      (func $restructure-br_if-constant-branch-2 (type $3) (param $x i32)
+  ;; CHECK:      (func $restructure-br_if-constant-branch-2 (type $4) (param $x i32)
   ;; CHECK-NEXT:  (local $1 i32)
   ;; CHECK-NEXT:  (local $2 i32)
   ;; CHECK-NEXT:  (block $x
@@ -600,7 +600,7 @@
   ;; CHECK:      (func $restructure-select-no-multivalue (type $1)
   ;; CHECK-NEXT:  (local $x i32)
   ;; CHECK-NEXT:  (tuple.drop 2
-  ;; CHECK-NEXT:   (block $block (type $5) (result i32 i32)
+  ;; CHECK-NEXT:   (block $block (type $7) (result i32 i32)
   ;; CHECK-NEXT:    (tuple.drop 2
   ;; CHECK-NEXT:     (br_if $block
   ;; CHECK-NEXT:      (tuple.make 2
@@ -915,6 +915,149 @@
         )
       )
       (br $label)
+    )
+  )
+
+  ;; CHECK:      (func $fold-bool-if-pos (type $3) (param $x i32) (param $y i32)
+  ;; CHECK-NEXT:  (local $t i32)
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (local.set $t
+  ;; CHECK-NEXT:     (local.get $y)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (call $nothing)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $fold-bool-if-pos (param $x i32) (param $y i32) (local $t i32)
+    (if
+      (if (result i32)
+        (local.get $x)
+        (then
+          (local.set $t (local.get $y))
+          (i32.const 1)
+        )
+        (else
+          (i32.const 0)
+        )
+      )
+      (then
+        (call $nothing)
+      )
+    )
+  )
+
+  ;; CHECK:      (func $fold-bool-if-neg (type $6) (param $x i32) (param $y i32) (result i32)
+  ;; CHECK-NEXT:  (local $t i32)
+  ;; CHECK-NEXT:  (if (result i32)
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (local.set $t
+  ;; CHECK-NEXT:     (local.get $y)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (local.get $t)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (else
+  ;; CHECK-NEXT:    (i32.const 10)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $fold-bool-if-neg (param $x i32) (param $y i32) (result i32) (local $t i32)
+    (if (result i32)
+      (i32.eqz
+        (if (result i32)
+          (local.get $x)
+          (then
+            (local.set $t (local.get $y))
+            (i32.const 1)
+          )
+          (else
+            (i32.const 0)
+          )
+        )
+      )
+      (then
+        (i32.const 10)
+      )
+      (else
+        (local.get $t)
+      )
+    )
+  )
+
+  ;; CHECK:      (func $fold-bool-if-short-circuit (type $3) (param $x i32) (param $y i32)
+  ;; CHECK-NEXT:  (local $t i32)
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (local.set $t
+  ;; CHECK-NEXT:     (i32.const 1)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (if
+  ;; CHECK-NEXT:     (local.get $y)
+  ;; CHECK-NEXT:     (then
+  ;; CHECK-NEXT:      (call $nothing)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $fold-bool-if-short-circuit (param $x i32) (param $y i32) (local $t i32)
+    (if
+      (if (result i32)
+        (local.get $x)
+        (then
+          (local.set $t (i32.const 1))
+          (local.get $y)
+        )
+        (else
+          (i32.const 0)
+        )
+      )
+      (then
+        (call $nothing)
+      )
+    )
+  )
+
+  ;; CHECK:      (func $fold-bool-br-if-neg (type $3) (param $x i32) (param $y i32)
+  ;; CHECK-NEXT:  (local $t i32)
+  ;; CHECK-NEXT:  (block $out
+  ;; CHECK-NEXT:   (br_if $out
+  ;; CHECK-NEXT:    (i32.eqz
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.set $t
+  ;; CHECK-NEXT:    (local.get $y)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (call $nothing)
+  ;; CHECK-NEXT:   (br_if $out
+  ;; CHECK-NEXT:    (local.get $t)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (call $nothing)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $fold-bool-br-if-neg (param $x i32) (param $y i32) (local $t i32)
+    (block $out
+      (br_if $out
+        (i32.eqz
+          (if (result i32)
+            (local.get $x)
+            (then
+              (local.set $t (local.get $y))
+              (i32.const 1)
+            )
+            (else
+              (i32.const 0)
+            )
+          )
+        )
+      )
+      (call $nothing)
+      (br_if $out (local.get $t))
+      (call $nothing)
     )
   )
 )

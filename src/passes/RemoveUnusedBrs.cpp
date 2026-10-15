@@ -159,6 +159,489 @@ static bool tooCostlyToRunUnconditionally(const PassOptions& passOptions,
   return tooCostlyToRunUnconditionally(passOptions, max);
 }
 
+static bool isI32Const(Expression* expr, int32_t& out) {
+  if (auto* c = expr->dynCast<Const>()) {
+    if (c->type == Type::i32) {
+      out = c->value.geti32();
+      return true;
+    }
+  }
+  return false;
+}
+
+// Split an `if (result i32)` arm into its optional side-effecting prefix list
+// `prefixOut` (all `Type::none` and free of external branches) and its final
+// i32 value expression `valueOut`.
+static bool splitBoolIfArm(Expression* arm,
+                           const PassOptions& passOptions,
+                           Module& wasm,
+                           std::vector<Expression*>& prefixOut,
+                           Expression*& valueOut) {
+  prefixOut.clear();
+  valueOut = nullptr;
+  if (!arm || arm->type != Type::i32) {
+    return false;
+  }
+  EffectAnalyzer effects(passOptions, wasm, arm);
+  if (effects.branchesOut || effects.hasExternalBreakTargets()) {
+    return false;
+  }
+  Expression* curr = arm;
+  while (auto* block = curr->dynCast<Block>()) {
+    if (block->name.is() && BranchUtils::BranchSeeker::has(block, block->name)) {
+      return false;
+    }
+    if (block->list.empty() || block->list.back()->type != Type::i32) {
+      return false;
+    }
+    for (Index i = 0; i + 1 < block->list.size(); i++) {
+      if (block->list[i]->type != Type::none) {
+        return false;
+      }
+      prefixOut.push_back(block->list[i]);
+    }
+    curr = block->list.back();
+  }
+  valueOut = curr;
+  return true;
+}
+
+// Prepend `Type::none` statements `prefix` to `arm` (which may be nullptr).
+static Expression* prependToArm(Builder& builder,
+                                const std::vector<Expression*>& prefix,
+                                Expression* arm) {
+  if (prefix.empty()) {
+    return arm;
+  }
+  if (!arm && prefix.size() == 1) {
+    return prefix[0];
+  }
+  auto* block = builder.makeBlock();
+  for (auto* item : prefix) {
+    block->list.push_back(item);
+  }
+  if (arm) {
+    if (auto* armBlock = arm->dynCast<Block>();
+        armBlock && !armBlock->name.is()) {
+      for (auto* item : armBlock->list) {
+        block->list.push_back(item);
+      }
+    } else {
+      block->list.push_back(arm);
+    }
+  }
+  block->finalize(arm ? arm->type : Type::none);
+  return block;
+}
+
+// Try to fold a boolean-producing `if (result i32)` condition (optionally
+// wrapped in `i32.eqz`) into `curr`.
+static bool tryFoldBooleanIfCondition(If* curr,
+                                      Function* func,
+                                      Module& wasm,
+                                      const PassOptions& passOptions) {
+  bool negated = false;
+  Expression* cond = curr->condition;
+  while (auto* u = cond->dynCast<Unary>()) {
+    if (u->op == EqZInt32) {
+      negated = !negated;
+      cond = u->value;
+    } else {
+      break;
+    }
+  }
+  auto* inner = cond->dynCast<If>();
+  if (!inner || !inner->ifFalse || inner->type != Type::i32 ||
+      inner->condition->type == Type::unreachable) {
+    return false;
+  }
+
+  Builder builder(wasm);
+  std::vector<Expression*> prefix;
+  Expression* val = nullptr;
+
+  int32_t falseConst = 0;
+  if (isI32Const(inner->ifFalse, falseConst) &&
+      splitBoolIfArm(inner->ifTrue, passOptions, wasm, prefix, val)) {
+    int32_t trueConst = 0;
+    bool valIsConst = isI32Const(val, trueConst);
+    // (a) `(if (if (result i32) c (then A 1) (else 0)) (then T) (else F))`
+    //  or `(if (i32.eqz (if (result i32) c (then A 0) (else 1))) (then T) (else F))`
+    //  => `(if c (then A T) (else F))`
+    if (valIsConst && ((falseConst == 0 && !negated && trueConst != 0) ||
+                       (falseConst != 0 && negated && trueConst == 0))) {
+      curr->condition = inner->condition;
+      curr->ifTrue = prependToArm(builder, prefix, curr->ifTrue);
+      BranchHints::copyTo(inner, curr, func);
+      curr->finalize();
+      return true;
+    }
+    // (b) `(if (i32.eqz (if (result i32) c (then A 1) (else 0))) (then T) (else F))`
+    //  or `(if (if (result i32) c (then A 0) (else 1)) (then T) (else F))`
+    //  => `(if c (then A F) (else T))` (or `(if (i32.eqz c) (then T))` if !F && A.empty())
+    if (valIsConst && ((falseConst == 0 && negated && trueConst != 0) ||
+                       (falseConst != 0 && !negated && trueConst == 0))) {
+      if (!curr->ifFalse && prefix.empty()) {
+        curr->condition = builder.makeUnary(EqZInt32, inner->condition);
+        BranchHints::copyFlippedTo(inner, curr, func);
+        curr->finalize();
+        return true;
+      }
+      Expression* oldTrue = curr->ifTrue;
+      Expression* oldFalse = curr->ifFalse;
+      curr->condition = inner->condition;
+      curr->ifTrue = prependToArm(builder, prefix, oldFalse);
+      if (!curr->ifTrue) {
+        curr->ifTrue = builder.makeNop();
+      }
+      curr->ifFalse = oldTrue;
+      BranchHints::copyTo(inner, curr, func);
+      curr->finalize();
+      return true;
+    }
+    // (d) Short-circuit `&&` without outer `else`:
+    // `(if (if (result i32) c (then A E) (else 0)) (then T))`
+    //  => `(if c (then A (if E (then T))))`
+    // `(if (i32.eqz (if (result i32) c (then A E) (else 1))) (then T))`
+    //  => `(if c (then A (if (i32.eqz E) (then T))))`
+    if (!valIsConst && !curr->ifFalse &&
+        ((falseConst == 0 && !negated) || (falseConst != 0 && negated))) {
+      Expression* innerCond =
+        negated ? builder.makeUnary(EqZInt32, val) : val;
+      auto* newInnerIf = builder.makeIf(innerCond, curr->ifTrue);
+      while (tryFoldBooleanIfCondition(newInnerIf, func, wasm, passOptions)) {
+      }
+      curr->condition = inner->condition;
+      curr->ifTrue = prependToArm(builder, prefix, newInnerIf);
+      BranchHints::copyTo(inner, curr, func);
+      curr->finalize();
+      return true;
+    }
+  }
+
+  int32_t trueConst = 0;
+  if (isI32Const(inner->ifTrue, trueConst) &&
+      splitBoolIfArm(inner->ifFalse, passOptions, wasm, prefix, val)) {
+    int32_t falseValConst = 0;
+    bool valIsConst = isI32Const(val, falseValConst);
+    // `(if (if (result i32) c (then 0) (else A 1)) (then T) (else F))`
+    if (valIsConst && ((trueConst == 0 && !negated && falseValConst != 0) ||
+                       (trueConst != 0 && negated && falseValConst == 0))) {
+      if (!curr->ifFalse) {
+        curr->condition = builder.makeUnary(EqZInt32, inner->condition);
+        curr->ifTrue = prependToArm(builder, prefix, curr->ifTrue);
+        BranchHints::copyFlippedTo(inner, curr, func);
+        curr->finalize();
+        return true;
+      }
+      Expression* oldTrue = curr->ifTrue;
+      Expression* oldFalse = curr->ifFalse;
+      curr->condition = inner->condition;
+      curr->ifTrue = oldFalse;
+      curr->ifFalse = prependToArm(builder, prefix, oldTrue);
+      BranchHints::copyTo(inner, curr, func);
+      curr->finalize();
+      return true;
+    }
+    // `(if (if (result i32) c (then 1) (else A 0)) (then T) (else F))`
+    if (valIsConst && ((trueConst != 0 && !negated && falseValConst == 0) ||
+                       (trueConst == 0 && negated && falseValConst != 0))) {
+      curr->condition = inner->condition;
+      if (curr->ifFalse || !prefix.empty()) {
+        curr->ifFalse = prependToArm(builder, prefix, curr->ifFalse);
+      }
+      BranchHints::copyTo(inner, curr, func);
+      curr->finalize();
+      return true;
+    }
+    // `(if (if (result i32) c (then 0) (else A E)) (then T))`
+    //  => `(if (i32.eqz c) (then A (if E (then T))))`
+    if (!valIsConst && !curr->ifFalse &&
+        ((trueConst == 0 && !negated) || (trueConst != 0 && negated))) {
+      Expression* innerCond =
+        negated ? builder.makeUnary(EqZInt32, val) : val;
+      auto* newInnerIf = builder.makeIf(innerCond, curr->ifTrue);
+      while (tryFoldBooleanIfCondition(newInnerIf, func, wasm, passOptions)) {
+      }
+      curr->condition = builder.makeUnary(EqZInt32, inner->condition);
+      curr->ifTrue = prependToArm(builder, prefix, newInnerIf);
+      BranchHints::copyFlippedTo(inner, curr, func);
+      curr->finalize();
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// Try to fold a boolean-producing `if (result i32)` condition in `br_if $L`.
+// Returns the replacement Expression* (either `curr` if modified in place, or
+// a new `If*`), or nullptr if not folded.
+static Expression* tryFoldBooleanBreakCondition(Break* curr,
+                                                Function* func,
+                                                Module& wasm,
+                                                const PassOptions& passOptions) {
+  if (!curr->condition || curr->value || curr->type == Type::unreachable) {
+    return nullptr;
+  }
+  bool negated = false;
+  Expression* cond = curr->condition;
+  while (auto* u = cond->dynCast<Unary>()) {
+    if (u->op == EqZInt32) {
+      negated = !negated;
+      cond = u->value;
+    } else {
+      break;
+    }
+  }
+  auto* inner = cond->dynCast<If>();
+  if (!inner || !inner->ifFalse || inner->type != Type::i32 ||
+      inner->condition->type == Type::unreachable) {
+    return nullptr;
+  }
+
+  Builder builder(wasm);
+  std::vector<Expression*> prefix;
+  Expression* val = nullptr;
+  int32_t falseConst = 0;
+  if (isI32Const(inner->ifFalse, falseConst) &&
+      splitBoolIfArm(inner->ifTrue, passOptions, wasm, prefix, val)) {
+    int32_t trueConst = 0;
+    bool valIsConst = isI32Const(val, trueConst);
+    // (c) `br_if $L (i32.eqz (if (result i32) c (then A 1) (else 0)))`
+    //  => `(if c (then A) (else (br $L)))` (or `br_if $L (i32.eqz c)` if A.empty())
+    if (valIsConst && ((falseConst == 0 && negated && trueConst != 0) ||
+                       (falseConst != 0 && !negated && trueConst == 0))) {
+      if (prefix.empty()) {
+        curr->condition = builder.makeUnary(EqZInt32, inner->condition);
+        BranchHints::copyFlippedTo(inner, curr, func);
+        curr->finalize();
+        return curr;
+      }
+      curr->condition = nullptr;
+      curr->finalize();
+      BranchHints::clear(curr, func);
+      auto* newIf = builder.makeIf(
+        inner->condition, prependToArm(builder, prefix, nullptr), curr);
+      BranchHints::copyTo(inner, newIf, func);
+      return newIf;
+    }
+    // `br_if $L (if (result i32) c (then A 1) (else 0))`
+    if (valIsConst && ((falseConst == 0 && !negated && trueConst != 0) ||
+                       (falseConst != 0 && negated && trueConst == 0))) {
+      if (prefix.empty()) {
+        curr->condition = inner->condition;
+        BranchHints::copyTo(inner, curr, func);
+        curr->finalize();
+        return curr;
+      }
+      curr->condition = nullptr;
+      curr->finalize();
+      BranchHints::clear(curr, func);
+      auto* newIf =
+        builder.makeIf(inner->condition, prependToArm(builder, prefix, curr));
+      BranchHints::copyTo(inner, newIf, func);
+      return newIf;
+    }
+    // `br_if $L (if (result i32) c (then A E) (else 0))`
+    //  => `(if c (then A (br_if $L E)))`
+    if (!valIsConst &&
+        ((falseConst == 0 && !negated) || (falseConst != 0 && negated))) {
+      curr->condition =
+        negated ? builder.makeUnary(EqZInt32, val) : val;
+      curr->finalize();
+      BranchHints::clear(curr, func);
+      auto* newIf =
+        builder.makeIf(inner->condition, prependToArm(builder, prefix, curr));
+      BranchHints::copyTo(inner, newIf, func);
+      return newIf;
+    }
+  }
+
+  int32_t trueConst = 0;
+  if (isI32Const(inner->ifTrue, trueConst) &&
+      splitBoolIfArm(inner->ifFalse, passOptions, wasm, prefix, val)) {
+    int32_t falseValConst = 0;
+    bool valIsConst = isI32Const(val, falseValConst);
+    if (valIsConst && ((trueConst == 0 && !negated && falseValConst != 0) ||
+                       (trueConst != 0 && negated && falseValConst == 0))) {
+      if (prefix.empty()) {
+        curr->condition = builder.makeUnary(EqZInt32, inner->condition);
+        BranchHints::copyFlippedTo(inner, curr, func);
+        curr->finalize();
+        return curr;
+      }
+      curr->condition = nullptr;
+      curr->finalize();
+      BranchHints::clear(curr, func);
+      auto* newIf =
+        builder.makeIf(builder.makeUnary(EqZInt32, inner->condition),
+                       prependToArm(builder, prefix, curr));
+      BranchHints::copyFlippedTo(inner, newIf, func);
+      return newIf;
+    }
+    if (valIsConst && ((trueConst != 0 && !negated && falseValConst == 0) ||
+                       (trueConst == 0 && negated && falseValConst != 0))) {
+      if (prefix.empty()) {
+        curr->condition = inner->condition;
+        BranchHints::copyTo(inner, curr, func);
+        curr->finalize();
+        return curr;
+      }
+      curr->condition = nullptr;
+      curr->finalize();
+      BranchHints::clear(curr, func);
+      auto* newIf = builder.makeIf(
+        inner->condition, curr, prependToArm(builder, prefix, nullptr));
+      BranchHints::copyTo(inner, newIf, func);
+      return newIf;
+    }
+    if (!valIsConst &&
+        ((trueConst == 0 && !negated) || (trueConst != 0 && negated))) {
+      curr->condition =
+        negated ? builder.makeUnary(EqZInt32, val) : val;
+      curr->finalize();
+      BranchHints::clear(curr, func);
+      auto* newIf =
+        builder.makeIf(builder.makeUnary(EqZInt32, inner->condition),
+                       prependToArm(builder, prefix, curr));
+      BranchHints::copyFlippedTo(inner, newIf, func);
+      return newIf;
+    }
+  }
+  return nullptr;
+}
+
+static bool stripVoidTrailingUnreachableExpr(Expression* curr,
+                                             bool inVoidContext) {
+  bool changed = false;
+  if (auto* block = curr->dynCast<Block>()) {
+    for (Index i = 0; i < block->list.size(); i++) {
+      bool isLast = (i + 1 == block->list.size());
+      bool childVoid = isLast ? (inVoidContext || block->type == Type::none)
+                              : (block->list[i]->type == Type::none);
+      if (stripVoidTrailingUnreachableExpr(block->list[i], childVoid)) {
+        changed = true;
+      }
+    }
+    if ((inVoidContext || block->type == Type::none) &&
+        block->list.size() >= 2 && block->list.back()->is<Unreachable>()) {
+      bool allPrevVoid = true;
+      for (Index i = 0; i + 1 < block->list.size(); i++) {
+        if (block->list[i]->type != Type::none) {
+          allPrevVoid = false;
+          break;
+        }
+      }
+      if (allPrevVoid && block->name.is()) {
+        BranchUtils::BranchSeeker seeker(block->name);
+        Expression* temp = block;
+        seeker.walk(temp);
+        for (auto t : seeker.types) {
+          if (t != Type::none) {
+            allPrevVoid = false;
+            break;
+          }
+        }
+      }
+      if (allPrevVoid) {
+        block->list.pop_back();
+        block->finalize();
+        changed = true;
+      }
+    }
+    if (changed && inVoidContext && block->type == Type::unreachable &&
+        !block->list.empty() && block->list.back()->type == Type::none) {
+      bool canBeVoid = true;
+      for (auto* item : block->list) {
+        if (item->type != Type::none) {
+          canBeVoid = false;
+          break;
+        }
+      }
+      if (canBeVoid && block->name.is()) {
+        BranchUtils::BranchSeeker seeker(block->name);
+        Expression* temp = block;
+        seeker.walk(temp);
+        for (auto t : seeker.types) {
+          if (t != Type::none) {
+            canBeVoid = false;
+            break;
+          }
+        }
+      }
+      if (canBeVoid) {
+        block->finalize();
+      }
+    }
+    return changed;
+  }
+  if (auto* iff = curr->dynCast<If>()) {
+    if (stripVoidTrailingUnreachableExpr(iff->condition, false)) {
+      changed = true;
+    }
+    bool armVoid = iff->condition->type != Type::unreachable &&
+                   (iff->type == Type::none ||
+                    (inVoidContext && iff->type == Type::unreachable));
+    if (armVoid) {
+      if (stripVoidTrailingUnreachableExpr(iff->ifTrue, true)) {
+        changed = true;
+      }
+      if (iff->ifFalse && stripVoidTrailingUnreachableExpr(iff->ifFalse, true)) {
+        changed = true;
+      }
+      if (changed) {
+        iff->finalize();
+      }
+    } else {
+      if ( stripVoidTrailingUnreachableExpr(
+             iff->ifTrue, iff->ifTrue->type == Type::none)) {
+        changed = true;
+      }
+      if (iff->ifFalse &&
+          stripVoidTrailingUnreachableExpr(
+            iff->ifFalse, iff->ifFalse->type == Type::none)) {
+        changed = true;
+      }
+    }
+    return changed;
+  }
+  if (auto* loop = curr->dynCast<Loop>()) {
+    bool bodyVoid = loop->type == Type::none ||
+                    (inVoidContext && loop->type == Type::unreachable);
+    if (stripVoidTrailingUnreachableExpr(
+          loop->body, bodyVoid || loop->body->type == Type::none)) {
+      loop->finalize();
+      changed = true;
+    }
+    return changed;
+  }
+  if (auto* tryy = curr->dynCast<Try>()) {
+    bool armVoid = tryy->type == Type::none ||
+                   (inVoidContext && tryy->type == Type::unreachable);
+    if (stripVoidTrailingUnreachableExpr(
+          tryy->body, armVoid || tryy->body->type == Type::none)) {
+      changed = true;
+    }
+    for (auto* catchBody : tryy->catchBodies) {
+      if (stripVoidTrailingUnreachableExpr(
+            catchBody, armVoid || catchBody->type == Type::none)) {
+        changed = true;
+      }
+    }
+    if (changed && armVoid) {
+      tryy->finalize();
+    }
+    return changed;
+  }
+  for (auto* child : ChildIterator(curr)) {
+    if (stripVoidTrailingUnreachableExpr(child, child->type == Type::none)) {
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
   bool isFunctionParallel() override { return true; }
 
@@ -1151,9 +1634,146 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
     return false;
   }
 
+  bool foldBooleanIfs(Function* func) {
+    struct BoolIfFolder : public PostWalker<BoolIfFolder> {
+      const PassOptions& passOptions;
+      bool worked = false;
+
+      BoolIfFolder(const PassOptions& passOptions) : passOptions(passOptions) {}
+
+      void visitIf(If* curr) {
+        while (tryFoldBooleanIfCondition(
+          curr, getFunction(), *getModule(), passOptions)) {
+          worked = true;
+        }
+      }
+
+      void visitBreak(Break* curr) {
+        if (auto* rep = tryFoldBooleanBreakCondition(
+              curr, getFunction(), *getModule(), passOptions)) {
+          if (rep != curr) {
+            replaceCurrent(rep);
+            if (auto* iff = rep->dynCast<If>()) {
+              visitIf(iff);
+            }
+          }
+          worked = true;
+        }
+      }
+    } folder(getPassOptions());
+
+    folder.walkFunctionInModule(func, getModule());
+    if (folder.worked) {
+      ReFinalize().walkFunctionInModule(func, getModule());
+      return true;
+    }
+    return false;
+  }
+
+  void optimizeTailBlockReturns(Function* func) {
+    std::vector<Block*> tailBlocks;
+    std::unordered_map<Name, Block*> nameToBlock;
+    std::function<void(Expression*, bool)> collectTailBlocks =
+      [&](Expression* curr, bool insideArm) {
+        if (!curr) {
+          return;
+        }
+        if (auto* block = curr->dynCast<Block>()) {
+          if (block->list.empty()) {
+            return;
+          }
+          for (Index i = 0; i + 1 < block->list.size(); i++) {
+            if (block->list[i]->type == Type::unreachable) {
+              return;
+            }
+          }
+          if (block->name.is() && block->type == func->getResults() &&
+              (!insideArm || block->list.back()->type != Type::unreachable)) {
+            tailBlocks.push_back(block);
+            nameToBlock[block->name] = block;
+          }
+          collectTailBlocks(block->list.back(), insideArm);
+        } else if (auto* iff = curr->dynCast<If>()) {
+          if (iff->condition->type == Type::unreachable ||
+              iff->type != func->getResults()) {
+            return;
+          }
+          collectTailBlocks(iff->ifTrue, true);
+          if (iff->ifFalse) {
+            collectTailBlocks(iff->ifFalse, true);
+          }
+        } else if (auto* loop = curr->dynCast<Loop>()) {
+          if (loop->type == func->getResults()) {
+            collectTailBlocks(loop->body, true);
+          }
+        }
+      };
+    collectTailBlocks(func->body, false);
+    if (tailBlocks.empty()) {
+      return;
+    }
+
+    struct TailBrRewriter : public PostWalker<TailBrRewriter> {
+      const std::unordered_map<Name, Block*>& nameToBlock;
+      Type funcResults;
+      Module& wasm;
+      Function* func;
+      std::unordered_set<Name> modifiedBlocks;
+
+      TailBrRewriter(const std::unordered_map<Name, Block*>& nameToBlock,
+                     Type funcResults,
+                     Module& wasm,
+                     Function* func)
+        : nameToBlock(nameToBlock), funcResults(funcResults), wasm(wasm),
+          func(func) {}
+
+      static void scan(TailBrRewriter* self, Expression** currp) {
+        if (auto* iff = (*currp)->dynCast<If>()) {
+          if (iff->condition->type == Type::unreachable) {
+            return;
+          }
+        }
+        PostWalker<TailBrRewriter>::scan(self, currp);
+      }
+
+      void visitBreak(Break* curr) {
+        if (curr->condition || !nameToBlock.contains(curr->name)) {
+          return;
+        }
+        if (funcResults == Type::none) {
+          if (curr->value) {
+            return;
+          }
+        } else {
+          if (!curr->value ||
+              !Type::isSubType(curr->value->type, funcResults)) {
+            return;
+          }
+        }
+        modifiedBlocks.insert(curr->name);
+        BranchHints::clear(curr, func);
+        replaceCurrent(Builder(wasm).makeReturn(curr->value));
+      }
+    } rewriter(nameToBlock, func->getResults(), *getModule(), func);
+
+    rewriter.walkFunction(func);
+    if (rewriter.modifiedBlocks.empty()) {
+      return;
+    }
+    for (auto* block : tailBlocks) {
+      if (rewriter.modifiedBlocks.contains(block->name) &&
+          !BranchUtils::BranchSeeker::has(block, block->name)) {
+        block->name = Name();
+      }
+    }
+    ReFinalize().walkFunctionInModule(func, getModule());
+  }
+
   void doWalkFunction(Function* func) {
     neverUnconditionalize =
       hasArgument("remove-unused-brs-never-unconditionalize");
+    bool foldBoolIf = getPassRunner()->options.shrinkLevel >= 2 ||
+                      !getPassRunner()->options.optimizeLevel;
 
     // multiple cycles may be needed
     do {
@@ -1190,6 +1810,9 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         anotherCycle = true;
       }
       if (optimizeGC(func)) {
+        anotherCycle = true;
+      }
+      if (foldBoolIf && foldBooleanIfs(func)) {
         anotherCycle = true;
       }
     } while (anotherCycle);
@@ -1304,6 +1927,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
       PassOptions& passOptions;
 
       bool shrink;
+      bool foldBoolIf;
       bool neverUnconditionalize;
 
       bool needUniqify = false;
@@ -1534,6 +2158,10 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                 ExpressionManipulator::nop(br);
                 BranchHints::clear(br, getFunction());
                 curr->finalize(curr->type);
+                while (foldBoolIf &&
+                       tryFoldBooleanIfCondition(
+                         iff, getFunction(), *getModule(), passOptions)) {
+                }
               } else {
                 // To use an if, the value must have no side effects, as in the
                 // if it may not execute.
@@ -1546,6 +2174,10 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                     auto* iff = builder.makeIf(br->condition, br->value, curr);
                     BranchHints::copyTo(br, iff, getFunction());
                     replaceCurrent(iff);
+                    while (foldBoolIf &&
+                           tryFoldBooleanIfCondition(
+                             iff, getFunction(), *getModule(), passOptions)) {
+                    }
                   }
                 } else {
                   // The value has side effects, so it must always execute. We
@@ -1604,6 +2236,10 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
       }
 
       void visitIf(If* curr) {
+        while (foldBoolIf &&
+               tryFoldBooleanIfCondition(
+                 curr, getFunction(), *getModule(), passOptions)) {
+        }
         // we may have simplified ifs enough to turn them into selects
         if (auto* select = selectify(curr)) {
           replaceCurrent(select);
@@ -2040,6 +2676,18 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         if (!curr->condition) {
           return;
         }
+        if (foldBoolIf) {
+          if (auto* rep = tryFoldBooleanBreakCondition(
+                curr, getFunction(), *getModule(), passOptions)) {
+            if (rep != curr) {
+              replaceCurrent(rep);
+              if (auto* iff = rep->dynCast<If>()) {
+                visitIf(iff);
+              }
+              return;
+            }
+          }
+        }
         auto* value = Properties::getFallthrough(
           curr->condition, passOptions, *getModule());
         // Optimize if condition's fallthrough is a constant.
@@ -2073,6 +2721,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
     FinalOptimizer finalOptimizer(getPassOptions());
     finalOptimizer.setModule(getModule());
     finalOptimizer.shrink = getPassRunner()->options.shrinkLevel > 0;
+    finalOptimizer.foldBoolIf = foldBoolIf;
     finalOptimizer.neverUnconditionalize = neverUnconditionalize;
 
     finalOptimizer.walkFunction(func);
@@ -2081,6 +2730,15 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
     }
     if (finalOptimizer.refinalize) {
       ReFinalize().walkFunctionInModule(func, getModule());
+    }
+    if (getPassRunner()->options.shrinkLevel >= 2) {
+      optimizeTailBlockReturns(func);
+    }
+    if (foldBoolIf && getPassOptions().trapsNeverHappen) {
+      if (stripVoidTrailingUnreachableExpr(
+            func->body, func->getResults() == Type::none)) {
+        ReFinalize().walkFunctionInModule(func, getModule());
+      }
     }
   }
 };
