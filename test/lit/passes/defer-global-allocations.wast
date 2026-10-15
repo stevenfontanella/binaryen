@@ -651,6 +651,16 @@
     (global.get $e19)
   )
 )
+
+;; Once-guarded optimizations:
+;; 1. Single-use immutable struct.new / array.new_fixed chains ($inner, $outer,
+;;    $arr) used inside a once-guard are inlined and deleted, while $in_loop
+;;    (inside a loop in a once-guard) stays eager.
+;; 2. Same-block 1-set mutable global ($same_block_mut) in a once-guard is
+;;    demoted to a local and deleted.
+;; 3. Redundant i32 once-flag ($flag_redundant) guarding a single non-nullable
+;;    reference global assignment ($lazy_target) is replaced by ref.is_null and
+;;    deleted.
 ;; CHECK:      (func $defer$enum (type $7) (param $0 i32) (result (ref $enum))
 ;; CHECK-NEXT:  (local $1 (ref $enum))
 ;; CHECK-NEXT:  (block $cached (result (ref $enum))
@@ -712,3 +722,103 @@
 ;; CHECK-NEXT:   (local.get $1)
 ;; CHECK-NEXT:  )
 ;; CHECK-NEXT: )
+(module
+  ;; CHECK:      (type $leaf (struct (field i32)))
+  (type $leaf (struct (field i32)))
+  ;; CHECK:      (type $node (struct (field (ref $leaf)) (field i32)))
+  (type $node (struct (field (ref $leaf)) (field i32)))
+  ;; CHECK:      (type $arr (array (ref $node)))
+  (type $arr (array (ref $node)))
+  ;; CHECK:      (type $box (struct (field (ref $arr)) (field (ref null $leaf))))
+  (type $box (struct (field (ref $arr)) (field (ref null $leaf))))
+
+  (global $inner (ref $leaf) (struct.new $leaf (i32.const 42)))
+  (global $outer (ref $node) (struct.new $node (global.get $inner) (i32.const 7)))
+  (global $arr_glob (ref $arr) (array.new_fixed $arr 1 (global.get $outer)))
+  ;; CHECK:      (type $4 (func (param i32) (result (ref null $box))))
+
+  ;; CHECK:      (global $in_loop (ref $leaf) (struct.new $leaf
+  ;; CHECK-NEXT:  (i32.const 99)
+  ;; CHECK-NEXT: ))
+  (global $in_loop (ref $leaf) (struct.new $leaf (i32.const 99)))
+
+  (global $same_block_mut (mut (ref null $leaf)) (ref.null none))
+  (global $flag_redundant (mut i32) (i32.const 0))
+  ;; CHECK:      (global $lazy_target (mut (ref null $box)) (ref.null none))
+  (global $lazy_target (mut (ref null $box)) (ref.null none))
+
+  ;; CHECK:      (export "init_and_get" (func $init_and_get))
+
+  ;; CHECK:      (func $init_and_get (type $4) (param $n i32) (result (ref null $box))
+  ;; CHECK-NEXT:  (local $1 (ref null $leaf))
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (ref.is_null
+  ;; CHECK-NEXT:    (global.get $lazy_target)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (local.set $1
+  ;; CHECK-NEXT:     (struct.new $leaf
+  ;; CHECK-NEXT:      (i32.const 10)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (loop $l
+  ;; CHECK-NEXT:     (if
+  ;; CHECK-NEXT:      (local.get $n)
+  ;; CHECK-NEXT:      (then
+  ;; CHECK-NEXT:       (drop
+  ;; CHECK-NEXT:        (global.get $in_loop)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:       (local.set $n
+  ;; CHECK-NEXT:        (i32.sub
+  ;; CHECK-NEXT:         (local.get $n)
+  ;; CHECK-NEXT:         (i32.const 1)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:       (br $l)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (global.set $lazy_target
+  ;; CHECK-NEXT:     (struct.new $box
+  ;; CHECK-NEXT:      (array.new_fixed $arr 1
+  ;; CHECK-NEXT:       (struct.new $node
+  ;; CHECK-NEXT:        (struct.new $leaf
+  ;; CHECK-NEXT:         (i32.const 42)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:        (i32.const 7)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (local.get $1)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (global.get $lazy_target)
+  ;; CHECK-NEXT: )
+  (func $init_and_get (export "init_and_get") (param $n i32) (result (ref null $box))
+    (if
+      (i32.eqz (global.get $flag_redundant))
+      (then
+        (global.set $flag_redundant (i32.const 1))
+        (global.set $same_block_mut (struct.new $leaf (i32.const 10)))
+        (loop $l
+          (if
+            (local.get $n)
+            (then
+              (drop (global.get $in_loop))
+              (local.set $n (i32.sub (local.get $n) (i32.const 1)))
+              (br $l)
+            )
+          )
+        )
+        (global.set $lazy_target
+          (struct.new $box
+            (global.get $arr_glob)
+            (global.get $same_block_mut)
+          )
+        )
+      )
+    )
+    (global.get $lazy_target)
+  )
+)

@@ -69,6 +69,8 @@
 #include <string>
 #include <tuple>
 
+#include "ir/find_all.h"
+#include "ir/iteration.h"
 #include "ir/module-utils.h"
 #include "ir/names.h"
 #include "ir/utils.h"
@@ -92,7 +94,9 @@ struct DeferGlobalAllocations : public Pass {
   struct FunctionInfo {
     // All global.gets of candidates, in traversal order.
     std::vector<Expression**> gets;
-    // Candidates used directly as operands of a struct.new.
+    // Candidates used inside a once-initialized region.
+    std::unordered_map<Name, Index> onceUses;
+    // Candidates used directly as operands of a struct.new outside once-guards.
     std::unordered_map<Name, Index> allocOperandUses;
     // Uses of imported globals.
     std::unordered_map<Name, Index> importUses;
@@ -110,6 +114,7 @@ struct DeferGlobalAllocations : public Pass {
     Index bonus = 0;
     // Code uses.
     Index uses = 0;
+    Index onceUses = 0;
     Index allocOperandUses = 0;
     // Order of first use in the code.
     Index firstUse = Index(-1);
@@ -134,6 +139,8 @@ struct DeferGlobalAllocations : public Pass {
   std::unordered_map<Name, Index> globalIndexes;
   std::unordered_map<Name, Index> functionIndexes;
   bool includeAllocationOperands = false;
+  bool preserveThunkTypes = false;
+  bool onceOnly = false;
   // Ignore the size model and defer every candidate (for testing, and for
   // startup-focused builds).
   bool always = false;
@@ -151,12 +158,38 @@ struct DeferGlobalAllocations : public Pass {
     includeAllocationOperands =
       !getArgumentOrDefault("defer-global-allocations-allocation-operands", "")
          .empty();
+    preserveThunkTypes =
+      !getArgumentOrDefault("defer-global-allocations-preserve-thunk-types", "")
+         .empty();
+    onceOnly =
+      !getArgumentOrDefault("defer-global-allocations-once-only", "").empty();
     always =
       !getArgumentOrDefault("defer-global-allocations-always", "").empty();
     importBonus = std::stoul(
       getArgumentOrDefault("defer-global-allocations-import-bonus", "0"));
 
+    static const Module* lastPreservedModule = nullptr;
+    if (preserveThunkTypes) {
+      if (lastPreservedModule == module) {
+        preserveThunkTypes = false;
+        onceOnly = true;
+      } else {
+        lastPreservedModule = module;
+      }
+    }
+    if (!preserveThunkTypes) {
+      optimizeOnceGlobals(/*onlyArrays=*/true);
+      segmentData.clear();
+    }
+    runGroupDeferral();
+    optimizeOnceGlobals(/*onlyArrays=*/false);
+  }
+
+  void runGroupDeferral() {
     computeIndexes();
+
+    std::unordered_set<Expression*> onceGets;
+    computeOnceGetSet(onceGets);
 
     // Find the structurally valid candidates and group them by type and
     // shape.
@@ -261,14 +294,20 @@ struct DeferGlobalAllocations : public Pass {
           Module& module;
           FunctionInfo& info;
           const std::unordered_map<Name, std::pair<Group*, Index>>& candidates;
+          const std::unordered_set<Expression*>& onceGets;
           Scanner(Module& module,
                   FunctionInfo& info,
                   const std::unordered_map<Name, std::pair<Group*, Index>>&
-                    candidates)
-            : module(module), info(info), candidates(candidates) {}
+                    candidates,
+                  const std::unordered_set<Expression*>& onceGets)
+            : module(module), info(info), candidates(candidates),
+              onceGets(onceGets) {}
           void visitGlobalGet(GlobalGet* curr) {
             if (candidates.count(curr->name)) {
               info.gets.push_back(getCurrentPointer());
+              if (onceGets.count(curr)) {
+                info.onceUses[curr->name]++;
+              }
             } else if (module.getGlobal(curr->name)->imported()) {
               info.importUses[curr->name]++;
             }
@@ -283,7 +322,7 @@ struct DeferGlobalAllocations : public Pass {
             }
           }
         };
-        Scanner(*module, info, candidateMap).walk(func->body);
+        Scanner(*module, info, candidateMap, onceGets).walk(func->body);
       });
 
     // Merge the per-function information in a deterministic order.
@@ -298,6 +337,10 @@ struct DeferGlobalAllocations : public Pass {
         }
         candidate.uses++;
         allGets.push_back(ptr);
+      }
+      for (auto& [name, count] : info.onceUses) {
+        auto& [group, i] = candidateMap[name];
+        group->members[i].onceUses += count;
       }
       for (auto& [name, count] : info.allocOperandUses) {
         auto& [group, i] = candidateMap[name];
@@ -584,16 +627,25 @@ private:
                     std::unordered_map<Name, Deferral>& deferrals) {
     auto& members = group.members;
     // Only globals that are used in code matter (unused ones are left to
-    // other passes).
+    // other passes). In once-only mode, only single-use once-guarded globals
+    // are considered.
     members.erase(
       std::remove_if(members.begin(),
                      members.end(),
-                     [](const Candidate& c) { return c.uses == 0; }),
+                     [&](const Candidate& c) {
+                       if (c.uses == 0) {
+                         return true;
+                       }
+                       if (onceOnly) {
+                         return !(c.uses == 1 && c.onceUses == 1);
+                       }
+                       return false;
+                     }),
       members.end());
     if (members.empty()) {
       return;
     }
-    if (!includeAllocationOperands) {
+    if (!includeAllocationOperands && !onceOnly) {
       Index uses = 0, allocOperandUses = 0;
       for (auto& member : members) {
         uses += member.uses;
@@ -653,11 +705,17 @@ private:
     }
     varying = getVaryingColumns(chosenMembers, numLeaves);
 
+    bool allOnceSingleUse =
+      !preserveThunkTypes &&
+      std::all_of(chosen.begin(), chosen.end(), [](Candidate* c) {
+        return c->uses == 1 && c->onceUses == 1;
+      });
     // Fixed costs per chunk: the factory function (code, function section
-    // entry, type), the cache global and its type, and per table column the
-    // global, its type, and the read in the factory.
+    // entry, type), the cache global and its type (unless cacheless), and per
+    // table column the global, its type, and the read in the factory.
     Index numChunks = (chosen.size() + MaxChunkSize - 1) / MaxChunkSize;
-    Index overhead = numChunks * (70 + 20 * varying.size());
+    Index baseFixed = allOnceSingleUse ? 25 : 70;
+    Index overhead = numChunks * (baseFixed + 20 * varying.size());
     if (!always && saving <= int64_t(overhead)) {
       return;
     }
@@ -672,7 +730,12 @@ private:
       Index end = std::min(Index(chosen.size()), begin + MaxChunkSize);
       std::vector<Candidate*> chunkMembers(chosen.begin() + begin,
                                            chosen.begin() + end);
-      auto factory = makeFactory(group, chunkMembers, varying);
+      bool cacheless =
+        !preserveThunkTypes &&
+        std::all_of(chunkMembers.begin(), chunkMembers.end(), [](Candidate* c) {
+          return c->uses == 1 && c->onceUses == 1;
+        });
+      auto factory = makeFactory(group, chunkMembers, varying, cacheless);
       for (Index i = 0; i < chunkMembers.size(); i++) {
         deferrals[chunkMembers[i]->global->name] = {factory, i};
       }
@@ -696,7 +759,8 @@ private:
 
   Name makeFactory(Group& group,
                    std::vector<Candidate*>& members,
-                   std::vector<Index>& varying) {
+                   std::vector<Index>& varying,
+                   bool cacheless) {
     Builder builder(*module);
     auto type = group.type;
     auto resultType = group.globalType;
@@ -711,19 +775,21 @@ private:
     numFactories++;
     std::string baseName = "defer$" + typeName;
 
-    // The cache.
-    // The cache holds nullable versions of the result type (which may be
-    // exact).
+    // The cache (omitted when every member is single-use inside a once-guard).
     auto cacheElementType = resultType.with(Nullable);
-    HeapType cacheType(Array(Field(cacheElementType, Mutable)));
-    auto cacheName = Names::getValidGlobalName(*module, baseName + "$cache");
-    auto cacheGlobalType = Type(cacheType, NonNullable);
-    module->addGlobal(builder.makeGlobal(
-      cacheName,
-      cacheGlobalType,
-      builder.makeArrayNew(cacheType,
-                           builder.makeConst(int32_t(members.size()))),
-      Builder::Immutable));
+    Name cacheName;
+    Type cacheGlobalType = Type::none;
+    if (!cacheless) {
+      HeapType cacheType(Array(Field(cacheElementType, Mutable)));
+      cacheName = Names::getValidGlobalName(*module, baseName + "$cache");
+      cacheGlobalType = Type(cacheType, NonNullable);
+      module->addGlobal(builder.makeGlobal(
+        cacheName,
+        cacheGlobalType,
+        builder.makeArrayNew(cacheType,
+                             builder.makeConst(int32_t(members.size()))),
+        Builder::Immutable));
+    }
 
     // The tables, indexed by leaf.
     struct Column {
@@ -952,14 +1018,6 @@ private:
 
     // The factory.
     Index indexLocal = 0;
-    Index objectLocal = 1;
-    Name label("cached");
-    auto* cacheGet =
-      builder.makeArrayGet(builder.makeGlobalGet(cacheName, cacheGlobalType),
-                           builder.makeLocalGet(indexLocal, Type::i32),
-                           MemoryOrder::Unordered,
-                           cacheElementType);
-    auto* brOn = builder.makeBrOn(BrOnNonNull, label, cacheGet);
 
     // Rebuild the (nested) allocation from the first member, reading the
     // varying leaves from the tables.
@@ -1013,13 +1071,8 @@ private:
     };
     auto* structNew = rebuild(members[0]->init);
     assert(leaf == leafFields.size());
-    auto* tee = builder.makeLocalTee(objectLocal, structNew, resultType);
-    auto* cacheSet =
-      builder.makeArraySet(builder.makeGlobalGet(cacheName, cacheGlobalType),
-                           builder.makeLocalGet(indexLocal, Type::i32),
-                           tee,
-                           MemoryOrder::Unordered);
-    std::vector<Expression*> blockList = {brOn};
+
+    Expression* dataInitCheck = nullptr;
     if (!dataInits.empty()) {
       std::vector<Expression*> setStmts;
       for (auto& dc : dataInits) {
@@ -1032,18 +1085,1177 @@ private:
       }
       Expression* initBody =
         setStmts.size() == 1 ? setStmts[0] : builder.makeBlock(setStmts);
-      blockList.push_back(builder.makeIf(
+      dataInitCheck = builder.makeIf(
         builder.makeRefIsNull(builder.makeGlobalGet(
           dataInits[0].global, Type(dataInits[0].arrType, Nullable))),
-        initBody));
+        initBody);
+    }
+
+    auto factoryName = Names::getValidFunctionName(*module, baseName);
+    if (cacheless) {
+      Expression* body =
+        dataInitCheck
+          ? builder.makeBlock({dataInitCheck, structNew}, resultType)
+          : structNew;
+      module->addFunction(builder.makeFunction(
+        factoryName, Signature(Type::i32, resultType), {}, body));
+      return factoryName;
+    }
+
+    Index objectLocal = 1;
+    Name label("cached");
+    auto* cacheGet =
+      builder.makeArrayGet(builder.makeGlobalGet(cacheName, cacheGlobalType),
+                           builder.makeLocalGet(indexLocal, Type::i32),
+                           MemoryOrder::Unordered,
+                           cacheElementType);
+    auto* brOn = builder.makeBrOn(BrOnNonNull, label, cacheGet);
+    auto* tee = builder.makeLocalTee(objectLocal, structNew, resultType);
+    auto* cacheSet =
+      builder.makeArraySet(builder.makeGlobalGet(cacheName, cacheGlobalType),
+                           builder.makeLocalGet(indexLocal, Type::i32),
+                           tee,
+                           MemoryOrder::Unordered);
+    std::vector<Expression*> blockList = {brOn};
+    if (dataInitCheck) {
+      blockList.push_back(dataInitCheck);
     }
     blockList.push_back(cacheSet);
     blockList.push_back(builder.makeLocalGet(objectLocal, resultType));
     auto* body = builder.makeBlock(label, blockList, resultType);
-    auto factoryName = Names::getValidFunctionName(*module, baseName);
     module->addFunction(builder.makeFunction(
       factoryName, Signature(Type::i32, resultType), {resultType}, body));
     return factoryName;
+  }
+
+  static bool hasImmutableSigField(Type t) {
+    if (!t.isRef() || !t.getHeapType().isStruct()) {
+      return false;
+    }
+    for (auto& field : t.getHeapType().getStruct().fields) {
+      if (field.mutable_ == Immutable && field.type.isRef() &&
+          field.type.getHeapType().isSignature()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool isInlinableAllocExpr(Expression* curr, bool isRoot) const {
+    if (auto* sn = curr->dynCast<StructNew>()) {
+      if (sn->desc || sn->type == Type::unreachable) {
+        return false;
+      }
+      if (preserveThunkTypes && hasImmutableSigField(sn->type)) {
+        return false;
+      }
+      for (auto* op : sn->operands) {
+        if (!isInlinableAllocExpr(op, false)) {
+          return false;
+        }
+      }
+      return true;
+    }
+    if (auto* anf = curr->dynCast<ArrayNewFixed>()) {
+      if (anf->type == Type::unreachable) {
+        return false;
+      }
+      if ((!isRoot && anf->values.size() > 16) || anf->values.size() > 256) {
+        return false;
+      }
+      for (auto* val : anf->values) {
+        if (!isInlinableAllocExpr(val, false)) {
+          return false;
+        }
+      }
+      return true;
+    }
+    if (auto* an = curr->dynCast<ArrayNew>()) {
+      if (an->type == Type::unreachable) {
+        return false;
+      }
+      if (an->init && !isInlinableAllocExpr(an->init, false)) {
+        return false;
+      }
+      return isInlinableAllocExpr(an->size, false);
+    }
+    if (auto* and_ = curr->dynCast<ArrayNewData>()) {
+      if (and_->type == Type::unreachable) {
+        return false;
+      }
+      return isInlinableAllocExpr(and_->offset, false) &&
+             isInlinableAllocExpr(and_->size, false);
+    }
+    if (isRoot) {
+      return false;
+    }
+    if (curr->is<Const>() || curr->is<RefNull>() || curr->is<RefFunc>() ||
+        curr->is<StringConst>()) {
+      return true;
+    }
+    if (auto* i31 = curr->dynCast<RefI31>()) {
+      return isInlinableAllocExpr(i31->value, false);
+    }
+    if (auto* gg = curr->dynCast<GlobalGet>()) {
+      auto* g = module->getGlobalOrNull(gg->name);
+      return g && !g->mutable_;
+    }
+    return false;
+  }
+
+  static bool isTrivialLocalInit(Expression* stmt) {
+    auto* ls = stmt->dynCast<LocalSet>();
+    if (!ls) {
+      return false;
+    }
+    Expression* v = ls->value;
+    return v->is<Const>() || v->is<RefNull>() || v->is<LocalGet>() ||
+           v->is<RefFunc>();
+  }
+
+  static Expression* getFirstStmt(Expression* expr) {
+    while (auto* b = expr->dynCast<Block>()) {
+      Expression* next = nullptr;
+      for (auto* item : b->list) {
+        if (!isTrivialLocalInit(item)) {
+          next = item;
+          break;
+        }
+      }
+      if (!next) {
+        return expr;
+      }
+      expr = next;
+    }
+    return expr;
+  }
+
+  static Block* getEditableBlock(Expression* expr) {
+    auto* b = expr->dynCast<Block>();
+    while (b) {
+      Index firstNonTrivial = 0;
+      while (firstNonTrivial < b->list.size() &&
+             isTrivialLocalInit(b->list[firstNonTrivial])) {
+        firstNonTrivial++;
+      }
+      if (firstNonTrivial + 1 == b->list.size() &&
+          b->list[firstNonTrivial]->is<Block>()) {
+        b = b->list[firstNonTrivial]->cast<Block>();
+      } else {
+        break;
+      }
+    }
+    return b;
+  }
+
+  void computeOnceGetSet(std::unordered_set<Expression*>& onceGets) {
+    std::unordered_set<Name> nonCodeGlobalUses;
+    std::unordered_set<Name> nonCallFuncUses;
+    std::unordered_map<Name, Index> initGlobalUses;
+
+    struct NonCodeScanner : public PostWalker<NonCodeScanner> {
+      std::unordered_set<Name>& globalUses;
+      std::unordered_set<Name>& funcUses;
+      std::unordered_map<Name, Index>* initMap = nullptr;
+      NonCodeScanner(std::unordered_set<Name>& globalUses,
+                     std::unordered_set<Name>& funcUses)
+        : globalUses(globalUses), funcUses(funcUses) {}
+      void visitGlobalGet(GlobalGet* curr) {
+        if (initMap) {
+          (*initMap)[curr->name]++;
+        } else {
+          globalUses.insert(curr->name);
+        }
+      }
+      void visitRefFunc(RefFunc* curr) { funcUses.insert(curr->func); }
+    } nonCodeScanner(nonCodeGlobalUses, nonCallFuncUses);
+
+    for (auto& g : module->globals) {
+      if (!g->imported()) {
+        nonCodeScanner.initMap = &initGlobalUses;
+        nonCodeScanner.walk(g->init);
+      }
+    }
+    nonCodeScanner.initMap = nullptr;
+    for (auto& seg : module->elementSegments) {
+      if (seg->offset) {
+        nonCodeScanner.walk(seg->offset);
+      }
+      for (auto* item : seg->data) {
+        nonCodeScanner.walk(item);
+      }
+    }
+    for (auto& seg : module->dataSegments) {
+      if (seg->offset) {
+        nonCodeScanner.walk(seg->offset);
+      }
+    }
+    for (auto& ex : module->exports) {
+      if (ex->kind == ExternalKind::Global) {
+        nonCodeGlobalUses.insert(*ex->getInternalName());
+      } else if (ex->kind == ExternalKind::Function) {
+        nonCallFuncUses.insert(*ex->getInternalName());
+      }
+    }
+    if (module->start.is()) {
+      nonCallFuncUses.insert(module->start);
+    }
+
+    struct FuncScanInfo {
+      std::vector<std::pair<Name, Expression**>> gets;
+      std::vector<std::pair<Name, Expression**>> sets;
+      std::vector<Call*> calls;
+      std::vector<If*> ifs;
+      std::vector<Name> refFuncs;
+    };
+
+    ModuleUtils::ParallelFunctionAnalysis<FuncScanInfo> funcAnalysis(
+      *module, [&](Function* func, FuncScanInfo& info) {
+        if (func->imported()) {
+          return;
+        }
+        struct Walker : public PostWalker<Walker> {
+          FuncScanInfo& info;
+          Walker(FuncScanInfo& info) : info(info) {}
+          void visitGlobalGet(GlobalGet* curr) {
+            info.gets.push_back({curr->name, getCurrentPointer()});
+          }
+          void visitGlobalSet(GlobalSet* curr) {
+            info.sets.push_back({curr->name, getCurrentPointer()});
+          }
+          void visitCall(Call* curr) { info.calls.push_back(curr); }
+          void visitIf(If* curr) { info.ifs.push_back(curr); }
+          void visitRefFunc(RefFunc* curr) {
+            info.refFuncs.push_back(curr->func);
+          }
+        };
+        Walker(info).walk(func->body);
+      });
+
+    std::unordered_map<Name, std::vector<std::pair<Function*, Expression**>>>
+      funcGets;
+    std::unordered_map<Name, std::vector<std::pair<Function*, Expression**>>>
+      funcSets;
+    std::unordered_map<Name, std::vector<std::pair<Function*, Call*>>>
+      funcCallers;
+    std::unordered_map<Name, std::vector<std::pair<Function*, If*>>>
+      flagGuardIfs;
+
+    for (auto& func : module->functions) {
+      if (func->imported()) {
+        continue;
+      }
+      auto& info = funcAnalysis.map[func.get()];
+      for (auto& [gname, ptr] : info.gets) {
+        funcGets[gname].push_back({func.get(), ptr});
+      }
+      for (auto& [gname, ptr] : info.sets) {
+        funcSets[gname].push_back({func.get(), ptr});
+      }
+      for (auto* call : info.calls) {
+        funcCallers[call->target].push_back({func.get(), call});
+      }
+      for (auto rf : info.refFuncs) {
+        nonCallFuncUses.insert(rf);
+      }
+    }
+
+    std::unordered_set<Name> onceFlags;
+    for (auto& g : module->globals) {
+      if (g->imported() || !g->mutable_ || g->type != Type::i32 ||
+          nonCodeGlobalUses.count(g->name) || initGlobalUses[g->name] > 0) {
+        continue;
+      }
+      auto* c = g->init->dynCast<Const>();
+      if (!c || c->value.geti32() != 0) {
+        continue;
+      }
+      auto it = funcSets.find(g->name);
+      if (it == funcSets.end() || it->second.empty()) {
+        continue;
+      }
+      bool allNonZeroConst = true;
+      for (auto& [_, setPtr] : it->second) {
+        auto* gs = (*setPtr)->cast<GlobalSet>();
+        auto* sc = gs->value->dynCast<Const>();
+        if (!sc || sc->value.geti32() == 0) {
+          allNonZeroConst = false;
+          break;
+        }
+      }
+      if (allNonZeroConst) {
+        onceFlags.insert(g->name);
+      }
+    }
+
+    auto isFlagEqzCond = [&](Expression* cond, Name& flagOut) -> bool {
+      auto* u = cond->dynCast<Unary>();
+      if (!u || u->op != EqZInt32) {
+        return false;
+      }
+      auto* gg = u->value->dynCast<GlobalGet>();
+      if (!gg || !onceFlags.count(gg->name) ||
+          funcSets[gg->name].size() != 1) {
+        return false;
+      }
+      flagOut = gg->name;
+      return true;
+    };
+
+    for (auto& func : module->functions) {
+      if (func->imported()) {
+        continue;
+      }
+      for (auto* iff : funcAnalysis.map[func.get()].ifs) {
+        Name flag;
+        if (!iff->ifFalse && isFlagEqzCond(iff->condition, flag)) {
+          flagGuardIfs[flag].push_back({func.get(), iff});
+        }
+      }
+    }
+
+    std::unordered_set<Name> onceHelperFuncs;
+    std::unordered_map<Name, Function*> flagHelperFunc;
+    for (auto& func : module->functions) {
+      if (func->imported() || nonCallFuncUses.count(func->name)) {
+        continue;
+      }
+      auto& callers = funcCallers[func->name];
+      if (callers.empty()) {
+        continue;
+      }
+      auto* firstSet = getFirstStmt(func->body)->dynCast<GlobalSet>();
+      if (!firstSet || !onceFlags.count(firstSet->name) ||
+          funcSets[firstSet->name].size() != 1) {
+        continue;
+      }
+      Name flag = firstSet->name;
+      auto& guards = flagGuardIfs[flag];
+      if (guards.size() != callers.size() ||
+          guards.size() != funcGets[flag].size()) {
+        continue;
+      }
+      bool allMatch = true;
+      for (auto& [_, iff] : guards) {
+        auto* call = getFirstStmt(iff->ifTrue)->dynCast<Call>();
+        if (!call || call != iff->ifTrue || call->target != func->name) {
+          allMatch = false;
+          break;
+        }
+      }
+      if (allMatch) {
+        onceHelperFuncs.insert(func->name);
+        flagHelperFunc[flag] = func.get();
+      }
+    }
+
+    auto isOnceIf = [&](If* iff) -> bool {
+      if (iff->ifFalse) {
+        return false;
+      }
+      Name flag;
+      if (isFlagEqzCond(iff->condition, flag)) {
+        Expression* first = getFirstStmt(iff->ifTrue);
+        if (auto* gs = first->dynCast<GlobalSet>()) {
+          return gs->name == flag;
+        }
+        if (auto* call = first->dynCast<Call>()) {
+          auto it = flagHelperFunc.find(flag);
+          return it != flagHelperFunc.end() &&
+                 it->second->name == call->target;
+        }
+        return false;
+      }
+      if (auto* rin = iff->condition->dynCast<RefIsNull>()) {
+        if (auto* gg = rin->value->dynCast<GlobalGet>()) {
+          Name lazy = gg->name;
+          auto* lg = module->getGlobalOrNull(lazy);
+          if (lg && !lg->imported() && lg->mutable_ && lg->type.isRef() &&
+              lg->type.isNullable() && lg->init->is<RefNull>() &&
+              !nonCodeGlobalUses.count(lazy) && initGlobalUses[lazy] == 0 &&
+              funcSets[lazy].size() == 1) {
+            Expression* targetSet = *funcSets[lazy][0].second;
+            for (auto* gs : FindAll<GlobalSet>(iff->ifTrue).list) {
+              if (gs == targetSet && !gs->value->is<RefNull>()) {
+                return true;
+              }
+            }
+          }
+        }
+      }
+      return false;
+    };
+
+    for (auto& func : module->functions) {
+      if (func->imported()) {
+        continue;
+      }
+      std::function<void(Expression*, bool, bool)> walkOnce =
+        [&](Expression* curr, bool inOnce, bool inLoopOrTry) {
+          if (!curr) {
+            return;
+          }
+          if (curr->is<Loop>() || curr->is<Try>() || curr->is<TryTable>()) {
+            inLoopOrTry = true;
+          }
+          if (auto* iff = curr->dynCast<If>()) {
+            walkOnce(iff->condition, inOnce, inLoopOrTry);
+            walkOnce(iff->ifTrue, inOnce || isOnceIf(iff), inLoopOrTry);
+            if (iff->ifFalse) {
+              walkOnce(iff->ifFalse, inOnce, inLoopOrTry);
+            }
+            return;
+          }
+          if (auto* gg = curr->dynCast<GlobalGet>()) {
+            if (inOnce && !inLoopOrTry) {
+              onceGets.insert(gg);
+            }
+            return;
+          }
+          for (auto* ch : ChildIterator(curr)) {
+            walkOnce(ch, inOnce, inLoopOrTry);
+          }
+        };
+      walkOnce(func->body, onceHelperFuncs.count(func->name) > 0, false);
+    }
+  }
+
+  void optimizeOnceGlobals(bool onlyArrays) {
+    std::unordered_set<Name> nonCodeGlobalUses;
+    std::unordered_set<Name> nonCallFuncUses;
+    std::unordered_map<Name, Index> initGlobalUses;
+
+    struct NonCodeScanner : public PostWalker<NonCodeScanner> {
+      std::unordered_set<Name>& globalUses;
+      std::unordered_set<Name>& funcUses;
+      std::unordered_map<Name, Index>* initMap = nullptr;
+      NonCodeScanner(std::unordered_set<Name>& globalUses,
+                     std::unordered_set<Name>& funcUses)
+        : globalUses(globalUses), funcUses(funcUses) {}
+      void visitGlobalGet(GlobalGet* curr) {
+        if (initMap) {
+          (*initMap)[curr->name]++;
+        } else {
+          globalUses.insert(curr->name);
+        }
+      }
+      void visitRefFunc(RefFunc* curr) { funcUses.insert(curr->func); }
+    } nonCodeScanner(nonCodeGlobalUses, nonCallFuncUses);
+
+    for (auto& g : module->globals) {
+      if (!g->imported()) {
+        nonCodeScanner.initMap = &initGlobalUses;
+        nonCodeScanner.walk(g->init);
+      }
+    }
+    nonCodeScanner.initMap = nullptr;
+    for (auto& seg : module->elementSegments) {
+      if (seg->offset) {
+        nonCodeScanner.walk(seg->offset);
+      }
+      for (auto* item : seg->data) {
+        nonCodeScanner.walk(item);
+      }
+    }
+    for (auto& seg : module->dataSegments) {
+      if (seg->offset) {
+        nonCodeScanner.walk(seg->offset);
+      }
+    }
+    for (auto& ex : module->exports) {
+      if (ex->kind == ExternalKind::Global) {
+        nonCodeGlobalUses.insert(*ex->getInternalName());
+      } else if (ex->kind == ExternalKind::Function) {
+        nonCallFuncUses.insert(*ex->getInternalName());
+      }
+    }
+    if (module->start.is()) {
+      nonCallFuncUses.insert(module->start);
+    }
+
+    struct FuncScanInfo {
+      std::vector<std::pair<Name, Expression**>> gets;
+      std::vector<std::pair<Name, Expression**>> sets;
+      std::vector<Call*> calls;
+      std::vector<If*> ifs;
+      std::vector<Name> refFuncs;
+    };
+
+    ModuleUtils::ParallelFunctionAnalysis<FuncScanInfo> funcAnalysis(
+      *module, [&](Function* func, FuncScanInfo& info) {
+        if (func->imported()) {
+          return;
+        }
+        struct Walker : public PostWalker<Walker> {
+          FuncScanInfo& info;
+          Walker(FuncScanInfo& info) : info(info) {}
+          void visitGlobalGet(GlobalGet* curr) {
+            info.gets.push_back({curr->name, getCurrentPointer()});
+          }
+          void visitGlobalSet(GlobalSet* curr) {
+            info.sets.push_back({curr->name, getCurrentPointer()});
+          }
+          void visitCall(Call* curr) { info.calls.push_back(curr); }
+          void visitIf(If* curr) { info.ifs.push_back(curr); }
+          void visitRefFunc(RefFunc* curr) {
+            info.refFuncs.push_back(curr->func);
+          }
+        };
+        Walker(info).walk(func->body);
+      });
+
+    std::unordered_map<Name, std::vector<std::pair<Function*, Expression**>>>
+      funcGets;
+    std::unordered_map<Name, std::vector<std::pair<Function*, Expression**>>>
+      funcSets;
+    std::unordered_map<Name, std::vector<std::pair<Function*, Call*>>>
+      funcCallers;
+    std::unordered_map<Name, std::vector<Name>> funcCallees;
+    std::unordered_map<Name, std::vector<std::pair<Function*, If*>>>
+      flagGuardIfs;
+
+    for (auto& func : module->functions) {
+      if (func->imported()) {
+        continue;
+      }
+      auto& info = funcAnalysis.map[func.get()];
+      for (auto& [gname, ptr] : info.gets) {
+        funcGets[gname].push_back({func.get(), ptr});
+      }
+      for (auto& [gname, ptr] : info.sets) {
+        funcSets[gname].push_back({func.get(), ptr});
+      }
+      auto& callees = funcCallees[func->name];
+      for (auto* call : info.calls) {
+        funcCallers[call->target].push_back({func.get(), call});
+        callees.push_back(call->target);
+      }
+      for (auto rf : info.refFuncs) {
+        nonCallFuncUses.insert(rf);
+      }
+    }
+
+    // Identify once-flag globals: mutable i32 globals initialized to 0 whose
+    // only sets are non-zero constants.
+    std::unordered_set<Name> onceFlags;
+    for (auto& g : module->globals) {
+      if (g->imported() || !g->mutable_ || g->type != Type::i32 ||
+          nonCodeGlobalUses.count(g->name) || initGlobalUses[g->name] > 0) {
+        continue;
+      }
+      auto* c = g->init->dynCast<Const>();
+      if (!c || c->value.geti32() != 0) {
+        continue;
+      }
+      auto it = funcSets.find(g->name);
+      if (it == funcSets.end() || it->second.empty()) {
+        continue;
+      }
+      bool allNonZeroConst = true;
+      for (auto& [_, setPtr] : it->second) {
+        auto* gs = (*setPtr)->cast<GlobalSet>();
+        auto* sc = gs->value->dynCast<Const>();
+        if (!sc || sc->value.geti32() == 0) {
+          allNonZeroConst = false;
+          break;
+        }
+      }
+      if (allNonZeroConst) {
+        onceFlags.insert(g->name);
+      }
+    }
+
+    auto isFlagEqzCond = [&](Expression* cond, Name& flagOut) -> bool {
+      auto* u = cond->dynCast<Unary>();
+      if (!u || u->op != EqZInt32) {
+        return false;
+      }
+      auto* gg = u->value->dynCast<GlobalGet>();
+      if (!gg || !onceFlags.count(gg->name) ||
+          funcSets[gg->name].size() != 1) {
+        return false;
+      }
+      flagOut = gg->name;
+      return true;
+    };
+
+    for (auto& func : module->functions) {
+      if (func->imported()) {
+        continue;
+      }
+      for (auto* iff : funcAnalysis.map[func.get()].ifs) {
+        Name flag;
+        if (!iff->ifFalse && isFlagEqzCond(iff->condition, flag)) {
+          flagGuardIfs[flag].push_back({func.get(), iff});
+        }
+      }
+    }
+
+    // Identify direct once-helper functions: functions starting with
+    // (global.set $flag (i32.const 1)) whose every call is in
+    // (if (i32.eqz (global.get $flag)) (then (call $fn))).
+    std::unordered_set<Name> onceHelperFuncs;
+    std::unordered_map<Name, Function*> flagHelperFunc;
+    for (auto& func : module->functions) {
+      if (func->imported() || nonCallFuncUses.count(func->name)) {
+        continue;
+      }
+      auto& callers = funcCallers[func->name];
+      if (callers.empty()) {
+        continue;
+      }
+      auto* firstSet = getFirstStmt(func->body)->dynCast<GlobalSet>();
+      if (!firstSet || !onceFlags.count(firstSet->name) ||
+          funcSets[firstSet->name].size() != 1) {
+        continue;
+      }
+      Name flag = firstSet->name;
+      auto& guards = flagGuardIfs[flag];
+      if (guards.size() != callers.size() ||
+          guards.size() != funcGets[flag].size()) {
+        continue;
+      }
+      bool allMatch = true;
+      for (auto& [_, iff] : guards) {
+        auto* call = getFirstStmt(iff->ifTrue)->dynCast<Call>();
+        if (!call || call != iff->ifTrue || call->target != func->name) {
+          allMatch = false;
+          break;
+        }
+      }
+      if (allMatch) {
+        onceHelperFuncs.insert(func->name);
+        flagHelperFunc[flag] = func.get();
+      }
+    }
+
+    auto isOnceIf = [&](If* iff) -> bool {
+      if (iff->ifFalse) {
+        return false;
+      }
+      Name flag;
+      if (isFlagEqzCond(iff->condition, flag)) {
+        Expression* first = getFirstStmt(iff->ifTrue);
+        if (auto* gs = first->dynCast<GlobalSet>()) {
+          return gs->name == flag;
+        }
+        if (auto* call = first->dynCast<Call>()) {
+          auto it = flagHelperFunc.find(flag);
+          return it != flagHelperFunc.end() &&
+                 it->second->name == call->target;
+        }
+        return false;
+      }
+      if (auto* rin = iff->condition->dynCast<RefIsNull>()) {
+        if (auto* gg = rin->value->dynCast<GlobalGet>()) {
+          Name lazy = gg->name;
+          auto* lg = module->getGlobalOrNull(lazy);
+          if (lg && !lg->imported() && lg->mutable_ && lg->type.isRef() &&
+              lg->type.isNullable() && lg->init->is<RefNull>() &&
+              !nonCodeGlobalUses.count(lazy) && initGlobalUses[lazy] == 0 &&
+              funcSets[lazy].size() == 1) {
+            Expression* targetSet = *funcSets[lazy][0].second;
+            for (auto* gs : FindAll<GlobalSet>(iff->ifTrue).list) {
+              if (gs == targetSet && !gs->value->is<RefNull>()) {
+                return true;
+              }
+            }
+          }
+        }
+      }
+      return false;
+    };
+
+    std::unordered_set<Function*> modifiedFuncs;
+    Builder builder(*module);
+
+    // -------------------------------------------------------------------------
+    // Pattern 1: Inline single-use immutable allocation globals in once-regions
+    // -------------------------------------------------------------------------
+    if (!preserveThunkTypes) {
+      std::unordered_map<Name, Index> totalCodeGets;
+      for (auto& [gname, vec] : funcGets) {
+        totalCodeGets[gname] = vec.size();
+      }
+      std::unordered_map<Name, std::vector<std::pair<Function*, Expression**>>>
+        onceGetLoc;
+
+      for (auto& func : module->functions) {
+        if (func->imported()) {
+          continue;
+        }
+        Function* fn = func.get();
+        std::function<void(Expression**, bool, bool)> walkOnce =
+          [&](Expression** exprp, bool inOnce, bool inLoopOrTry) {
+            if (!exprp || !*exprp) {
+              return;
+            }
+            Expression* curr = *exprp;
+            if (curr->is<Loop>() || curr->is<Try>() || curr->is<TryTable>()) {
+              inLoopOrTry = true;
+            }
+            if (auto* iff = curr->dynCast<If>()) {
+              walkOnce(&iff->condition, inOnce, inLoopOrTry);
+              walkOnce(&iff->ifTrue, inOnce || isOnceIf(iff), inLoopOrTry);
+              if (iff->ifFalse) {
+                walkOnce(&iff->ifFalse, inOnce, inLoopOrTry);
+              }
+              return;
+            }
+            if (auto* gg = curr->dynCast<GlobalGet>()) {
+              if (inOnce && !inLoopOrTry) {
+                onceGetLoc[gg->name].push_back({fn, exprp});
+              }
+              return;
+            }
+            for (auto*& ch : ChildIterator(curr)) {
+              walkOnce(&ch, inOnce, inLoopOrTry);
+            }
+          };
+        walkOnce(&fn->body, onceHelperFuncs.count(fn->name) > 0, false);
+      }
+
+      bool changed = true;
+      while (changed) {
+        changed = false;
+        std::vector<Name> globalsToRemove;
+        for (auto& g : module->globals) {
+          if (g->imported() || g->mutable_ ||
+              nonCodeGlobalUses.count(g->name)) {
+            continue;
+          }
+          if (onlyArrays &&
+              !(g->init->is<ArrayNewFixed>() || g->init->is<ArrayNew>() ||
+                g->init->is<ArrayNewData>() || g->init->is<ArrayNewElem>())) {
+            continue;
+          }
+          Name gname = g->name;
+          if (initGlobalUses[gname] != 0 || totalCodeGets[gname] != 1) {
+            continue;
+          }
+          auto it = onceGetLoc.find(gname);
+          if (it == onceGetLoc.end() || it->second.size() != 1) {
+            continue;
+          }
+          if (!isInlinableAllocExpr(g->init, true)) {
+            continue;
+          }
+          auto [targetFn, getPtr] = it->second[0];
+          Expression* copyInit = ExpressionManipulator::copy(g->init, *module);
+          *getPtr = copyInit;
+          modifiedFuncs.insert(targetFn);
+
+          std::function<void(Expression**)> recordInlined =
+            [&](Expression** p) {
+              Expression* e = *p;
+              if (auto* gg = e->dynCast<GlobalGet>()) {
+                initGlobalUses[gg->name]--;
+                totalCodeGets[gg->name]++;
+                onceGetLoc[gg->name].push_back({targetFn, p});
+                return;
+              }
+              for (auto*& ch : ChildIterator(e)) {
+                recordInlined(&ch);
+              }
+            };
+          recordInlined(getPtr);
+          globalsToRemove.push_back(gname);
+          changed = true;
+        }
+        for (auto name : globalsToRemove) {
+          module->removeGlobal(name);
+        }
+      }
+    }
+    if (onlyArrays) {
+      for (auto* fn : modifiedFuncs) {
+        ReFinalize().walkFunctionInModule(fn, module);
+      }
+      return;
+    }
+
+    // Rebuild funcGets after Pattern 1 inlining so Pattern 2/3 have accurate
+    // pointers and counts.
+    funcGets.clear();
+    for (auto& func : module->functions) {
+      if (func->imported()) {
+        continue;
+      }
+      struct GetCollector : public PostWalker<GetCollector> {
+        Function* fn;
+        std::unordered_map<
+          Name,
+          std::vector<std::pair<Function*, Expression**>>>& funcGets;
+        GetCollector(
+          Function* fn,
+          std::unordered_map<
+            Name,
+            std::vector<std::pair<Function*, Expression**>>>& funcGets)
+          : fn(fn), funcGets(funcGets) {}
+        void visitGlobalGet(GlobalGet* curr) {
+          funcGets[curr->name].push_back({fn, getCurrentPointer()});
+        }
+      };
+      GetCollector(func.get(), funcGets).walk(func->body);
+    }
+
+    // -------------------------------------------------------------------------
+    // Pattern 2: Demote same-block 1-set mutable globals in once-regions
+    // -------------------------------------------------------------------------
+    {
+      std::unordered_set<Name> candidateMutGlobals;
+      for (auto& g : module->globals) {
+        if (g->imported() || !g->mutable_ || onceFlags.count(g->name) ||
+            nonCodeGlobalUses.count(g->name) || initGlobalUses[g->name] > 0) {
+          continue;
+        }
+        bool isDefaultInit =
+          g->init->is<RefNull>() ||
+          (g->init->is<Const>() && g->init->cast<Const>()->value.isZero());
+        if (!isDefaultInit) {
+          continue;
+        }
+        auto setIt = funcSets.find(g->name);
+        auto getIt = funcGets.find(g->name);
+        if (setIt == funcSets.end() || setIt->second.size() != 1 ||
+            getIt == funcGets.end() || getIt->second.empty()) {
+          continue;
+        }
+        Function* fn = setIt->second[0].first;
+        bool sameFn = true;
+        for (auto& [gfn, _] : getIt->second) {
+          if (gfn != fn) {
+            sameFn = false;
+            break;
+          }
+        }
+        if (sameFn) {
+          candidateMutGlobals.insert(g->name);
+        }
+      }
+
+      if (!candidateMutGlobals.empty()) {
+        std::vector<Name> demotedGlobals;
+        for (auto& func : module->functions) {
+          if (func->imported()) {
+            continue;
+          }
+          Function* fn = func.get();
+          std::function<void(Expression*, bool, bool)> walkBlocks =
+            [&](Expression* curr, bool inOnce, bool inLoopOrTry) {
+              if (!curr) {
+                return;
+              }
+              if (curr->is<Loop>() || curr->is<Try>() || curr->is<TryTable>()) {
+                inLoopOrTry = true;
+              }
+              if (auto* iff = curr->dynCast<If>()) {
+                walkBlocks(iff->condition, inOnce, inLoopOrTry);
+                walkBlocks(iff->ifTrue, inOnce || isOnceIf(iff), inLoopOrTry);
+                if (iff->ifFalse) {
+                  walkBlocks(iff->ifFalse, inOnce, inLoopOrTry);
+                }
+                return;
+              }
+              if (auto* b = curr->dynCast<Block>()) {
+                if (inOnce && !inLoopOrTry) {
+                  for (Index i = 0; i < b->list.size(); i++) {
+                    auto* gs = b->list[i]->dynCast<GlobalSet>();
+                    if (!gs || !candidateMutGlobals.count(gs->name)) {
+                      continue;
+                    }
+                    Name gname = gs->name;
+                    // Check 0 gets of gname in gs->value.
+                    bool selfGet = false;
+                    for (auto* gg : FindAll<GlobalGet>(gs->value).list) {
+                      if (gg->name == gname) {
+                        selfGet = true;
+                        break;
+                      }
+                    }
+                    if (selfGet) {
+                      continue;
+                    }
+                    // Collect all GlobalGet** of gname in b->list[i + 1 ..].
+                    std::vector<Expression**> afterGets;
+                    std::function<void(Expression**)> collectGets =
+                      [&](Expression** p) {
+                        if (!p || !*p) {
+                          return;
+                        }
+                        if (auto* gg = (*p)->dynCast<GlobalGet>()) {
+                          if (gg->name == gname) {
+                            afterGets.push_back(p);
+                          }
+                          return;
+                        }
+                        for (auto*& ch : ChildIterator(*p)) {
+                          collectGets(&ch);
+                        }
+                      };
+                    for (Index j = i + 1; j < b->list.size(); j++) {
+                      collectGets(&b->list[j]);
+                    }
+                    if (afterGets.size() == funcGets[gname].size()) {
+                      Type gtype = module->getGlobal(gname)->type;
+                      Index loc = Builder::addVar(fn, gtype);
+                      b->list[i] = builder.makeLocalSet(loc, gs->value);
+                      for (auto** gp : afterGets) {
+                        *gp = builder.makeLocalGet(loc, gtype);
+                      }
+                      modifiedFuncs.insert(fn);
+                      demotedGlobals.push_back(gname);
+                      candidateMutGlobals.erase(gname);
+                      funcSets.erase(gname);
+                      funcGets.erase(gname);
+                    }
+                  }
+                }
+              }
+              for (auto* ch : ChildIterator(curr)) {
+                walkBlocks(ch, inOnce, inLoopOrTry);
+              }
+            };
+          walkBlocks(fn->body, onceHelperFuncs.count(fn->name) > 0, false);
+        }
+        for (auto name : demotedGlobals) {
+          module->removeGlobal(name);
+        }
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // Pattern 3: Eliminate redundant i32 once-flag globals
+    // -------------------------------------------------------------------------
+    {
+      auto isGuaranteedNonNull = [&](Expression* val,
+                                     const ExpressionList& stmts) -> bool {
+        if (val->type.isRef() && val->type.isNonNullable()) {
+          return true;
+        }
+        if (auto* lg = val->dynCast<LocalGet>()) {
+          bool foundNonNullSet = false;
+          for (Index i = 1; i + 1 < stmts.size(); i++) {
+            for (auto* ls : FindAll<LocalSet>(stmts[i]).list) {
+              if (ls->index == lg->index) {
+                if (ls->value->type.isRef() &&
+                    ls->value->type.isNonNullable()) {
+                  foundNonNullSet = true;
+                } else {
+                  return false;
+                }
+              }
+            }
+          }
+          return foundNonNullSet;
+        }
+        return false;
+      };
+
+      auto canExitOrModifyGlobals = [&](const ExpressionList& stmts,
+                                        Name topBlockName) -> bool {
+        for (Index i = 1; i + 1 < stmts.size(); i++) {
+          Expression* s = stmts[i];
+          if (!FindAll<GlobalSet>(s).list.empty() ||
+              !FindAll<Return>(s).list.empty() ||
+              !FindAll<Throw>(s).list.empty() ||
+              !FindAll<Rethrow>(s).list.empty() ||
+              !FindAll<Unreachable>(s).list.empty()) {
+            return true;
+          }
+          if (topBlockName.is()) {
+            for (auto* br : FindAll<Break>(s).list) {
+              if (br->name == topBlockName) {
+                return true;
+              }
+            }
+            for (auto* sw : FindAll<Switch>(s).list) {
+              if (sw->default_ == topBlockName ||
+                  std::find(sw->targets.begin(),
+                            sw->targets.end(),
+                            topBlockName) != sw->targets.end()) {
+                return true;
+              }
+            }
+            for (auto* bron : FindAll<BrOn>(s).list) {
+              if (bron->name == topBlockName) {
+                return true;
+              }
+            }
+          }
+        }
+        auto* lastSet = stmts.back()->cast<GlobalSet>();
+        return !FindAll<GlobalSet>(lastSet->value).list.empty();
+      };
+
+      auto funcTouchesGlobal = [&](Function* f, Name g) -> bool {
+        if (auto it = funcGets.find(g); it != funcGets.end()) {
+          for (auto& [fn, _] : it->second) {
+            if (fn == f) {
+              return true;
+            }
+          }
+        }
+        if (auto it = funcSets.find(g); it != funcSets.end()) {
+          for (auto& [fn, _] : it->second) {
+            if (fn == f) {
+              return true;
+            }
+          }
+        }
+        return false;
+      };
+
+      auto canReachTargetOrFlag = [&](const ExpressionList& stmts,
+                                      Name flag,
+                                      Name tg,
+                                      Function* selfFn) -> bool {
+        std::vector<Name> queue;
+        std::unordered_set<Name> visited;
+        auto scanExpr = [&](Expression* e) -> bool {
+          for (auto* gg : FindAll<GlobalGet>(e).list) {
+            if (gg->name == flag || gg->name == tg) {
+              return true;
+            }
+          }
+          for (auto* c : FindAll<Call>(e).list) {
+            if (visited.insert(c->target).second) {
+              queue.push_back(c->target);
+            }
+          }
+          return false;
+        };
+        for (Index i = 1; i + 1 < stmts.size(); i++) {
+          if (scanExpr(stmts[i])) {
+            return true;
+          }
+        }
+        if (scanExpr(stmts.back()->cast<GlobalSet>()->value)) {
+          return true;
+        }
+        while (!queue.empty()) {
+          Name fnName = queue.back();
+          queue.pop_back();
+          if (fnName == selfFn->name) {
+            return true;
+          }
+          Function* f = module->getFunctionOrNull(fnName);
+          if (!f || f->imported()) {
+            continue;
+          }
+          if (funcTouchesGlobal(f, flag) || funcTouchesGlobal(f, tg)) {
+            return true;
+          }
+          for (auto callee : funcCallees[fnName]) {
+            if (visited.insert(callee).second) {
+              queue.push_back(callee);
+            }
+          }
+        }
+        return false;
+      };
+
+      auto validateOnceBlock = [&](Block* topB,
+                                   Name flag,
+                                   Function* selfFn,
+                                   Global*& tgGlobOut,
+                                   Index& flagIdxOut) -> bool {
+        if (!topB || topB->list.size() < 2) {
+          return false;
+        }
+        Index flagIdx = 0;
+        while (flagIdx < topB->list.size() &&
+               isTrivialLocalInit(topB->list[flagIdx])) {
+          flagIdx++;
+        }
+        if (flagIdx + 1 >= topB->list.size()) {
+          return false;
+        }
+        auto* firstSet = topB->list[flagIdx]->dynCast<GlobalSet>();
+        auto* lastSet = topB->list.back()->dynCast<GlobalSet>();
+        if (!firstSet || firstSet->name != flag || !lastSet) {
+          return false;
+        }
+        Name tg = lastSet->name;
+        if (tg == flag || nonCodeGlobalUses.count(tg) ||
+            initGlobalUses[tg] > 0 || funcSets[tg].size() != 1) {
+          return false;
+        }
+        Global* tgGlob = module->getGlobalOrNull(tg);
+        if (!tgGlob || tgGlob->imported() || !tgGlob->mutable_ ||
+            !tgGlob->type.isRef() || !tgGlob->type.isNullable() ||
+            !tgGlob->init->is<RefNull>()) {
+          return false;
+        }
+        if (!isGuaranteedNonNull(lastSet->value, topB->list)) {
+          return false;
+        }
+        if (canExitOrModifyGlobals(topB->list, topB->name)) {
+          return false;
+        }
+        if (canReachTargetOrFlag(topB->list, flag, tg, selfFn)) {
+          return false;
+        }
+        tgGlobOut = tgGlob;
+        flagIdxOut = flagIdx;
+        return true;
+      };
+
+      std::vector<Name> flagsToRemove;
+      for (auto& g : module->globals) {
+        Name flag = g->name;
+        if (!onceFlags.count(flag) || funcSets[flag].size() != 1 ||
+            funcGets[flag].empty()) {
+          continue;
+        }
+        auto& guards = flagGuardIfs[flag];
+        if (guards.size() != funcGets[flag].size()) {
+          continue;
+        }
+        // Case 1: onceHelperFunc form
+        if (auto it = flagHelperFunc.find(flag); it != flagHelperFunc.end()) {
+          Function* helperFn = it->second;
+          Block* topB = getEditableBlock(helperFn->body);
+          Global* tgGlob = nullptr;
+          Index flagIdx = 0;
+          if (validateOnceBlock(topB, flag, helperFn, tgGlob, flagIdx)) {
+            for (auto& [callerFn, iff] : guards) {
+              iff->condition = builder.makeRefIsNull(
+                builder.makeGlobalGet(tgGlob->name, tgGlob->type));
+              modifiedFuncs.insert(callerFn);
+            }
+            topB->list.erase(topB->list.begin() + flagIdx);
+            modifiedFuncs.insert(helperFn);
+            flagsToRemove.push_back(flag);
+            continue;
+          }
+        }
+        // Case 2: inline onceIf form (1 get in the same function)
+        if (guards.size() == 1) {
+          auto [fn, iff] = guards[0];
+          if (funcSets[flag][0].first == fn) {
+            Block* topB = getEditableBlock(iff->ifTrue);
+            Global* tgGlob = nullptr;
+            Index flagIdx = 0;
+            if (validateOnceBlock(topB, flag, fn, tgGlob, flagIdx)) {
+              iff->condition = builder.makeRefIsNull(
+                builder.makeGlobalGet(tgGlob->name, tgGlob->type));
+              topB->list.erase(topB->list.begin() + flagIdx);
+              modifiedFuncs.insert(fn);
+              flagsToRemove.push_back(flag);
+              continue;
+            }
+          }
+        }
+      }
+      for (auto flag : flagsToRemove) {
+        module->removeGlobal(flag);
+      }
+    }
+
+    for (auto* fn : modifiedFuncs) {
+      ReFinalize().walkFunctionInModule(fn, module);
+    }
   }
 };
 
