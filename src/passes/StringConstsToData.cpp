@@ -46,14 +46,17 @@
 //
 // Data layout: all strings are laid out as one stream of UTF-16 code units.
 // Each group of strings (a column, or a chunk of direct uses) stores its
-// strings back-to-back, followed by one unit per string holding its length
-// (0xFFFF escapes to two more units, little-endian). The unit stream is
-// LZ77-compressed and Huffman-coded into a byte stream that is stored in one
-// passive data segment (see lz-huffman.h for the format and the decoder).
+// strings back-to-back, each followed by one 0 unit (strings that contain
+// U+0000 are left alone). The unit stream is LZ77-compressed and
+// Huffman-coded into a byte stream that is stored in one passive data segment
+// (see lz-huffman.h for the format and the decoder). Groups of direct uses
+// (and the start-fill group) are laid out in content order, which keeps
+// similar strings close together for the compressor; columns keep their
+// element order, which the reads index.
 //
 // On the first use of any string the stream is decoded once into a mutable
 // i16 array kept in a global, and the segment is dropped. On the first use of
-// a group, a helper reads the group's lengths from the array and builds an
+// a group, a helper scans the group's units for the terminators and builds an
 // i32 array of (start, end) pairs, so no per-string constants appear in the
 // code or in global initializers. A string is created with
 // fromCharCodeArray(array, start, end).
@@ -63,6 +66,8 @@
 // --pass-arg=string-consts-to-data-compress@0 emits only literal runs.
 // --pass-arg=string-consts-to-data-huffman@0 never entropy-codes the bytes,
 // @1 always does (the default decides by size).
+// --pass-arg=string-consts-to-data-sort@0 keeps the first-use order instead of
+// the content order.
 //
 // --pass-arg=string-consts-to-data-start-fill@1 additionally removes the
 // strings that are operands of struct.new or array.new_fixed in global
@@ -88,9 +93,9 @@
 #include "ir/type-updating.h"
 #include "pass.h"
 #include "passes/lz-huffman.h"
+#include "passes/string-consts.h"
 #include "passes/string-utils.h"
 #include "support/insert_ordered.h"
-#include "support/json.h"
 #include "support/string.h"
 #include "wasm-builder.h"
 #include "wasm.h"
@@ -102,9 +107,6 @@ namespace {
 // Maximum number of strings per group of direct uses, which keeps the indexes
 // at most 2 bytes as an SLEB.
 constexpr Index MaxChunkSize = 8192;
-
-const char* StringConstsModule = "string.const";
-const char* StringConstsSection = "string.consts";
 
 struct StringConstsToData : public Pass {
   struct StringInfo {
@@ -120,6 +122,9 @@ struct StringConstsToData : public Pass {
     bool pinned = false;
     // Whether the string has a slot in a global initializer (start-fill mode).
     bool hasSlot = false;
+    // Whether the string contains a 0 unit, which the terminated layout cannot
+    // represent; such a string is never moved to the data.
+    bool hasNul = false;
   };
 
   struct ColumnInfo {
@@ -156,6 +161,9 @@ struct StringConstsToData : public Pass {
   // 0: never, 1: always, 2: by size.
   int huffman = 2;
   bool startFill = false;
+  // Whether groups of direct uses and the start-fill group are ordered by
+  // content.
+  bool sort = true;
   InsertOrderedMap<Name, StringInfo> strings;
   InsertOrderedMap<Name, ColumnInfo> columns;
   std::vector<Slot> slots;
@@ -191,6 +199,7 @@ struct StringConstsToData : public Pass {
     }
     startFill =
       !getArgumentOrDefault("string-consts-to-data-start-fill", "").empty();
+    sort = getArgumentOrDefault("string-consts-to-data-sort", "1") != "0";
 
     if (!readStrings()) {
       return;
@@ -266,7 +275,13 @@ struct StringConstsToData : public Pass {
       }
     };
     for (auto& [name, column] : columns) {
-      if (column.pinned || column.gets != column.reads.size() ||
+      bool hasNul =
+        std::any_of(column.init->values.begin(),
+                    column.init->values.end(),
+                    [&](Expression* value) {
+                      return strings[value->cast<GlobalGet>()->name].hasNul;
+                    });
+      if (column.pinned || hasNul || column.gets != column.reads.size() ||
           column.reads.empty()) {
         pinColumn(column);
       }
@@ -322,7 +337,7 @@ struct StringConstsToData : public Pass {
       int64_t saving = int64_t(getImportBytes(string.wtf16)) -
                        int64_t(getEntryBytes(string.wtf16)) -
                        int64_t(string.codeUses) * 4;
-      if (always || startFill || saving > 0) {
+      if (!string.hasNul && (always || startFill || saving > 0)) {
         rawStrings.emplace_back(name, &string);
         modelSaving += saving;
       } else {
@@ -358,10 +373,15 @@ struct StringConstsToData : public Pass {
     }
 
     if (!rawStrings.empty()) {
+      // Order the group by content (first use breaks ties), which keeps
+      // similar strings together for the compressor.
       std::sort(rawStrings.begin(),
                 rawStrings.end(),
-                [](const std::pair<Name, StringInfo*>& a,
-                   const std::pair<Name, StringInfo*>& b) {
+                [&](const std::pair<Name, StringInfo*>& a,
+                    const std::pair<Name, StringInfo*>& b) {
+                  if (sort && a.second->wtf16 != b.second->wtf16) {
+                    return StringConsts::less(a.second->wtf16, b.second->wtf16);
+                  }
                   return a.second->firstUse < b.second->firstUse;
                 });
       std::unordered_map<Name, std::pair<Name, Index>> rawIndexes;
@@ -419,40 +439,20 @@ private:
   // false if there is nothing to do or the section is not in the expected
   // form.
   bool readStrings() {
-    auto iter = std::find_if(module->customSections.begin(),
-                             module->customSections.end(),
-                             [&](CustomSection& section) {
-                               return section.name == StringConstsSection;
-                             });
-    if (iter == module->customSections.end()) {
+    auto read = StringConsts::read(*module);
+    if (!read) {
       return false;
     }
-    std::string copy(iter->data.begin(), iter->data.end());
-    json::Value array;
-    array.parse(copy.data(), json::Value::WTF16);
-    if (!array.isArray()) {
-      return false;
+    for (auto& [name, wtf16] : *read) {
+      auto& info = strings[name];
+      for (size_t i = 0; i + 1 < wtf16.size(); i += 2) {
+        if (!wtf16[i] && !wtf16[i + 1]) {
+          info.hasNul = true;
+        }
+      }
+      info.wtf16 = std::move(wtf16);
     }
-    for (auto& global : module->globals) {
-      if (!global->imported() || global->module != StringConstsModule) {
-        continue;
-      }
-      if (global->mutable_ || global->type != refExtern) {
-        return false;
-      }
-      auto base = global->base.toString();
-      if (base.empty() || !std::all_of(base.begin(), base.end(), [](char c) {
-            return c >= '0' && c <= '9';
-          })) {
-        return false;
-      }
-      auto index = std::stoull(base);
-      if (index >= array.size() || !array[index]->isString()) {
-        return false;
-      }
-      strings[global->name].wtf16 = array[index]->getIString().toString();
-    }
-    return !strings.empty();
+    return true;
   }
 
   void findColumnsAndPinnedUses() {
@@ -586,7 +586,7 @@ private:
     }
   }
 
-  // Drops the slots whose string is pinned, too long for the fill helper, or
+  // Drops the slots whose string is pinned, contains a 0 unit, or
   // whose container cannot be made mutable, and collects the fields to make
   // mutable. A field must have the same mutability in all the types of its
   // hierarchy, and only private types can be changed.
@@ -637,8 +637,7 @@ private:
     // Pin the strings that cannot be filled, then drop all their slots.
     for (auto& slot : slots) {
       auto& string = strings[slot.string];
-      if (string.wtf16.size() / 2 >= 0xFFFF ||
-          !canMutate(slot.container, slot.index)) {
+      if (string.hasNul || !canMutate(slot.container, slot.index)) {
         string.pinned = true;
       }
     }
@@ -654,14 +653,17 @@ private:
   // returns the next string of the start group:
   //
   //   (func $next (result (ref extern))
-  //     (local $len i32) (local $start i32) (local $data (ref $i16))
+  //     (local $start i32) (local $p i32) (local $data (ref $i16))
   //     (local.set $data (ref.as_non_null (global.get $data)))
-  //     (local.set $len (array.get_u $i16 (local.get $data) (global.get $lp)))
-  //     (global.set $lp (i32.add (global.get $lp) (i32.const 1)))
-  //     (local.set $start (global.get $sp))
-  //     (global.set $sp (i32.add (local.get $start) (local.get $len)))
+  //     (local.set $p (local.tee $start (global.get $sp)))
+  //     (loop $scan
+  //       (if (array.get_u $i16 (local.get $data) (local.get $p))
+  //         (then
+  //           (local.set $p (i32.add (local.get $p) (i32.const 1)))
+  //           (br $scan))))
+  //     (global.set $sp (i32.add (local.get $p) (i32.const 1)))
   //     (call $fromCharCodeArray (local.get $data) (local.get $start)
-  //                              (global.get $sp)))
+  //                              (local.get $p)))
   //
   // The start function calls the decoder and then fills the slots in the
   // order in which their strings were added to the group, either one by one,
@@ -682,6 +684,8 @@ private:
   //
   // An element that is a global.get of another global holding a struct is
   // followed in a loop, and that struct's slot is then filled by the loop.
+  // The items are ordered by their (first) string, so that the group is
+  // sorted by content as far as the loops allow.
   void makeStartFill() {
     Builder builder(*module);
     auto i32 = Type::i32;
@@ -689,8 +693,12 @@ private:
     for (Index i = 0; i < slots.size(); i++) {
       slotIndexes[*slots[i].ptr] = i;
     }
-    std::vector<Expression*> items;
-    std::vector<std::string*> contents;
+    // An item of the start function: its code and the strings it reads.
+    struct Item {
+      std::vector<Expression*> code;
+      std::vector<std::string*> contents;
+    };
+    std::vector<Item> items;
     std::vector<bool> filled(slots.size(), false);
     Name nextName = Names::getValidFunctionName(*module, "string.consts$next");
     Index iLocal = 0;
@@ -723,20 +731,22 @@ private:
     auto needsItem = [&](Index slot) {
       return !filled[slot] && !inLoop.count(slot);
     };
-    auto fill = [&](Index slot, Expression* ref) -> Expression* {
+    auto fill = [&](Index slot, Expression* ref) {
       filled[slot] = true;
-      contents.push_back(&strings[slots[slot].string].wtf16);
       auto& info = slots[slot];
+      Expression* set;
       if (info.container.isStruct()) {
-        return builder.makeStructSet(info.index,
-                                     castTo(ref, info.container),
-                                     next(),
-                                     MemoryOrder::Unordered);
+        set = builder.makeStructSet(info.index,
+                                    castTo(ref, info.container),
+                                    next(),
+                                    MemoryOrder::Unordered);
+      } else {
+        set = builder.makeArraySet(castTo(ref, info.container),
+                                   builder.makeConst(int32_t(info.index)),
+                                   next(),
+                                   MemoryOrder::Unordered);
       }
-      return builder.makeArraySet(castTo(ref, info.container),
-                                  builder.makeConst(int32_t(info.index)),
-                                  next(),
-                                  MemoryOrder::Unordered);
+      items.push_back({{set}, {&strings[info.string].wtf16}});
     };
 
     // Fills the slots below curr, whose value is created by makeRef. The
@@ -750,7 +760,7 @@ private:
             auto* operand = structNew->operands[i];
             if (auto slot = getSlot(operand); slot != Index(-1)) {
               if (needsItem(slot)) {
-                items.push_back(fill(slot, makeRef()));
+                fill(slot, makeRef());
               }
             } else if (containsSlot(operand)) {
               auto fieldType = type.getStruct().fields[i].type;
@@ -769,7 +779,7 @@ private:
             auto* value = arrayNew->values[i];
             if (auto slot = getSlot(value); slot != Index(-1)) {
               if (needsItem(slot)) {
-                items.push_back(fill(slot, makeRef()));
+                fill(slot, makeRef());
               }
             } else if (containsSlot(value)) {
               emit(value, [=, &builder]() {
@@ -914,10 +924,11 @@ private:
           }
           // A slot in another global may be filled by several loops, each
           // adding its string again, which is harmless.
+          Item item;
           for (Index k = run.from; k < run.to; k++) {
             auto slot = getShape(arrayNew->values[k]).slot;
             filled[slot] = true;
-            contents.push_back(&strings[slots[slot].string].wtf16);
+            item.contents.push_back(&strings[slots[slot].string].wtf16);
           }
           auto* loop = builder.makeLoop(
             loopName,
@@ -934,15 +945,16 @@ private:
                        AddInt32, getI(), builder.makeConst(int32_t(1))),
                      i32),
                    builder.makeConst(int32_t(run.to))))}));
-          items.push_back(
+          item.code.push_back(
             builder.makeLocalSet(iLocal, builder.makeConst(int32_t(run.from))));
-          items.push_back(loop);
+          item.code.push_back(loop);
+          items.push_back(std::move(item));
           i = run.to;
           continue;
         }
         if (auto slot = getSlot(value); slot != Index(-1)) {
           if (needsItem(slot)) {
-            items.push_back(fill(slot, makeRoot()));
+            fill(slot, makeRoot());
           }
         } else if (containsSlot(value)) {
           emit(value, [=, &builder]() {
@@ -965,57 +977,68 @@ private:
       *slot.ptr = builder.makeRefNull(heapType.getBottom());
     }
 
+    // Order the items by content (stable, so the original order breaks ties).
+    if (sort) {
+      std::stable_sort(
+        items.begin(), items.end(), [](const Item& a, const Item& b) {
+          return StringConsts::less(*a.contents[0], *b.contents[0]);
+        });
+    }
+    std::vector<std::string*> contents;
+    for (auto& item : items) {
+      contents.insert(
+        contents.end(), item.contents.begin(), item.contents.end());
+    }
+
     // The group and the helper.
     auto layout = addGroup(contents);
     auto spName = Names::getValidGlobalName(*module, "string.consts$sp");
-    auto lpName = Names::getValidGlobalName(*module, "string.consts$lp");
     module->addGlobal(
       builder.makeGlobal(spName,
                          i32,
                          builder.makeConst(int32_t(layout.stringsOffset)),
                          Builder::Mutable));
-    module->addGlobal(
-      builder.makeGlobal(lpName,
-                         i32,
-                         builder.makeConst(int32_t(layout.lengthsOffset)),
-                         Builder::Mutable));
-    Index len = 0, start = 1, data = 2;
+    Index start = 0, p = 1, data = 2;
     Type i16Ref(i16ArrayType, NonNullable);
     auto* setData = builder.makeLocalSet(data, getData(true));
-    auto* setLen = builder.makeLocalSet(
-      len,
-      builder.makeArrayGet(builder.makeLocalGet(data, i16Ref),
-                           builder.makeGlobalGet(lpName, i32),
-                           MemoryOrder::Unordered,
-                           i32,
-                           false));
-    auto* incLp = builder.makeGlobalSet(
-      lpName,
+    auto* setStart = builder.makeLocalSet(
+      p, builder.makeLocalTee(start, builder.makeGlobalGet(spName, i32), i32));
+    Name scanLabel("scan");
+    auto* scan = builder.makeLoop(
+      scanLabel,
+      builder.makeIf(
+        builder.makeArrayGet(builder.makeLocalGet(data, i16Ref),
+                             builder.makeLocalGet(p, i32),
+                             MemoryOrder::Unordered,
+                             i32,
+                             false),
+        builder.makeBlock(
+          {builder.makeLocalSet(p,
+                                builder.makeBinary(AddInt32,
+                                                   builder.makeLocalGet(p, i32),
+                                                   builder.makeConst(1))),
+           builder.makeBreak(scanLabel)})));
+    auto* setSp = builder.makeGlobalSet(
+      spName,
       builder.makeBinary(
-        AddInt32, builder.makeGlobalGet(lpName, i32), builder.makeConst(1)));
-    auto* setStart =
-      builder.makeLocalSet(start, builder.makeGlobalGet(spName, i32));
-    auto* incSp =
-      builder.makeGlobalSet(spName,
-                            builder.makeBinary(AddInt32,
-                                               builder.makeLocalGet(start, i32),
-                                               builder.makeLocalGet(len, i32)));
+        AddInt32, builder.makeLocalGet(p, i32), builder.makeConst(1)));
     auto* make = builder.makeCall(fromCharCodeArray,
                                   {builder.makeLocalGet(data, i16Ref),
                                    builder.makeLocalGet(start, i32),
-                                   builder.makeGlobalGet(spName, i32)},
+                                   builder.makeLocalGet(p, i32)},
                                   refExtern);
     module->addFunction(builder.makeFunction(
       nextName,
       Signature(Type::none, refExtern),
       {i32, i32, i16Ref},
-      builder.makeBlock({setData, setLen, incLp, setStart, incSp, make},
-                        refExtern)));
+      builder.makeBlock({setData, setStart, scan, setSp, make}, refExtern)));
 
     // The start function.
     std::vector<Expression*> body;
     body.push_back(builder.makeCall(decodeFuncName, {}, Type::none));
-    body.insert(body.end(), items.begin(), items.end());
+    for (auto& item : items) {
+      body.insert(body.end(), item.code.begin(), item.code.end());
+    }
     if (module->start.is()) {
       body.push_back(builder.makeCall(module->start, {}, Type::none));
     }
@@ -1064,44 +1087,34 @@ private:
     return 13 + 5 + 4 + json.str().size() + 1;
   }
 
-  // The (uncompressed) bytes of the data and the length unit for a string.
+  // The (uncompressed) bytes of the data and the terminator for a string.
   Index getEntryBytes(const std::string& wtf16) {
-    Index bytes = 2;
+    Index bytes = 1;
     for (size_t i = 0; i < wtf16.size(); i += 2) {
       bytes += wtf16[i + 1] ? 2 : 1;
     }
     return bytes;
   }
 
-  // Emits the strings of a group into the unit stream, followed by their
-  // lengths. Returns the offsets (in units) of the strings and of the lengths.
+  // Emits the strings of a group into the unit stream, each followed by a 0
+  // unit. Returns the offset (in units) of the group.
   struct GroupLayout {
     Index stringsOffset;
-    Index lengthsOffset;
   };
 
   GroupLayout addGroup(std::vector<std::string*>& contents) {
     GroupLayout layout;
     layout.stringsOffset = units.size();
-    std::vector<uint32_t> lengths;
     for (auto* content : contents) {
       auto& wtf16 = *content;
       Index numUnits = wtf16.size() / 2;
-      lengths.push_back(numUnits);
       for (Index i = 0; i < numUnits; i++) {
-        units.push_back(uint8_t(wtf16[2 * i]) |
-                        (uint16_t(uint8_t(wtf16[2 * i + 1])) << 8));
+        uint16_t unit =
+          uint8_t(wtf16[2 * i]) | (uint16_t(uint8_t(wtf16[2 * i + 1])) << 8);
+        assert(unit != 0);
+        units.push_back(unit);
       }
-    }
-    layout.lengthsOffset = units.size();
-    for (auto length : lengths) {
-      if (length < 0xFFFF) {
-        units.push_back(length);
-      } else {
-        units.push_back(0xFFFF);
-        units.push_back(length & 0xFFFF);
-        units.push_back(length >> 16);
-      }
+      units.push_back(0);
     }
     return layout;
   }
@@ -1185,40 +1198,36 @@ private:
     return builder.makeRefAs(RefAsNonNull, get);
   }
 
-  // The shared table filler, which turns the length units of a group into a
-  // table of (start, end) pairs:
+  // The shared table filler, which scans the units of a group for the
+  // terminators and builds a table of (start, end) pairs:
   //
-  //   (func $fill (param $table (ref $table)) (param $p i32) (param $off i32)
-  //     (local $i i32) (local $v i32) (local $data (ref $i16))
+  //   (func $fill (param $table (ref $table)) (param $p i32)
+  //     (local $i i32) (local $data (ref $i16))
   //     (if (ref.is_null (global.get $data)) (then (call $decode)))
   //     (local.set $data (ref.as_non_null (global.get $data)))
   //     (loop $next
-  //       (array.set $table (local.get $table) (local.get $i) (local.get $off))
-  //       (local.set $v (array.get_u $i16 (local.get $data) (local.get $p)))
-  //       (local.set $p (i32.add (local.get $p) (i32.const 1)))
-  //       (if (i32.eq (local.get $v) (i32.const 65535))
-  //         (then
-  //           (local.set $v (i32.or ..2 units at $p, little-endian..))
-  //           (local.set $p (i32.add (local.get $p) (i32.const 2)))))
-  //       (local.set $off (i32.add (local.get $off) (local.get $v)))
+  //       (array.set $table (local.get $table) (local.get $i) (local.get $p))
+  //       (loop $scan
+  //         (if (array.get_u $i16 (local.get $data) (local.get $p))
+  //           (then
+  //             (local.set $p (i32.add (local.get $p) (i32.const 1)))
+  //             (br $scan))))
   //       (array.set $table (local.get $table)
-  //         (i32.or (local.get $i) (i32.const 1)) (local.get $off))
+  //         (i32.or (local.get $i) (i32.const 1)) (local.get $p))
+  //       (local.set $p (i32.add (local.get $p) (i32.const 1)))
   //       (br_if $next (i32.lt_u (local.tee $i (i32.add (local.get $i) 2))
   //                              (array.len (local.get $table))))))
   //
   void makeFiller() {
     Builder builder(*module);
-    Index table = 0, p = 1, off = 2, i = 3, v = 4, data = 5;
+    Index table = 0, p = 1, i = 2, data = 3;
     Type tableRef(tableType, NonNullable);
     Type i16Ref(i16ArrayType, NonNullable);
     auto i32 = Type::i32;
     auto get = [&](Index index) { return builder.makeLocalGet(index, i32); };
-    auto readUnit = [&](Expression* index) {
-      return builder.makeArrayGet(builder.makeLocalGet(data, i16Ref),
-                                  index,
-                                  MemoryOrder::Unordered,
-                                  i32,
-                                  false);
+    auto incP = [&]() {
+      return builder.makeLocalSet(
+        p, builder.makeBinary(AddInt32, get(p), builder.makeConst(1)));
     };
     auto* decode =
       builder.makeIf(builder.makeRefIsNull(builder.makeGlobalGet(
@@ -1227,30 +1236,22 @@ private:
     auto* setData = builder.makeLocalSet(data, getData(true));
     auto* setStart = builder.makeArraySet(builder.makeLocalGet(table, tableRef),
                                           get(i),
-                                          get(off),
+                                          get(p),
                                           MemoryOrder::Unordered);
-    auto* readV = builder.makeLocalSet(v, readUnit(get(p)));
-    auto* incP = builder.makeLocalSet(
-      p, builder.makeBinary(AddInt32, get(p), builder.makeConst(1)));
-    auto* longV = builder.makeBinary(
-      OrInt32,
-      readUnit(get(p)),
-      builder.makeBinary(
-        ShlInt32,
-        readUnit(builder.makeBinary(AddInt32, get(p), builder.makeConst(1))),
-        builder.makeConst(16)));
-    auto* escape = builder.makeIf(
-      builder.makeBinary(EqInt32, get(v), builder.makeConst(0xFFFF)),
-      builder.makeBlock(
-        {builder.makeLocalSet(v, longV),
-         builder.makeLocalSet(
-           p, builder.makeBinary(AddInt32, get(p), builder.makeConst(2)))}));
-    auto* advance =
-      builder.makeLocalSet(off, builder.makeBinary(AddInt32, get(off), get(v)));
+    Name scanLabel("scan");
+    auto* scan = builder.makeLoop(
+      scanLabel,
+      builder.makeIf(
+        builder.makeArrayGet(builder.makeLocalGet(data, i16Ref),
+                             get(p),
+                             MemoryOrder::Unordered,
+                             i32,
+                             false),
+        builder.makeBlock({incP(), builder.makeBreak(scanLabel)})));
     auto* setEnd = builder.makeArraySet(
       builder.makeLocalGet(table, tableRef),
       builder.makeBinary(OrInt32, get(i), builder.makeConst(1)),
-      get(off),
+      get(p),
       MemoryOrder::Unordered);
     Name label("next");
     auto* next = builder.makeBreak(
@@ -1262,13 +1263,11 @@ private:
           i, builder.makeBinary(AddInt32, get(i), builder.makeConst(2)), i32),
         builder.makeArrayLen(builder.makeLocalGet(table, tableRef))));
     auto* loop = builder.makeLoop(
-      label,
-      builder.makeBlock(
-        {setStart, readV, incP, escape, advance, setEnd, next}));
+      label, builder.makeBlock({setStart, scan, setEnd, incP(), next}));
     module->addFunction(
       builder.makeFunction(fillFuncName,
-                           Signature({tableRef, i32, i32}, Type::none),
-                           {i32, i32, i16Ref},
+                           Signature({tableRef, i32}, Type::none),
+                           {i32, i16Ref},
                            builder.makeBlock({decode, setData, loop})));
   }
 
@@ -1280,8 +1279,7 @@ private:
   //       (then
   //         (global.set $table
   //           (local.tee $t (array.new_default $table (i32.const 2 * N))))
-  //         (call $fill (local.get $t) (i32.const lengthsOffset)
-  //                                    (i32.const stringsOffset))))
+  //         (call $fill (local.get $t) (i32.const stringsOffset))))
   //     (call $fromCharCodeArray
   //       (ref.as_non_null (global.get $data))
   //       (array.get $table (global.get $table) (i32.shl (local.get $k) 1))
@@ -1319,7 +1317,6 @@ private:
              tableRef)),
          builder.makeCall(fillFuncName,
                           {builder.makeLocalGet(t, tableRef),
-                           builder.makeConst(int32_t(layout.lengthsOffset)),
                            builder.makeConst(int32_t(layout.stringsOffset))},
                           Type::none)}));
     auto readTable = [&](bool end) {
@@ -1383,7 +1380,7 @@ private:
     std::stringstream json;
     Index index = 0;
     for (auto& global : module->globals) {
-      if (!global->imported() || global->module != StringConstsModule) {
+      if (!global->imported() || global->module != StringConsts::ImportModule) {
         continue;
       }
       if (index > 0) {
@@ -1396,7 +1393,7 @@ private:
     auto iter = std::find_if(module->customSections.begin(),
                              module->customSections.end(),
                              [&](CustomSection& section) {
-                               return section.name == StringConstsSection;
+                               return section.name == StringConsts::SectionName;
                              });
     assert(iter != module->customSections.end());
     if (index == 0) {
