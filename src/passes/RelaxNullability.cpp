@@ -4080,9 +4080,9 @@ struct RelaxNullability : public Pass {
       }
 
       // Propagate parameter and return demands across direct and indirect calls
-      // for up to 4 rounds, followed by 1 verification pass.
-      for (int round = 0; round < 5; ++round) {
-        bool verifyOnly = (round == 4);
+      // for up to 4 rounds, followed by verification passes until convergence.
+      for (int round = 0; round < 16; ++round) {
+        bool verifyOnly = (round >= 4);
         struct FuncAnalysisResult {
           std::vector<HeapType> allowedHTs;
           std::unordered_map<Name, CallReturnDemand> callDemands;
@@ -4259,7 +4259,10 @@ struct RelaxNullability : public Pass {
           }
         }
 
-        if (!anyChanged && !verifyOnly) {
+        if (!anyChanged) {
+          if (verifyOnly) {
+            break;
+          }
           // Jump straight to verification pass.
           round = 3;
         }

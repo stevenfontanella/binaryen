@@ -456,6 +456,7 @@
   )
 
 )
+
 ;; CHECK:      (func $byn$mgfn-shared$yes-offset-local-indices-1 (type $1) (param $0 i32) (param $1 i32) (param $2 i32)
 ;; CHECK-NEXT:  (local $3 i32)
 ;; CHECK-NEXT:  (local $4 i32)
@@ -493,5 +494,120 @@
 ;; CHECK-NEXT:  )
 ;; CHECK-NEXT:  (drop
 ;; CHECK-NEXT:   (local.get $2)
+;; CHECK-NEXT:  )
+;; CHECK-NEXT: )
+(module
+  ;; CHECK:      (type $0 (func (param i32) (result i32)))
+
+  ;; CHECK:      (type $1 (func (param i32 (ref $0) i32) (result i32)))
+
+  ;; CHECK:      (global $g1 i32 (i32.const 100))
+  (global $g1 i32 (i32.const 100))
+  ;; CHECK:      (global $g2 i32 (i32.const 200))
+  (global $g2 i32 (i32.const 200))
+
+  ;; CHECK:      (elem declare func $target-a $target-b)
+
+  ;; CHECK:      (export "caller1" (func $caller-1))
+
+  ;; CHECK:      (export "caller2" (func $caller-2))
+
+  ;; CHECK:      (func $target-a (type $0) (param $0 i32) (result i32)
+  ;; CHECK-NEXT:  (local.get $0)
+  ;; CHECK-NEXT: )
+  (func $target-a (param i32) (result i32)
+    (local.get 0)
+  )
+  ;; CHECK:      (func $target-b (type $0) (param $0 i32) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (local.get $0)
+  ;; CHECK-NEXT:   (i32.const 1)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $target-b (param i32) (result i32)
+    (i32.add (local.get 0) (i32.const 1))
+  )
+
+  ;; Non-escaped 1-caller cluster members with repeated global.get + call target
+  ;; differences: both callers should be forwarded directly to the shared helper
+  ;; and the intermediate thunks eliminated.
+  (func $merged-callee-1 (param $x i32) (result i32)
+    (local $a i32)
+    (local $b i32)
+    (local.set $b (i32.add (local.get $x) (global.get $g1)))
+    (local.set $a (call $target-a (local.get $b)))
+    (if (result i32)
+      (i32.eq (i32.const 7) (local.get $a))
+      (then (i32.add (local.get $b) (global.get $g1)))
+      (else (call $target-a (local.get $a)))
+    )
+  )
+
+  (func $merged-callee-2 (param $x i32) (result i32)
+    (local $a i32)
+    (local $b i32)
+    (local.set $a (i32.add (local.get $x) (global.get $g2)))
+    (local.set $b (call $target-b (local.get $a)))
+    (if (result i32)
+      (i32.eq (local.get $b) (i32.const 7))
+      (then (i32.add (local.get $a) (global.get $g2)))
+      (else (call $target-b (local.get $b)))
+    )
+  )
+
+  ;; CHECK:      (func $caller-1 (type $0) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (call $byn$mgfn-shared$merged-callee-1
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (ref.func $target-a)
+  ;; CHECK-NEXT:   (global.get $g1)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $caller-1 (export "caller1") (param $x i32) (result i32)
+    (call $merged-callee-1 (local.get $x))
+  )
+
+  ;; CHECK:      (func $caller-2 (type $0) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (call $byn$mgfn-shared$merged-callee-1
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (ref.func $target-b)
+  ;; CHECK-NEXT:   (global.get $g2)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $caller-2 (export "caller2") (param $x i32) (result i32)
+    (call $merged-callee-2 (local.get $x))
+  )
+)
+;; CHECK:      (func $byn$mgfn-shared$merged-callee-1 (type $1) (param $0 i32) (param $1 (ref $0)) (param $2 i32) (result i32)
+;; CHECK-NEXT:  (local $3 i32)
+;; CHECK-NEXT:  (local $4 i32)
+;; CHECK-NEXT:  (local.set $3
+;; CHECK-NEXT:   (i32.add
+;; CHECK-NEXT:    (local.get $0)
+;; CHECK-NEXT:    (local.get $2)
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:  )
+;; CHECK-NEXT:  (local.set $4
+;; CHECK-NEXT:   (call_ref $0
+;; CHECK-NEXT:    (local.get $3)
+;; CHECK-NEXT:    (local.get $1)
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:  )
+;; CHECK-NEXT:  (if (result i32)
+;; CHECK-NEXT:   (i32.eq
+;; CHECK-NEXT:    (local.get $4)
+;; CHECK-NEXT:    (i32.const 7)
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (then
+;; CHECK-NEXT:    (i32.add
+;; CHECK-NEXT:     (local.get $3)
+;; CHECK-NEXT:     (local.get $2)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (else
+;; CHECK-NEXT:    (call_ref $0
+;; CHECK-NEXT:     (local.get $4)
+;; CHECK-NEXT:     (local.get $1)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
 ;; CHECK-NEXT:  )
 ;; CHECK-NEXT: )
