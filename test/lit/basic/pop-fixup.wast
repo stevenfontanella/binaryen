@@ -9,22 +9,16 @@
 
  ;; CHECK:      (func $stacky (type $0)
  ;; CHECK-NEXT:  (local $scratch i32)
- ;; CHECK-NEXT:  (local $1 i32)
  ;; CHECK-NEXT:  (try
  ;; CHECK-NEXT:   (do
  ;; CHECK-NEXT:   )
  ;; CHECK-NEXT:   (catch $e
- ;; CHECK-NEXT:    (local.set $1
+ ;; CHECK-NEXT:    (local.set $scratch
  ;; CHECK-NEXT:     (pop i32)
  ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:    (nop)
  ;; CHECK-NEXT:    (drop
- ;; CHECK-NEXT:     (block (result i32)
- ;; CHECK-NEXT:      (local.set $scratch
- ;; CHECK-NEXT:       (local.get $1)
- ;; CHECK-NEXT:      )
- ;; CHECK-NEXT:      (nop)
- ;; CHECK-NEXT:      (local.get $scratch)
- ;; CHECK-NEXT:     )
+ ;; CHECK-NEXT:     (local.get $scratch)
  ;; CHECK-NEXT:    )
  ;; CHECK-NEXT:   )
  ;; CHECK-NEXT:  )
@@ -39,24 +33,18 @@
 
  ;; CHECK:      (func $stacky-later (type $0)
  ;; CHECK-NEXT:  (local $scratch i32)
- ;; CHECK-NEXT:  (local $1 i32)
  ;; CHECK-NEXT:  (try
  ;; CHECK-NEXT:   (do
  ;; CHECK-NEXT:   )
  ;; CHECK-NEXT:   (catch $e
- ;; CHECK-NEXT:    (local.set $1
- ;; CHECK-NEXT:     (pop i32)
- ;; CHECK-NEXT:    )
- ;; CHECK-NEXT:    (drop
- ;; CHECK-NEXT:     (block (result i32)
- ;; CHECK-NEXT:      (local.set $scratch
- ;; CHECK-NEXT:       (i32.eqz
- ;; CHECK-NEXT:        (local.get $1)
- ;; CHECK-NEXT:       )
- ;; CHECK-NEXT:      )
- ;; CHECK-NEXT:      (nop)
- ;; CHECK-NEXT:      (local.get $scratch)
+ ;; CHECK-NEXT:    (local.set $scratch
+ ;; CHECK-NEXT:     (i32.eqz
+ ;; CHECK-NEXT:      (pop i32)
  ;; CHECK-NEXT:     )
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:    (nop)
+ ;; CHECK-NEXT:    (drop
+ ;; CHECK-NEXT:     (local.get $scratch)
  ;; CHECK-NEXT:    )
  ;; CHECK-NEXT:   )
  ;; CHECK-NEXT:  )
@@ -120,24 +108,24 @@
  ;; CHECK-NEXT:    (local.set $2
  ;; CHECK-NEXT:     (pop (tuple i32 i32))
  ;; CHECK-NEXT:    )
- ;; CHECK-NEXT:    (drop
- ;; CHECK-NEXT:     (block (result i32)
- ;; CHECK-NEXT:      (local.set $scratch_1
- ;; CHECK-NEXT:       (block (result i32)
- ;; CHECK-NEXT:        (local.set $scratch
- ;; CHECK-NEXT:         (local.get $2)
- ;; CHECK-NEXT:        )
- ;; CHECK-NEXT:        (nop)
- ;; CHECK-NEXT:        (tuple.extract 2 0
- ;; CHECK-NEXT:         (local.get $scratch)
- ;; CHECK-NEXT:        )
+ ;; CHECK-NEXT:    (block
+ ;; CHECK-NEXT:     (local.set $scratch_1
+ ;; CHECK-NEXT:      (block (result i32)
+ ;; CHECK-NEXT:       (local.set $scratch
+ ;; CHECK-NEXT:        (local.get $2)
  ;; CHECK-NEXT:       )
- ;; CHECK-NEXT:      )
- ;; CHECK-NEXT:      (drop
- ;; CHECK-NEXT:       (tuple.extract 2 1
+ ;; CHECK-NEXT:       (nop)
+ ;; CHECK-NEXT:       (tuple.extract 2 0
  ;; CHECK-NEXT:        (local.get $scratch)
  ;; CHECK-NEXT:       )
  ;; CHECK-NEXT:      )
+ ;; CHECK-NEXT:     )
+ ;; CHECK-NEXT:     (drop
+ ;; CHECK-NEXT:      (tuple.extract 2 1
+ ;; CHECK-NEXT:       (local.get $scratch)
+ ;; CHECK-NEXT:      )
+ ;; CHECK-NEXT:     )
+ ;; CHECK-NEXT:     (drop
  ;; CHECK-NEXT:      (local.get $scratch_1)
  ;; CHECK-NEXT:     )
  ;; CHECK-NEXT:    )
@@ -165,26 +153,26 @@
  ;; CHECK-NEXT:    (local.set $3
  ;; CHECK-NEXT:     (pop (tuple i32 i32))
  ;; CHECK-NEXT:    )
- ;; CHECK-NEXT:    (drop
- ;; CHECK-NEXT:     (block (result i32)
- ;; CHECK-NEXT:      (local.set $scratch_2
- ;; CHECK-NEXT:       (block (result i32)
- ;; CHECK-NEXT:        (local.set $scratch
- ;; CHECK-NEXT:         (local.tee $0
- ;; CHECK-NEXT:          (local.get $3)
- ;; CHECK-NEXT:         )
- ;; CHECK-NEXT:        )
- ;; CHECK-NEXT:        (nop)
- ;; CHECK-NEXT:        (tuple.extract 2 0
- ;; CHECK-NEXT:         (local.get $scratch)
+ ;; CHECK-NEXT:    (block
+ ;; CHECK-NEXT:     (local.set $scratch_2
+ ;; CHECK-NEXT:      (block (result i32)
+ ;; CHECK-NEXT:       (local.set $scratch
+ ;; CHECK-NEXT:        (local.tee $0
+ ;; CHECK-NEXT:         (local.get $3)
  ;; CHECK-NEXT:        )
  ;; CHECK-NEXT:       )
- ;; CHECK-NEXT:      )
- ;; CHECK-NEXT:      (drop
- ;; CHECK-NEXT:       (tuple.extract 2 1
+ ;; CHECK-NEXT:       (nop)
+ ;; CHECK-NEXT:       (tuple.extract 2 0
  ;; CHECK-NEXT:        (local.get $scratch)
  ;; CHECK-NEXT:       )
  ;; CHECK-NEXT:      )
+ ;; CHECK-NEXT:     )
+ ;; CHECK-NEXT:     (drop
+ ;; CHECK-NEXT:      (tuple.extract 2 1
+ ;; CHECK-NEXT:       (local.get $scratch)
+ ;; CHECK-NEXT:      )
+ ;; CHECK-NEXT:     )
+ ;; CHECK-NEXT:     (drop
  ;; CHECK-NEXT:      (local.get $scratch_2)
  ;; CHECK-NEXT:     )
  ;; CHECK-NEXT:    )

@@ -63,6 +63,7 @@
 #include "ir/principal-type.h"
 #include "ir/properties.h"
 #include "ir/utils.h"
+#include "support/small_set.h"
 #include "wasm-ir-builder.h"
 #include "wasm.h"
 
@@ -123,8 +124,124 @@ MaybeResult<IRBuilder::HoistedVal> IRBuilder::hoistLastValue(bool greedy) {
     return {};
   }
 
+  auto isPureTree = [&](Expression* root, SmallSet<Index, 4>& readLocals) {
+    if (!root->type.asWrittenGivenFeatures(wasm.features).isSingle()) {
+      return false;
+    }
+    SmallVector<Expression*, 8> worklist = {root};
+    while (!worklist.empty()) {
+      auto* curr = worklist.back();
+      worklist.pop_back();
+      if (auto* get = curr->dynCast<LocalGet>()) {
+        readLocals.insert(get->index);
+      } else if (curr->is<Const>() || curr->is<RefNull>() ||
+                 curr->is<RefFunc>()) {
+        // Pure leaf.
+      } else if (auto* gg = curr->dynCast<GlobalGet>()) {
+        auto* g = wasm.getGlobalOrNull(gg->name);
+        if (!g || g->mutable_ != Immutable) {
+          return false;
+        }
+      } else if (auto* bin = curr->dynCast<Binary>()) {
+        switch (bin->op) {
+          case DivSInt32:
+          case DivUInt32:
+          case RemSInt32:
+          case RemUInt32:
+          case DivSInt64:
+          case DivUInt64:
+          case RemSInt64:
+          case RemUInt64:
+            return false;
+          default:
+            break;
+        }
+        worklist.push_back(bin->left);
+        worklist.push_back(bin->right);
+      } else if (auto* un = curr->dynCast<Unary>()) {
+        switch (un->op) {
+          case TruncSFloat32ToInt32:
+          case TruncUFloat32ToInt32:
+          case TruncSFloat64ToInt32:
+          case TruncUFloat64ToInt32:
+          case TruncSFloat32ToInt64:
+          case TruncUFloat32ToInt64:
+          case TruncSFloat64ToInt64:
+          case TruncUFloat64ToInt64:
+            return false;
+          default:
+            break;
+        }
+        worklist.push_back(un->value);
+      } else if (auto* sel = curr->dynCast<Select>()) {
+        worklist.push_back(sel->ifTrue);
+        worklist.push_back(sel->ifFalse);
+        worklist.push_back(sel->condition);
+      } else if (auto* rin = curr->dynCast<RefIsNull>()) {
+        worklist.push_back(rin->value);
+      } else if (auto* req = curr->dynCast<RefEq>()) {
+        worklist.push_back(req->left);
+        worklist.push_back(req->right);
+      } else if (auto* rt = curr->dynCast<RefTest>()) {
+        worklist.push_back(rt->ref);
+      } else if (auto* rc = curr->dynCast<RefCast>()) {
+        if (rc->desc || !rc->ref->type.isRef() ||
+            (rc->type.isNonNullable() && rc->ref->type.isNull())) {
+          return false;
+        }
+        worklist.push_back(rc->ref);
+      } else if (auto* ra = curr->dynCast<RefAs>()) {
+        if (ra->op != RefAsNonNull || !ra->value->type.isRef() ||
+            ra->value->type.isNull()) {
+          return false;
+        }
+        worklist.push_back(ra->value);
+      } else if (auto* sg = curr->dynCast<StructGet>()) {
+        if (!sg->ref->type.isStruct() || sg->ref->type.isNull() ||
+            sg->order != MemoryOrder::Unordered ||
+            sg->ref->type.getHeapType().getStruct().fields[sg->index].mutable_ !=
+              Immutable) {
+          return false;
+        }
+        worklist.push_back(sg->ref);
+      } else {
+        return false;
+      }
+    }
+    return true;
+  };
+  auto canRotatePrecedingValues = [&](int limitIndex,
+                                      size_t stackEnd,
+                                      bool requirePrecedingValue) {
+    bool foundValue = false;
+    for (int i = 0; i < limitIndex; ++i) {
+      if (stack[i]->type == Type::none) {
+        continue;
+      }
+      foundValue = true;
+      SmallSet<Index, 4> preReadLocals;
+      if (!isPureTree(stack[i], preReadLocals)) {
+        return false;
+      }
+      if (!preReadLocals.empty()) {
+        for (size_t j = i + 1; j < stackEnd; ++j) {
+          for (auto* set : FindAll<LocalSet>(stack[j]).list) {
+            if (preReadLocals.contains(set->index)) {
+              return false;
+            }
+          }
+        }
+      }
+    }
+    return !requirePrecedingValue || foundValue;
+  };
+
+  auto*& expr = stack[valIndex];
+  auto type = expr->type.asWrittenGivenFeatures(wasm.features);
   int hoistIndex = valIndex;
-  if (greedy) {
+  if (greedy &&
+      !(type.isSingle() &&
+        canRotatePrecedingValues(valIndex, stack.size(), true))) {
     while (hoistIndex > 0 && stack[hoistIndex - 1]->type == Type::none) {
       --hoistIndex;
     }
@@ -134,7 +251,6 @@ MaybeResult<IRBuilder::HoistedVal> IRBuilder::hoistLastValue(bool greedy) {
     // Value-producing expression already on top of the stack.
     return HoistedVal{Index(hoistIndex), nullptr};
   }
-  auto*& expr = stack[valIndex];
   if (expr->type == Type::unreachable) {
     // No need for a scratch local to hoist an unreachable.
     return HoistedVal{Index(hoistIndex), nullptr};
@@ -147,7 +263,6 @@ MaybeResult<IRBuilder::HoistedVal> IRBuilder::hoistLastValue(bool greedy) {
   // text roundtripping if the block type would conflict after binary writing
   // with another function type in the module. Avoid this problem by
   // generalizing the scratch local type eagerly.
-  auto type = expr->type.asWrittenGivenFeatures(wasm.features);
   if (auto* tee = expr->dynCast<LocalSet>();
       tee && tee->isTee() && type.isSingle() &&
       func->getLocalType(tee->index) == type) {
@@ -167,26 +282,49 @@ MaybeResult<IRBuilder::HoistedVal> IRBuilder::hoistLastValue(bool greedy) {
       tee->makeSet();
       auto* get = builder.makeLocalGet(tee->index, type);
       pushSynthetic(get);
-      if (!greedy) {
-        bool hasPrecedingValue = false;
-        for (int i = 0; i < valIndex; ++i) {
-          if (stack[i]->type != Type::none) {
-            hasPrecedingValue = true;
-            break;
-          }
-        }
-        if (!hasPrecedingValue) {
-          hoistIndex = stack.size() - 1;
-        }
+      if (canRotatePrecedingValues(valIndex, stack.size() - 1, greedy)) {
+        hoistIndex = stack.size() - 1;
       }
       return HoistedVal{Index(hoistIndex), get};
     }
   }
+  if (type.isSingle()) {
+    SmallSet<Index, 4> readLocals;
+    if (isPureTree(expr, readLocals)) {
+      bool modified = false;
+      for (size_t i = valIndex + 1; i < stack.size(); ++i) {
+        if (!readLocals.empty()) {
+          for (auto* set : FindAll<LocalSet>(stack[i]).list) {
+            if (readLocals.contains(set->index)) {
+              modified = true;
+              break;
+            }
+          }
+        }
+        if (modified) {
+          break;
+        }
+      }
+      if (!modified) {
+        std::rotate(
+          stack.begin() + valIndex, stack.begin() + valIndex + 1, stack.end());
+        if (canRotatePrecedingValues(valIndex, stack.size() - 1, greedy)) {
+          hoistIndex = stack.size() - 1;
+        }
+        return HoistedVal{Index(hoistIndex), stack.back()->dynCast<LocalGet>()};
+      }
+    }
+  }
   auto scratchIdx = addScratchLocal(type);
   CHECK_ERR(scratchIdx);
+  bool isTupleExtract = expr->is<TupleExtract>();
   expr = builder.makeLocalSet(*scratchIdx, expr);
   auto* get = builder.makeLocalGet(*scratchIdx, type);
   pushSynthetic(get);
+  if (type.isSingle() && !isTupleExtract &&
+      canRotatePrecedingValues(valIndex, stack.size() - 1, greedy)) {
+    hoistIndex = stack.size() - 1;
+  }
   return HoistedVal{Index(hoistIndex), get};
 }
 

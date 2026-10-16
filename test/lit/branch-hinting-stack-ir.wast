@@ -9,18 +9,12 @@
  ;; CHECK:      (type $0 (func))
 
  ;; CHECK:      (func $empty-if (type $0)
- ;; CHECK-NEXT:  (local $scratch i32)
+ ;; CHECK-NEXT:  (drop
+ ;; CHECK-NEXT:   (i32.const 1)
+ ;; CHECK-NEXT:  )
  ;; CHECK-NEXT:  (@metadata.code.branch_hint "\00")
  ;; CHECK-NEXT:  (if
- ;; CHECK-NEXT:   (block (result i32)
- ;; CHECK-NEXT:    (local.set $scratch
- ;; CHECK-NEXT:     (i32.const 0)
- ;; CHECK-NEXT:    )
- ;; CHECK-NEXT:    (drop
- ;; CHECK-NEXT:     (i32.const 1)
- ;; CHECK-NEXT:    )
- ;; CHECK-NEXT:    (local.get $scratch)
- ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (i32.const 0)
  ;; CHECK-NEXT:   (then
  ;; CHECK-NEXT:   )
  ;; CHECK-NEXT:   (else

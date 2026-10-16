@@ -2,10 +2,10 @@
 ;; RUN: wasm-opt %s --simplify-locals -all -S -o - | filecheck %s
 
 (module
-  ;; CHECK:      (tag $e-i32 (type $0) (param i32))
+  ;; CHECK:      (tag $e-i32 (type $1) (param i32))
   (tag $e-i32 (param i32))
 
-  ;; CHECK:      (func $bar (type $1) (result i32)
+  ;; CHECK:      (func $bar (type $0) (result i32)
   ;; CHECK-NEXT:  (i32.const 3)
   ;; CHECK-NEXT: )
   (func $bar (result i32) (i32.const 3))
@@ -80,7 +80,7 @@
     )
   )
 
-  ;; CHECK:      (func $return-call-can-be-sinked-into-try_table (type $1) (result i32)
+  ;; CHECK:      (func $return-call-can-be-sinked-into-try_table (type $0) (result i32)
   ;; CHECK-NEXT:  (local $0 i32)
   ;; CHECK-NEXT:  (nop)
   ;; CHECK-NEXT:  (block $tryend (result i32)
@@ -125,7 +125,7 @@
     )
   )
 
-  ;; CHECK:      (func $equivalent-set-removal-call (type $0) (param $0 i32)
+  ;; CHECK:      (func $equivalent-set-removal-call (type $1) (param $0 i32)
   ;; CHECK-NEXT:  (local $1 i32)
   ;; CHECK-NEXT:  (nop)
   ;; CHECK-NEXT:  (drop
@@ -138,9 +138,7 @@
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (local.get $0)
   ;; CHECK-NEXT:  )
-  ;; CHECK-NEXT:  (drop
-  ;; CHECK-NEXT:   (local.get $0)
-  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (nop)
   ;; CHECK-NEXT: )
   (func $equivalent-set-removal-call (param $0 i32)
     (local $1 i32)
@@ -222,5 +220,87 @@
     ;; As in the else, this could be optimized. TODO
     (drop (local.get $0))
     (drop (local.get $1))
+  )
+
+  ;; CHECK:      (func $sink-pure-set-across-throwing-call (type $0) (result i32)
+  ;; CHECK-NEXT:  (local $0 i32)
+  ;; CHECK-NEXT:  (local $1 i32)
+  ;; CHECK-NEXT:  (nop)
+  ;; CHECK-NEXT:  (nop)
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $bar)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (i32.const 42)
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (local.tee $1
+  ;; CHECK-NEXT:     (i32.const 7)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (local.get $1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $sink-pure-set-across-throwing-call (result i32)
+    (local $0 i32)
+    (local $1 i32)
+    (local.set $0 (i32.const 42))
+    (local.set $1 (i32.const 7))
+    (drop (call $bar))
+    (i32.add
+      (local.get $0)
+      (i32.add
+        (local.get $1)
+        (local.get $1)
+      )
+    )
+  )
+
+  ;; CHECK:      (func $no-sink-multi-use-set-across-throwing-call-in-try (type $0) (result i32)
+  ;; CHECK-NEXT:  (local $0 i32)
+  ;; CHECK-NEXT:  (local $1 i32)
+  ;; CHECK-NEXT:  (block $tryend (result i32)
+  ;; CHECK-NEXT:   (drop
+  ;; CHECK-NEXT:    (block $catch (result i32)
+  ;; CHECK-NEXT:     (try_table (catch $e-i32 $catch)
+  ;; CHECK-NEXT:      (nop)
+  ;; CHECK-NEXT:      (local.set $1
+  ;; CHECK-NEXT:       (i32.const 20)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (drop
+  ;; CHECK-NEXT:       (call $bar)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (drop
+  ;; CHECK-NEXT:       (i32.const 10)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (drop
+  ;; CHECK-NEXT:       (local.get $1)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (br $tryend
+  ;; CHECK-NEXT:      (i32.const 0)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.get $1)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $no-sink-multi-use-set-across-throwing-call-in-try (result i32)
+    (local $0 i32)
+    (local $1 i32)
+    (block $tryend (result i32)
+      (drop
+        (block $catch (result i32)
+          (try_table (catch $e-i32 $catch)
+            (local.set $0 (i32.const 10))
+            (local.set $1 (i32.const 20))
+            (drop (call $bar))
+            (drop (local.get $0))
+            (drop (local.get $1))
+          )
+          (br $tryend (i32.const 0))
+        )
+      )
+      (local.get $1)
+    )
   )
 )

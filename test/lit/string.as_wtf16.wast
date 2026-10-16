@@ -99,19 +99,15 @@
   ;; RTRIP:      (func $slice (type $0) (result stringref)
   ;; RTRIP-NEXT:  (local $0 i32)
   ;; RTRIP-NEXT:  (local $1 i32)
-  ;; RTRIP-NEXT:  (local $scratch i32)
   ;; RTRIP-NEXT:  (stringview_wtf16.slice
   ;; RTRIP-NEXT:   (string.const "abc")
   ;; RTRIP-NEXT:   (block (result i32)
   ;; RTRIP-NEXT:    (local.set $0
   ;; RTRIP-NEXT:     (block (result i32)
-  ;; RTRIP-NEXT:      (local.set $scratch
-  ;; RTRIP-NEXT:       (i32.const 1)
-  ;; RTRIP-NEXT:      )
   ;; RTRIP-NEXT:      (local.set $1
   ;; RTRIP-NEXT:       (i32.const 2)
   ;; RTRIP-NEXT:      )
-  ;; RTRIP-NEXT:      (local.get $scratch)
+  ;; RTRIP-NEXT:      (i32.const 1)
   ;; RTRIP-NEXT:     )
   ;; RTRIP-NEXT:    )
   ;; RTRIP-NEXT:    (local.get $0)
@@ -123,22 +119,18 @@
   ;; RRTRP-NEXT:  (local $0 i32)
   ;; RRTRP-NEXT:  (local $1 i32)
   ;; RRTRP-NEXT:  (local $2 i32)
-  ;; RRTRP-NEXT:  (local $scratch i32)
   ;; RRTRP-NEXT:  (stringview_wtf16.slice
   ;; RRTRP-NEXT:   (string.const "abc")
   ;; RRTRP-NEXT:   (block (result i32)
+  ;; RRTRP-NEXT:    (local.set $0
+  ;; RRTRP-NEXT:     (i32.const 2)
+  ;; RRTRP-NEXT:    )
   ;; RRTRP-NEXT:    (local.set $1
   ;; RRTRP-NEXT:     (block (result i32)
-  ;; RRTRP-NEXT:      (local.set $scratch
-  ;; RRTRP-NEXT:       (i32.const 1)
-  ;; RRTRP-NEXT:      )
-  ;; RRTRP-NEXT:      (local.set $0
-  ;; RRTRP-NEXT:       (i32.const 2)
-  ;; RRTRP-NEXT:      )
   ;; RRTRP-NEXT:      (local.set $2
   ;; RRTRP-NEXT:       (local.get $0)
   ;; RRTRP-NEXT:      )
-  ;; RRTRP-NEXT:      (local.get $scratch)
+  ;; RRTRP-NEXT:      (i32.const 1)
   ;; RRTRP-NEXT:     )
   ;; RRTRP-NEXT:    )
   ;; RRTRP-NEXT:    (local.get $1)
@@ -170,19 +162,15 @@
   ;; RTRIP-NEXT:  (local $start i32)
   ;; RTRIP-NEXT:  (local $1 i32)
   ;; RTRIP-NEXT:  (local $2 i32)
-  ;; RTRIP-NEXT:  (local $scratch i32)
   ;; RTRIP-NEXT:  (stringview_wtf16.slice
   ;; RTRIP-NEXT:   (string.const "abc")
   ;; RTRIP-NEXT:   (block (result i32)
   ;; RTRIP-NEXT:    (local.set $1
   ;; RTRIP-NEXT:     (block (result i32)
-  ;; RTRIP-NEXT:      (local.set $scratch
-  ;; RTRIP-NEXT:       (local.get $start)
-  ;; RTRIP-NEXT:      )
   ;; RTRIP-NEXT:      (local.set $2
   ;; RTRIP-NEXT:       (i32.const 2)
   ;; RTRIP-NEXT:      )
-  ;; RTRIP-NEXT:      (local.get $scratch)
+  ;; RTRIP-NEXT:      (local.get $start)
   ;; RTRIP-NEXT:     )
   ;; RTRIP-NEXT:    )
   ;; RTRIP-NEXT:    (local.get $1)
@@ -195,22 +183,18 @@
   ;; RRTRP-NEXT:  (local $1 i32)
   ;; RRTRP-NEXT:  (local $2 i32)
   ;; RRTRP-NEXT:  (local $3 i32)
-  ;; RRTRP-NEXT:  (local $scratch i32)
   ;; RRTRP-NEXT:  (stringview_wtf16.slice
   ;; RRTRP-NEXT:   (string.const "abc")
   ;; RRTRP-NEXT:   (block (result i32)
+  ;; RRTRP-NEXT:    (local.set $1
+  ;; RRTRP-NEXT:     (i32.const 2)
+  ;; RRTRP-NEXT:    )
   ;; RRTRP-NEXT:    (local.set $2
   ;; RRTRP-NEXT:     (block (result i32)
-  ;; RRTRP-NEXT:      (local.set $scratch
-  ;; RRTRP-NEXT:       (local.get $start)
-  ;; RRTRP-NEXT:      )
-  ;; RRTRP-NEXT:      (local.set $1
-  ;; RRTRP-NEXT:       (i32.const 2)
-  ;; RRTRP-NEXT:      )
   ;; RRTRP-NEXT:      (local.set $3
   ;; RRTRP-NEXT:       (local.get $1)
   ;; RRTRP-NEXT:      )
-  ;; RRTRP-NEXT:      (local.get $scratch)
+  ;; RRTRP-NEXT:      (local.get $start)
   ;; RRTRP-NEXT:     )
   ;; RRTRP-NEXT:    )
   ;; RRTRP-NEXT:    (local.get $2)
@@ -240,19 +224,15 @@
   ;; RTRIP-NEXT:  (local $end i32)
   ;; RTRIP-NEXT:  (local $1 i32)
   ;; RTRIP-NEXT:  (local $2 i32)
-  ;; RTRIP-NEXT:  (local $scratch i32)
   ;; RTRIP-NEXT:  (stringview_wtf16.slice
   ;; RTRIP-NEXT:   (string.const "abc")
   ;; RTRIP-NEXT:   (block (result i32)
   ;; RTRIP-NEXT:    (local.set $1
   ;; RTRIP-NEXT:     (block (result i32)
-  ;; RTRIP-NEXT:      (local.set $scratch
-  ;; RTRIP-NEXT:       (i32.const 1)
-  ;; RTRIP-NEXT:      )
   ;; RTRIP-NEXT:      (local.set $2
   ;; RTRIP-NEXT:       (local.get $end)
   ;; RTRIP-NEXT:      )
-  ;; RTRIP-NEXT:      (local.get $scratch)
+  ;; RTRIP-NEXT:      (i32.const 1)
   ;; RTRIP-NEXT:     )
   ;; RTRIP-NEXT:    )
   ;; RTRIP-NEXT:    (local.get $1)
@@ -265,22 +245,18 @@
   ;; RRTRP-NEXT:  (local $1 i32)
   ;; RRTRP-NEXT:  (local $2 i32)
   ;; RRTRP-NEXT:  (local $3 i32)
-  ;; RRTRP-NEXT:  (local $scratch i32)
   ;; RRTRP-NEXT:  (stringview_wtf16.slice
   ;; RRTRP-NEXT:   (string.const "abc")
   ;; RRTRP-NEXT:   (block (result i32)
+  ;; RRTRP-NEXT:    (local.set $1
+  ;; RRTRP-NEXT:     (local.get $end)
+  ;; RRTRP-NEXT:    )
   ;; RRTRP-NEXT:    (local.set $2
   ;; RRTRP-NEXT:     (block (result i32)
-  ;; RRTRP-NEXT:      (local.set $scratch
-  ;; RRTRP-NEXT:       (i32.const 1)
-  ;; RRTRP-NEXT:      )
-  ;; RRTRP-NEXT:      (local.set $1
-  ;; RRTRP-NEXT:       (local.get $end)
-  ;; RRTRP-NEXT:      )
   ;; RRTRP-NEXT:      (local.set $3
   ;; RRTRP-NEXT:       (local.get $1)
   ;; RRTRP-NEXT:      )
-  ;; RRTRP-NEXT:      (local.get $scratch)
+  ;; RRTRP-NEXT:      (i32.const 1)
   ;; RRTRP-NEXT:     )
   ;; RRTRP-NEXT:    )
   ;; RRTRP-NEXT:    (local.get $2)

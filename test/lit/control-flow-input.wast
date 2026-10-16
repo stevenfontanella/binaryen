@@ -107,16 +107,12 @@
 
   ;; CHECK:      (func $block-passthrough-nop (type $0) (result i32)
   ;; CHECK-NEXT:  (local $scratch i32)
-  ;; CHECK-NEXT:  (local $scratch_1 i32)
   ;; CHECK-NEXT:  (local.set $scratch
   ;; CHECK-NEXT:   (i32.const 0)
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT:  (block (result i32)
-  ;; CHECK-NEXT:   (local.set $scratch_1
-  ;; CHECK-NEXT:    (local.get $scratch)
-  ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:   (nop)
-  ;; CHECK-NEXT:   (local.get $scratch_1)
+  ;; CHECK-NEXT:   (local.get $scratch)
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
   (func $block-passthrough-nop (result i32)

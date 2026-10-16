@@ -32,11 +32,13 @@
 
 namespace wasm {
 
-StackIROptimizer::StackIROptimizer(Function* func,
+StackIROptimizer::StackIROptimizer(Module& module,
+                                   Function* func,
                                    StackIR& insts,
                                    const PassOptions& passOptions,
                                    FeatureSet features)
-  : func(func), insts(insts), passOptions(passOptions), features(features) {}
+  : module(module), func(func), insts(insts), passOptions(passOptions),
+    features(features) {}
 
 void StackIROptimizer::run() {
   dce();
@@ -145,6 +147,100 @@ bool StackIROptimizer::isConsumedBySymmetricOp(Index getIndex) {
   return inst->origin->is<RefEq>();
 }
 
+bool StackIROptimizer::isPureSlice(Index start,
+                                   Index end,
+                                   SmallLocalSet& readLocals,
+                                   bool allowTrapsNeverHappen) {
+  if (start > end) {
+    return false;
+  }
+  int needed = 1;
+  bool seenAny = false;
+  for (Index i = end;; i--) {
+    if (auto* inst = insts[i]) {
+      if (needed <= 0) {
+        return false;
+      }
+      if (inst->op != StackInst::Basic || !inst->type.isConcrete() ||
+          !inst->type.isSingle()) {
+        return false;
+      }
+      auto* orig = inst->origin;
+      if (orig->is<LocalSet>()) {
+        return false;
+      }
+      if (auto* get = orig->dynCast<LocalGet>()) {
+        readLocals.insert(get->index);
+      } else if (orig->is<Const>() || orig->is<RefNull>() ||
+                 orig->is<RefFunc>() || orig->is<Select>() ||
+                 orig->is<RefIsNull>() || orig->is<RefEq>()) {
+        // Pure.
+      } else if (auto* gg = orig->dynCast<GlobalGet>()) {
+        auto* g = module.getGlobalOrNull(gg->name);
+        if (!g || g->mutable_ != Immutable) {
+          return false;
+        }
+      } else if (auto* bin = orig->dynCast<Binary>()) {
+        switch (bin->op) {
+          case DivSInt32:
+          case DivUInt32:
+          case RemSInt32:
+          case RemUInt32:
+          case DivSInt64:
+          case DivUInt64:
+          case RemSInt64:
+          case RemUInt64:
+            return false;
+          default:
+            break;
+        }
+      } else if (auto* un = orig->dynCast<Unary>()) {
+        switch (un->op) {
+          case TruncSFloat32ToInt32:
+          case TruncUFloat32ToInt32:
+          case TruncSFloat64ToInt32:
+          case TruncUFloat64ToInt32:
+          case TruncSFloat32ToInt64:
+          case TruncUFloat32ToInt64:
+          case TruncSFloat64ToInt64:
+          case TruncUFloat64ToInt64:
+            return false;
+          default:
+            break;
+        }
+      } else if (orig->is<RefTest>()) {
+        // ref.test is always pure and non-trapping.
+      } else if (auto* rc = orig->dynCast<RefCast>()) {
+        if (!allowTrapsNeverHappen || rc->desc || !rc->ref->type.isRef() ||
+            (rc->type.isNonNullable() && rc->ref->type.isNull())) {
+          return false;
+        }
+      } else if (auto* ra = orig->dynCast<RefAs>()) {
+        if (!allowTrapsNeverHappen || ra->op != RefAsNonNull ||
+            !ra->value->type.isRef() || ra->value->type.isNull()) {
+          return false;
+        }
+      } else if (auto* sg = orig->dynCast<StructGet>()) {
+        if (!sg->ref->type.isStruct() || sg->ref->type.isNull() ||
+            sg->order != MemoryOrder::Unordered ||
+            (!allowTrapsNeverHappen && sg->ref->type.isNullable()) ||
+            sg->ref->type.getHeapType().getStruct().fields[sg->index].mutable_ !=
+              Immutable) {
+          return false;
+        }
+      } else {
+        return false;
+      }
+      needed = needed - 1 + int(getNumConsumedValues(inst));
+      seenAny = true;
+    }
+    if (i == start) {
+      break;
+    }
+  }
+  return seenAny && needed == 0;
+}
+
 // If ordered properly, we can avoid a local.set/local.get pair,
 // and use the value directly from the stack, for example
 //    [..produce a value on the stack..]
@@ -170,15 +266,33 @@ void StackIROptimizer::local2Stack() {
   // LocalGets.
   auto deferredGets = findStringViewDeferredGets();
 
+  bool hasTry = false;
+  for (auto* inst : insts) {
+    if (inst && (inst->op == StackInst::TryBegin ||
+                 inst->op == StackInst::TryTableBegin)) {
+      hasTry = true;
+      break;
+    }
+  }
+
   // We maintain a stack of relevant values. This contains:
-  //  * a null for each actual value that the value stack would have
+  //  * a null setIndex for each actual value that the value stack would have
   //  * an index of each LocalSet that *could* be on the value
-  //    stack at that location.
+  //    stack at that location, along with its value slice bounds.
   const Index null = -1;
-  std::vector<Index> values;
+  struct StackEntry {
+    Index setIndex;
+    Index valStart;
+    Index valEnd;
+  };
+  struct SavedStack {
+    std::vector<StackEntry> values;
+    Index controlFlowStart;
+  };
+  std::vector<StackEntry> values;
   // We also maintain a stack of values vectors for control flow,
   // saving the stack as we enter and restoring it when we exit.
-  std::vector<std::vector<Index>> savedValues;
+  std::vector<SavedStack> savedValues;
 #if STACK_OPT_DEBUG
   std::cout << "func: " << func->name << '\n' << insts << '\n';
 #endif
@@ -193,21 +307,23 @@ void StackIROptimizer::local2Stack() {
     std::cout << "  " << instIndex << " : " << *inst << ", " << values.size()
               << " on stack, will consume " << consumed << "\n    ";
     for (auto s : values)
-      std::cout << s << ' ';
+      std::cout << s.setIndex << ' ';
     std::cout << '\n';
 #endif
     // TODO: currently we run dce before this, but if we didn't, we'd need
     //       to handle unreachable code here - it's ok to pop multiple values
     //       there even if the stack is at size 0.
+    Index firstOperandStart = instIndex;
     while (consumed > 0) {
       assert(values.size() > 0);
       // Whenever we hit a possible stack value, kill it - it would
       // be consumed here, so we can never optimize to it.
-      while (values.back() != null) {
+      while (values.back().setIndex != null) {
         values.pop_back();
         assert(values.size() > 0);
       }
       // Finally, consume the actual value that is consumed here.
+      firstOperandStart = values.back().valStart;
       values.pop_back();
       consumed--;
     }
@@ -215,11 +331,12 @@ void StackIROptimizer::local2Stack() {
     // control flow.
     if (isControlFlowBegin(inst)) {
       // Save the stack for when we end this control flow.
-      savedValues.push_back(values); // TODO: optimize copies
+      savedValues.push_back({std::move(values), firstOperandStart});
       values.clear();
     } else if (isControlFlowEnd(inst)) {
       assert(!savedValues.empty());
-      values = savedValues.back();
+      firstOperandStart = savedValues.back().controlFlowStart;
+      values = std::move(savedValues.back().values);
       savedValues.pop_back();
     } else if (isControlFlow(inst)) {
       // Otherwise, in the middle of control flow, just clear it
@@ -240,22 +357,12 @@ void StackIROptimizer::local2Stack() {
         // can reach the set.
         if (values.size() > 0) {
           Index j = values.size() - 1;
-          // If an actual value is in the way then the set's value is not on
-          // top of the stack at the get. That is fine if exactly one value is
-          // in the way and it is consumed together with the get by an
-          // operation with interchangeable operands, as then the order does
-          // not matter.
-          bool intervening = false;
+          Index numInterveningVals = 0;
           while (1) {
-            auto setIndex = values[j];
+            auto setIndex = values[j].setIndex;
             if (setIndex == null) {
-              if (intervening || !isConsumedBySymmetricOp(getIndex)) {
-                // More than one value is in the way, or the value that is in
-                // the way is not consumed together with the get: give up.
-                break;
-              }
-              intervening = true;
-              if (j == 0) {
+              numInterveningVals++;
+              if (numInterveningVals > 6 || j == 0) {
                 break;
               }
               j--;
@@ -268,33 +375,316 @@ void StackIROptimizer::local2Stack() {
               auto& sets = localGraph.getSets(get);
               if (sets.size() == 1 && *sets.begin() == set) {
                 auto& setInfluences = localGraph.getSetInfluences(set);
-                // If this has the proper value of 1, also do the potentially-
-                // expensive check of whether we can remove this pair at all.
-                if (setInfluences.size() == 1 &&
-                    canRemoveSetGetPair(setIndex, getIndex)) {
-                  assert(*setInfluences.begin() == get);
-                  // Do it! The set and the get can go away, the proper
-                  // value is on the stack.
+                if (numInterveningVals == 0 ||
+                    (numInterveningVals == 1 &&
+                     isConsumedBySymmetricOp(getIndex))) {
+                  // If this has the proper value of 1, also do the potentially-
+                  // expensive check of whether we can remove this pair at all.
+                  if (setInfluences.size() == 1 &&
+                      canRemoveSetGetPair(setIndex, getIndex)) {
+                    assert(*setInfluences.begin() == get);
+                    // Do it! The set and the get can go away, the proper
+                    // value is on the stack.
 #if STACK_OPT_DEBUG
-                  std::cout << "  stackify the get\n";
+                    std::cout << "  stackify the get\n";
 #endif
-                  insts[setIndex] = nullptr;
-                  insts[getIndex] = nullptr;
-                } else {
-                  // The local value is still needed for other gets (or for
-                  // validation dominance), so we cannot remove the set, but we
-                  // can turn the set into a tee and remove this get.
-                  insts[setIndex]->type = func->getLocalType(set->index);
-                  insts[getIndex] = nullptr;
+                    insts[setIndex] = nullptr;
+                    insts[getIndex] = nullptr;
+                  } else {
+                    // The local value is still needed for other gets (or for
+                    // validation dominance), so we cannot remove the set, but
+                    // we can turn the set into a tee and remove this get.
+                    insts[setIndex]->type = func->getLocalType(set->index);
+                    insts[getIndex] = nullptr;
+                  }
+                  // Continuing on from here, replace this on the stack
+                  // with a null, representing a regular value. We
+                  // keep possible values above us active - they may
+                  // be optimized later, as they would be pushed after
+                  // us, and used before us, so there is no conflict.
+                  values[j] = {null, values[j].valStart, setIndex};
+                  optimized = true;
+                  break;
                 }
-                // Continuing on from here, replace this on the stack
-                // with a null, representing a regular value. We
-                // keep possible values above us active - they may
-                // be optimized later, as they would be pushed after
-                // us, and used before us, so there is no conflict.
-                values[j] = null;
-                optimized = true;
-                break;
+
+                // We have 1..6 intervening values on the stack.
+                // Direction 1: Forward pure-set sinking.
+                Index setValStart = values[j].valStart;
+                bool canSinkForward = setValStart < setIndex;
+                for (size_t m = j + 1; canSinkForward && m < values.size();
+                     ++m) {
+                  if (values[m].valStart <= setIndex) {
+                    canSinkForward = false;
+                  }
+                }
+                bool hasThrowingCall = false;
+                for (Index p = setIndex + 1; canSinkForward && p < getIndex;
+                     ++p) {
+                  auto* pInst = insts[p];
+                  if (!pInst) {
+                    continue;
+                  }
+                  if (pInst->op != StackInst::Basic) {
+                    canSinkForward = false;
+                    break;
+                  }
+                  auto* orig = pInst->origin;
+                  if (Properties::isBranch(orig) || orig->is<Return>() ||
+                      orig->is<Throw>() || orig->is<Rethrow>() ||
+                      orig->is<Unreachable>() || orig->is<Pop>()) {
+                    canSinkForward = false;
+                    break;
+                  }
+                  if (orig->is<Call>() || orig->is<CallRef>() ||
+                      orig->is<CallIndirect>()) {
+                    if (hasTry && setInfluences.size() > 1) {
+                      canSinkForward = false;
+                      break;
+                    }
+                    hasThrowingCall = true;
+                  }
+                  if (auto* lg = orig->dynCast<LocalGet>()) {
+                    if (lg->index == set->index) {
+                      canSinkForward = false;
+                      break;
+                    }
+                  } else if (auto* ls = orig->dynCast<LocalSet>()) {
+                    if (ls->index == set->index) {
+                      canSinkForward = false;
+                      break;
+                    }
+                  }
+                }
+                SmallLocalSet setReadLocals;
+                if (canSinkForward &&
+                    !isPureSlice(setValStart,
+                                 setIndex - 1,
+                                 setReadLocals,
+                                 passOptions.trapsNeverHappen &&
+                                   !hasThrowingCall)) {
+                  canSinkForward = false;
+                }
+                if (canSinkForward && !setReadLocals.empty()) {
+                  for (Index p = setIndex + 1; p < getIndex; ++p) {
+                    auto* pInst = insts[p];
+                    if (!pInst) {
+                      continue;
+                    }
+                    if (auto* ls = pInst->origin->dynCast<LocalSet>()) {
+                      if (setReadLocals.contains(ls->index)) {
+                        canSinkForward = false;
+                        break;
+                      }
+                    }
+                  }
+                }
+                if (canSinkForward) {
+                  if (setInfluences.size() == 1 &&
+                      canRemoveSetGetPair(setIndex, getIndex)) {
+                    insts[setIndex] = nullptr;
+                    insts[getIndex] = nullptr;
+                  } else {
+                    insts[setIndex]->type = func->getLocalType(set->index);
+                    insts[getIndex] = nullptr;
+                  }
+                  Index sliceLen = setIndex - setValStart + 1;
+                  std::rotate(insts.begin() + setValStart,
+                              insts.begin() + setIndex + 1,
+                              insts.begin() + getIndex);
+                  values.erase(values.begin() + j);
+                  for (size_t m = j; m < values.size(); ++m) {
+                    if (values[m].setIndex != null) {
+                      values[m].setIndex -= sliceLen;
+                    }
+                    values[m].valStart -= sliceLen;
+                    values[m].valEnd -= sliceLen;
+                  }
+                  values.push_back({null, getIndex - sliceLen, getIndex - 1});
+                  optimized = true;
+                  break;
+                }
+
+                // Direction 2: Backward pure-subtree rotation.
+                size_t firstValIdx = values.size() - numInterveningVals;
+                bool canRotateBackward =
+                  setValStart < setIndex && firstValIdx > j;
+                for (size_t m = j + 1; canRotateBackward && m < firstValIdx;
+                     ++m) {
+                  if (values[m].setIndex == null ||
+                      values[m].valStart <= setIndex) {
+                    canRotateBackward = false;
+                  }
+                }
+                for (size_t m = firstValIdx;
+                     canRotateBackward && m < values.size();
+                     ++m) {
+                  if (values[m].setIndex != null ||
+                      values[m].valStart > values[m].valEnd) {
+                    canRotateBackward = false;
+                    break;
+                  }
+                  Index nextStart =
+                    (m + 1 < values.size()) ? values[m + 1].valStart : getIndex;
+                  if (values[m].valEnd >= nextStart) {
+                    canRotateBackward = false;
+                    break;
+                  }
+                  for (Index p = values[m].valEnd + 1; p < nextStart; ++p) {
+                    if (insts[p]) {
+                      canRotateBackward = false;
+                      break;
+                    }
+                  }
+                }
+                Index ivFirstStart =
+                  canRotateBackward ? values[firstValIdx].valStart : 0;
+                if (canRotateBackward && ivFirstStart <= setIndex) {
+                  canRotateBackward = false;
+                }
+                for (size_t m = j + 1; canRotateBackward && m < firstValIdx;
+                     ++m) {
+                  if (values[m].setIndex >= ivFirstStart) {
+                    canRotateBackward = false;
+                  }
+                }
+                int depth = 0;
+                bool hasBranchOrThrow = false;
+                for (Index p = setValStart;
+                     canRotateBackward && p < ivFirstStart;
+                     ++p) {
+                  auto* pInst = insts[p];
+                  if (!pInst) {
+                    continue;
+                  }
+                  if (pInst->op != StackInst::Basic) {
+                    if (pInst->op == StackInst::LoopBegin ||
+                        pInst->op == StackInst::LoopEnd ||
+                        pInst->op == StackInst::TryBegin ||
+                        pInst->op == StackInst::TryEnd ||
+                        pInst->op == StackInst::Catch ||
+                        pInst->op == StackInst::CatchAll ||
+                        pInst->op == StackInst::Delegate ||
+                        pInst->op == StackInst::TryTableBegin ||
+                        pInst->op == StackInst::TryTableEnd) {
+                      canRotateBackward = false;
+                      break;
+                    }
+                    if (isControlFlowBegin(pInst)) {
+                      depth++;
+                      hasBranchOrThrow = true;
+                    } else if (isControlFlowEnd(pInst)) {
+                      if (depth == 0) {
+                        canRotateBackward = false;
+                        break;
+                      }
+                      depth--;
+                      hasBranchOrThrow = true;
+                    } else if (pInst->op == StackInst::IfElse) {
+                      if (depth == 0) {
+                        canRotateBackward = false;
+                        break;
+                      }
+                      hasBranchOrThrow = true;
+                    }
+                    continue;
+                  }
+                  auto* orig = pInst->origin;
+                  if (orig->is<Pop>() || orig->is<Return>() ||
+                      orig->is<Throw>() || orig->is<Rethrow>() ||
+                      orig->is<Unreachable>()) {
+                    canRotateBackward = false;
+                    break;
+                  }
+                  if (Properties::isBranch(orig)) {
+                    if (depth == 0) {
+                      canRotateBackward = false;
+                      break;
+                    }
+                    hasBranchOrThrow = true;
+                  }
+                  if (orig->is<Call>() || orig->is<CallRef>() ||
+                      orig->is<CallIndirect>()) {
+                    if (!passOptions.trapsNeverHappen || depth > 0) {
+                      hasBranchOrThrow = true;
+                    }
+                  }
+                  if (p > setIndex) {
+                    if (auto* ls = orig->dynCast<LocalSet>()) {
+                      if (ls->index == set->index) {
+                        canRotateBackward = false;
+                        break;
+                      }
+                    } else if (auto* lg = orig->dynCast<LocalGet>()) {
+                      if (lg->index == set->index) {
+                        canRotateBackward = false;
+                        break;
+                      }
+                    }
+                  }
+                }
+                if (depth != 0) {
+                  canRotateBackward = false;
+                }
+                SmallLocalSet ivReadLocals;
+                for (size_t m = firstValIdx;
+                     canRotateBackward && m < values.size();
+                     ++m) {
+                  if (!isPureSlice(values[m].valStart,
+                                   values[m].valEnd,
+                                   ivReadLocals,
+                                   passOptions.trapsNeverHappen &&
+                                     !hasBranchOrThrow)) {
+                    canRotateBackward = false;
+                    break;
+                  }
+                }
+                if (ivReadLocals.contains(set->index)) {
+                  canRotateBackward = false;
+                }
+                if (canRotateBackward && !ivReadLocals.empty()) {
+                  for (Index p = setValStart; p < getIndex; ++p) {
+                    auto* pInst = insts[p];
+                    if (!pInst) {
+                      continue;
+                    }
+                    if (auto* ls = pInst->origin->dynCast<LocalSet>()) {
+                      if (ivReadLocals.contains(ls->index)) {
+                        canRotateBackward = false;
+                        break;
+                      }
+                    }
+                  }
+                }
+                if (canRotateBackward) {
+                  if (setInfluences.size() == 1 &&
+                      canRemoveSetGetPair(setIndex, getIndex)) {
+                    insts[setIndex] = nullptr;
+                    insts[getIndex] = nullptr;
+                  } else {
+                    insts[setIndex]->type = func->getLocalType(set->index);
+                    insts[getIndex] = nullptr;
+                  }
+                  Index ivLen = getIndex - ivFirstStart;
+                  Index prefixLen = ivFirstStart - setValStart;
+                  std::rotate(insts.begin() + setValStart,
+                              insts.begin() + ivFirstStart,
+                              insts.begin() + getIndex);
+                  values[j] = {null, setValStart + ivLen, setIndex + ivLen};
+                  for (size_t m = j + 1; m < firstValIdx; ++m) {
+                    values[m].setIndex += ivLen;
+                    values[m].valStart += ivLen;
+                    values[m].valEnd += ivLen;
+                  }
+                  for (size_t m = firstValIdx; m < values.size(); ++m) {
+                    values[m].valStart -= prefixLen;
+                    values[m].valEnd -= prefixLen;
+                  }
+                  std::rotate(values.begin() + j,
+                              values.begin() + firstValIdx,
+                              values.end());
+                  optimized = true;
+                  break;
+                }
               }
             }
             // We failed here. Can we look some more?
@@ -307,11 +697,11 @@ void StackIROptimizer::local2Stack() {
       }
       if (!optimized) {
         // This is an actual regular value on the value stack.
-        values.push_back(null);
+        values.push_back({null, firstOperandStart, instIndex});
       }
     } else if (inst->origin->is<LocalSet>() && inst->type == Type::none) {
       // This set is potentially optimizable later, add to stack.
-      values.push_back(instIndex);
+      values.push_back({instIndex, firstOperandStart, instIndex - 1});
     }
   }
 

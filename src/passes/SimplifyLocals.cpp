@@ -76,13 +76,28 @@ struct SimplifyLocals
       SimplifyLocals<allowTee, allowStructure, allowNesting>>();
   }
 
+  bool connectAdjacentCalls = true;
+
+  // Nested depth of try / try_table scopes.
+  Index tryDepth = 0;
+
   // information for a local.set we can sink
   struct SinkableInfo {
     Expression** item;
     EffectAnalyzer effects;
+    bool crossedCall = false;
 
-    SinkableInfo(Expression** item, PassOptions& passOptions, Module& module)
-      : item(item), effects(passOptions, module, *item) {}
+    SinkableInfo(Expression** item,
+                 PassOptions& passOptions,
+                 Module& module,
+                 bool addLocalWritten = false)
+      : item(item),
+        effects(
+          passOptions, module, (*item)->template cast<LocalSet>()->value) {
+      if (addLocalWritten) {
+        effects.localsWritten.insert((*item)->template cast<LocalSet>()->index);
+      }
+    }
   };
 
   // a list of sinkables in a linear execution trace
@@ -303,8 +318,12 @@ struct SimplifyLocals
     // TODO: this is O(bad)
     std::vector<Index> invalidated;
     for (auto& [index, info] : sinkables) {
-      if (effects.orderedAfter(info.effects)) {
+      if (effects.localsRead.contains(index) ||
+          effects.localsWritten.contains(index) ||
+          effects.orderedAfter(info.effects)) {
         invalidated.push_back(index);
+      } else if (effects.throws()) {
+        info.crossedCall = true;
       }
     }
     for (auto index : invalidated) {
@@ -324,6 +343,7 @@ struct SimplifyLocals
     // Certain expressions cannot be sinked into 'try'/'try_table', and so at
     // the start of 'try'/'try_table' we forget about them.
     if (curr->is<Try>() || curr->is<TryTable>()) {
+      self->tryDepth++;
       std::vector<Index> invalidated;
       for (auto& [index, info] : self->sinkables) {
         // Expressions that may throw cannot be moved into a try (which might
@@ -331,6 +351,10 @@ struct SimplifyLocals
         if (info.effects.throws()) {
           invalidated.push_back(index);
           continue;
+        }
+        bool oneUse = self->firstCycle || self->getCounter.num[index] == 1;
+        if (!oneUse) {
+          info.effects.localsWritten.insert(index);
         }
       }
       for (auto index : invalidated) {
@@ -424,6 +448,11 @@ struct SimplifyLocals
       }
     }
 
+    if (original->is<Try>() || original->is<TryTable>()) {
+      assert(self->tryDepth > 0);
+      self->tryDepth--;
+    }
+
     EffectAnalyzer effects(self->getPassOptions(), *self->getModule());
     if (effects.checkPost(original)) {
       self->checkInvalidations(effects);
@@ -432,9 +461,13 @@ struct SimplifyLocals
     if (set && self->canSink(set)) {
       Index index = set->index;
       assert(!self->sinkables.contains(index));
-      self->sinkables.emplace(std::pair{
-        index,
-        SinkableInfo(currp, self->getPassOptions(), *self->getModule())});
+      bool oneUse = self->firstCycle || self->getCounter.num[index] == 1;
+      self->sinkables.emplace(
+        std::pair{index,
+                  SinkableInfo(currp,
+                               self->getPassOptions(),
+                               *self->getModule(),
+                               self->tryDepth > 0 && !oneUse)});
     }
 
     if (!allowNesting) {
@@ -799,7 +832,18 @@ struct SimplifyLocals
     // element).
     //
     // TODO investigate more
-    Index goodIndex = sinkables.begin()->first;
+    Index goodIndex = -1;
+    bool found = false;
+    for (auto& [index, info] : sinkables) {
+      if (!info.crossedCall) {
+        goodIndex = index;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      return;
+    }
     auto localType = this->getFunction()->getLocalType(goodIndex);
     if (!localType.isDefaultable()) {
       return;
@@ -973,6 +1017,7 @@ struct SimplifyLocals
       anotherCycle = true;
     }
     // clean up
+    tryDepth = 0;
     sinkables.clear();
     blockBreaks.clear();
     unoptimizableBlocks.clear();

@@ -23,6 +23,7 @@
 #include "ir/properties.h"
 #include "pass.h"
 #include "support/insert_ordered.h"
+#include "support/small_set.h"
 #include "wasm-binary.h"
 #include "wasm-traversal.h"
 #include "wasm.h"
@@ -635,13 +636,15 @@ private:
 
 // Stack IR optimizer
 class StackIROptimizer {
+  Module& module;
   Function* func;
   StackIR& insts;
   const PassOptions& passOptions;
   FeatureSet features;
 
 public:
-  StackIROptimizer(Function* func,
+  StackIROptimizer(Module& module,
+                   Function* func,
                    StackIR& insts,
                    const PassOptions& passOptions,
                    FeatureSet features);
@@ -649,6 +652,8 @@ public:
   void run();
 
 private:
+  using SmallLocalSet = SmallSet<Index, 4>;
+
   void dce();
   void vacuum();
   void local2Stack();
@@ -661,6 +666,10 @@ private:
   Index getNumConsumedValues(StackInst* inst);
   bool canRemoveSetGetPair(Index setIndex, Index getIndex);
   bool isConsumedBySymmetricOp(Index getIndex);
+  bool isPureSlice(Index start,
+                   Index end,
+                   SmallLocalSet& readLocals,
+                   bool allowTrapsNeverHappen);
   std::unordered_set<LocalGet*> findStringViewDeferredGets();
 };
 

@@ -38,11 +38,9 @@
 
   ;; CHECK:      (func $read-g-with-throw-in-between (type $1) (result i32)
   ;; CHECK-NEXT:  (local $x i32)
-  ;; CHECK-NEXT:  (local.set $x
-  ;; CHECK-NEXT:   (global.get $g)
-  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (nop)
   ;; CHECK-NEXT:  (call $throws)
-  ;; CHECK-NEXT:  (local.get $x)
+  ;; CHECK-NEXT:  (global.get $g)
   ;; CHECK-NEXT: )
   (func $read-g-with-throw-in-between (result i32)
     (local $x i32)
@@ -132,15 +130,13 @@
 
   ;; CHECK:      (func $read-g-with-effectful-call-ref (type $3) (param $ref (ref $throw-type)) (result i32)
   ;; CHECK-NEXT:  (local $x i32)
-  ;; CHECK-NEXT:  (local.set $x
-  ;; CHECK-NEXT:   (global.get $g)
-  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (nop)
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (call_ref $throw-type
   ;; CHECK-NEXT:    (local.get $ref)
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
-  ;; CHECK-NEXT:  (local.get $x)
+  ;; CHECK-NEXT:  (global.get $g)
   ;; CHECK-NEXT: )
   (func $read-g-with-effectful-call-ref (param $ref (ref $throw-type)) (result i32)
     (local $x i32)
@@ -155,15 +151,13 @@
 
   ;; CHECK:      (func $read-g-with-effectful-call-indirect (type $3) (param $ref (ref $throw-type)) (result i32)
   ;; CHECK-NEXT:  (local $x i32)
-  ;; CHECK-NEXT:  (local.set $x
-  ;; CHECK-NEXT:   (global.get $g)
-  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (nop)
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (call_indirect $t (type $throw-type)
   ;; CHECK-NEXT:    (i32.const 0)
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
-  ;; CHECK-NEXT:  (local.get $x)
+  ;; CHECK-NEXT:  (global.get $g)
   ;; CHECK-NEXT: )
   (func $read-g-with-effectful-call-indirect (param $ref (ref $throw-type)) (result i32)
     (local $x i32)

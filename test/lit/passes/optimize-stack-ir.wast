@@ -3,10 +3,10 @@
 ;; RUN: wasm-opt %s -all --optimize-level=3 --generate-stack-ir --optimize-stack-ir --print-stack-ir | filecheck %s
 
 (module
+  ;; CHECK:      (type $6 (func (param i32) (result i32)))
+
   ;; CHECK:      (type $FUNCSIG$v (func))
   (type $FUNCSIG$v (func))
-
-  ;; CHECK:      (type $6 (func (param i32) (result i32)))
 
   ;; CHECK:      (type $5 (func (result i32)))
 
@@ -632,9 +632,8 @@
   ;; CHECK-NEXT:  (local $z f32)
   ;; CHECK-NEXT:  (local $asm2wasm_i32_temp i32)
   ;; CHECK-NEXT:  i32.const 0
-  ;; CHECK-NEXT:  local.set $asm2wasm_i32_temp
   ;; CHECK-NEXT:  i32.const 0
-  ;; CHECK-NEXT:  local.get $asm2wasm_i32_temp
+  ;; CHECK-NEXT:  local.tee $asm2wasm_i32_temp
   ;; CHECK-NEXT:  i32.sub
   ;; CHECK-NEXT:  local.get $asm2wasm_i32_temp
   ;; CHECK-NEXT:  local.get $asm2wasm_i32_temp
@@ -1124,14 +1123,12 @@
 
   ;; CHECK:      (func $local-to-stack-1d-sub-no (type $6) (param $x i32) (result i32)
   ;; CHECK-NEXT:  (local $temp i32)
+  ;; CHECK-NEXT:  i32.const 3
   ;; CHECK-NEXT:  i32.const 1
   ;; CHECK-NEXT:  call $local-to-stack
-  ;; CHECK-NEXT:  local.set $temp
   ;; CHECK-NEXT:  i32.const 2
   ;; CHECK-NEXT:  call $local-to-stack
   ;; CHECK-NEXT:  drop
-  ;; CHECK-NEXT:  i32.const 3
-  ;; CHECK-NEXT:  local.get $temp
   ;; CHECK-NEXT:  i32.sub
   ;; CHECK-NEXT: )
   (func $local-to-stack-1d-sub-no (param $x i32) (result i32)
@@ -1565,6 +1562,73 @@
         (call $local-to-stack (i32.const 4))
         (local.get $temp)
       )
+    )
+  )
+
+  ;; An effectful value is in the way of a non-commutative op, so the set/get
+  ;; pair must stay.
+  ;; CHECK:      (func $local-to-stack-1d-sub-effectful-no (type $6) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (local $temp i32)
+  ;; CHECK-NEXT:  i32.const 1
+  ;; CHECK-NEXT:  call $local-to-stack
+  ;; CHECK-NEXT:  local.set $temp
+  ;; CHECK-NEXT:  i32.const 2
+  ;; CHECK-NEXT:  call $local-to-stack
+  ;; CHECK-NEXT:  drop
+  ;; CHECK-NEXT:  i32.const 3
+  ;; CHECK-NEXT:  call $local-to-stack
+  ;; CHECK-NEXT:  local.get $temp
+  ;; CHECK-NEXT:  i32.sub
+  ;; CHECK-NEXT: )
+  (func $local-to-stack-1d-sub-effectful-no (param $x i32) (result i32)
+    (local $temp i32)
+    (local.set $temp (call $local-to-stack (i32.const 1)))
+    (drop (call $local-to-stack (i32.const 2)))
+    (i32.sub
+      (call $local-to-stack (i32.const 3))
+      (local.get $temp)
+    )
+  )
+
+  ;; Forward pure-set sinking across an effectful intervening value on the stack.
+  ;; CHECK:      (func $local-to-stack-forward-pure-set (type $6) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (local $temp i32)
+  ;; CHECK-NEXT:  i32.const 3
+  ;; CHECK-NEXT:  call $local-to-stack
+  ;; CHECK-NEXT:  local.get $x
+  ;; CHECK-NEXT:  i32.const 10
+  ;; CHECK-NEXT:  i32.add
+  ;; CHECK-NEXT:  i32.sub
+  ;; CHECK-NEXT: )
+  (func $local-to-stack-forward-pure-set (param $x i32) (result i32)
+    (local $temp i32)
+    (local.set $temp (i32.add (local.get $x) (i32.const 10)))
+    (i32.sub
+      (call $local-to-stack (i32.const 3))
+      (local.get $temp)
+    )
+  )
+
+  ;; Backward pure-subtree rotation with multiple uses converted to local.tee.
+  ;; CHECK:      (func $local-to-stack-backward-pure-rotate-tee (type $6) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (local $temp i32)
+  ;; CHECK-NEXT:  local.get $x
+  ;; CHECK-NEXT:  i32.const 1
+  ;; CHECK-NEXT:  call $local-to-stack
+  ;; CHECK-NEXT:  local.tee $temp
+  ;; CHECK-NEXT:  i32.sub
+  ;; CHECK-NEXT:  local.get $temp
+  ;; CHECK-NEXT:  i32.add
+  ;; CHECK-NEXT: )
+  (func $local-to-stack-backward-pure-rotate-tee (param $x i32) (result i32)
+    (local $temp i32)
+    (local.set $temp (call $local-to-stack (i32.const 1)))
+    (i32.add
+      (i32.sub
+        (local.get $x)
+        (local.get $temp)
+      )
+      (local.get $temp)
     )
   )
 )

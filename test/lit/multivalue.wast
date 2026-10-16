@@ -220,17 +220,11 @@
 
  ;; Test multivalue globals
  ;; CHECK:      (func $global (type $0) (result i32 i64)
- ;; CHECK-NEXT:  (local $scratch i32)
+ ;; CHECK-NEXT:  (global.set $g2
+ ;; CHECK-NEXT:   (i64.const 7)
+ ;; CHECK-NEXT:  )
  ;; CHECK-NEXT:  (global.set $g1
- ;; CHECK-NEXT:   (block (result i32)
- ;; CHECK-NEXT:    (local.set $scratch
- ;; CHECK-NEXT:     (i32.const 42)
- ;; CHECK-NEXT:    )
- ;; CHECK-NEXT:    (global.set $g2
- ;; CHECK-NEXT:     (i64.const 7)
- ;; CHECK-NEXT:    )
- ;; CHECK-NEXT:    (local.get $scratch)
- ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (i32.const 42)
  ;; CHECK-NEXT:  )
  ;; CHECK-NEXT:  (drop
  ;; CHECK-NEXT:   (global.get $g2)
@@ -284,17 +278,11 @@
  )
 
  ;; CHECK:      (func $drop-tuple-make (type $1)
- ;; CHECK-NEXT:  (local $scratch i32)
  ;; CHECK-NEXT:  (drop
- ;; CHECK-NEXT:   (block (result i32)
- ;; CHECK-NEXT:    (local.set $scratch
- ;; CHECK-NEXT:     (i32.const 42)
- ;; CHECK-NEXT:    )
- ;; CHECK-NEXT:    (drop
- ;; CHECK-NEXT:     (i64.const 42)
- ;; CHECK-NEXT:    )
- ;; CHECK-NEXT:    (local.get $scratch)
- ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (i64.const 42)
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (drop
+ ;; CHECK-NEXT:   (i32.const 42)
  ;; CHECK-NEXT:  )
  ;; CHECK-NEXT: )
  (func $drop-tuple-make

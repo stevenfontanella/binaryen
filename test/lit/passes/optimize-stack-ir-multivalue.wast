@@ -368,10 +368,6 @@
   ;; ROUNDTRIP-NEXT:  (local $scratch_8 (tuple i32 f64 anyref))
   ;; ROUNDTRIP-NEXT:  (local $scratch_9 f64)
   ;; ROUNDTRIP-NEXT:  (local $scratch_10 i32)
-  ;; ROUNDTRIP-NEXT:  (local $scratch_11 f64)
-  ;; ROUNDTRIP-NEXT:  (local $scratch_12 i32)
-  ;; ROUNDTRIP-NEXT:  (local $scratch_13 f64)
-  ;; ROUNDTRIP-NEXT:  (local $scratch_14 i32)
   ;; ROUNDTRIP-NEXT:  call $multivalue-return
   ;; ROUNDTRIP-NEXT:  local.tee $scratch_8
   ;; ROUNDTRIP-NEXT:  tuple.extract 3 0
@@ -382,17 +378,15 @@
   ;; ROUNDTRIP-NEXT:  local.set $6
   ;; ROUNDTRIP-NEXT:  local.set $3
   ;; ROUNDTRIP-NEXT:  local.tee $temp
-  ;; ROUNDTRIP-NEXT:  local.get $temp
-  ;; ROUNDTRIP-NEXT:  local.get $3
   ;; ROUNDTRIP-NEXT:  local.get $6
-  ;; ROUNDTRIP-NEXT:  local.set $7
+  ;; ROUNDTRIP-NEXT:  local.get $3
   ;; ROUNDTRIP-NEXT:  local.set $4
+  ;; ROUNDTRIP-NEXT:  local.get $temp
+  ;; ROUNDTRIP-NEXT:  local.set $scratch
+  ;; ROUNDTRIP-NEXT:  drop
   ;; ROUNDTRIP-NEXT:  local.get $4
-  ;; ROUNDTRIP-NEXT:  local.get $7
+  ;; ROUNDTRIP-NEXT:  local.get $scratch
   ;; ROUNDTRIP-NEXT:  drop
-  ;; ROUNDTRIP-NEXT:  local.set $5
-  ;; ROUNDTRIP-NEXT:  drop
-  ;; ROUNDTRIP-NEXT:  local.get $5
   ;; ROUNDTRIP-NEXT:  local.get $6
   ;; ROUNDTRIP-NEXT:  tuple.make 3
   ;; ROUNDTRIP-NEXT: )

@@ -3720,7 +3720,7 @@ ModuleStackIR::ModuleStackIR(Module& wasm, const PassOptions& options)
       stackIR = std::move(stackIRGen.getStackIR());
 
       if (options.optimizeStackIR) {
-        StackIROptimizer optimizer(func, stackIR, options, wasm.features);
+        StackIROptimizer optimizer(wasm, func, stackIR, options, wasm.features);
         optimizer.run();
       }
     }) {}

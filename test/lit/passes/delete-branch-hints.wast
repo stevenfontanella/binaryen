@@ -123,15 +123,13 @@
 
   ;; CHECK:      (func $stacky (type $2) (param $c i32) (result i32)
   ;; CHECK-NEXT:  (block $l (result i32)
+  ;; CHECK-NEXT:   (nop)
   ;; CHECK-NEXT:   (br_if $l
   ;; CHECK-NEXT:    (i32.const 42)
-  ;; CHECK-NEXT:    (block (result i32)
-  ;; CHECK-NEXT:     (nop)
-  ;; CHECK-NEXT:     (call $log
-  ;; CHECK-NEXT:      (local.get $c)
-  ;; CHECK-NEXT:      (i32.const 1)
-  ;; CHECK-NEXT:      (i32.const 10)
-  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    (call $log
+  ;; CHECK-NEXT:     (local.get $c)
+  ;; CHECK-NEXT:     (i32.const 1)
+  ;; CHECK-NEXT:     (i32.const 10)
   ;; CHECK-NEXT:    )
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
