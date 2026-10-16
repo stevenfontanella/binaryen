@@ -60,7 +60,37 @@ inline bool equal(Function* left, Function* right) {
   }
   // TODO: Compare expression-level annotations like removableIfUnused, not just
   //       function-level.
-  return ExpressionAnalyzer::equal(left->body, right->body);
+  ExpressionAnalyzer::ExprComparer selfComparator;
+  selfComparator = [left, right, &selfComparator](Expression* l,
+                                                  Expression* r) -> bool {
+    if (l->_id != r->_id || l->type != r->type) {
+      return false;
+    }
+    if (auto* lCall = l->dynCast<Call>()) {
+      auto* rCall = r->cast<Call>();
+      if (lCall->target == left->name && rCall->target == right->name) {
+        if (lCall->isReturn != rCall->isReturn ||
+            lCall->operands.size() != rCall->operands.size()) {
+          return false;
+        }
+        for (Index i = 0; i < lCall->operands.size(); i++) {
+          if (!ExpressionAnalyzer::flexibleEqual(
+                lCall->operands[i], rCall->operands[i], selfComparator)) {
+            return false;
+          }
+        }
+        return true;
+      }
+    } else if (auto* lRef = l->dynCast<RefFunc>()) {
+      auto* rRef = r->cast<RefFunc>();
+      if (lRef->func == left->name && rRef->func == right->name) {
+        return true;
+      }
+    }
+    return false;
+  };
+  return ExpressionAnalyzer::flexibleEqual(
+    left->body, right->body, selfComparator);
 }
 
 } // namespace wasm::FunctionUtils

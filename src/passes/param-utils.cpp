@@ -28,7 +28,64 @@
 
 namespace wasm::ParamUtils {
 
+namespace {
+
+// Returns the set of LocalGet expressions in `func->body` that are direct
+// pass-through arguments to a self-recursive call (`call->target == func->name`
+// where `call->operands[i]` is `local.get $i`) for a parameter `i` that is
+// never written (`local.set`/`local.tee`) in `func->body`.
+std::unordered_set<LocalGet*> getSelfPassThroughGets(Function* func) {
+  std::unordered_set<LocalGet*> result;
+  if (!func || func->imported() || !func->body) {
+    return result;
+  }
+  auto numParams = func->getNumParams();
+  if (numParams == 0) {
+    return result;
+  }
+  struct Scanner : public PostWalker<Scanner> {
+    Function* func;
+    Index numParams;
+    std::vector<bool> hasSet;
+    std::vector<LocalGet*> candidates;
+
+    Scanner(Function* func, Index numParams)
+      : func(func), numParams(numParams), hasSet(numParams, false) {}
+
+    void visitLocalSet(LocalSet* curr) {
+      if (curr->index < numParams) {
+        hasSet[curr->index] = true;
+      }
+    }
+
+    void visitCall(Call* curr) {
+      if (curr->target != func->name) {
+        return;
+      }
+      for (Index i = 0; i < curr->operands.size() && i < numParams; i++) {
+        if (auto* get = curr->operands[i]->dynCast<LocalGet>()) {
+          if (get->index == i) {
+            candidates.push_back(get);
+          }
+        }
+      }
+    }
+  } scanner(func, numParams);
+  scanner.walk(func->body);
+
+  for (auto* get : scanner.candidates) {
+    if (!scanner.hasSet[get->index]) {
+      result.insert(get);
+    }
+  }
+  return result;
+}
+
+} // anonymous namespace
+
 std::unordered_set<Index> getUsedParams(Function* func, Module* module) {
+  auto selfPassThroughGets = getSelfPassThroughGets(func);
+
   // To find which params are used, compute liveness at the entry.
   // TODO: We could write bespoke code here rather than reuse LivenessWalker, as
   //       we only need liveness at the entry. The code below computes it for
@@ -42,11 +99,15 @@ std::unordered_set<Index> getUsedParams(Function* func, Module* module) {
     // Branches outside of the function can be ignored, as we only look at
     // locals, which vanish when we leave.
     bool ignoreBranchesOutsideOfFunc = true;
+    const std::unordered_set<LocalGet*>* selfPassThroughGets = nullptr;
 
-    // Ignore unreachable code and non-params.
+    // Ignore unreachable code, non-params, and direct self-recursive
+    // pass-through gets.
     static void doVisitLocalGet(ParamLiveness* self, Expression** currp) {
       auto* get = (*currp)->cast<LocalGet>();
-      if (self->currBasicBlock && self->getFunction()->isParam(get->index)) {
+      if (self->currBasicBlock && self->getFunction()->isParam(get->index) &&
+          (!self->selfPassThroughGets ||
+           !self->selfPassThroughGets->contains(get))) {
         Super::doVisitLocalGet(self, currp);
       }
     }
@@ -57,6 +118,7 @@ std::unordered_set<Index> getUsedParams(Function* func, Module* module) {
       }
     }
   } walker;
+  walker.selfPassThroughGets = &selfPassThroughGets;
   walker.setModule(module);
   walker.walkFunction(func);
 
@@ -169,20 +231,23 @@ RemovalOutcome removeParameter(const std::vector<Function*>& funcs,
       }
     }
   };
+  // Remove the arguments from the calls before updating local operations so
+  // that any removed self-recursive call arguments (such as pass-through
+  // parameters of non-defaultable types) are not seen as remaining uses in the
+  // function body by handleNonDefaultableLocals.
+  for (auto* call : calls) {
+    call->operands.erase(call->operands.begin() + index);
+  }
+  for (auto* call : callRefs) {
+    call->operands.erase(call->operands.begin() + index);
+  }
+
   for (Index i = 0; i < funcs.size(); i++) {
     auto* func = funcs[i];
     if (!func->imported()) {
       LocalUpdater(funcs[i], index, newIndexes[i]);
       TypeUpdating::handleNonDefaultableLocals(func, *module);
     }
-  }
-
-  // Remove the arguments from the calls.
-  for (auto* call : calls) {
-    call->operands.erase(call->operands.begin() + index);
-  }
-  for (auto* call : callRefs) {
-    call->operands.erase(call->operands.begin() + index);
   }
 
   return Success;
@@ -242,23 +307,39 @@ SortedVector<Index> applyConstantValues(const std::vector<Function*>& funcs,
   }
 #endif
 
+  std::unordered_set<Expression*> selfPassThroughGets;
+  for (auto* func : funcs) {
+    for (auto* get : getSelfPassThroughGets(func)) {
+      selfPassThroughGets.insert(get);
+    }
+  }
+
   SortedVector<Index> optimized;
   auto numParams = first->getNumParams();
   for (Index i = 0; i < numParams; i++) {
     PossibleConstantValues value;
+    bool hasNonSelfCall = false;
     for (auto* call : calls) {
+      if (selfPassThroughGets.contains(call->operands[i])) {
+        continue;
+      }
+      hasNonSelfCall = true;
       value.note(call->operands[i], *module);
       if (!value.isConstant()) {
         break;
       }
     }
     for (auto* call : callRefs) {
+      if (selfPassThroughGets.contains(call->operands[i])) {
+        continue;
+      }
+      hasNonSelfCall = true;
       value.note(call->operands[i], *module);
       if (!value.isConstant()) {
         break;
       }
     }
-    if (!value.isConstant()) {
+    if (!hasNonSelfCall || !value.isConstant()) {
       continue;
     }
 

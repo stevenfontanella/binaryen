@@ -36,11 +36,14 @@ struct FunctionHasher : public WalkerPass<PostWalker<FunctionHasher>> {
 
   FunctionHasher(Map* output, ExpressionAnalyzer::ExprHasher customHasher)
     : output(output), customHasher(customHasher) {}
-  FunctionHasher(Map* output)
-    : output(output), customHasher(ExpressionAnalyzer::nothingHasher) {}
+  FunctionHasher(Map* output, Map* literalOutput = nullptr)
+    : output(output), literalOutput(literalOutput) {}
 
   std::unique_ptr<Pass> create() override {
-    return std::make_unique<FunctionHasher>(output, customHasher);
+    if (customHasher) {
+      return std::make_unique<FunctionHasher>(output, customHasher);
+    }
+    return std::make_unique<FunctionHasher>(output, literalOutput);
   }
 
   static Map createMap(Module* module) {
@@ -54,7 +57,16 @@ struct FunctionHasher : public WalkerPass<PostWalker<FunctionHasher>> {
   }
 
   void doWalkFunction(Function* func) {
-    output->at(func) = flexibleHashFunction(func, customHasher);
+    if (customHasher) {
+      output->at(func) = flexibleHashFunction(func, customHasher);
+      return;
+    }
+    bool hasSelfRef = false;
+    output->at(func) = hashFunction(func, &hasSelfRef);
+    if (literalOutput && hasSelfRef) {
+      literalOutput->at(func) =
+        flexibleHashFunction(func, ExpressionAnalyzer::nothingHasher);
+    }
   }
 
   static size_t
@@ -71,12 +83,40 @@ struct FunctionHasher : public WalkerPass<PostWalker<FunctionHasher>> {
     return digest;
   }
 
-  static size_t hashFunction(Function* func) {
-    return flexibleHashFunction(func, ExpressionAnalyzer::nothingHasher);
+  static size_t hashFunction(Function* func, bool* hasSelfRef = nullptr) {
+    ExpressionAnalyzer::ExprHasher selfHasher;
+    selfHasher =
+      [func, hasSelfRef, &selfHasher](Expression* curr, size_t& digest) -> bool {
+      if (auto* call = curr->dynCast<Call>()) {
+        if (call->target == func->name) {
+          if (hasSelfRef) {
+            *hasSelfRef = true;
+          }
+          rehash(digest, 0x5e1fca11u);
+          rehash(digest, call->isReturn);
+          for (auto* op : call->operands) {
+            hash_combine(digest,
+                         ExpressionAnalyzer::flexibleHash(op, selfHasher));
+          }
+          return true;
+        }
+      } else if (auto* ref = curr->dynCast<RefFunc>()) {
+        if (ref->func == func->name) {
+          if (hasSelfRef) {
+            *hasSelfRef = true;
+          }
+          rehash(digest, 0x5e1f7ef0u);
+          return true;
+        }
+      }
+      return false;
+    };
+    return flexibleHashFunction(func, selfHasher);
   }
 
 private:
   Map* output;
+  Map* literalOutput = nullptr;
   ExpressionAnalyzer::ExprHasher customHasher;
 };
 

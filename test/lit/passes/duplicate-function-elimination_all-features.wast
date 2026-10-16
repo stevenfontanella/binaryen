@@ -77,3 +77,70 @@
   )
  )
 )
+;; Self-recursive and self-ref.func functions can be deduplicated.
+(module
+ ;; CHECK:      (type $0 (func (param i32) (result funcref)))
+
+ ;; CHECK:      (elem declare func $rec1)
+
+ ;; CHECK:      (export "caller" (func $caller))
+
+ ;; CHECK:      (func $rec1 (type $0) (param $0 i32) (result funcref)
+ ;; CHECK-NEXT:  (if (result funcref)
+ ;; CHECK-NEXT:   (local.get $0)
+ ;; CHECK-NEXT:   (then
+ ;; CHECK-NEXT:    (call $rec1
+ ;; CHECK-NEXT:     (i32.sub
+ ;; CHECK-NEXT:      (local.get $0)
+ ;; CHECK-NEXT:      (i32.const 1)
+ ;; CHECK-NEXT:     )
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (else
+ ;; CHECK-NEXT:    (ref.func $rec1)
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT: )
+ (func $rec1 (param $0 i32) (result funcref)
+  (if (result funcref)
+   (local.get $0)
+   (then
+    (call $rec1
+     (i32.sub
+      (local.get $0)
+      (i32.const 1)
+     )
+    )
+   )
+   (else
+    (ref.func $rec1)
+   )
+  )
+ )
+ (func $rec2 (param $0 i32) (result funcref)
+  (if (result funcref)
+   (local.get $0)
+   (then
+    (call $rec2
+     (i32.sub
+      (local.get $0)
+      (i32.const 1)
+     )
+    )
+   )
+   (else
+    (ref.func $rec2)
+   )
+  )
+ )
+ ;; CHECK:      (func $caller (type $0) (param $0 i32) (result funcref)
+ ;; CHECK-NEXT:  (call $rec1
+ ;; CHECK-NEXT:   (local.get $0)
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT: )
+ (func $caller (export "caller") (param $0 i32) (result funcref)
+  (call $rec2
+   (local.get $0)
+  )
+ )
+)

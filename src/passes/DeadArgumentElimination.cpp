@@ -38,7 +38,10 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "ir/branch-utils.h"
 #include "ir/lubs.h"
+#include "ir/manipulation.h"
+#include "ir/names.h"
 #include "ir/return-utils.h"
 #include "ir/type-updating.h"
 #include "ir/utils.h"
@@ -517,6 +520,16 @@ struct DAE : public Pass {
         markStale(name);
         markCallersStale(index);
       }
+      if (worthOptimizing.empty() && refinedCallers.empty() &&
+          callTargetsToLocalize.empty()) {
+        splitDroppedReturnTails(module,
+                                infoMap,
+                                allCalls,
+                                callers,
+                                tailCallees,
+                                hasUnseenCalls,
+                                worthOptimizing);
+      }
     }
     if (!callTargetsToLocalize.empty()) {
       ParamUtils::localizeCallsTo(
@@ -540,6 +553,445 @@ struct DAE : public Pass {
 
 private:
   std::unordered_map<Call*, Expression**> allDroppedCalls;
+
+  int getPureReturnSize(Expression* curr,
+                        Function* func,
+                        const std::vector<bool>& hasSet,
+                        Module* module) {
+    auto numParams = func->getNumParams();
+    if (auto* get = curr->dynCast<LocalGet>()) {
+      return (get->index < numParams && !hasSet[get->index]) ? 2 : 0;
+    }
+    if (curr->is<Const>() || curr->is<RefNull>()) {
+      return 2;
+    }
+    if (curr->is<RefFunc>()) {
+      return 3;
+    }
+    if (auto* gget = curr->dynCast<GlobalGet>()) {
+      auto* g = module->getGlobalOrNull(gget->name);
+      return (g && !g->mutable_) ? 3 : 0;
+    }
+    if (getPassOptions().trapsNeverHappen) {
+      if (auto* rc = curr->dynCast<RefCast>()) {
+        if (!rc->desc) {
+          if (auto* get = rc->ref->dynCast<LocalGet>()) {
+            if (get->index < numParams && !hasSet[get->index]) {
+              return 6;
+            }
+          }
+        }
+      }
+    }
+    return 0;
+  }
+
+  std::vector<bool> getParamSets(Function* func) {
+    auto numParams = func->getNumParams();
+    std::vector<bool> hasSet(numParams, false);
+    if (numParams == 0 || !func->body) {
+      return hasSet;
+    }
+    struct SetScanner : public PostWalker<SetScanner> {
+      Index numParams;
+      std::vector<bool>& hasSet;
+      SetScanner(Index numParams, std::vector<bool>& hasSet)
+        : numParams(numParams), hasSet(hasSet) {}
+      void visitLocalSet(LocalSet* curr) {
+        if (curr->index < numParams) {
+          hasSet[curr->index] = true;
+        }
+      }
+    } scanner(numParams, hasSet);
+    scanner.walk(func->body);
+    return hasSet;
+  }
+
+  Name getWrappedVoidCallee(Function* func, Module* module) {
+    if (!func || func->imported() || !func->vars.empty()) {
+      return Name();
+    }
+    auto* block = func->body->dynCast<Block>();
+    if (!block || block->list.size() != 2) {
+      return Name();
+    }
+    if (block->name.is() &&
+        BranchUtils::BranchSeeker::has(block, block->name)) {
+      return Name();
+    }
+    auto* call = block->list[0]->dynCast<Call>();
+    if (!call || call->isReturn || call->type != Type::none) {
+      return Name();
+    }
+    auto numParams = func->getNumParams();
+    if (call->operands.size() != numParams) {
+      return Name();
+    }
+    for (Index i = 0; i < numParams; i++) {
+      auto* get = call->operands[i]->dynCast<LocalGet>();
+      if (!get || get->index != i) {
+        return Name();
+      }
+    }
+    std::vector<bool> hasSet(numParams, false);
+    if (getPureReturnSize(block->list[1], func, hasSet, module) <= 0) {
+      return Name();
+    }
+    auto* targetFunc = module->getFunctionOrNull(call->target);
+    if (!targetFunc || targetFunc->getResults() != Type::none ||
+        targetFunc->getParams() != func->getParams()) {
+      return Name();
+    }
+    return call->target;
+  }
+
+  void splitDroppedReturnTails(Module* module,
+                               DAEFunctionInfoMap& infoMap,
+                               const std::vector<std::vector<Call*>>& allCalls,
+                               const std::vector<std::vector<Name>>& callers,
+                               const std::vector<bool>& tailCallees,
+                               const std::vector<bool>& hasUnseenCalls,
+                               std::unordered_set<Function*>& worthOptimizing) {
+    Index origNumFunctions = numFunctions;
+    auto markStale = [&](Name func) {
+      assert(func.is());
+      infoMap[func].markStale();
+    };
+    auto markCallersStale = [&](Index index) {
+      for (auto caller : callers[index]) {
+        markStale(caller);
+      }
+    };
+
+    // Pass 0 splits Shape A functions (whose body is a Block ending directly in
+    // a pure value expression). Pass 1 redirects dropped calls to existing void
+    // wrappers and splits Shape B functions (whose tail calls a Shape A
+    // function and forwards or casts its pure return value).
+    for (int pass = 0; pass < 2; pass++) {
+      for (Index index = 0; index < origNumFunctions; index++) {
+        auto* func = module->functions[index].get();
+        if (func->imported() || !func->getResults().isSingle()) {
+          continue;
+        }
+        auto name = func->name;
+        if (infoMap[name].hasTailCalls || tailCallees[index]) {
+          continue;
+        }
+        if (infoMap[name].calls.contains(name)) {
+          continue;
+        }
+        auto& calls = allCalls[index];
+        if (calls.empty()) {
+          continue;
+        }
+        std::vector<Call*> droppedCalls;
+        Index usedCallCount = 0;
+        for (auto* call : calls) {
+          if (allDroppedCalls.contains(call)) {
+            droppedCalls.push_back(call);
+          } else {
+            usedCallCount++;
+          }
+        }
+        if (droppedCalls.empty()) {
+          continue;
+        }
+        if (usedCallCount == 0 && !hasUnseenCalls[index]) {
+          continue;
+        }
+
+        // Rule 1: If func is already a 0-var wrapper around a void callee with
+        // a pure return value, redirect all dropped calls directly to the void
+        // callee at zero wrapper cost.
+        if (Name voidTarget = getWrappedVoidCallee(func, module);
+            voidTarget.is()) {
+          if (indexes[voidTarget] >= 16384 && index < 16384 &&
+              droppedCalls.size() < 2) {
+            continue;
+          }
+          for (auto* call : droppedCalls) {
+            auto iter = allDroppedCalls.find(call);
+            if (iter == allDroppedCalls.end()) {
+              continue;
+            }
+            Expression** location = iter->second;
+            *location = call;
+            call->target = voidTarget;
+            if (call->type != Type::unreachable) {
+              call->type = Type::none;
+            }
+            allDroppedCalls.erase(iter);
+          }
+          for (auto caller : callers[index]) {
+            worthOptimizing.insert(module->getFunction(caller));
+          }
+          markStale(name);
+          markCallersStale(index);
+          continue;
+        }
+
+        // Rule 2: Void-Tail Splitting. Only create new wrapper functions when
+        // shrinking or running standalone DAE (not in -O3 dae-optimizing where
+        // subsequent inlining passes could re-inline the wrapper).
+        if (optimize && getPassOptions().shrinkLevel == 0) {
+          continue;
+        }
+        if (droppedCalls.size() < 4) {
+          continue;
+        }
+        if (ReturnUtils::getInfo(func->body).hasReturn) {
+          continue;
+        }
+
+        auto numParams = func->getNumParams();
+        if (pass == 0) {
+          // Shape A: func->body is an untargeted Block whose elements before
+          // the final pure return value all have Type::none.
+          auto* block = func->body->dynCast<Block>();
+          if (!block || block->list.size() < 2) {
+            continue;
+          }
+          if (block->name.is() &&
+              BranchUtils::BranchSeeker::has(block, block->name)) {
+            continue;
+          }
+          bool priorAllVoid = true;
+          for (Index i = 0; i + 1 < block->list.size(); i++) {
+            if (block->list[i]->type != Type::none) {
+              priorAllVoid = false;
+              break;
+            }
+          }
+          if (!priorAllVoid) {
+            continue;
+          }
+          auto hasSet = getParamSets(func);
+          Expression* tail = block->list.back();
+          int retSize = getPureReturnSize(tail, func, hasSet, module);
+          if (retSize <= 0) {
+            continue;
+          }
+          int wrapperCost = (usedCallCount == 1 && !hasUnseenCalls[index])
+                              ? 1
+                              : int(6 + 2 * numParams + retSize);
+          int saved = int(droppedCalls.size()) - wrapperCost;
+          if (saved < 8) {
+            continue;
+          }
+
+          Builder builder(*module);
+          Name voidName = Names::getValidFunctionName(
+            *module, func->name.toString() + "_void");
+          auto voidFunc =
+            builder.makeFunction(voidName,
+                                 Signature(func->getParams(), Type::none),
+                                 std::move(func->vars));
+          func->vars.clear();
+
+          block->list.pop_back();
+          block->type = Type::none;
+          voidFunc->body = block;
+
+          std::vector<Expression*> args;
+          args.reserve(numParams);
+          for (Index i = 0; i < numParams; i++) {
+            args.push_back(builder.makeLocalGet(i, func->getLocalType(i)));
+          }
+          auto* voidCall = builder.makeCall(voidName, args, Type::none);
+          func->body = builder.makeSequence(voidCall, tail);
+
+          infoMap.try_emplace(voidName);
+          indexes[voidName] = numFunctions++;
+          Function* voidFuncPtr = module->addFunction(std::move(voidFunc));
+
+          for (auto* call : droppedCalls) {
+            auto iter = allDroppedCalls.find(call);
+            assert(iter != allDroppedCalls.end());
+            Expression** location = iter->second;
+            *location = call;
+            call->target = voidName;
+            if (call->type != Type::unreachable) {
+              call->type = Type::none;
+            }
+            allDroppedCalls.erase(iter);
+          }
+          for (auto caller : callers[index]) {
+            worthOptimizing.insert(module->getFunction(caller));
+          }
+          worthOptimizing.insert(voidFuncPtr);
+          markStale(name);
+          markStale(voidName);
+          markCallersStale(index);
+        } else {
+          // Shape B: func's tail is a non-tail Call (or under TNH a RefCast of
+          // a non-tail Call) to a Shape A function G whose pure return value
+          // maps to a pure return value in func.
+          Block* block = func->body->dynCast<Block>();
+          Expression** tailPtr = nullptr;
+          if (block) {
+            if (block->list.size() < 2) {
+              continue;
+            }
+            if (block->name.is() &&
+                BranchUtils::BranchSeeker::has(block, block->name)) {
+              continue;
+            }
+            bool priorAllVoid = true;
+            for (Index i = 0; i + 1 < block->list.size(); i++) {
+              if (block->list[i]->type != Type::none) {
+                priorAllVoid = false;
+                break;
+              }
+            }
+            if (!priorAllVoid) {
+              continue;
+            }
+            tailPtr = &block->list.back();
+          } else {
+            tailPtr = &func->body;
+          }
+
+          Expression* tail = *tailPtr;
+          RefCast* rc = nullptr;
+          Call* innerCall = tail->dynCast<Call>();
+          if (!innerCall && getPassOptions().trapsNeverHappen) {
+            rc = tail->dynCast<RefCast>();
+            if (rc && !rc->desc) {
+              innerCall = rc->ref->dynCast<Call>();
+            }
+          }
+          if (!innerCall || innerCall->isReturn) {
+            continue;
+          }
+          Function* G = module->getFunctionOrNull(innerCall->target);
+          if (!G || G->imported() || G == func || !G->getResults().isSingle()) {
+            continue;
+          }
+          if (ReturnUtils::getInfo(G->body).hasReturn) {
+            continue;
+          }
+          auto* gBlock = G->body->dynCast<Block>();
+          if (!gBlock || gBlock->list.size() < 2) {
+            continue;
+          }
+          if (gBlock->name.is() &&
+              BranchUtils::BranchSeeker::has(gBlock, gBlock->name)) {
+            continue;
+          }
+          bool gPriorAllVoid = true;
+          for (Index i = 0; i + 1 < gBlock->list.size(); i++) {
+            if (gBlock->list[i]->type != Type::none) {
+              gPriorAllVoid = false;
+              break;
+            }
+          }
+          if (!gPriorAllVoid) {
+            continue;
+          }
+          auto gHasSet = getParamSets(G);
+          Expression* gTail = gBlock->list.back();
+          if (getPureReturnSize(gTail, G, gHasSet, module) <= 0) {
+            continue;
+          }
+
+          Expression* candRet = nullptr;
+          if (auto* gGet = gTail->dynCast<LocalGet>()) {
+            if (gGet->index < innerCall->operands.size()) {
+              candRet = innerCall->operands[gGet->index];
+            }
+          } else if (gTail->is<Const>() || gTail->is<RefNull>() ||
+                     gTail->is<RefFunc>() || gTail->is<GlobalGet>()) {
+            candRet = gTail;
+          }
+          if (!candRet) {
+            continue;
+          }
+
+          auto hasSet = getParamSets(func);
+          if (getPureReturnSize(candRet, func, hasSet, module) <= 0) {
+            continue;
+          }
+
+          Builder builder(*module);
+          Expression* retVal = ExpressionManipulator::copy(candRet, *module);
+          if (rc && !Type::isSubType(retVal->type, rc->type)) {
+            retVal = builder.makeRefCast(retVal, rc->type);
+          }
+          if (!Type::isSubType(retVal->type, func->getResults())) {
+            continue;
+          }
+          int retSize = getPureReturnSize(retVal, func, hasSet, module);
+          if (retSize <= 0) {
+            continue;
+          }
+
+          Name voidG = getWrappedVoidCallee(G, module);
+          int extraDropCost = voidG.is() ? 0 : 1;
+          int wrapperCost = ((usedCallCount == 1 && !hasUnseenCalls[index])
+                               ? 1
+                               : int(6 + 2 * numParams + retSize)) +
+                            extraDropCost;
+          int saved = int(droppedCalls.size()) - wrapperCost;
+          if (saved < 8) {
+            continue;
+          }
+
+          Name voidName = Names::getValidFunctionName(
+            *module, func->name.toString() + "_void");
+          auto voidFunc =
+            builder.makeFunction(voidName,
+                                 Signature(func->getParams(), Type::none),
+                                 std::move(func->vars));
+          func->vars.clear();
+
+          if (voidG.is()) {
+            innerCall->target = voidG;
+            if (innerCall->type != Type::unreachable) {
+              innerCall->type = Type::none;
+            }
+            *tailPtr = innerCall;
+          } else {
+            *tailPtr = builder.makeDrop(innerCall);
+          }
+          if (block) {
+            block->type = Type::none;
+          }
+          voidFunc->body = func->body;
+
+          std::vector<Expression*> args;
+          args.reserve(numParams);
+          for (Index i = 0; i < numParams; i++) {
+            args.push_back(builder.makeLocalGet(i, func->getLocalType(i)));
+          }
+          auto* voidCall = builder.makeCall(voidName, args, Type::none);
+          func->body = builder.makeSequence(voidCall, retVal);
+
+          infoMap.try_emplace(voidName);
+          indexes[voidName] = numFunctions++;
+          Function* voidFuncPtr = module->addFunction(std::move(voidFunc));
+
+          for (auto* call : droppedCalls) {
+            auto iter = allDroppedCalls.find(call);
+            assert(iter != allDroppedCalls.end());
+            Expression** location = iter->second;
+            *location = call;
+            call->target = voidName;
+            if (call->type != Type::unreachable) {
+              call->type = Type::none;
+            }
+            allDroppedCalls.erase(iter);
+          }
+          for (auto caller : callers[index]) {
+            worthOptimizing.insert(module->getFunction(caller));
+          }
+          worthOptimizing.insert(voidFuncPtr);
+          markStale(name);
+          markStale(voidName);
+          markCallersStale(index);
+        }
+      }
+    }
+  }
 
   // Returns `true` if the caller should be optimized.
   bool

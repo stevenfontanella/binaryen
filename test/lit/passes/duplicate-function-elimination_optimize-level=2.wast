@@ -774,9 +774,6 @@
   (func $keep2-but-in-theory-we-could-erase (type $0)
     (call $keep2-but-in-theory-we-could-erase)
   )
-  ;; CHECK:      (func $other
-  ;; CHECK-NEXT:  (call $other)
-  ;; CHECK-NEXT: )
   (func $other (type $0)
     (call $other)
   )

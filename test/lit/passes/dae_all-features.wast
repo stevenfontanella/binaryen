@@ -754,26 +754,21 @@
 )
 
 (module
- ;; CHECK:      (type $0 (func (param f64) (result i32)))
+ ;; CHECK:      (type $0 (func (result i32)))
 
- ;; CHECK:      (func $target (type $0) (param $0 f64) (result i32)
+ ;; CHECK:      (func $target (type $0) (result i32)
+ ;; CHECK-NEXT:  (local $0 f64)
  ;; CHECK-NEXT:  (local $1 i32)
  ;; CHECK-NEXT:  (local $2 i32)
  ;; CHECK-NEXT:  (local $3 i32)
  ;; CHECK-NEXT:  (local $4 i32)
  ;; CHECK-NEXT:  (local.set $1
- ;; CHECK-NEXT:   (call $target
- ;; CHECK-NEXT:    (f64.const 1.1)
- ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (call $target)
  ;; CHECK-NEXT:  )
  ;; CHECK-NEXT:  (local.set $2
- ;; CHECK-NEXT:   (call $target
- ;; CHECK-NEXT:    (f64.const 4.4)
- ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (call $target)
  ;; CHECK-NEXT:  )
- ;; CHECK-NEXT:  (call $target
- ;; CHECK-NEXT:   (local.get $0)
- ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (call $target)
  ;; CHECK-NEXT: )
  (func $target (param $a i32) (param $b f64) (param $c i32) (result i32)
   ;; Test removing a parameter despite calls having interesting non-unreachable
@@ -973,3 +968,106 @@
   )
  )
 )
+
+;; Self-recursive pass-through dead parameter and constant propagation, plus
+;; majority-dropped return void-tail splitting.
+(module
+ ;; CHECK:      (type $0 (func (param i32)))
+
+ ;; CHECK:      (type $1 (func (result i32)))
+
+ ;; CHECK:      (type $2 (func (param i32) (result i32)))
+
+ ;; CHECK:      (type $3 (func))
+
+ ;; CHECK:      (func $self-rec (type $0) (param $0 i32)
+ ;; CHECK-NEXT:  (local $1 i32)
+ ;; CHECK-NEXT:  (local $2 i32)
+ ;; CHECK-NEXT:  (local.set $1
+ ;; CHECK-NEXT:   (i32.const 42)
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (block
+ ;; CHECK-NEXT:   (local.set $2
+ ;; CHECK-NEXT:    (i32.const 99)
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (if
+ ;; CHECK-NEXT:    (local.get $0)
+ ;; CHECK-NEXT:    (then
+ ;; CHECK-NEXT:     (call $self-rec
+ ;; CHECK-NEXT:      (i32.sub
+ ;; CHECK-NEXT:       (local.get $0)
+ ;; CHECK-NEXT:       (local.get $1)
+ ;; CHECK-NEXT:      )
+ ;; CHECK-NEXT:     )
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT: )
+ (func $self-rec (param $0 i32) (param $dead i32) (param $const i32)
+  (if
+   (local.get $0)
+   (then
+    (call $self-rec
+     (i32.sub
+      (local.get $0)
+      (local.get $const)
+     )
+     (local.get $dead)
+     (local.get $const)
+    )
+   )
+  )
+ )
+
+ ;; CHECK:      (func $split-ret (type $1) (result i32)
+ ;; CHECK-NEXT:  (local $0 i32)
+ ;; CHECK-NEXT:  (local.set $0
+ ;; CHECK-NEXT:   (i32.const 10)
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (block (result i32)
+ ;; CHECK-NEXT:   (call $split-ret_void)
+ ;; CHECK-NEXT:   (local.get $0)
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT: )
+ (func $split-ret (param $0 i32) (result i32)
+  (nop)
+  (local.get $0)
+ )
+
+ ;; CHECK:      (func $caller (type $2) (param $x i32) (result i32)
+ ;; CHECK-NEXT:  (call $self-rec
+ ;; CHECK-NEXT:   (local.get $x)
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (call $split-ret_void)
+ ;; CHECK-NEXT:  (call $split-ret_void)
+ ;; CHECK-NEXT:  (call $split-ret_void)
+ ;; CHECK-NEXT:  (call $split-ret_void)
+ ;; CHECK-NEXT:  (call $split-ret_void)
+ ;; CHECK-NEXT:  (call $split-ret_void)
+ ;; CHECK-NEXT:  (call $split-ret_void)
+ ;; CHECK-NEXT:  (call $split-ret_void)
+ ;; CHECK-NEXT:  (call $split-ret_void)
+ ;; CHECK-NEXT:  (call $split-ret)
+ ;; CHECK-NEXT: )
+ (func $caller (param $x i32) (result i32)
+  (call $self-rec
+   (local.get $x)
+   (i32.const 99)
+   (i32.const 42)
+  )
+  (drop (call $split-ret (i32.const 1)))
+  (drop (call $split-ret (i32.const 2)))
+  (drop (call $split-ret (i32.const 3)))
+  (drop (call $split-ret (i32.const 4)))
+  (drop (call $split-ret (i32.const 5)))
+  (drop (call $split-ret (i32.const 6)))
+  (drop (call $split-ret (i32.const 7)))
+  (drop (call $split-ret (i32.const 8)))
+  (drop (call $split-ret (i32.const 9)))
+  (call $split-ret (i32.const 10))
+ )
+)
+;; CHECK:      (func $split-ret_void (type $3)
+;; CHECK-NEXT:  (local $0 i32)
+;; CHECK-NEXT:  (nop)
+;; CHECK-NEXT: )

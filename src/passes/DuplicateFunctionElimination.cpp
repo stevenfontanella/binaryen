@@ -56,11 +56,17 @@ struct DuplicateFunctionElimination : public Pass {
       limit--;
       // Hash all the functions
       auto hashes = FunctionHasher::createMap(module);
-      FunctionHasher(&hashes).run(getPassRunner(), module);
+      auto literalHashes = FunctionHasher::createMap(module);
+      FunctionHasher(&hashes, &literalHashes).run(getPassRunner(), module);
       // Find hash-equal groups
       std::map<uint32_t, std::vector<Function*>> hashGroups;
       ModuleUtils::iterDefinedFunctions(*module, [&](Function* func) {
-        hashGroups[hashes[func]].push_back(func);
+        uint32_t h = hashes[func];
+        hashGroups[h].push_back(func);
+        uint32_t litH = literalHashes[func];
+        if (litH != uint32_t(hash(0)) && litH != h) {
+          hashGroups[litH].push_back(func);
+        }
       });
       // Find actually equal functions and prepare to replace them
       std::map<Name, Name> replacements;
@@ -80,7 +86,7 @@ struct DuplicateFunctionElimination : public Pass {
           }
           for (Index j = i + 1; j < size; j++) {
             auto* second = group[j];
-            if (duplicates.contains(second->name)) {
+            if (second == first || duplicates.contains(second->name)) {
               continue;
             }
             if (FunctionUtils::equal(first, second)) {
