@@ -828,3 +828,126 @@
     )
   )
 )
+
+(module
+  ;; CHECK:      (type $A (struct (field (mut (ref null $A))) (field (mut i32))))
+  ;; SHRINK:      (type $A (struct (field (mut (ref null $A))) (field (mut i32))))
+  (type $A (struct (field (mut (ref null $A))) (field (mut i32))))
+
+  ;; CHECK:      (type $1 (func (param (ref $A)) (result i32)))
+  ;; SHRINK:      (type $1 (func (param (ref $A)) (result i32)))
+
+  ;; CHECK:      (func $uncse-tee-across-disjoint-field (type $1) (param $a (ref $A)) (result i32)
+  ;; CHECK-NEXT:  (local $x (ref null $A))
+  ;; CHECK-NEXT:  (struct.set $A 1
+  ;; CHECK-NEXT:   (local.get $a)
+  ;; CHECK-NEXT:   (ref.is_null
+  ;; CHECK-NEXT:    (local.tee $x
+  ;; CHECK-NEXT:     (struct.get $A 0
+  ;; CHECK-NEXT:      (local.get $a)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (ref.eq
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (local.get $a)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $uncse-tee-across-disjoint-field (type $1) (param $a (ref $A)) (result i32)
+  ;; SHRINK-NEXT:  (struct.set $A 1
+  ;; SHRINK-NEXT:   (local.get $a)
+  ;; SHRINK-NEXT:   (ref.is_null
+  ;; SHRINK-NEXT:    (struct.get $A 0
+  ;; SHRINK-NEXT:     (local.get $a)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; CHECK-NEXT-NOT: local
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (ref.eq
+  ;; SHRINK-NEXT:   (struct.get $A 0
+  ;; SHRINK-NEXT:    (local.get $a)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (local.get $a)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $uncse-tee-across-disjoint-field (param $a (ref $A)) (result i32)
+    (local $x (ref null $A))
+    (struct.set $A 1
+      (local.get $a)
+      (ref.is_null
+        (local.tee $x
+          (struct.get $A 0
+            (local.get $a)
+          )
+        )
+      )
+    )
+    (ref.eq
+      (local.get $x)
+      (local.get $a)
+    )
+  )
+
+  ;; CHECK:      (func $cse-across-disjoint-field (type $1) (param $a (ref $A)) (result i32)
+  ;; CHECK-NEXT:  (struct.set $A 1
+  ;; CHECK-NEXT:   (local.get $a)
+  ;; CHECK-NEXT:   (ref.is_null
+  ;; CHECK-NEXT:    (struct.get $A 0
+  ;; CHECK-NEXT:     (local.get $a)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (ref.is_null
+  ;; CHECK-NEXT:    (struct.get $A 0
+  ;; CHECK-NEXT:     (local.get $a)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (ref.is_null
+  ;; CHECK-NEXT:    (struct.get $A 0
+  ;; CHECK-NEXT:     (local.get $a)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $cse-across-disjoint-field (type $1) (param $a (ref $A)) (result i32)
+  ;; SHRINK-NEXT:  (local $1 i32)
+  ;; SHRINK-NEXT:  (struct.set $A 1
+  ;; SHRINK-NEXT:   (local.get $a)
+  ;; SHRINK-NEXT:   (local.tee $1
+  ;; SHRINK-NEXT:    (ref.is_null
+  ;; SHRINK-NEXT:     (struct.get $A 0
+  ;; SHRINK-NEXT:      (local.get $a)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (i32.add
+  ;; SHRINK-NEXT:   (local.get $1)
+  ;; SHRINK-NEXT:   (local.get $1)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $cse-across-disjoint-field (param $a (ref $A)) (result i32)
+    (struct.set $A 1
+      (local.get $a)
+      (ref.is_null
+        (struct.get $A 0
+          (local.get $a)
+        )
+      )
+    )
+    (i32.add
+      (ref.is_null
+        (struct.get $A 0
+          (local.get $a)
+        )
+      )
+      (ref.is_null
+        (struct.get $A 0
+          (local.get $a)
+        )
+      )
+    )
+  )
+)

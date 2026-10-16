@@ -1320,7 +1320,9 @@ struct ScopedDominatorCSE {
     Index reuses = 0;
     SmallVector<Index, 4> localsRead;
     SmallVector<Name, 2> mutableGlobalsRead;
+    SmallVector<std::pair<HeapType, Index>, 2> mutableStructFieldsRead;
     bool readsMutableStruct = false;
+    bool readsUnknownMutableStruct = false;
     bool readsMutableArray = false;
     bool readsMemory = false;
     bool readsTable = false;
@@ -1454,6 +1456,21 @@ struct ScopedDominatorCSE {
         }
         if (eff.readsMutableStruct || eff.readsSharedMutableStruct) {
           rec.readsMutableStruct = true;
+          if (auto* sg = e->dynCast<StructGet>()) {
+            if (!eff.readsSharedMutableStruct && sg->ref->type.isRef()) {
+              std::pair<HeapType, Index> key{sg->ref->type.getHeapType(),
+                                             sg->index};
+              if (std::find(rec.mutableStructFieldsRead.begin(),
+                            rec.mutableStructFieldsRead.end(),
+                            key) == rec.mutableStructFieldsRead.end()) {
+                rec.mutableStructFieldsRead.push_back(key);
+              }
+            } else {
+              rec.readsUnknownMutableStruct = true;
+            }
+          } else {
+            rec.readsUnknownMutableStruct = true;
+          }
         }
         if (eff.readsMutableArray || eff.readsSharedMutableArray) {
           rec.readsMutableArray = true;
@@ -1486,7 +1503,52 @@ struct ScopedDominatorCSE {
     }
     if (rec.readsMutableStruct &&
         (eff.writesStruct || eff.writesSharedStruct || eff.calls)) {
-      return true;
+      if (rec.readsUnknownMutableStruct || eff.writesSharedStruct ||
+          eff.calls || !killerExpr) {
+        return true;
+      }
+      if (!FindAll<CallRef>(killerExpr).list.empty() ||
+          !FindAll<CallIndirect>(killerExpr).list.empty()) {
+        return true;
+      }
+      bool aliasFound = false;
+      for (auto* call : FindAll<Call>(killerExpr).list) {
+        auto* target = wasm.getFunctionOrNull(call->target);
+        if (!target || !target->effects) {
+          aliasFound = true;
+          break;
+        }
+        const auto& tEff = *target->effects;
+        if ((tEff.writesStruct || tEff.writesSharedStruct || tEff.calls) &&
+            !(tEff.isIdempotent && tEff.onlyTouchesInitGlobals)) {
+          aliasFound = true;
+          break;
+        }
+      }
+      if (aliasFound) {
+        return true;
+      }
+      for (auto* ss : FindAll<StructSet>(killerExpr).list) {
+        if (!ss->ref->type.isRef()) {
+          aliasFound = true;
+          break;
+        }
+        HeapType wHT = ss->ref->type.getHeapType();
+        for (auto& [rHT, rIdx] : rec.mutableStructFieldsRead) {
+          if (ss->index == rIdx &&
+              (HeapType::isSubType(wHT, rHT) ||
+               HeapType::isSubType(rHT, wHT))) {
+            aliasFound = true;
+            break;
+          }
+        }
+        if (aliasFound) {
+          break;
+        }
+      }
+      if (aliasFound) {
+        return true;
+      }
     }
     if (rec.readsMutableArray &&
         (eff.writesArray || eff.writesSharedArray || eff.calls)) {
@@ -1579,7 +1641,7 @@ struct ScopedDominatorCSE {
         continue;
       }
       for (Index i = 0; i < j; i++) {
-        if (isKilledByEffects(childNormRecs[i], jEff)) {
+        if (isKilledByEffects(childNormRecs[i], jEff, children[j])) {
           return false;
         }
       }
@@ -1636,7 +1698,7 @@ struct ScopedDominatorCSE {
           }
           EffectAnalyzer eff(options, wasm, block->list[i]);
           eff.trap = false;
-          invalidateByEffects(eff);
+          invalidateByEffects(eff, block->list[i]);
         }
       }
       return {};
@@ -1655,11 +1717,11 @@ struct ScopedDominatorCSE {
         activeMap = std::move(afterCond);
         EffectAnalyzer thenEff(options, wasm, iff->ifTrue);
         thenEff.trap = false;
-        invalidateByEffects(thenEff);
+        invalidateByEffects(thenEff, iff->ifTrue);
         if (iff->ifFalse) {
           EffectAnalyzer elseEff(options, wasm, iff->ifFalse);
           elseEff.trap = false;
-          invalidateByEffects(elseEff);
+          invalidateByEffects(elseEff, iff->ifFalse);
         }
       }
       return {};
@@ -1667,7 +1729,7 @@ struct ScopedDominatorCSE {
     if (auto* loop = curr->dynCast<Loop>()) {
       EffectAnalyzer loopEff(options, wasm, loop->body);
       loopEff.trap = false;
-      invalidateByEffects(loopEff);
+      invalidateByEffects(loopEff, loop->body);
       ActiveMap beforeLoop = activeMap;
       walkExpr(loop->body);
       if (loop->type == Type::unreachable) {
@@ -1684,7 +1746,7 @@ struct ScopedDominatorCSE {
       bodyEff.trap = false;
       for (auto* cb : tryy->catchBodies) {
         activeMap = beforeTry;
-        invalidateByEffects(bodyEff);
+        invalidateByEffects(bodyEff, tryy->body);
         walkExpr(cb);
       }
       if (tryy->type == Type::unreachable) {
@@ -1693,7 +1755,7 @@ struct ScopedDominatorCSE {
         activeMap = std::move(beforeTry);
         EffectAnalyzer tryEff(options, wasm, tryy);
         tryEff.trap = false;
-        invalidateByEffects(tryEff);
+        invalidateByEffects(tryEff, tryy);
       }
       return {};
     }
@@ -1706,7 +1768,7 @@ struct ScopedDominatorCSE {
         activeMap = std::move(beforeTry);
         EffectAnalyzer ttEff(options, wasm, tt);
         ttEff.trap = false;
-        invalidateByEffects(ttEff);
+        invalidateByEffects(ttEff, tt);
       }
       return {};
     }
@@ -2015,8 +2077,9 @@ struct ScopedDominatorCSE {
 
 static bool unCseSingleWriteTees(Function* func,
                                  Module& wasm,
-                                 PassOptions& options) {
-  if (!func->body || func->getNumVars() == 0) {
+                                 PassOptions& options,
+                                 bool allowNonTeeAndMultiWrite = false) {
+  if (!func->body || func->getNumLocals() == 0) {
     return false;
   }
 
@@ -2026,19 +2089,38 @@ static bool unCseSingleWriteTees(Function* func,
 
   auto isDuplicableValue = [&](Expression* root,
                                ScopedDominatorCSE::OrigRecord& rec,
-                               Index& estBytesOut) -> bool {
+                               Index& estBytesOut,
+                               LocalSet*& innerTeeOut) -> bool {
     estBytesOut = 0;
+    innerTeeOut = nullptr;
     bool ok = true;
-    std::function<void(Expression*)> walkVal = [&](Expression* e) {
+    std::function<void(Expression*, bool)> walkVal = [&](Expression* e,
+                                                         bool onLeftmostPath) {
       if (!ok || !e) {
         return;
       }
-      if (e->is<LocalSet>() || e->is<Block>() || e->is<If>() ||
-          e->is<Loop>() || e->is<Try>() || e->is<TryTable>() ||
-          e->is<Break>() || e->is<BrOn>() || e->is<Switch>() ||
-          e->is<Return>() || e->is<Throw>() || e->is<Rethrow>() ||
-          e->is<Unreachable>() || e->is<CallRef>() || e->is<CallIndirect>() ||
-          e->is<Pop>() || e->is<TupleMake>() || e->is<TupleExtract>()) {
+      if (auto* ls = e->dynCast<LocalSet>()) {
+        if (e != root && onLeftmostPath && !innerTeeOut && ls->isTee() &&
+            ls->value->type.isConcrete() &&
+            Type::isSubType(ls->value->type, func->getLocalType(ls->index))) {
+          innerTeeOut = ls;
+          estBytesOut += 2;
+          if (std::find(rec.localsRead.begin(),
+                        rec.localsRead.end(),
+                        ls->index) == rec.localsRead.end()) {
+            rec.localsRead.push_back(ls->index);
+          }
+          return;
+        }
+        ok = false;
+        return;
+      }
+      if (e->is<Block>() || e->is<If>() || e->is<Loop>() || e->is<Try>() ||
+          e->is<TryTable>() || e->is<Break>() || e->is<BrOn>() ||
+          e->is<Switch>() || e->is<Return>() || e->is<Throw>() ||
+          e->is<Rethrow>() || e->is<Unreachable>() || e->is<CallRef>() ||
+          e->is<CallIndirect>() || e->is<Pop>() || e->is<TupleMake>() ||
+          e->is<TupleExtract>()) {
         ok = false;
         return;
       }
@@ -2057,7 +2139,7 @@ static bool unCseSingleWriteTees(Function* func,
           return;
         }
         auto* target = wasm.getFunctionOrNull(call->target);
-        if (!target || target->imported() || !target->effects) {
+        if (!target || !target->effects) {
           ok = false;
           return;
         }
@@ -2084,6 +2166,7 @@ static bool unCseSingleWriteTees(Function* func,
           }
           if (tEff.readsMutableStruct || tEff.readsSharedMutableStruct) {
             rec.readsMutableStruct = true;
+            rec.readsUnknownMutableStruct = true;
           }
           if (tEff.readsMutableArray || tEff.readsSharedMutableArray) {
             rec.readsMutableArray = true;
@@ -2095,8 +2178,10 @@ static bool unCseSingleWriteTees(Function* func,
             rec.readsTable = true;
           }
         }
+        bool firstChild = onLeftmostPath;
         for (auto* ch : ChildIterator(e)) {
-          walkVal(ch);
+          walkVal(ch, firstChild);
+          firstChild = false;
         }
         return;
       }
@@ -2120,6 +2205,21 @@ static bool unCseSingleWriteTees(Function* func,
       }
       if (eff.readsMutableStruct || eff.readsSharedMutableStruct) {
         rec.readsMutableStruct = true;
+        if (auto* sg = e->dynCast<StructGet>()) {
+          if (!eff.readsSharedMutableStruct && sg->ref->type.isRef()) {
+            std::pair<HeapType, Index> key{sg->ref->type.getHeapType(),
+                                           sg->index};
+            if (std::find(rec.mutableStructFieldsRead.begin(),
+                          rec.mutableStructFieldsRead.end(),
+                          key) == rec.mutableStructFieldsRead.end()) {
+              rec.mutableStructFieldsRead.push_back(key);
+            }
+          } else {
+            rec.readsUnknownMutableStruct = true;
+          }
+        } else {
+          rec.readsUnknownMutableStruct = true;
+        }
       }
       if (eff.readsMutableArray || eff.readsSharedMutableArray) {
         rec.readsMutableArray = true;
@@ -2130,45 +2230,58 @@ static bool unCseSingleWriteTees(Function* func,
       if (eff.readsTable) {
         rec.readsTable = true;
       }
+      bool firstChild = onLeftmostPath;
       for (auto* ch : ChildIterator(e)) {
-        walkVal(ch);
+        walkVal(ch, firstChild);
+        firstChild = false;
       }
     };
-    walkVal(root);
+    walkVal(root, true);
     return ok;
   };
 
-  for (int iter = 0; iter < 3; iter++) {
+  for (int iter = 0; iter < 4; iter++) {
     Index numLocals = func->getNumLocals();
     Index varBase = func->getVarIndexBase();
     std::vector<SmallVector<LocalSet*, 2>> writes(numLocals);
     std::vector<SmallVector<LocalGet*, 4>> reads(numLocals);
+    std::vector<SmallVector<LocalGet*, 4>> readsAfterLastWrite(numLocals);
     std::vector<Index> teePostOrder(numLocals, 0);
+    std::vector<Index> writeLoopDepth(numLocals, 0);
     std::vector<bool> inConcreteParent(numLocals, false);
     std::unordered_set<Index> coupledCallRefLocals;
 
     Index postCounter = 0;
+    Index scanLoopDepth = 0;
     std::vector<Expression*> parentStack;
     std::function<void(Expression*)> scanAST = [&](Expression* curr) {
       if (!curr) {
         return;
+      }
+      bool isLoop = curr->is<Loop>();
+      if (isLoop) {
+        scanLoopDepth++;
       }
       parentStack.push_back(curr);
       for (auto* ch : ChildIterator(curr)) {
         scanAST(ch);
       }
       parentStack.pop_back();
+      if (isLoop) {
+        scanLoopDepth--;
+      }
       Index myPost = ++postCounter;
       if (auto* lg = curr->dynCast<LocalGet>()) {
         reads[lg->index].push_back(lg);
+        readsAfterLastWrite[lg->index].push_back(lg);
       } else if (auto* ls = curr->dynCast<LocalSet>()) {
         writes[ls->index].push_back(ls);
-        if (ls->isTee()) {
-          teePostOrder[ls->index] = myPost;
-          if (!parentStack.empty() &&
-              parentStack.back()->type.isConcrete()) {
-            inConcreteParent[ls->index] = true;
-          }
+        readsAfterLastWrite[ls->index].clear();
+        teePostOrder[ls->index] = myPost;
+        writeLoopDepth[ls->index] = scanLoopDepth;
+        if (ls->isTee() && !parentStack.empty() &&
+            parentStack.back()->type.isConcrete()) {
+          inConcreteParent[ls->index] = true;
         }
       } else if (auto* cr = curr->dynCast<CallRef>()) {
         if (!cr->operands.empty() && cr->target) {
@@ -2179,6 +2292,14 @@ static bool unCseSingleWriteTees(Function* func,
                   coupledCallRefLocals.insert(ls->index);
                   break;
                 }
+              }
+            }
+          }
+          for (auto* lg0 : FindAll<LocalGet>(cr->operands[0]).list) {
+            for (auto* lgT : FindAll<LocalGet>(cr->target).list) {
+              if (lg0->index == lgT->index) {
+                coupledCallRefLocals.insert(lg0->index);
+                break;
               }
             }
           }
@@ -2198,27 +2319,52 @@ static bool unCseSingleWriteTees(Function* func,
     std::vector<bool> isCandidate(numLocals, false);
     std::vector<ScopedDominatorCSE::OrigRecord> candRec(numLocals);
     std::vector<Index> candEstBytes(numLocals, 0);
+    std::vector<LocalSet*> candInnerTee(numLocals, nullptr);
     bool anyCand = false;
 
-    for (Index x = varBase; x < numLocals; x++) {
-      if (writes[x].size() != 1 || !writes[x][0]->isTee() ||
-          reads[x].size() > 3 || coupledCallRefLocals.contains(x)) {
+    for (Index x = 0; x < numLocals; x++) {
+      if (writes[x].empty()) {
         continue;
       }
-      LocalSet* wx = writes[x][0];
+      bool isSingleWriteVar = (x >= varBase && writes[x].size() == 1);
+      if (!allowNonTeeAndMultiWrite &&
+          (!isSingleWriteVar || !writes[x][0]->isTee())) {
+        continue;
+      }
+      if (!isSingleWriteVar && writeLoopDepth[x] > 0) {
+        continue;
+      }
+      const auto& targetReads =
+        isSingleWriteVar ? reads[x] : readsAfterLastWrite[x];
+      if (targetReads.size() > 3) {
+        continue;
+      }
+      LocalSet* wx = writes[x].back();
       Expression* V = wx->value;
       if (!V->type.isConcrete() ||
           !Type::isSubType(V->type, func->getLocalType(x))) {
         continue;
       }
-      if (reads[x].empty()) {
-        isCandidate[x] = true;
-        anyCand = true;
+      if (coupledCallRefLocals.contains(x) && !V->is<LocalGet>()) {
+        continue;
+      }
+      if (targetReads.empty()) {
+        if (isSingleWriteVar && wx->isTee()) {
+          isCandidate[x] = true;
+          anyCand = true;
+        }
         continue;
       }
       candRec[x].orig = V;
       Index estV = 0;
-      if (!isDuplicableValue(V, candRec[x], estV)) {
+      LocalSet* innerTee = nullptr;
+      if (!isDuplicableValue(V, candRec[x], estV, innerTee)) {
+        continue;
+      }
+      if (innerTee &&
+          (!allowNonTeeAndMultiWrite ||
+           EffectAnalyzer(options, wasm, innerTee->value)
+             .localsWritten.contains(x))) {
         continue;
       }
       if (std::find(candRec[x].localsRead.begin(),
@@ -2227,6 +2373,7 @@ static bool unCseSingleWriteTees(Function* func,
         continue;
       }
       candEstBytes[x] = estV;
+      candInnerTee[x] = innerTee;
       isCandidate[x] = true;
       anyCand = true;
     }
@@ -2315,7 +2462,7 @@ static bool unCseSingleWriteTees(Function* func,
             }
             EffectAnalyzer eff(options, wasm, block->list[i]);
             eff.trap = false;
-            invalidateActiveByEffects(eff);
+            invalidateActiveByEffects(eff, block->list[i]);
           }
         }
         return;
@@ -2340,7 +2487,7 @@ static bool unCseSingleWriteTees(Function* func,
           if (!thenExitsFunc) {
             EffectAnalyzer thenEff(options, wasm, iff->ifTrue);
             thenEff.trap = false;
-            invalidateActiveByEffects(thenEff);
+            invalidateActiveByEffects(thenEff, iff->ifTrue);
           }
           if (iff->ifFalse) {
             bool elseExitsFunc =
@@ -2351,7 +2498,7 @@ static bool unCseSingleWriteTees(Function* func,
             if (!elseExitsFunc) {
               EffectAnalyzer elseEff(options, wasm, iff->ifFalse);
               elseEff.trap = false;
-              invalidateActiveByEffects(elseEff);
+              invalidateActiveByEffects(elseEff, iff->ifFalse);
             }
           }
         }
@@ -2360,7 +2507,7 @@ static bool unCseSingleWriteTees(Function* func,
       if (auto* loop = curr->dynCast<Loop>()) {
         EffectAnalyzer loopEff(options, wasm, loop->body);
         loopEff.trap = false;
-        invalidateActiveByEffects(loopEff);
+        invalidateActiveByEffects(loopEff, loop->body);
         auto beforeLoop = activeTees;
         currentLoopDepth++;
         walkDom(loop->body);
@@ -2379,7 +2526,7 @@ static bool unCseSingleWriteTees(Function* func,
         bodyEff.trap = false;
         for (auto* cb : tryy->catchBodies) {
           activeTees = beforeTry;
-          invalidateActiveByEffects(bodyEff);
+          invalidateActiveByEffects(bodyEff, tryy->body);
           walkDom(cb);
         }
         if (tryy->type == Type::unreachable) {
@@ -2388,7 +2535,7 @@ static bool unCseSingleWriteTees(Function* func,
           activeTees = std::move(beforeTry);
           EffectAnalyzer tryEff(options, wasm, tryy);
           tryEff.trap = false;
-          invalidateActiveByEffects(tryEff);
+          invalidateActiveByEffects(tryEff, tryy);
         }
         return;
       }
@@ -2401,7 +2548,7 @@ static bool unCseSingleWriteTees(Function* func,
           activeTees = std::move(beforeTry);
           EffectAnalyzer ttEff(options, wasm, tt);
           ttEff.trap = false;
-          invalidateActiveByEffects(ttEff);
+          invalidateActiveByEffects(ttEff, tt);
         }
         return;
       }
@@ -2452,16 +2599,25 @@ static bool unCseSingleWriteTees(Function* func,
       }
       if (auto* lg = curr->dynCast<LocalGet>()) {
         auto it = activeTees.find(lg->index);
-        if (it != activeTees.end() && it->second == currentLoopDepth) {
-          validReads[lg->index]++;
+        if (it != activeTees.end()) {
+          Expression* origV = candRec[lg->index].orig;
+          bool isLoopSafeLeaf = origV &&
+                                (origV->is<Const>() || origV->is<RefNull>() ||
+                                 origV->is<RefFunc>() ||
+                                 origV->is<LocalGet>() ||
+                                 origV->is<GlobalGet>());
+          if (it->second == currentLoopDepth ||
+              (isLoopSafeLeaf && it->second < currentLoopDepth)) {
+            validReads[lg->index]++;
+          }
         }
         return;
       }
       if (auto* ls = curr->dynCast<LocalSet>()) {
         walkDom(ls->value);
         invalidateActiveByLocalWrite(ls->index);
-        if (ls->isTee() && isCandidate[ls->index] &&
-            writes[ls->index][0] == ls) {
+        activeTees.erase(ls->index);
+        if (isCandidate[ls->index] && writes[ls->index].back() == ls) {
           activeTees[ls->index] = currentLoopDepth;
         }
         return;
@@ -2494,8 +2650,14 @@ static bool unCseSingleWriteTees(Function* func,
     walkDom(func->body);
 
     std::vector<Index> domCandidates;
-    for (Index x = varBase; x < numLocals; x++) {
-      if (isCandidate[x] && validReads[x] == reads[x].size()) {
+    for (Index x = 0; x < numLocals; x++) {
+      if (!isCandidate[x]) {
+        continue;
+      }
+      bool isSingleWriteVar = (x >= varBase && writes[x].size() == 1);
+      const auto& targetReads =
+        isSingleWriteVar ? reads[x] : readsAfterLastWrite[x];
+      if (validReads[x] == targetReads.size()) {
         domCandidates.push_back(x);
       }
     }
@@ -2503,7 +2665,7 @@ static bool unCseSingleWriteTees(Function* func,
       break;
     }
 
-    // Evaluate inner/later tees first (descending post-order of wx).
+    // Evaluate inner/later writes first (descending post-order of wx).
     std::sort(domCandidates.begin(),
               domCandidates.end(),
               [&](Index a, Index b) {
@@ -2516,11 +2678,49 @@ static bool unCseSingleWriteTees(Function* func,
     }
 
     std::unordered_set<Index> selectedLocals;
-    std::unordered_map<Index, Expression*> selectedValues;
+    std::unordered_set<Index> readBySelectedLocals;
+    std::unordered_map<LocalSet*, Expression*> selectedWriteNodes;
+    std::unordered_map<LocalSet*, LocalSet*> selectedWriteInnerTee;
+    std::unordered_map<LocalGet*, Expression*> selectedGetNodes;
+
+    auto makeNormCopy = [&](Expression* V, LocalSet* innerTee) -> Expression* {
+      if (!innerTee) {
+        return V;
+      }
+      Expression* copyV = ExpressionManipulator::copy(V, wasm);
+      struct TeeToGet : public PostWalker<TeeToGet> {
+        Module& wasm;
+        Function* func;
+        Index targetIdx;
+        bool done = false;
+        TeeToGet(Module& wasm, Function* func, Index targetIdx)
+          : wasm(wasm), func(func), targetIdx(targetIdx) {}
+        void visitLocalSet(LocalSet* curr) {
+          if (!done && curr->isTee() && curr->index == targetIdx) {
+            done = true;
+            replaceCurrent(Builder(wasm).makeLocalGet(
+              targetIdx, func->getLocalType(targetIdx)));
+          }
+        }
+      } converter(wasm, func, innerTee->index);
+      converter.walk(copyV);
+      return copyV;
+    };
 
     for (Index x : domCandidates) {
-      Index k = currentReadCount[x];
+      bool isSingleWriteVar = (x >= varBase && writes[x].size() == 1);
+      LocalSet* wx = writes[x].back();
+      LocalSet* innerTee = candInnerTee[x];
+      const auto& targetReads =
+        isSingleWriteVar ? reads[x] : readsAfterLastWrite[x];
+      Index k = isSingleWriteVar ? currentReadCount[x] : targetReads.size();
       if (k > 3) {
+        continue;
+      }
+      if ((!isSingleWriteVar || innerTee) && k == 0) {
+        continue;
+      }
+      if (selectedLocals.contains(x) || readBySelectedLocals.contains(x)) {
         continue;
       }
       if (k > 0) {
@@ -2537,69 +2737,134 @@ static bool unCseSingleWriteTees(Function* func,
         Type xType = func->getLocalType(x);
         Type binType = ScopedDominatorCSE::getBinaryVarType(xType);
         Index headerBytes = 0;
-        if (varTypeCounts[binType] == 1) {
+        if (isSingleWriteVar && varTypeCounts[binType] == 1) {
           if (xType.isRef() && !xType.getHeapType().isBasic()) {
             headerBytes = 4;
           } else if (options.shrinkLevel >= 2) {
-            headerBytes = 2;
+            bool sharedWithParam = false;
+            if (!options.trapsNeverHappen) {
+              for (Index p = 0; p < varBase; p++) {
+                if (ScopedDominatorCSE::getBinaryVarType(
+                      func->getLocalType(p)) == binType) {
+                  sharedWithParam = true;
+                  break;
+                }
+              }
+            }
+            if (!sharedWithParam) {
+              headerBytes = 2;
+            }
           }
         }
         Index estV = candEstBytes[x];
-        Index lhs = estV > 2 ? k * (estV - 2) : 0;
-        Index rhs = 2 + headerBytes;
-        if (lhs > rhs) {
-          continue;
-        }
-        if (lhs == rhs && !inConcreteParent[x]) {
-          continue;
+        if (wx->isTee()) {
+          Index lhs = estV > 2 ? k * (estV - 2) : 0;
+          Index rhs = 2 + headerBytes;
+          if (lhs > rhs) {
+            continue;
+          }
+          if (lhs == rhs && !inConcreteParent[x]) {
+            continue;
+          }
+        } else {
+          Index lhs = (k - 1) * estV;
+          Index rhs = (innerTee ? 0 : 2) +
+                      2 * (options.trapsNeverHappen ? k : (k - 1)) +
+                      headerBytes;
+          if (lhs > rhs) {
+            continue;
+          }
+          if (lhs == rhs && !inConcreteParent[x]) {
+            continue;
+          }
         }
       }
 
       selectedLocals.insert(x);
-      allUnCsedLocals.insert(x);
-      Expression* V = writes[x][0]->value;
-      selectedValues[x] = V;
-      Type binType =
-        ScopedDominatorCSE::getBinaryVarType(func->getLocalType(x));
-      if (varTypeCounts[binType] > 0) {
-        varTypeCounts[binType]--;
+      for (Index r : candRec[x].localsRead) {
+        readBySelectedLocals.insert(r);
+      }
+      Expression* V = wx->value;
+      Expression* normV = makeNormCopy(V, innerTee);
+      selectedWriteNodes[wx] = V;
+      if (innerTee && !wx->isTee()) {
+        selectedWriteInnerTee[wx] = innerTee;
+      }
+      for (LocalGet* lg : targetReads) {
+        selectedGetNodes[lg] = normV;
+      }
+      if (isSingleWriteVar) {
+        allUnCsedLocals.insert(x);
+        Type binType =
+          ScopedDominatorCSE::getBinaryVarType(func->getLocalType(x));
+        if (varTypeCounts[binType] > 0) {
+          varTypeCounts[binType]--;
+        }
       }
       if (k > 0) {
-        for (auto* lg : FindAll<LocalGet>(V).list) {
-          currentReadCount[lg->index] += k;
+        for (auto* lg : FindAll<LocalGet>(normV).list) {
+          if (innerTee && lg->index == innerTee->index) {
+            currentReadCount[lg->index] += k;
+          } else {
+            currentReadCount[lg->index] += (wx->isTee() ? k : (k - 1));
+          }
         }
       }
     }
 
-    if (selectedLocals.empty()) {
+    if (selectedWriteNodes.empty()) {
       break;
     }
 
     struct UnCseReplacer : public PostWalker<UnCseReplacer> {
       Module& wasm;
-      const std::unordered_set<Index>& selectedLocals;
-      const std::unordered_map<Index, Expression*>& selectedValues;
+      const std::unordered_map<LocalSet*, Expression*>& selectedWriteNodes;
+      const std::unordered_map<LocalSet*, LocalSet*>& selectedWriteInnerTee;
+      const std::unordered_map<LocalGet*, Expression*>& selectedGetNodes;
 
       UnCseReplacer(
         Module& wasm,
-        const std::unordered_set<Index>& selectedLocals,
-        const std::unordered_map<Index, Expression*>& selectedValues)
-        : wasm(wasm), selectedLocals(selectedLocals),
-          selectedValues(selectedValues) {}
+        const std::unordered_map<LocalSet*, Expression*>& selectedWriteNodes,
+        const std::unordered_map<LocalSet*, LocalSet*>& selectedWriteInnerTee,
+        const std::unordered_map<LocalGet*, Expression*>& selectedGetNodes)
+        : wasm(wasm), selectedWriteNodes(selectedWriteNodes),
+          selectedWriteInnerTee(selectedWriteInnerTee),
+          selectedGetNodes(selectedGetNodes) {}
 
       void visitLocalGet(LocalGet* curr) {
-        auto it = selectedValues.find(curr->index);
-        if (it != selectedValues.end()) {
+        auto it = selectedGetNodes.find(curr);
+        if (it != selectedGetNodes.end()) {
           replaceCurrent(ExpressionManipulator::copy(it->second, wasm));
         }
       }
 
       void visitLocalSet(LocalSet* curr) {
-        if (curr->isTee() && selectedLocals.contains(curr->index)) {
-          replaceCurrent(curr->value);
+        auto it = selectedWriteNodes.find(curr);
+        if (it != selectedWriteNodes.end()) {
+          if (curr->isTee()) {
+            replaceCurrent(curr->value);
+          } else {
+            auto tIt = selectedWriteInnerTee.find(curr);
+            if (tIt != selectedWriteInnerTee.end()) {
+              LocalSet* innerTee = tIt->second;
+              innerTee->makeSet();
+              replaceCurrent(innerTee);
+            } else {
+              ExpressionManipulator::nop(curr);
+            }
+          }
         }
       }
-    } replacer(wasm, selectedLocals, selectedValues);
+
+      void visitBlock(Block* curr) {
+        curr->list.erase(
+          std::remove_if(curr->list.begin(),
+                         curr->list.end(),
+                         [](Expression* e) { return e->is<Nop>(); }),
+          curr->list.end());
+      }
+    } replacer(
+      wasm, selectedWriteNodes, selectedWriteInnerTee, selectedGetNodes);
     replacer.walk(func->body);
     anyChanged = true;
   }
@@ -2678,13 +2943,20 @@ struct LocalCSE : public WalkerPass<PostWalker<LocalCSE>> {
       if (unaliasSingleFieldProjectionLocals(func, *getModule(), options)) {
         changed = true;
       }
-      if (unCseSingleWriteTees(func, *getModule(), options)) {
+      if (unCseSingleWriteTees(func, *getModule(), options, false)) {
         changed = true;
       }
       if (changed) {
         ReFinalize().walkFunctionInModule(func, getModule());
       }
       ScopedDominatorCSE(func, *getModule(), options).run();
+      if (unCseSingleWriteTees(func,
+                               *getModule(),
+                               options,
+                               options.shrinkLevel >= 2 ||
+                                 options.trapsNeverHappen)) {
+        ReFinalize().walkFunctionInModule(func, getModule());
+      }
       TypeUpdating::handleNonDefaultableLocals(func, *getModule());
       return;
     }
