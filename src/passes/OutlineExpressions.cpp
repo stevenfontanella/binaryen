@@ -275,15 +275,23 @@ struct KeyInfo {
   SmallVector<Name, 3> scratchGlobals;
   // Whether we decided to outline the sites with this key.
   bool outline = false;
+  // Whether this key holds leftover sites that were rejected during constant
+  // sub-key splitting.
+  bool disabled = false;
   // Whether the fields below have been computed.
   bool prepared = false;
   // For each hole position, whether all sites have the same constant there, so
   // that it stays inline in the helper instead of becoming a parameter.
   std::vector<bool> fixed;
-  // The number of parameters the helper has: the local holes, and the
+  // For each varying constant hole position, the index of an earlier varying
+  // constant hole that always has the equal constant across all sites in this
+  // key, or Index(-1) if unique.
+  std::vector<Index> dupOf;
+  // The number of parameters the helper has: the local holes, and the unique
   // constant holes that are not fixed.
   Index numLocals = 0;
   Index numVarying = 0;
+  Index numDupVarying = 0;
 };
 
 // An expression tree (or contiguous block slice) in a function body that we may
@@ -341,9 +349,13 @@ struct Site {
   bool selectedForKey = false;
   // The holes, in evaluation order, computed when the key is prepared.
   std::vector<Hole> holes;
-  // The estimated size of the constants at positions that are not fixed, which
+  bool holesComputed = false;
+  // The estimated size of the constants at unique varying positions, which
   // the site must pass as arguments.
   Index varyingBytes = 0;
+  // The estimated size of the constants at all non-fixed positions, which are
+  // replaced by local.get in the helper body.
+  Index helperVaryingBytes = 0;
 
   bool isInternalLocal(Index idx) const {
     for (Index internalIdx : internalLocals) {
@@ -1161,10 +1173,11 @@ struct Replacer : public WalkerPass<
   Expression* makeReplacementExpr(const Replacement& replacement, Type type) {
     auto* site = replacement.site;
     auto& fixed = site->key->fixed;
+    auto& dupOf = site->key->dupOf;
     Builder builder(*getModule());
     std::vector<Expression*> args;
     for (Index i = 0; i < site->holes.size(); i++) {
-      if (!fixed[i]) {
+      if (!fixed[i] && dupOf[i] == Index(-1)) {
         auto& hole = site->holes[i];
         args.push_back(hole.expr
                          ? hole.expr
@@ -1222,9 +1235,10 @@ struct Replacer : public WalkerPass<
           Type type = site->getType();
           if (type == Type::unreachable) {
             auto& fixed = site->key->fixed;
+            auto& dupOf = site->key->dupOf;
             std::vector<Expression*> args;
             for (Index i = 0; i < site->holes.size(); i++) {
-              if (!fixed[i]) {
+              if (!fixed[i] && dupOf[i] == Index(-1)) {
                 auto& hole = site->holes[i];
                 args.push_back(
                   hole.expr ? hole.expr
@@ -1305,12 +1319,14 @@ struct OutlineExpressions : public Pass {
         break;
       }
     }
+    foldCallRefDispatch(true);
     constHoles = true;
     for (Index round = 0; round < MaxConstRounds; round++) {
       if (!runRound(mode)) {
         break;
       }
     }
+    foldCallRefDispatch(true);
 
     if (!scratchGlobals.empty()) {
       for (auto& func : wasm->functions) {
@@ -1368,6 +1384,10 @@ struct OutlineExpressions : public Pass {
       }
     }
 
+    if (constHoles) {
+      splitKeysByConstants();
+    }
+
     // Decide what to outline. Nested sites complicate this, as a site inside
     // an outlined site vanishes along with it, and so must not be counted for
     // its own key, which may change the decision for that key, and so forth.
@@ -1377,6 +1397,9 @@ struct OutlineExpressions : public Pass {
       updateCandidates(analysis);
       bool changed = false;
       for (auto& info : keys) {
+        if (info.disabled) {
+          continue;
+        }
         bool outline = false;
         if (info.helper) {
           // The helper already exists, so any use of it is a win.
@@ -1405,10 +1428,11 @@ struct OutlineExpressions : public Pass {
                      int64_t(site->varyingBytes);
           }
           auto* site = info.sites[0];
-          int64_t cost = int64_t(site->bytes) - int64_t(site->varyingBytes) +
-                         LocalGetBytes * int64_t(info.numVarying) +
-                         HelperOverheadBytes +
-                         LocalSetBytes * int64_t(site->internalLocals.size());
+          int64_t cost =
+            int64_t(site->bytes) - int64_t(site->helperVaryingBytes) +
+            LocalGetBytes * int64_t(info.numVarying + info.numDupVarying) +
+            HelperOverheadBytes +
+            LocalSetBytes * int64_t(site->internalLocals.size());
           if (!site->written.empty()) {
             // The helper returns written[0]'s final value, writes written[1..]
             // into scratch globals, and declares any written locals that are
@@ -1696,43 +1720,382 @@ struct OutlineExpressions : public Pass {
     return key;
   }
 
+  void ensureHoles(Site* site) {
+    if (!site->holesComputed) {
+      site->holes = getHoles(*wasm, site, constHoles);
+      site->holesComputed = true;
+    }
+  }
+
   // Computes the holes of a key's sites, which constant holes are fixed (all
-  // sites have the same constant there), and the resulting parameter counts
-  // and per-site argument sizes.
+  // sites have the same constant there) or duplicates of earlier varying
+  // constant holes, and the resulting parameter counts and per-site argument
+  // sizes.
   void prepareKey(KeyInfo& key) {
     if (key.prepared) {
       return;
     }
     key.prepared = true;
     for (auto* site : key.sites) {
-      site->holes = getHoles(*wasm, site, constHoles);
+      ensureHoles(site);
+      site->varyingBytes = 0;
+      site->helperVaryingBytes = 0;
     }
     auto& first = key.sites[0]->holes;
-    key.fixed.resize(first.size());
-    for (Index i = 0; i < first.size(); i++) {
+    Index numHoles = first.size();
+    key.fixed.assign(numHoles, false);
+    key.dupOf.assign(numHoles, Index(-1));
+    key.numLocals = 0;
+    key.numVarying = 0;
+    key.numDupVarying = 0;
+    for (Index i = 0; i < numHoles; i++) {
       key.fixed[i] = !first[i].isLocal;
     }
     for (auto* site : key.sites) {
-      assert(site->holes.size() == first.size());
-      for (Index i = 0; i < first.size(); i++) {
+      assert(site->holes.size() == numHoles);
+      for (Index i = 0; i < numHoles; i++) {
         if (key.fixed[i] &&
             !ExpressionAnalyzer::equal(first[i].expr, site->holes[i].expr)) {
           key.fixed[i] = false;
         }
       }
     }
-    for (Index i = 0; i < first.size(); i++) {
+    for (Index i = 0; i < numHoles; i++) {
       if (first[i].isLocal) {
         key.numLocals++;
       } else if (!key.fixed[i]) {
-        key.numVarying++;
+        for (Index j = 0; j < i; j++) {
+          if (!first[j].isLocal && !key.fixed[j] && key.dupOf[j] == Index(-1)) {
+            bool allEq = true;
+            for (auto* site : key.sites) {
+              if (!ExpressionAnalyzer::equal(site->holes[i].expr,
+                                             site->holes[j].expr)) {
+                allEq = false;
+                break;
+              }
+            }
+            if (allEq) {
+              key.dupOf[i] = j;
+              break;
+            }
+          }
+        }
+        if (key.dupOf[i] == Index(-1)) {
+          key.numVarying++;
+        } else {
+          key.numDupVarying++;
+        }
       }
     }
     for (auto* site : key.sites) {
-      for (Index i = 0; i < first.size(); i++) {
+      for (Index i = 0; i < numHoles; i++) {
         auto& hole = site->holes[i];
         if (!hole.isLocal && !key.fixed[i]) {
-          site->varyingBytes += getShallowBytes(hole.expr);
+          Index b = getShallowBytes(hole.expr);
+          site->helperVaryingBytes += b;
+          if (key.dupOf[i] == Index(-1)) {
+            site->varyingBytes += b;
+          }
+        }
+      }
+    }
+  }
+
+  int64_t evalSubset(const std::vector<Site*>& subset) {
+    if (subset.size() < 2) {
+      return 0;
+    }
+    for (auto* site : subset) {
+      site->selectedForKey = false;
+    }
+    std::vector<Site*> active;
+    active.reserve(subset.size());
+    for (auto it = subset.rbegin(); it != subset.rend(); ++it) {
+      auto* site = *it;
+      if (site->helperBody || isShadowedWithinKey(site)) {
+        continue;
+      }
+      site->selectedForKey = true;
+      active.push_back(site);
+    }
+    for (auto* site : subset) {
+      site->selectedForKey = false;
+    }
+    if (active.size() < 2) {
+      return 0;
+    }
+    auto& first = active[0]->holes;
+    Index numHoles = first.size();
+    std::vector<bool> fixed(numHoles, false);
+    std::vector<Index> dupOf(numHoles, Index(-1));
+    for (Index i = 0; i < numHoles; i++) {
+      if (!first[i].isLocal) {
+        bool allEq = true;
+        for (Index s = 1; s < active.size(); s++) {
+          if (!ExpressionAnalyzer::equal(first[i].expr,
+                                         active[s]->holes[i].expr)) {
+            allEq = false;
+            break;
+          }
+        }
+        fixed[i] = allEq;
+      }
+    }
+    Index numLocals = 0;
+    Index numVarying = 0;
+    Index numDupVarying = 0;
+    for (Index i = 0; i < numHoles; i++) {
+      if (first[i].isLocal) {
+        numLocals++;
+      } else if (!fixed[i]) {
+        for (Index j = 0; j < i; j++) {
+          if (!first[j].isLocal && !fixed[j] && dupOf[j] == Index(-1)) {
+            bool allEq = true;
+            for (auto* site : active) {
+              if (!ExpressionAnalyzer::equal(site->holes[i].expr,
+                                             site->holes[j].expr)) {
+                allEq = false;
+                break;
+              }
+            }
+            if (allEq) {
+              dupOf[i] = j;
+              break;
+            }
+          }
+        }
+        if (dupOf[i] == Index(-1)) {
+          numVarying++;
+        } else {
+          numDupVarying++;
+        }
+      }
+    }
+    int64_t saved = 0;
+    for (auto* site : active) {
+      Index varBytes = 0;
+      for (Index i = 0; i < numHoles; i++) {
+        if (!first[i].isLocal && !fixed[i] && dupOf[i] == Index(-1)) {
+          varBytes += getShallowBytes(site->holes[i].expr);
+        }
+      }
+      saved += int64_t(site->bytes) - getCallBytes(site) -
+               LocalGetBytes * int64_t(numLocals) - int64_t(varBytes);
+    }
+    auto* site0 = active[0];
+    Index helperVarBytes = 0;
+    for (Index i = 0; i < numHoles; i++) {
+      if (!first[i].isLocal && !fixed[i]) {
+        helperVarBytes += getShallowBytes(site0->holes[i].expr);
+      }
+    }
+    int64_t cost = int64_t(site0->bytes) - int64_t(helperVarBytes) +
+                   LocalGetBytes * int64_t(numVarying + numDupVarying) +
+                   HelperOverheadBytes +
+                   LocalSetBytes * int64_t(site0->internalLocals.size());
+    if (!site0->written.empty()) {
+      cost += LocalSetBytes + 4 * int64_t(site0->written.size() - 1);
+      for (auto& w : site0->written) {
+        if (!isWrittenParam(site0, w.index)) {
+          cost += LocalSetBytes;
+        }
+      }
+    }
+    return saved > cost ? saved - cost : 0;
+  }
+
+  std::vector<std::vector<Site*>>
+  partitionByHole(const std::vector<Site*>& subset, Index holeIdx) {
+    std::vector<std::vector<Site*>> parts;
+    std::unordered_map<size_t, SmallVector<Index, 2>> buckets;
+    for (auto* site : subset) {
+      Expression* c = site->holes[holeIdx].expr;
+      size_t h = ExpressionAnalyzer::hash(c);
+      auto& bucket = buckets[h];
+      Index found = Index(-1);
+      for (Index pIdx : bucket) {
+        if (ExpressionAnalyzer::equal(parts[pIdx][0]->holes[holeIdx].expr, c)) {
+          found = pIdx;
+          break;
+        }
+      }
+      if (found == Index(-1)) {
+        found = parts.size();
+        parts.push_back({site});
+        bucket.push_back(found);
+      } else {
+        parts[found].push_back(site);
+      }
+    }
+    return parts;
+  }
+
+  int64_t bestRecursiveSplit(const std::vector<Site*>& subset,
+                             std::vector<std::vector<Site*>>& outGroups,
+                             Index depth = 0) {
+    outGroups.clear();
+    if (subset.size() < 2) {
+      return 0;
+    }
+    int64_t baseScore = evalSubset(subset);
+    if (depth >= 4) {
+      if (baseScore > 0) {
+        outGroups.push_back(subset);
+      }
+      return baseScore;
+    }
+    Index numHoles = subset[0]->holes.size();
+    int64_t bestScore = baseScore;
+    Index bestHole = Index(-1);
+    for (Index i = 0; i < numHoles; i++) {
+      if (subset[0]->holes[i].isLocal) {
+        continue;
+      }
+      auto parts = partitionByHole(subset, i);
+      if (parts.size() <= 1) {
+        continue;
+      }
+      int64_t subScore = 0;
+      std::unordered_set<Site*> kept;
+      for (auto& part : parts) {
+        if (part.size() >= 2) {
+          int64_t sc = evalSubset(part);
+          if (sc > 0) {
+            subScore += sc;
+            for (auto* s : part) {
+              kept.insert(s);
+            }
+          }
+        }
+      }
+      if (kept.size() < subset.size() && subset.size() - kept.size() >= 2 &&
+          !kept.empty()) {
+        std::vector<Site*> leftovers;
+        leftovers.reserve(subset.size() - kept.size());
+        for (auto* s : subset) {
+          if (!kept.contains(s)) {
+            leftovers.push_back(s);
+          }
+        }
+        subScore += evalSubset(leftovers);
+      }
+      if (subScore > bestScore) {
+        bestScore = subScore;
+        bestHole = i;
+      }
+    }
+    if (bestHole == Index(-1)) {
+      if (baseScore > 0) {
+        outGroups.push_back(subset);
+      }
+      return baseScore;
+    }
+    auto parts = partitionByHole(subset, bestHole);
+    int64_t totalScore = 0;
+    std::vector<std::vector<Site*>> splitGroups;
+    std::unordered_set<Site*> kept;
+    for (auto& part : parts) {
+      if (part.size() >= 2) {
+        std::vector<std::vector<Site*>> subOut;
+        int64_t sc = bestRecursiveSplit(part, subOut, depth + 1);
+        if (sc > 0) {
+          totalScore += sc;
+          for (auto& g : subOut) {
+            for (auto* s : g) {
+              kept.insert(s);
+            }
+            splitGroups.push_back(std::move(g));
+          }
+        }
+      }
+    }
+    if (kept.size() < subset.size() && subset.size() - kept.size() >= 2 &&
+        !kept.empty()) {
+      std::vector<Site*> leftovers;
+      leftovers.reserve(subset.size() - kept.size());
+      for (auto* s : subset) {
+        if (!kept.contains(s)) {
+          leftovers.push_back(s);
+        }
+      }
+      std::vector<std::vector<Site*>> leftOut;
+      int64_t sc = bestRecursiveSplit(leftovers, leftOut, depth + 1);
+      if (sc > 0) {
+        totalScore += sc;
+        for (auto& g : leftOut) {
+          splitGroups.push_back(std::move(g));
+        }
+      }
+    }
+    if (totalScore > baseScore) {
+      outGroups = std::move(splitGroups);
+      return totalScore;
+    }
+    if (baseScore > 0) {
+      outGroups.push_back(subset);
+    }
+    return baseScore;
+  }
+
+  void splitKeysByConstants() {
+    size_t origNumKeys = keys.size();
+    for (size_t kIdx = 0; kIdx < origNumKeys; kIdx++) {
+      auto& key = keys[kIdx];
+      if (key.helper || key.sites.size() < 2) {
+        continue;
+      }
+      for (auto* site : key.sites) {
+        ensureHoles(site);
+      }
+      bool hasConstHole = false;
+      for (auto& h : key.sites[0]->holes) {
+        if (!h.isLocal) {
+          hasConstHole = true;
+          break;
+        }
+      }
+      if (!hasConstHole) {
+        continue;
+      }
+      std::vector<std::vector<Site*>> groups;
+      int64_t score = bestRecursiveSplit(key.sites, groups);
+      if (score <= 0 ||
+          (groups.size() == 1 && groups[0].size() == key.sites.size())) {
+        continue;
+      }
+      std::unordered_set<Site*> chosen;
+      for (auto& g : groups) {
+        for (auto* s : g) {
+          chosen.insert(s);
+        }
+      }
+      if (chosen.size() < key.sites.size()) {
+        std::vector<Site*> unchosen;
+        unchosen.reserve(key.sites.size() - chosen.size());
+        for (auto* s : key.sites) {
+          if (!chosen.contains(s)) {
+            unchosen.push_back(s);
+          }
+        }
+        keys.emplace_back();
+        auto& deadKey = keys.back();
+        deadKey.disabled = true;
+        deadKey.sites = std::move(unchosen);
+        for (auto* s : deadKey.sites) {
+          s->key = &deadKey;
+        }
+      }
+      key.sites = std::move(groups[0]);
+      key.prepared = false;
+      for (auto* s : key.sites) {
+        s->key = &key;
+      }
+      for (size_t g = 1; g < groups.size(); g++) {
+        keys.emplace_back();
+        auto& subKey = keys.back();
+        subKey.sites = std::move(groups[g]);
+        for (auto* s : subKey.sites) {
+          s->key = &subKey;
         }
       }
     }
@@ -1931,15 +2294,24 @@ struct OutlineExpressions : public Pass {
     assert(holes.size() == site->holes.size());
     std::vector<Type> params;
     HoleReplacer replacer(*wasm);
+    std::vector<Index> holeParamIdx(holes.size(), Index(-1));
     for (Index i = 0; i < holes.size(); i++) {
       if (key.fixed[i]) {
         continue;
       }
+      if (key.dupOf[i] != Index(-1)) {
+        Index primary = key.dupOf[i];
+        assert(holeParamIdx[primary] != Index(-1));
+        replacer.paramOfConst[holes[i].expr] = holeParamIdx[primary];
+        continue;
+      }
       auto& hole = holes[i];
+      Index pIdx = params.size();
+      holeParamIdx[i] = pIdx;
       if (hole.isLocal) {
-        replacer.paramOfLocal[hole.localIndex] = params.size();
+        replacer.paramOfLocal[hole.localIndex] = pIdx;
       } else {
-        replacer.paramOfConst[hole.expr] = params.size();
+        replacer.paramOfConst[hole.expr] = pIdx;
       }
       params.push_back(hole.type);
     }
@@ -2008,6 +2380,529 @@ struct OutlineExpressions : public Pass {
                             Signature(Type(params), getHelperResults(site)),
                             std::move(vars),
                             body));
+  }
+
+  struct CallRefReplacer : public PostWalker<CallRefReplacer> {
+    Module& wasm;
+    struct RepInfo {
+      Name helper;
+      bool unwrapTee = false;
+    };
+    std::unordered_map<Expression*, RepInfo> replacements;
+    CallRefReplacer(Module& wasm) : wasm(wasm) {}
+
+    void visitCallRef(CallRef* curr) {
+      auto it = replacements.find(curr);
+      if (it == replacements.end()) {
+        return;
+      }
+      const auto& info = it->second;
+      Builder builder(wasm);
+      Index numArgs = curr->operands.size();
+      std::vector<Expression*> args(numArgs);
+      for (Index i = 0; i < numArgs; i++) {
+        args[i] = curr->operands[i];
+      }
+      if (info.unwrapTee) {
+        auto* tee = args[0]->cast<LocalSet>();
+        assert(tee->isTee());
+        args[0] = tee->value;
+      }
+      replaceCurrent(
+        builder.makeCall(info.helper, args, curr->type, curr->isReturn));
+    }
+  };
+
+  static bool buildInlineTargetSkel(Expression* e,
+                                    Index recvLocal,
+                                    SmallVector<uint32_t, 16>& out,
+                                    unsigned& tBytes,
+                                    unsigned& numRecvGets) {
+    if (!e || e->type == Type::unreachable) {
+      return false;
+    }
+    if (auto* lg = e->dynCast<LocalGet>()) {
+      if (lg->index != recvLocal) {
+        return false;
+      }
+      out.push_back(1);
+      tBytes += 2;
+      numRecvGets++;
+      return true;
+    }
+    if (auto* sg = e->dynCast<StructGet>()) {
+      if (!sg->ref || sg->ref->type == Type::unreachable ||
+          !sg->ref->type.isStruct()) {
+        return false;
+      }
+      uint64_t htId = sg->ref->type.getHeapType().getID();
+      out.push_back(2);
+      out.push_back(sg->index);
+      out.push_back(sg->signed_ ? 1 : 0);
+      out.push_back(uint32_t(htId));
+      out.push_back(uint32_t(htId >> 32));
+      tBytes += 4;
+      return buildInlineTargetSkel(
+        sg->ref, recvLocal, out, tBytes, numRecvGets);
+    }
+    if (auto* rc = e->dynCast<RefCast>()) {
+      if (rc->desc || !rc->ref || rc->ref->type == Type::unreachable) {
+        return false;
+      }
+      uint64_t tId = rc->type.getID();
+      out.push_back(3);
+      out.push_back(uint32_t(tId));
+      out.push_back(uint32_t(tId >> 32));
+      tBytes += 4;
+      return buildInlineTargetSkel(
+        rc->ref, recvLocal, out, tBytes, numRecvGets);
+    }
+    if (auto* ra = e->dynCast<RefAs>()) {
+      if (ra->op != RefAsNonNull || !ra->value ||
+          ra->value->type == Type::unreachable) {
+        return false;
+      }
+      out.push_back(4);
+      tBytes += 1;
+      return buildInlineTargetSkel(
+        ra->value, recvLocal, out, tBytes, numRecvGets);
+    }
+    if (auto* ag = e->dynCast<ArrayGet>()) {
+      if (!ag->ref || ag->ref->type == Type::unreachable ||
+          !ag->ref->type.isArray() || !ag->index) {
+        return false;
+      }
+      uint64_t htId = ag->ref->type.getHeapType().getID();
+      out.push_back(5);
+      out.push_back(ag->signed_ ? 1 : 0);
+      out.push_back(uint32_t(htId));
+      out.push_back(uint32_t(htId >> 32));
+      tBytes += 4;
+      return buildInlineTargetSkel(
+               ag->ref, recvLocal, out, tBytes, numRecvGets) &&
+             buildInlineTargetSkel(
+               ag->index, recvLocal, out, tBytes, numRecvGets);
+    }
+    if (auto* c = e->dynCast<Const>()) {
+      if (c->value.type != Type::i32) {
+        return false;
+      }
+      out.push_back(6);
+      out.push_back(uint32_t(c->value.geti32()));
+      tBytes += getShallowBytes(c);
+      return true;
+    }
+    return false;
+  }
+
+  bool foldCallRefDispatch(bool allowInlinePart2 = true) {
+    // Collect referenced functions (exports, tables, globals, ref.func) and
+    // total direct call counts across the module.
+    std::unordered_set<Name> disallowedHelpers;
+    for (auto& ex : wasm->exports) {
+      if (ex->kind == ExternalKind::Function) {
+        disallowedHelpers.insert(*ex->getInternalName());
+      }
+    }
+    for (auto& seg : wasm->elementSegments) {
+      for (auto* expr : seg->data) {
+        for (auto* rf : FindAll<RefFunc>(expr).list) {
+          disallowedHelpers.insert(rf->func);
+        }
+      }
+    }
+    for (auto& g : wasm->globals) {
+      if (!g->imported() && g->init) {
+        for (auto* rf : FindAll<RefFunc>(g->init).list) {
+          disallowedHelpers.insert(rf->func);
+        }
+      }
+    }
+    std::unordered_map<Name, Index> totalCalls;
+    for (auto& f : wasm->functions) {
+      if (f->imported()) {
+        continue;
+      }
+      for (auto* rf : FindAll<RefFunc>(f->body).list) {
+        disallowedHelpers.insert(rf->func);
+      }
+      for (auto* c : FindAll<Call>(f->body).list) {
+        totalCalls[c->target]++;
+      }
+    }
+
+    auto isDispatchHelperBody = [](Function* func, CallRef* cr) -> bool {
+      if (!cr || func->body != cr || !func->vars.empty() ||
+          func->getNumParams() != cr->operands.size() || cr->operands.empty()) {
+        return false;
+      }
+      for (Index i = 0; i < cr->operands.size(); i++) {
+        auto* lg = cr->operands[i]->dynCast<LocalGet>();
+        if (!lg || lg->index != i) {
+          return false;
+        }
+      }
+      return true;
+    };
+
+    struct CRSite {
+      Function* func;
+      CallRef* cr;
+      HeapType sigHt;
+      Index recvLocal;
+      bool isTeeOfRecv;
+      unsigned numTargetGets;
+      unsigned targetBytes;
+    };
+
+    // Part 1: (helperName, sigHeapTypeID) -> sites
+    std::map<std::pair<Name, uint64_t>, std::vector<CRSite>> part1Groups;
+    // Part 2: (sigHeapTypeID, numArgs, skel) -> sites
+    std::map<std::tuple<uint64_t, Index, std::vector<uint32_t>>,
+             std::vector<CRSite>>
+      part2Groups;
+
+    std::unordered_map<Function*, std::vector<Index>> funcLocalReads;
+
+    for (auto& f : wasm->functions) {
+      if (f->imported()) {
+        continue;
+      }
+      Function* func = f.get();
+      auto allCallRefs = FindAll<CallRef>(func->body).list;
+      if (allCallRefs.empty()) {
+        continue;
+      }
+      std::vector<Index> reads(func->getNumLocals(), 0);
+      for (auto* lg : FindAll<LocalGet>(func->body).list) {
+        reads[lg->index]++;
+      }
+      funcLocalReads[func] = std::move(reads);
+
+      for (auto* cr : allCallRefs) {
+        if (cr->isReturn || cr->type == Type::unreachable ||
+            cr->operands.empty() || !cr->target ||
+            cr->target->type == Type::unreachable ||
+            !cr->target->type.isSignature()) {
+          continue;
+        }
+        if (isDispatchHelperBody(func, cr)) {
+          continue;
+        }
+        bool hasUnreachableOp = false;
+        for (auto* op : cr->operands) {
+          if (op->type == Type::unreachable) {
+            hasUnreachableOp = true;
+            break;
+          }
+        }
+        if (hasUnreachableOp) {
+          continue;
+        }
+        HeapType sigHt = cr->target->type.getHeapType();
+        Signature sig = sigHt.getSignature();
+        if (sig.params.size() != cr->operands.size() ||
+            sig.results != cr->type) {
+          continue;
+        }
+
+        // Determine candidate receiver local(s) from operands[0].
+        SmallVector<Index, 2> candLocals;
+        Expression* a0 = cr->operands[0];
+        if (auto* lg = a0->dynCast<LocalGet>()) {
+          candLocals.push_back(lg->index);
+        } else if (auto* tee = a0->dynCast<LocalSet>()) {
+          if (tee->isTee()) {
+            candLocals.push_back(tee->index);
+            if (auto* innerLg = tee->value->dynCast<LocalGet>()) {
+              candLocals.push_back(innerLg->index);
+            }
+          }
+        }
+        if (candLocals.empty()) {
+          continue;
+        }
+
+        auto isWrittenInLaterArgs = [&](Index loc) -> bool {
+          for (Index i = 1; i < cr->operands.size(); i++) {
+            for (auto* ls : FindAll<LocalSet>(cr->operands[i]).list) {
+              if (ls->index == loc) {
+                return true;
+              }
+            }
+          }
+          return false;
+        };
+
+        if (auto* targetCall = cr->target->dynCast<Call>()) {
+          if (targetCall->isReturn || targetCall->operands.size() != 1) {
+            continue;
+          }
+          auto* tLg = targetCall->operands[0]->dynCast<LocalGet>();
+          if (!tLg) {
+            continue;
+          }
+          Index recvLocal = tLg->index;
+          bool matchCand = false;
+          for (Index cLoc : candLocals) {
+            if (cLoc == recvLocal) {
+              matchCand = true;
+              break;
+            }
+          }
+          if (!matchCand || isWrittenInLaterArgs(recvLocal)) {
+            continue;
+          }
+          Function* h = wasm->getFunctionOrNull(targetCall->target);
+          if (!h || h->imported() || h->getNumParams() != 1 ||
+              !h->getResults().isSingle() || !h->getResults().isRef() ||
+              disallowedHelpers.count(h->name)) {
+            continue;
+          }
+          Type param0Type =
+            Type::getGreatestLowerBound(sig.params[0], h->getLocalType(0));
+          if (param0Type == Type::none || param0Type.isNull() ||
+              !Type::isSubType(a0->type, param0Type)) {
+            continue;
+          }
+          bool isTeeOfRecv =
+            a0->is<LocalSet>() && a0->cast<LocalSet>()->index == recvLocal;
+          part1Groups[{h->name, sigHt.getID()}].push_back(
+            {func, cr, sigHt, recvLocal, isTeeOfRecv, 1, 5});
+        } else if (allowInlinePart2 &&
+                   (cr->target->is<StructGet>() || cr->target->is<RefCast>())) {
+          for (Index recvLocal : candLocals) {
+            if (isWrittenInLaterArgs(recvLocal)) {
+              continue;
+            }
+            SmallVector<uint32_t, 16> skel;
+            unsigned tBytes = 0;
+            unsigned numGets = 0;
+            if (!buildInlineTargetSkel(
+                  cr->target, recvLocal, skel, tBytes, numGets) ||
+                numGets == 0) {
+              continue;
+            }
+            Type recvLocalType = func->getLocalType(recvLocal);
+            Type param0Type =
+              Type::getGreatestLowerBound(sig.params[0], recvLocalType);
+            if (param0Type == Type::none || param0Type.isNull() ||
+                !Type::isSubType(a0->type, param0Type)) {
+              continue;
+            }
+            bool isTeeOfRecv =
+              a0->is<LocalSet>() && a0->cast<LocalSet>()->index == recvLocal;
+            std::vector<uint32_t> skelVec(skel.begin(), skel.end());
+            part2Groups[{sigHt.getID(),
+                         Index(cr->operands.size()),
+                         std::move(skelVec)}]
+              .push_back(
+                {func, cr, sigHt, recvLocal, isTeeOfRecv, numGets, tBytes});
+            break;
+          }
+        }
+      }
+    }
+
+    Builder builder(*wasm);
+    struct PendingSite {
+      CRSite site;
+      Name helperName;
+    };
+    std::vector<PendingSite> acceptedSites;
+
+    // Process Part 1 groups.
+    for (auto& [keyPair, sites] : part1Groups) {
+      Name hName = keyPair.first;
+      HeapType sigHt = sites[0].sigHt;
+      Function* h = wasm->getFunction(hName);
+      Signature sig = sigHt.getSignature();
+      Index nArgs = sig.params.size();
+      Type param0Type =
+        Type::getGreatestLowerBound(sig.params[0], h->getLocalType(0));
+      if (param0Type == Type::none || param0Type.isNull()) {
+        continue;
+      }
+
+      unsigned siteSavings = 0;
+      for (const auto& s : sites) {
+        unsigned sv = 5;
+        if (s.isTeeOfRecv &&
+            funcLocalReads[s.func][s.recvLocal] == s.numTargetGets) {
+          sv += 2;
+        }
+        siteSavings += sv;
+      }
+
+      bool canModifyInPlace =
+        sites.size() == totalCalls[hName] && h->vars.empty() &&
+        FindAll<LocalSet>(h->body).list.empty() &&
+        FindAll<Return>(h->body).list.empty() &&
+        FindAll<CallRef>(h->body).list.empty();
+
+      if (canModifyInPlace) {
+        unsigned hCost = 3 + 2 * nArgs;
+        if (siteSavings <= hCost) {
+          continue;
+        }
+        // Update LocalGet(0) types inside h->body to param0Type.
+        for (auto* lg : FindAll<LocalGet>(h->body).list) {
+          assert(lg->index == 0);
+          lg->type = param0Type;
+        }
+        std::vector<Type> newParams(nArgs);
+        newParams[0] = param0Type;
+        for (Index i = 1; i < nArgs; i++) {
+          newParams[i] = sig.params[i];
+        }
+        std::vector<Expression*> callArgs(nArgs);
+        for (Index i = 0; i < nArgs; i++) {
+          callArgs[i] = builder.makeLocalGet(i, newParams[i]);
+        }
+        h->setParams(Type(newParams));
+        h->setResults(sig.results);
+        h->body = builder.makeCallRef(h->body, callArgs, sig.results, false);
+        ReFinalize().walkFunctionInModule(h, wasm);
+        if (h->effects) {
+          h->effects =
+            std::make_unique<EffectAnalyzer>(getPassOptions(), *wasm, h);
+        }
+        for (const auto& s : sites) {
+          acceptedSites.push_back({s, hName});
+        }
+      } else if (sites.size() >= 3) {
+        unsigned hCost = 14 + 2 * nArgs;
+        if (siteSavings <= hCost) {
+          continue;
+        }
+        std::vector<Type> newParams(nArgs);
+        newParams[0] = param0Type;
+        for (Index i = 1; i < nArgs; i++) {
+          newParams[i] = sig.params[i];
+        }
+        std::vector<Expression*> callArgs(nArgs);
+        for (Index i = 0; i < nArgs; i++) {
+          callArgs[i] = builder.makeLocalGet(i, newParams[i]);
+        }
+        Expression* callH = builder.makeCall(
+          hName, {builder.makeLocalGet(0, param0Type)}, h->getResults());
+        Expression* newBody =
+          builder.makeCallRef(callH, callArgs, sig.results, false);
+        Name newName = Names::getValidFunctionName(*wasm, "outlined_cr");
+        wasm->addFunction(Builder::makeFunction(
+          newName, Signature(Type(newParams), sig.results), {}, newBody));
+        for (const auto& s : sites) {
+          acceptedSites.push_back({s, newName});
+        }
+      }
+    }
+
+    // Process Part 2 groups.
+    for (auto& [keyTuple, sites] : part2Groups) {
+      if (sites.size() < 2) {
+        continue;
+      }
+      HeapType sigHt = sites[0].sigHt;
+      Signature sig = sigHt.getSignature();
+      Index nArgs = sig.params.size();
+      unsigned tBytes = sites[0].targetBytes;
+
+      // Find common param0Type across sites.
+      Type recvType = sites[0].func->getLocalType(sites[0].recvLocal);
+      Type param0Type = Type::getGreatestLowerBound(sig.params[0], recvType);
+      if (param0Type == Type::none || param0Type.isNull()) {
+        continue;
+      }
+      bool allTypeOk = true;
+      for (const auto& s : sites) {
+        if (!Type::isSubType(s.cr->operands[0]->type, param0Type) ||
+            !Type::isSubType(param0Type,
+                             s.func->getLocalType(s.recvLocal))) {
+          allTypeOk = false;
+          break;
+        }
+      }
+      if (!allTypeOk) {
+        continue;
+      }
+
+      unsigned siteSavings = 0;
+      for (const auto& s : sites) {
+        unsigned sv = tBytes;
+        if (s.isTeeOfRecv &&
+            funcLocalReads[s.func][s.recvLocal] == s.numTargetGets) {
+          sv += 2;
+        }
+        siteSavings += sv;
+      }
+      unsigned hCost = 9 + 2 * nArgs + tBytes;
+      if (siteSavings <= hCost) {
+        continue;
+      }
+
+      Expression* targetCopy =
+        ExpressionManipulator::copy(sites[0].cr->target, *wasm);
+      for (auto* lg : FindAll<LocalGet>(targetCopy).list) {
+        assert(lg->index == sites[0].recvLocal);
+        lg->index = 0;
+        lg->type = param0Type;
+      }
+      std::vector<Type> newParams(nArgs);
+      newParams[0] = param0Type;
+      for (Index i = 1; i < nArgs; i++) {
+        newParams[i] = sig.params[i];
+      }
+      std::vector<Expression*> callArgs(nArgs);
+      for (Index i = 0; i < nArgs; i++) {
+        callArgs[i] = builder.makeLocalGet(i, newParams[i]);
+      }
+      Expression* newBody =
+        builder.makeCallRef(targetCopy, callArgs, sig.results, false);
+      Name newName = Names::getValidFunctionName(*wasm, "outlined_cr");
+      Function* newFunc = wasm->addFunction(Builder::makeFunction(
+        newName, Signature(Type(newParams), sig.results), {}, newBody));
+      ReFinalize().walkFunctionInModule(newFunc, wasm);
+      for (const auto& s : sites) {
+        acceptedSites.push_back({s, newName});
+      }
+    }
+
+    if (acceptedSites.empty()) {
+      return false;
+    }
+
+    // Count total removed LocalGet reads per (func, local) across accepted
+    // sites so we know when a local has zero remaining reads in func.
+    std::unordered_map<Function*, std::unordered_map<Index, Index>>
+      removedReads;
+    for (const auto& ps : acceptedSites) {
+      removedReads[ps.site.func][ps.site.recvLocal] += ps.site.numTargetGets;
+    }
+
+    std::unordered_map<
+      Function*,
+      std::unordered_map<Expression*, CallRefReplacer::RepInfo>>
+      funcReplacements;
+    for (const auto& ps : acceptedSites) {
+      const auto& s = ps.site;
+      bool unwrapTee =
+        s.isTeeOfRecv &&
+        funcLocalReads[s.func][s.recvLocal] ==
+          removedReads[s.func][s.recvLocal];
+      funcReplacements[s.func][s.cr] = {ps.helperName, unwrapTee};
+    }
+
+    for (auto& [func, reps] : funcReplacements) {
+      CallRefReplacer replacer(*wasm);
+      replacer.replacements = std::move(reps);
+      replacer.walk(func->body);
+      ReFinalize().walkFunctionInModule(func, wasm);
+      if (func->effects) {
+        func->effects =
+          std::make_unique<EffectAnalyzer>(getPassOptions(), *wasm, func);
+      }
+    }
+    return true;
   }
 };
 

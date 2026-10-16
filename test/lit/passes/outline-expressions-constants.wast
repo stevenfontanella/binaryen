@@ -192,6 +192,9 @@
     (call $g (local.get $z) (i32.const 3))
   )
 )
+
+;; Test equal constant-hole deduplication, constant sub-key splitting, and
+;; virtual call_ref dispatch folding.
 ;; CHECK:      (func $outlined (type $7) (param $0 f64) (result (ref (exact $T)))
 ;; CHECK-NEXT:  (struct.new $T
 ;; CHECK-NEXT:   (global.get $vtable)
@@ -205,6 +208,291 @@
 ;; CHECK-NEXT:   (local.get $0)
 ;; CHECK-NEXT:   (i32.const 100000)
 ;; CHECK-NEXT:   (i32.const 100001)
+;; CHECK-NEXT:   (local.get $1)
+;; CHECK-NEXT:  )
+;; CHECK-NEXT: )
+(module
+  (rec
+    ;; CHECK:      (type $0 (func (param anyref) (result i32)))
+
+    ;; CHECK:      (type $1 (func (param i32) (result i32)))
+
+    ;; CHECK:      (rec
+    ;; CHECK-NEXT:  (type $vmethod (func (param (ref null $obj) i32) (result i32)))
+    (type $vmethod (func (param (ref null $obj) i32) (result i32)))
+    ;; CHECK:       (type $vt (struct (field (ref $vmethod))))
+    (type $vt (struct (field (ref $vmethod))))
+    ;; CHECK:       (type $obj (struct (field (ref $vt))))
+    (type $obj (struct (field (ref $vt))))
+  )
+
+  ;; CHECK:      (type $5 (func (param anyref i32) (result i32)))
+
+  ;; CHECK:      (type $6 (func (param anyref i32 i32 i32) (result i32)))
+
+  ;; CHECK:      (type $7 (func (param i32) (result (ref $obj))))
+
+  ;; CHECK:      (type $8 (func (param (ref null $obj) i32) (result i32)))
+
+  ;; CHECK:      (import "env" "f" (func $f (type $6) (param anyref i32 i32 i32) (result i32)))
+  (import "env" "f" (func $f (param anyref i32 i32 i32) (result i32)))
+  ;; CHECK:      (import "env" "make_obj" (func $make_obj (type $7) (param i32) (result (ref $obj))))
+  (import "env" "make_obj" (func $make_obj (param i32) (result (ref $obj))))
+
+  ;; Equal varying constant holes across all sites are deduplicated to a single
+  ;; helper parameter.
+  ;; CHECK:      (export "dup1" (func $dup1))
+
+  ;; CHECK:      (export "dup2" (func $dup2))
+
+  ;; CHECK:      (export "dup3" (func $dup3))
+
+  ;; CHECK:      (export "split1" (func $split1))
+
+  ;; CHECK:      (export "split2" (func $split2))
+
+  ;; CHECK:      (export "split3" (func $split3))
+
+  ;; CHECK:      (export "split4" (func $split4))
+
+  ;; CHECK:      (export "split5" (func $split5))
+
+  ;; CHECK:      (export "split6" (func $split6))
+
+  ;; CHECK:      (export "split7" (func $split7))
+
+  ;; CHECK:      (export "vcall1" (func $vcall1))
+
+  ;; CHECK:      (export "vcall2" (func $vcall2))
+
+  ;; CHECK:      (export "vcall3" (func $vcall3))
+
+  ;; CHECK:      (export "vfold1" (func $vfold1))
+
+  ;; CHECK:      (export "vfold2" (func $vfold2))
+
+  ;; CHECK:      (func $dup1 (type $0) (param $x anyref) (result i32)
+  ;; CHECK-NEXT:  (call $outlined_20
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (i32.const 500)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $dup1 (export "dup1") (param $x anyref) (result i32)
+    (call $f (local.get $x) (i32.const 100000) (i32.const 500) (i32.const 500))
+  )
+  ;; CHECK:      (func $dup2 (type $0) (param $x anyref) (result i32)
+  ;; CHECK-NEXT:  (call $outlined_20
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (i32.const 600)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $dup2 (export "dup2") (param $x anyref) (result i32)
+    (call $f (local.get $x) (i32.const 100000) (i32.const 600) (i32.const 600))
+  )
+  ;; CHECK:      (func $dup3 (type $0) (param $x anyref) (result i32)
+  ;; CHECK-NEXT:  (call $outlined_20
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (i32.const 700)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $dup3 (export "dup3") (param $x anyref) (result i32)
+    (call $f (local.get $x) (i32.const 100000) (i32.const 700) (i32.const 700))
+  )
+
+  ;; Sub-key splitting by shared constant operand: 4 sites share 999999 and 3
+  ;; sites share 888888 in the second constant hole.
+  ;; CHECK:      (func $split1 (type $0) (param $x anyref) (result i32)
+  ;; CHECK-NEXT:  (call $outlined
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (i32.const 1)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $split1 (export "split1") (param $x anyref) (result i32)
+    (call $f (local.get $x) (i32.const 200000) (i32.const 999999) (i32.const 1))
+  )
+  ;; CHECK:      (func $split2 (type $0) (param $x anyref) (result i32)
+  ;; CHECK-NEXT:  (call $outlined
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (i32.const 2)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $split2 (export "split2") (param $x anyref) (result i32)
+    (call $f (local.get $x) (i32.const 200000) (i32.const 999999) (i32.const 2))
+  )
+  ;; CHECK:      (func $split3 (type $0) (param $x anyref) (result i32)
+  ;; CHECK-NEXT:  (call $outlined
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (i32.const 3)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $split3 (export "split3") (param $x anyref) (result i32)
+    (call $f (local.get $x) (i32.const 200000) (i32.const 999999) (i32.const 3))
+  )
+  ;; CHECK:      (func $split4 (type $0) (param $x anyref) (result i32)
+  ;; CHECK-NEXT:  (call $outlined
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (i32.const 4)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $split4 (export "split4") (param $x anyref) (result i32)
+    (call $f (local.get $x) (i32.const 200000) (i32.const 999999) (i32.const 4))
+  )
+  ;; CHECK:      (func $split5 (type $0) (param $x anyref) (result i32)
+  ;; CHECK-NEXT:  (call $outlined_19
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (i32.const 5)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $split5 (export "split5") (param $x anyref) (result i32)
+    (call $f (local.get $x) (i32.const 200000) (i32.const 888888) (i32.const 5))
+  )
+  ;; CHECK:      (func $split6 (type $0) (param $x anyref) (result i32)
+  ;; CHECK-NEXT:  (call $outlined_19
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (i32.const 6)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $split6 (export "split6") (param $x anyref) (result i32)
+    (call $f (local.get $x) (i32.const 200000) (i32.const 888888) (i32.const 6))
+  )
+  ;; CHECK:      (func $split7 (type $0) (param $x anyref) (result i32)
+  ;; CHECK-NEXT:  (call $outlined_19
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (i32.const 7)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $split7 (export "split7") (param $x anyref) (result i32)
+    (call $f (local.get $x) (i32.const 200000) (i32.const 888888) (i32.const 7))
+  )
+
+  ;; Virtual call_ref dispatch folding: the vtable lookup target is folded with
+  ;; the enclosing call_ref into a dispatch helper, and dead local.tee on $r is
+  ;; unwrapped.
+  ;; CHECK:      (func $vcall1 (type $1) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (local $r (ref null $obj))
+  ;; CHECK-NEXT:  (call $get_vmethod
+  ;; CHECK-NEXT:   (call $make_obj
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.const 10)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $vcall1 (export "vcall1") (param $x i32) (result i32)
+    (local $r (ref null $obj))
+    (call_ref $vmethod
+      (local.tee $r (call $make_obj (local.get $x)))
+      (i32.const 10)
+      (struct.get $vt 0 (struct.get $obj 0 (local.get $r)))
+    )
+  )
+  ;; CHECK:      (func $vcall2 (type $1) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (local $r (ref null $obj))
+  ;; CHECK-NEXT:  (call $get_vmethod
+  ;; CHECK-NEXT:   (call $make_obj
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.const 20)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $vcall2 (export "vcall2") (param $x i32) (result i32)
+    (local $r (ref null $obj))
+    (call_ref $vmethod
+      (local.tee $r (call $make_obj (local.get $x)))
+      (i32.const 20)
+      (struct.get $vt 0 (struct.get $obj 0 (local.get $r)))
+    )
+  )
+  ;; CHECK:      (func $vcall3 (type $1) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (local $r (ref null $obj))
+  ;; CHECK-NEXT:  (call $get_vmethod
+  ;; CHECK-NEXT:   (call $make_obj
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.const 30)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $vcall3 (export "vcall3") (param $x i32) (result i32)
+    (local $r (ref null $obj))
+    (call_ref $vmethod
+      (local.tee $r (call $make_obj (local.get $x)))
+      (i32.const 30)
+      (struct.get $vt 0 (struct.get $obj 0 (local.get $r)))
+    )
+  )
+
+  ;; Folding call_ref into an existing single-purpose target helper in-place.
+  ;; CHECK:      (func $get_vmethod (type $8) (param $r (ref null $obj)) (param $1 i32) (result i32)
+  ;; CHECK-NEXT:  (call_ref $vmethod
+  ;; CHECK-NEXT:   (local.get $r)
+  ;; CHECK-NEXT:   (local.get $1)
+  ;; CHECK-NEXT:   (struct.get $vt 0
+  ;; CHECK-NEXT:    (struct.get $obj 0
+  ;; CHECK-NEXT:     (local.get $r)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $get_vmethod (param $r (ref null $obj)) (result (ref $vmethod))
+    (struct.get $vt 0 (struct.get $obj 0 (local.get $r)))
+  )
+  ;; CHECK:      (func $vfold1 (type $1) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (local $r (ref null $obj))
+  ;; CHECK-NEXT:  (call $get_vmethod
+  ;; CHECK-NEXT:   (call $make_obj
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.const 40)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $vfold1 (export "vfold1") (param $x i32) (result i32)
+    (local $r (ref null $obj))
+    (call_ref $vmethod
+      (local.tee $r (call $make_obj (local.get $x)))
+      (i32.const 40)
+      (call $get_vmethod (local.get $r))
+    )
+  )
+  ;; CHECK:      (func $vfold2 (type $1) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (local $r (ref null $obj))
+  ;; CHECK-NEXT:  (call $get_vmethod
+  ;; CHECK-NEXT:   (call $make_obj
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.const 50)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $vfold2 (export "vfold2") (param $x i32) (result i32)
+    (local $r (ref null $obj))
+    (call_ref $vmethod
+      (local.tee $r (call $make_obj (local.get $x)))
+      (i32.const 50)
+      (call $get_vmethod (local.get $r))
+    )
+  )
+)
+;; CHECK:      (func $outlined (type $5) (param $0 anyref) (param $1 i32) (result i32)
+;; CHECK-NEXT:  (call $f
+;; CHECK-NEXT:   (local.get $0)
+;; CHECK-NEXT:   (i32.const 200000)
+;; CHECK-NEXT:   (i32.const 999999)
+;; CHECK-NEXT:   (local.get $1)
+;; CHECK-NEXT:  )
+;; CHECK-NEXT: )
+
+;; CHECK:      (func $outlined_19 (type $5) (param $0 anyref) (param $1 i32) (result i32)
+;; CHECK-NEXT:  (call $f
+;; CHECK-NEXT:   (local.get $0)
+;; CHECK-NEXT:   (i32.const 200000)
+;; CHECK-NEXT:   (i32.const 888888)
+;; CHECK-NEXT:   (local.get $1)
+;; CHECK-NEXT:  )
+;; CHECK-NEXT: )
+
+;; CHECK:      (func $outlined_20 (type $5) (param $0 anyref) (param $1 i32) (result i32)
+;; CHECK-NEXT:  (call $f
+;; CHECK-NEXT:   (local.get $0)
+;; CHECK-NEXT:   (i32.const 100000)
+;; CHECK-NEXT:   (local.get $1)
 ;; CHECK-NEXT:   (local.get $1)
 ;; CHECK-NEXT:  )
 ;; CHECK-NEXT: )
