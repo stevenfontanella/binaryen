@@ -546,18 +546,92 @@ struct SymbolDecoder {
 inline const char* SymbolFuncName = "lz$symbol";
 inline const char* BitsGlobalName = "lz$bits";
 
-// Finds an existing symbol decoder in the module, if any.
+// Finds an existing symbol decoder in the module, if any. Matches structurally
+// as well as by name so that a decoder created by an earlier pass can still be
+// shared after passes that strip names (--roundtrip) or relax parameter
+// nullability (--relax-nullability).
 inline std::optional<SymbolDecoder> findSymbolDecoder(Module& module,
                                                       HeapType i8ArrayType) {
-  auto* func = module.getFunctionOrNull(SymbolFuncName);
-  auto* global = module.getGlobalOrNull(BitsGlobalName);
-  if (!func || !global || func->imported() || global->imported() ||
-      !global->mutable_ || global->type != Type::i32 ||
-      func->getSig() !=
-        Signature({Type(i8ArrayType, NonNullable), Type::i32}, Type::i32)) {
-    return std::nullopt;
+  auto check = [&](Function* func) -> std::optional<SymbolDecoder> {
+    if (!func || func->imported() || func->vars.size() != 5) {
+      return std::nullopt;
+    }
+    auto params = func->getParams();
+    if (params.size() != 2 || !params[0].isRef() ||
+        params[0].getHeapType() != i8ArrayType || params[1] != Type::i32 ||
+        func->getResults() != Type::i32) {
+      return std::nullopt;
+    }
+    for (auto var : func->vars) {
+      if (var != Type::i32) {
+        return std::nullopt;
+      }
+    }
+    struct Scanner : public PostWalker<Scanner> {
+      HeapType i8ArrayType;
+      Index globalGets = 0;
+      Index globalSets = 0;
+      Index loops = 0;
+      Index arrayGets = 0;
+      Name getGlobal;
+      Name setGlobal;
+      bool hasMaxLen = false;
+      bool bad = false;
+      Scanner(HeapType i8ArrayType) : i8ArrayType(i8ArrayType) {}
+      void visitGlobalGet(GlobalGet* curr) {
+        globalGets++;
+        getGlobal = curr->name;
+      }
+      void visitGlobalSet(GlobalSet* curr) {
+        globalSets++;
+        setGlobal = curr->name;
+      }
+      void visitLoop(Loop* curr) { loops++; }
+      void visitArrayGet(ArrayGet* curr) {
+        if (curr->signed_ || curr->ref->type.isNull() ||
+            curr->ref->type.getHeapType() != i8ArrayType) {
+          bad = true;
+        }
+        arrayGets++;
+      }
+      void visitConst(Const* curr) {
+        if (curr->type == Type::i32 &&
+            curr->value.geti32() == int32_t(MaxCodeLength)) {
+          hasMaxLen = true;
+        }
+      }
+      void visitCall(Call* curr) { bad = true; }
+      void visitCallRef(CallRef* curr) { bad = true; }
+      void visitCallIndirect(CallIndirect* curr) { bad = true; }
+      void visitArraySet(ArraySet* curr) { bad = true; }
+      void visitStructGet(StructGet* curr) { bad = true; }
+      void visitStructSet(StructSet* curr) { bad = true; }
+    };
+    Scanner scanner(i8ArrayType);
+    scanner.walk(func->body);
+    if (scanner.bad || scanner.globalGets != 1 || scanner.globalSets != 1 ||
+        scanner.getGlobal != scanner.setGlobal || scanner.loops != 1 ||
+        scanner.arrayGets != 3 || !scanner.hasMaxLen) {
+      return std::nullopt;
+    }
+    auto* global = module.getGlobalOrNull(scanner.getGlobal);
+    if (!global || global->imported() || !global->mutable_ ||
+        global->type != Type::i32) {
+      return std::nullopt;
+    }
+    return SymbolDecoder{func->name, global->name};
+  };
+  if (auto* func = module.getFunctionOrNull(SymbolFuncName)) {
+    if (auto found = check(func)) {
+      return found;
+    }
   }
-  return SymbolDecoder{func->name, global->name};
+  for (auto& func : module.functions) {
+    if (auto found = check(func.get())) {
+      return found;
+    }
+  }
+  return std::nullopt;
 }
 
 // The canonical Huffman symbol decoder (see puff.c in zlib), which reads

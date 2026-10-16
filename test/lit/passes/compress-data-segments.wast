@@ -98,7 +98,7 @@
 
   ;; CHECK:      (global $segments$data (mut (ref null $i8)) (ref.null none))
 
-  ;; CHECK:      (global $lz$bits (mut i32) (i32.const 648))
+  ;; CHECK:      (global $lz$bits (mut i32) (i32.const 672))
 
   ;; CHECK:      (memory $0 1)
 
@@ -110,7 +110,7 @@
   (data $active (i32.const 0) "xyzxyzxyzxyzxyzxyzxyzxyzxyzxyzxyzxyz")
 
 
-  ;; CHECK:      (data $segments "\00\00\06\04\00\00\00\00\00\00\00\00\00\00\00\16,BDV~\04\08\12\14\00\01\00\05\0e\00\00\00\00\00\00\00\00\00\00\00 bclo\01\02\03!,?@HWader\f0\00\02\04\00\00\00\00\00\00\00\00\00\00\00\00\0b\0f\00\02\05\08\9e\d7=\9a\acx~\aal\b5\f6Q\8c\8c\t\c8@\01\81\ec\ef\f7\19\11")
+  ;; CHECK:      (data $segments "\00\00\04\08\00\00\00\00\00\00\00\00\00\00\00\0c\0e\16~\04\10\1a\1e$6>D\00\00\01\08\0c\00\00\00\00\00\00\00\00\00\00\00\01 abclo\f0\10!,?@HWder\fe\ff\00\02\04\00\00\00\00\00\00\00\00\00\00\00\00\00\02\07\13\14\1f?\8f{4^q}W\165;P\18\84\e8\c9\04\f0e\10W\dd\10d\c7\81,\a3\0f")
 
   ;; CHECK:      (func $bytes (type $6) (param $off i32) (param $n i32) (result (ref $i8))
   ;; CHECK-NEXT:  (call $segments$slice
@@ -347,7 +347,7 @@
 ;; CHECK-NEXT:  (local.set $0
 ;; CHECK-NEXT:   (array.new_data $i8 $segments
 ;; CHECK-NEXT:    (i32.const 0)
-;; CHECK-NEXT:    (i32.const 105)
+;; CHECK-NEXT:    (i32.const 113)
 ;; CHECK-NEXT:   )
 ;; CHECK-NEXT:  )
 ;; CHECK-NEXT:  (local.set $1
@@ -403,7 +403,7 @@
 ;; CHECK-NEXT:       (local.get $3)
 ;; CHECK-NEXT:       (call $lz$symbol
 ;; CHECK-NEXT:        (local.get $0)
-;; CHECK-NEXT:        (i32.const 25)
+;; CHECK-NEXT:        (i32.const 27)
 ;; CHECK-NEXT:       )
 ;; CHECK-NEXT:      )
 ;; CHECK-NEXT:      (local.set $3
@@ -449,7 +449,7 @@
 ;; CHECK-NEXT:       (local.set $6
 ;; CHECK-NEXT:        (call $lz$symbol
 ;; CHECK-NEXT:         (local.get $0)
-;; CHECK-NEXT:         (i32.const 60)
+;; CHECK-NEXT:         (i32.const 63)
 ;; CHECK-NEXT:        )
 ;; CHECK-NEXT:       )
 ;; CHECK-NEXT:      )
@@ -545,6 +545,7 @@
 ;; CHECK-NEXT:  (local $4 i32)
 ;; CHECK-NEXT:  (local $5 i32)
 ;; CHECK-NEXT:  (local $6 i32)
+;; CHECK-NEXT:  (local $7 i32)
 ;; CHECK-NEXT:  (local.set $2
 ;; CHECK-NEXT:   (array.new_default $i16
 ;; CHECK-NEXT:    (local.get $1)
@@ -578,10 +579,13 @@
 ;; CHECK-NEXT:          (local.get $3)
 ;; CHECK-NEXT:          (i32.add
 ;; CHECK-NEXT:           (local.get $0)
-;; CHECK-NEXT:           (local.tee $5
-;; CHECK-NEXT:            (i32.sub
-;; CHECK-NEXT:             (local.get $5)
-;; CHECK-NEXT:             (i32.const 1)
+;; CHECK-NEXT:           (i32.mul
+;; CHECK-NEXT:            (local.get $1)
+;; CHECK-NEXT:            (local.tee $5
+;; CHECK-NEXT:             (i32.sub
+;; CHECK-NEXT:              (local.get $5)
+;; CHECK-NEXT:              (i32.const 1)
+;; CHECK-NEXT:             )
 ;; CHECK-NEXT:            )
 ;; CHECK-NEXT:           )
 ;; CHECK-NEXT:          )
@@ -596,12 +600,17 @@
 ;; CHECK-NEXT:     (array.set $i16
 ;; CHECK-NEXT:      (local.get $2)
 ;; CHECK-NEXT:      (local.get $4)
-;; CHECK-NEXT:      (local.get $6)
+;; CHECK-NEXT:      (local.tee $7
+;; CHECK-NEXT:       (i32.add
+;; CHECK-NEXT:        (local.get $7)
+;; CHECK-NEXT:        (local.get $6)
+;; CHECK-NEXT:       )
+;; CHECK-NEXT:      )
 ;; CHECK-NEXT:     )
 ;; CHECK-NEXT:     (local.set $0
 ;; CHECK-NEXT:      (i32.add
 ;; CHECK-NEXT:       (local.get $0)
-;; CHECK-NEXT:       (i32.const 2)
+;; CHECK-NEXT:       (i32.const 1)
 ;; CHECK-NEXT:      )
 ;; CHECK-NEXT:     )
 ;; CHECK-NEXT:     (local.set $4
@@ -623,6 +632,7 @@
 ;; CHECK-NEXT:  (local $4 i32)
 ;; CHECK-NEXT:  (local $5 i32)
 ;; CHECK-NEXT:  (local $6 i32)
+;; CHECK-NEXT:  (local $7 i32)
 ;; CHECK-NEXT:  (local.set $2
 ;; CHECK-NEXT:   (array.new_default $i32
 ;; CHECK-NEXT:    (local.get $1)
@@ -656,10 +666,13 @@
 ;; CHECK-NEXT:          (local.get $3)
 ;; CHECK-NEXT:          (i32.add
 ;; CHECK-NEXT:           (local.get $0)
-;; CHECK-NEXT:           (local.tee $5
-;; CHECK-NEXT:            (i32.sub
-;; CHECK-NEXT:             (local.get $5)
-;; CHECK-NEXT:             (i32.const 1)
+;; CHECK-NEXT:           (i32.mul
+;; CHECK-NEXT:            (local.get $1)
+;; CHECK-NEXT:            (local.tee $5
+;; CHECK-NEXT:             (i32.sub
+;; CHECK-NEXT:              (local.get $5)
+;; CHECK-NEXT:              (i32.const 1)
+;; CHECK-NEXT:             )
 ;; CHECK-NEXT:            )
 ;; CHECK-NEXT:           )
 ;; CHECK-NEXT:          )
@@ -674,12 +687,17 @@
 ;; CHECK-NEXT:     (array.set $i32
 ;; CHECK-NEXT:      (local.get $2)
 ;; CHECK-NEXT:      (local.get $4)
-;; CHECK-NEXT:      (local.get $6)
+;; CHECK-NEXT:      (local.tee $7
+;; CHECK-NEXT:       (i32.add
+;; CHECK-NEXT:        (local.get $7)
+;; CHECK-NEXT:        (local.get $6)
+;; CHECK-NEXT:       )
+;; CHECK-NEXT:      )
 ;; CHECK-NEXT:     )
 ;; CHECK-NEXT:     (local.set $0
 ;; CHECK-NEXT:      (i32.add
 ;; CHECK-NEXT:       (local.get $0)
-;; CHECK-NEXT:       (i32.const 4)
+;; CHECK-NEXT:       (i32.const 1)
 ;; CHECK-NEXT:      )
 ;; CHECK-NEXT:     )
 ;; CHECK-NEXT:     (local.set $4
@@ -701,6 +719,7 @@
 ;; CHECK-NEXT:  (local $4 i32)
 ;; CHECK-NEXT:  (local $5 i32)
 ;; CHECK-NEXT:  (local $6 i64)
+;; CHECK-NEXT:  (local $7 i64)
 ;; CHECK-NEXT:  (local.set $2
 ;; CHECK-NEXT:   (array.new_default $f64
 ;; CHECK-NEXT:    (local.get $1)
@@ -735,10 +754,13 @@
 ;; CHECK-NEXT:           (local.get $3)
 ;; CHECK-NEXT:           (i32.add
 ;; CHECK-NEXT:            (local.get $0)
-;; CHECK-NEXT:            (local.tee $5
-;; CHECK-NEXT:             (i32.sub
-;; CHECK-NEXT:              (local.get $5)
-;; CHECK-NEXT:              (i32.const 1)
+;; CHECK-NEXT:            (i32.mul
+;; CHECK-NEXT:             (local.get $1)
+;; CHECK-NEXT:             (local.tee $5
+;; CHECK-NEXT:              (i32.sub
+;; CHECK-NEXT:               (local.get $5)
+;; CHECK-NEXT:               (i32.const 1)
+;; CHECK-NEXT:              )
 ;; CHECK-NEXT:             )
 ;; CHECK-NEXT:            )
 ;; CHECK-NEXT:           )
@@ -755,13 +777,18 @@
 ;; CHECK-NEXT:      (local.get $2)
 ;; CHECK-NEXT:      (local.get $4)
 ;; CHECK-NEXT:      (f64.reinterpret_i64
-;; CHECK-NEXT:       (local.get $6)
+;; CHECK-NEXT:       (local.tee $7
+;; CHECK-NEXT:        (i64.add
+;; CHECK-NEXT:         (local.get $7)
+;; CHECK-NEXT:         (local.get $6)
+;; CHECK-NEXT:        )
+;; CHECK-NEXT:       )
 ;; CHECK-NEXT:      )
 ;; CHECK-NEXT:     )
 ;; CHECK-NEXT:     (local.set $0
 ;; CHECK-NEXT:      (i32.add
 ;; CHECK-NEXT:       (local.get $0)
-;; CHECK-NEXT:       (i32.const 8)
+;; CHECK-NEXT:       (i32.const 1)
 ;; CHECK-NEXT:      )
 ;; CHECK-NEXT:     )
 ;; CHECK-NEXT:     (local.set $4

@@ -3,6 +3,7 @@
 ;; restoring the position around its own decoding.
 
 ;; RUN: wasm-opt %s -all --string-lowering --string-consts-to-data --pass-arg=string-consts-to-data-always@1 --pass-arg=string-consts-to-data-huffman@1 --compress-data-segments --pass-arg=compress-data-segments-always@1 --pass-arg=compress-data-segments-huffman@1 -S -o - | filecheck %s
+;; RUN: wasm-opt %s -all --string-lowering --string-consts-to-data --pass-arg=string-consts-to-data-always@1 --pass-arg=string-consts-to-data-huffman@1 --roundtrip --closed-world --traps-never-happen --relax-nullability --compress-data-segments --pass-arg=compress-data-segments-always@1 --pass-arg=compress-data-segments-huffman@1 -S -o - | filecheck %s --check-prefix=ROUNDTRIP
 
 (module
   (type $i8 (array (mut i8)))
@@ -47,3 +48,22 @@
 ;; CHECK-NEXT:    (local.get $7)
 ;; CHECK-NEXT:   )
 ;; CHECK-NEXT:  )
+
+;; Also shared when --roundtrip strips names and --relax-nullability relaxes
+;; the i8 array parameter to nullable.
+;; ROUNDTRIP:      (global $global$2 (mut i32) (i32.const {{[0-9]+}}))
+;; ROUNDTRIP-NOT:  (global $lz$bits
+;; ROUNDTRIP:      (func $3 (type ${{[0-9]+}}) (param $0 (ref null $i8)) (param $1 i32) (result i32)
+;; ROUNDTRIP-NOT:  (func $lz$symbol
+;; ROUNDTRIP:      (func $segments$decode
+;; ROUNDTRIP:        (local.set $7
+;; ROUNDTRIP-NEXT:    (global.get $global$2)
+;; ROUNDTRIP-NEXT:   )
+;; ROUNDTRIP-NEXT:   (global.set $global$2
+;; ROUNDTRIP-NEXT:    (i32.const {{[0-9]+}})
+;; ROUNDTRIP-NEXT:   )
+;; ROUNDTRIP:        (data.drop $segments)
+;; ROUNDTRIP:        (global.set $global$2
+;; ROUNDTRIP-NEXT:    (local.get $7)
+;; ROUNDTRIP-NEXT:   )
+;; ROUNDTRIP-NEXT:  )
