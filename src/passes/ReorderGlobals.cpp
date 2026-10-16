@@ -31,7 +31,8 @@
 // for each global in a smooth manner. "Always" is mainly useful for testing.
 //
 
-#include "memory"
+#include <algorithm>
+#include <memory>
 
 #include "ir/find_all.h"
 #include "pass.h"
@@ -203,6 +204,161 @@ struct ReorderGlobals : public Pass {
 
     addOption(sumCounts);
     addOption(exponentialCounts);
+
+    // Also try a max-density ancestor-closure selection for the first 128
+    // globals (whose indices fit in a 1-byte U32LEB, saving 1 byte per
+    // global.get/global.set compared to 2-byte U32LEB indices 128..16383).
+    // At each step we greedily pick an unselected ancestor-closed subset S of
+    // size <= remaining top-128 slots (considering single nodes u and stars of
+    // immediate dependents v unlocked by anc(u)) that maximizes the average
+    // use density sum_{x in S} counts[x] / |S|, then order the remaining
+    // globals by sumCounts or exponentialCounts.
+    {
+      Index n = globals.size();
+      std::vector<std::vector<Index>> prereqs(n);
+      for (Index u = 0; u < n; u++) {
+        for (Index v : deps[u]) {
+          prereqs[v].push_back(u);
+        }
+      }
+      // Compute transitive prerequisites (ancestors) in topological order.
+      std::vector<std::vector<Index>> anc(n);
+      std::vector<Index> mark(n, 0);
+      Index curMark = 0;
+      for (Index v : sorted) {
+        curMark++;
+        for (Index p : prereqs[v]) {
+          for (Index a : anc[p]) {
+            if (mark[a] != curMark) {
+              mark[a] = curMark;
+              anc[v].push_back(a);
+            }
+          }
+        }
+        mark[v] = curMark;
+        anc[v].push_back(v);
+      }
+
+      std::vector<bool> selected(n, false);
+      std::vector<Index> topOrder;
+      Index targetTop = std::min<Index>(n, 128);
+      topOrder.reserve(targetTop);
+      for (Index i = 0; i < n && topOrder.size() < targetTop; i++) {
+        if (globals[i]->imported()) {
+          selected[i] = true;
+          topOrder.push_back(i);
+        }
+      }
+
+      std::vector<Index> inAu(n, 0);
+      std::vector<Index> seenCand(n, 0);
+      while (topOrder.size() < targetTop) {
+        Index rem = targetTop - topOrder.size();
+        std::vector<Index> bestClosure;
+        double bestWeight = -1.0;
+        Index bestSize = 1;
+
+        for (Index u = 0; u < n; u++) {
+          if (selected[u]) {
+            continue;
+          }
+          // Count unselected ancestors of u.
+          Index baseSize = 0;
+          for (Index a : anc[u]) {
+            if (!selected[a]) {
+              baseSize++;
+            }
+          }
+          if (baseSize == 0 || baseSize > rem) {
+            continue;
+          }
+          curMark++;
+          std::vector<Index> closure;
+          closure.reserve(baseSize + 4);
+          double wt = 0;
+          for (Index a : anc[u]) {
+            if (!selected[a]) {
+              inAu[a] = curMark;
+              closure.push_back(a);
+              wt += counts[a];
+            }
+          }
+
+          if (closure.size() < rem) {
+            std::vector<Index> cands;
+            for (Index x : closure) {
+              for (Index v : deps[x]) {
+                if (!selected[v] && inAu[v] != curMark &&
+                    seenCand[v] != curMark) {
+                  seenCand[v] = curMark;
+                  bool allPrereqsReady = true;
+                  for (Index p : prereqs[v]) {
+                    if (!selected[p] && inAu[p] != curMark) {
+                      allPrereqsReady = false;
+                      break;
+                    }
+                  }
+                  if (allPrereqsReady) {
+                    cands.push_back(v);
+                  }
+                }
+              }
+            }
+            if (!cands.empty()) {
+              std::sort(
+                cands.begin(), cands.end(), [&](Index a, Index b) -> bool {
+                  if (counts[a] != counts[b]) {
+                    return counts[a] > counts[b];
+                  }
+                  return a < b;
+                });
+              for (Index v : cands) {
+                if (closure.size() < rem &&
+                    counts[v] * closure.size() > wt) {
+                  closure.push_back(v);
+                  wt += counts[v];
+                } else {
+                  break;
+                }
+              }
+            }
+          }
+
+          Index sz = closure.size();
+          if (bestClosure.empty() || wt * bestSize > bestWeight * sz ||
+              (wt * bestSize == bestWeight * sz && wt > bestWeight)) {
+            bestWeight = wt;
+            bestSize = sz;
+            bestClosure = std::move(closure);
+          }
+        }
+
+        if (bestClosure.empty()) {
+          break;
+        }
+        for (Index x : bestClosure) {
+          selected[x] = true;
+          topOrder.push_back(x);
+        }
+      }
+
+      double maxCount = 0;
+      for (Index i = 0; i < n; i++) {
+        maxCount = std::max(maxCount, sumCounts[i]);
+      }
+      IndexCountMap closureSumCounts(n), closureExpCounts(n);
+      for (Index i = 0; i < n; i++) {
+        closureSumCounts[i] = sumCounts[i];
+        closureExpCounts[i] = exponentialCounts[i];
+      }
+      for (Index rank = 0; rank < topOrder.size(); rank++) {
+        double prio = maxCount + 1.0 + double(n - rank);
+        closureSumCounts[topOrder[rank]] = prio;
+        closureExpCounts[topOrder[rank]] = prio;
+      }
+      addOption(closureSumCounts);
+      addOption(closureExpCounts);
+    }
 
     // Pick the best out of all the options we computed.
     IndexIndexMap* best = nullptr;

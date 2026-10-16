@@ -813,3 +813,224 @@
   )
 )
 
+;; A situation where zeroes, greedy counts, exponentialCounts, and sumCounts
+;; are all suboptimal, and max-density ancestor-closure selection wins:
+;; - $m has 5 uses (beats $p's 2 uses and exponentialCounts[$p] = 3.9)
+;; - $q1 -> $q2 -> $q3 -> $r has total uses 1 + 1 + 1 + 20 = 23 over 4 globals
+;;   (beats $p's sumCounts = 22, but has lower density 23/4 = 5.75)
+;; - $p -> {$d1, $d2} has total uses 2 + 10 + 10 = 22 over 3 globals (highest
+;;   density 22/3 = 7.33, so $p, $d1, $d2 should be emitted first).
+(module
+  ;; CHECK:      (global $p i32 (i32.const 2))
+
+  ;; CHECK:      (global $d1 i32 (global.get $p))
+
+  ;; CHECK:      (global $d2 i32 (global.get $p))
+
+  ;; CHECK:      (global $q1 i32 (i32.const 1))
+
+  ;; CHECK:      (global $q2 i32 (global.get $q1))
+
+  ;; CHECK:      (global $q3 i32 (global.get $q2))
+
+  ;; CHECK:      (global $r i32 (global.get $q3))
+
+  ;; CHECK:      (global $m i32 (i32.const 0))
+  (global $m i32 (i32.const 0))
+  (global $q1 i32 (i32.const 1))
+  (global $q2 i32 (global.get $q1))
+  (global $q3 i32 (global.get $q2))
+  (global $r i32 (global.get $q3))
+  (global $p i32 (i32.const 2))
+  (global $d1 i32 (global.get $p))
+  (global $d2 i32 (global.get $p))
+
+  ;; CHECK:      (func $uses (type $0)
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $m)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $m)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $m)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $m)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $m)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $d1)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $d1)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $d1)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $d1)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $d1)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $d1)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $d1)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $d1)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $d1)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $d1)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $d2)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $d2)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $d2)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $d2)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $d2)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $d2)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $d2)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $d2)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $d2)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $d2)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $r)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $r)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $r)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $r)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $r)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $r)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $r)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $r)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $r)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $r)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $r)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $r)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $r)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $r)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $r)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $r)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $r)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $r)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $r)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $r)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $uses
+    (drop (global.get $m))
+    (drop (global.get $m))
+    (drop (global.get $m))
+    (drop (global.get $m))
+    (drop (global.get $m))
+
+    (drop (global.get $d1))
+    (drop (global.get $d1))
+    (drop (global.get $d1))
+    (drop (global.get $d1))
+    (drop (global.get $d1))
+    (drop (global.get $d1))
+    (drop (global.get $d1))
+    (drop (global.get $d1))
+    (drop (global.get $d1))
+    (drop (global.get $d1))
+
+    (drop (global.get $d2))
+    (drop (global.get $d2))
+    (drop (global.get $d2))
+    (drop (global.get $d2))
+    (drop (global.get $d2))
+    (drop (global.get $d2))
+    (drop (global.get $d2))
+    (drop (global.get $d2))
+    (drop (global.get $d2))
+    (drop (global.get $d2))
+
+    (drop (global.get $r))
+    (drop (global.get $r))
+    (drop (global.get $r))
+    (drop (global.get $r))
+    (drop (global.get $r))
+    (drop (global.get $r))
+    (drop (global.get $r))
+    (drop (global.get $r))
+    (drop (global.get $r))
+    (drop (global.get $r))
+    (drop (global.get $r))
+    (drop (global.get $r))
+    (drop (global.get $r))
+    (drop (global.get $r))
+    (drop (global.get $r))
+    (drop (global.get $r))
+    (drop (global.get $r))
+    (drop (global.get $r))
+    (drop (global.get $r))
+    (drop (global.get $r))
+  )
+)
+
