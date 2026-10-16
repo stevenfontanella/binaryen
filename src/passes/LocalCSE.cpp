@@ -236,6 +236,26 @@ bool isIdempotent(Expression* curr, Module& wasm) {
   return false;
 }
 
+bool isPureReadOnlyCall(Expression* curr,
+                        Module& wasm,
+                        const PassOptions& options) {
+  if (auto* call = curr->dynCast<Call>()) {
+    if (call->isReturn) {
+      return false;
+    }
+    auto* target = wasm.getFunctionOrNull(call->target);
+    if (!target || target->imported() || !target->effects) {
+      return false;
+    }
+    const auto& eff = *target->effects;
+    if (!options.trapsNeverHappen && eff.trap) {
+      return false;
+    }
+    return !eff.hasNonTrapSideEffects() && !eff.generative && !eff.throws();
+  }
+  return false;
+}
+
 struct Scanner
   : public LinearExecutionWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
   PassOptions& options;
@@ -1322,6 +1342,14 @@ struct ScopedDominatorCSE {
   // Maps normalized hash -> active original indices in the current scope.
   using ActiveMap = std::unordered_map<size_t, SmallVector<Index, 1>>;
   ActiveMap activeMap;
+  std::unordered_set<Type> activeVarTypes;
+
+  static Type getBinaryVarType(Type t) {
+    if (t.isRef()) {
+      return Type(t.getHeapType(), Nullable, Inexact);
+    }
+    return t;
+  }
 
   static bool getNormLocalIndex(Expression* e, Index& idxOut) {
     if (auto* lg = e->dynCast<LocalGet>()) {
@@ -1351,7 +1379,7 @@ struct ScopedDominatorCSE {
       });
   }
 
-  static Index getShallowEstBytes(Expression* curr) {
+  Index getShallowEstBytes(Expression* curr) const {
     if (curr->is<LocalGet>() || curr->is<LocalSet>()) {
       return 2;
     }
@@ -1382,7 +1410,12 @@ struct ScopedDominatorCSE {
       return 3;
     }
     if (auto* call = curr->dynCast<Call>()) {
-      return call->operands.empty() ? 3 : 4;
+      if (auto* f = wasm.getFunctionOrNull(call->target)) {
+        if (f->imported()) {
+          return 2;
+        }
+      }
+      return 3;
     }
     if (curr->is<ArrayLen>() || curr->is<RefI31>() || curr->is<I31Get>()) {
       return 2;
@@ -1723,9 +1756,15 @@ struct ScopedDominatorCSE {
       return {};
     }
     if (auto* lg = curr->dynCast<LocalGet>()) {
+      if (func->isVar(lg->index)) {
+        activeVarTypes.insert(getBinaryVarType(func->getLocalType(lg->index)));
+      }
       return {wasm::hash(lg->index), 2, true, false};
     }
     if (auto* ls = curr->dynCast<LocalSet>()) {
+      if (func->isVar(ls->index)) {
+        activeVarTypes.insert(getBinaryVarType(func->getLocalType(ls->index)));
+      }
       NodeInfo valInfo = walkExpr(ls->value);
       invalidateByLocalWrite(ls->index);
       if (valInfo.possible && !origRecords.empty() &&
@@ -1763,6 +1802,7 @@ struct ScopedDominatorCSE {
     }
 
     bool idempotentCall = isIdempotent(curr, wasm);
+    bool pureReadOnlyCall = isPureReadOnlyCall(curr, wasm, options);
     ShallowEffectAnalyzer shallow(options, wasm, curr);
     shallow.trap = false;
     if (idempotentCall) {
@@ -1783,7 +1823,7 @@ struct ScopedDominatorCSE {
     }
 
     bool shallowPossible =
-      idempotentCall ||
+      idempotentCall || pureReadOnlyCall ||
       (!shallow.hasNonTrapSideEffects() &&
        !Properties::isShallowlyGenerative(curr, func, wasm));
     bool possible = childrenPossible && shallowPossible;
@@ -1850,6 +1890,25 @@ struct ScopedDominatorCSE {
       origRepeats[origIdx].push_back(rep);
     }
 
+    auto getHeaderBytes = [&](Type t) -> Index {
+      Type binType = getBinaryVarType(t);
+      if (activeVarTypes.contains(binType)) {
+        return 0;
+      }
+      if (t.isRef() && !t.getHeapType().isBasic()) {
+        return 4;
+      }
+      if (options.shrinkLevel >= 2) {
+        for (Index p = 0; p < func->getNumParams(); p++) {
+          if (getBinaryVarType(func->getLocalType(p)) == binType) {
+            return 0;
+          }
+        }
+        return 2;
+      }
+      return 0;
+    };
+
     auto passesByteCostGate = [&](const OrigRecord& rec,
                                   Index effBytes) -> bool {
       if (rec.reuses == 0 || effBytes <= 2) {
@@ -1858,7 +1917,8 @@ struct ScopedDominatorCSE {
       if (rec.existingLocal != Index(-1)) {
         return effBytes >= 4;
       }
-      return rec.reuses * (effBytes - 2) >= 3;
+      Index headerBytes = getHeaderBytes(rec.orig->type);
+      return rec.reuses * (effBytes - 2) >= 2 + headerBytes + 1;
     };
 
     // Evaluate originals in reverse postorder (parents before children).
@@ -1891,6 +1951,8 @@ struct ScopedDominatorCSE {
             }
           }
         }
+      } else if (rec.existingLocal == Index(-1)) {
+        activeVarTypes.insert(getBinaryVarType(rec.orig->type));
       }
     }
 
@@ -1951,6 +2013,651 @@ struct ScopedDominatorCSE {
   }
 };
 
+static bool unCseSingleWriteTees(Function* func,
+                                 Module& wasm,
+                                 PassOptions& options) {
+  if (!func->body || func->getNumVars() == 0) {
+    return false;
+  }
+
+  ScopedDominatorCSE helper(func, wasm, options);
+  bool anyChanged = false;
+  std::unordered_set<Index> allUnCsedLocals;
+
+  auto isDuplicableValue = [&](Expression* root,
+                               ScopedDominatorCSE::OrigRecord& rec,
+                               Index& estBytesOut) -> bool {
+    estBytesOut = 0;
+    bool ok = true;
+    std::function<void(Expression*)> walkVal = [&](Expression* e) {
+      if (!ok || !e) {
+        return;
+      }
+      if (e->is<LocalSet>() || e->is<Block>() || e->is<If>() ||
+          e->is<Loop>() || e->is<Try>() || e->is<TryTable>() ||
+          e->is<Break>() || e->is<BrOn>() || e->is<Switch>() ||
+          e->is<Return>() || e->is<Throw>() || e->is<Rethrow>() ||
+          e->is<Unreachable>() || e->is<CallRef>() || e->is<CallIndirect>() ||
+          e->is<Pop>() || e->is<TupleMake>() || e->is<TupleExtract>()) {
+        ok = false;
+        return;
+      }
+      estBytesOut += helper.getShallowEstBytes(e);
+      if (auto* lg = e->dynCast<LocalGet>()) {
+        if (std::find(rec.localsRead.begin(),
+                      rec.localsRead.end(),
+                      lg->index) == rec.localsRead.end()) {
+          rec.localsRead.push_back(lg->index);
+        }
+        return;
+      }
+      if (auto* call = e->dynCast<Call>()) {
+        if (call->isReturn) {
+          ok = false;
+          return;
+        }
+        auto* target = wasm.getFunctionOrNull(call->target);
+        if (!target || target->imported() || !target->effects) {
+          ok = false;
+          return;
+        }
+        const auto& tEff = *target->effects;
+        bool idempotentInit =
+          tEff.isIdempotent && tEff.onlyTouchesInitGlobals && !tEff.throws();
+        bool pureReadOnly =
+          !tEff.hasNonTrapSideEffects() && !tEff.generative && !tEff.throws();
+        if (!idempotentInit && !pureReadOnly) {
+          ok = false;
+          return;
+        }
+        if (!options.trapsNeverHappen && tEff.trap) {
+          ok = false;
+          return;
+        }
+        if (!idempotentInit) {
+          for (Name g : tEff.mutableGlobalsRead) {
+            if (std::find(rec.mutableGlobalsRead.begin(),
+                          rec.mutableGlobalsRead.end(),
+                          g) == rec.mutableGlobalsRead.end()) {
+              rec.mutableGlobalsRead.push_back(g);
+            }
+          }
+          if (tEff.readsMutableStruct || tEff.readsSharedMutableStruct) {
+            rec.readsMutableStruct = true;
+          }
+          if (tEff.readsMutableArray || tEff.readsSharedMutableArray) {
+            rec.readsMutableArray = true;
+          }
+          if (tEff.readsMemory || tEff.readsSharedMemory) {
+            rec.readsMemory = true;
+          }
+          if (tEff.readsTable) {
+            rec.readsTable = true;
+          }
+        }
+        for (auto* ch : ChildIterator(e)) {
+          walkVal(ch);
+        }
+        return;
+      }
+      ShallowEffectAnalyzer eff(options, wasm, e);
+      if (!options.trapsNeverHappen && eff.trap) {
+        ok = false;
+        return;
+      }
+      eff.trap = false;
+      if (eff.hasNonTrapSideEffects() ||
+          Properties::isShallowlyGenerative(e, func, wasm)) {
+        ok = false;
+        return;
+      }
+      for (Name g : eff.mutableGlobalsRead) {
+        if (std::find(rec.mutableGlobalsRead.begin(),
+                      rec.mutableGlobalsRead.end(),
+                      g) == rec.mutableGlobalsRead.end()) {
+          rec.mutableGlobalsRead.push_back(g);
+        }
+      }
+      if (eff.readsMutableStruct || eff.readsSharedMutableStruct) {
+        rec.readsMutableStruct = true;
+      }
+      if (eff.readsMutableArray || eff.readsSharedMutableArray) {
+        rec.readsMutableArray = true;
+      }
+      if (eff.readsMemory || eff.readsSharedMemory) {
+        rec.readsMemory = true;
+      }
+      if (eff.readsTable) {
+        rec.readsTable = true;
+      }
+      for (auto* ch : ChildIterator(e)) {
+        walkVal(ch);
+      }
+    };
+    walkVal(root);
+    return ok;
+  };
+
+  for (int iter = 0; iter < 3; iter++) {
+    Index numLocals = func->getNumLocals();
+    Index varBase = func->getVarIndexBase();
+    std::vector<SmallVector<LocalSet*, 2>> writes(numLocals);
+    std::vector<SmallVector<LocalGet*, 4>> reads(numLocals);
+    std::vector<Index> teePostOrder(numLocals, 0);
+    std::vector<bool> inConcreteParent(numLocals, false);
+    std::unordered_set<Index> coupledCallRefLocals;
+
+    Index postCounter = 0;
+    std::vector<Expression*> parentStack;
+    std::function<void(Expression*)> scanAST = [&](Expression* curr) {
+      if (!curr) {
+        return;
+      }
+      parentStack.push_back(curr);
+      for (auto* ch : ChildIterator(curr)) {
+        scanAST(ch);
+      }
+      parentStack.pop_back();
+      Index myPost = ++postCounter;
+      if (auto* lg = curr->dynCast<LocalGet>()) {
+        reads[lg->index].push_back(lg);
+      } else if (auto* ls = curr->dynCast<LocalSet>()) {
+        writes[ls->index].push_back(ls);
+        if (ls->isTee()) {
+          teePostOrder[ls->index] = myPost;
+          if (!parentStack.empty() &&
+              parentStack.back()->type.isConcrete()) {
+            inConcreteParent[ls->index] = true;
+          }
+        }
+      } else if (auto* cr = curr->dynCast<CallRef>()) {
+        if (!cr->operands.empty() && cr->target) {
+          for (auto* ls : FindAll<LocalSet>(cr->operands[0]).list) {
+            if (ls->isTee()) {
+              for (auto* lg : FindAll<LocalGet>(cr->target).list) {
+                if (lg->index == ls->index) {
+                  coupledCallRefLocals.insert(ls->index);
+                  break;
+                }
+              }
+            }
+          }
+        }
+      }
+    };
+    scanAST(func->body);
+
+    std::unordered_map<Type, Index> varTypeCounts;
+    for (Index v = varBase; v < numLocals; v++) {
+      if (!writes[v].empty() || !reads[v].empty()) {
+        varTypeCounts[ScopedDominatorCSE::getBinaryVarType(
+          func->getLocalType(v))]++;
+      }
+    }
+
+    std::vector<bool> isCandidate(numLocals, false);
+    std::vector<ScopedDominatorCSE::OrigRecord> candRec(numLocals);
+    std::vector<Index> candEstBytes(numLocals, 0);
+    bool anyCand = false;
+
+    for (Index x = varBase; x < numLocals; x++) {
+      if (writes[x].size() != 1 || !writes[x][0]->isTee() ||
+          reads[x].size() > 3 || coupledCallRefLocals.contains(x)) {
+        continue;
+      }
+      LocalSet* wx = writes[x][0];
+      Expression* V = wx->value;
+      if (!V->type.isConcrete() ||
+          !Type::isSubType(V->type, func->getLocalType(x))) {
+        continue;
+      }
+      if (reads[x].empty()) {
+        isCandidate[x] = true;
+        anyCand = true;
+        continue;
+      }
+      candRec[x].orig = V;
+      Index estV = 0;
+      if (!isDuplicableValue(V, candRec[x], estV)) {
+        continue;
+      }
+      if (std::find(candRec[x].localsRead.begin(),
+                    candRec[x].localsRead.end(),
+                    x) != candRec[x].localsRead.end()) {
+        continue;
+      }
+      candEstBytes[x] = estV;
+      isCandidate[x] = true;
+      anyCand = true;
+    }
+
+    if (!anyCand) {
+      break;
+    }
+
+    std::unordered_map<Index, Index> activeTees;
+    std::vector<Index> validReads(numLocals, 0);
+    Index currentLoopDepth = 0;
+
+    auto invalidateActiveByLocalWrite = [&](Index localIdx) {
+      for (auto it = activeTees.begin(); it != activeTees.end();) {
+        const auto& rec = candRec[it->first];
+        if (std::find(rec.localsRead.begin(),
+                      rec.localsRead.end(),
+                      localIdx) != rec.localsRead.end()) {
+          it = activeTees.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    };
+
+    auto invalidateActiveByEffects = [&](const EffectAnalyzer& eff,
+                                         Expression* killerExpr = nullptr) {
+      if (!eff.hasNonTrapSideEffects()) {
+        return;
+      }
+      for (auto it = activeTees.begin(); it != activeTees.end();) {
+        if (helper.isKilledByEffects(candRec[it->first], eff, killerExpr)) {
+          it = activeTees.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    };
+
+    std::function<void(Expression*)> walkDom = [&](Expression* curr) {
+      if (!curr) {
+        return;
+      }
+      if (auto* block = curr->dynCast<Block>()) {
+        Index firstBranchIdx = block->list.size();
+        if (block->name.is()) {
+          for (Index i = 0; i < block->list.size(); i++) {
+            if (SubtreeTargetsName(block->list[i], block->name)) {
+              firstBranchIdx = i;
+              break;
+            }
+          }
+        }
+        std::unordered_map<Index, Index> savedExitMap;
+        bool capturedAfterDirectBr = false;
+        for (Index i = 0; i < block->list.size(); i++) {
+          if (i == firstBranchIdx) {
+            bool isDirectCondBr = false;
+            if (auto* br = block->list[i]->dynCast<Break>()) {
+              isDirectCondBr = br->name == block->name && br->condition &&
+                               !SubtreeTargetsName(br->value, block->name) &&
+                               !SubtreeTargetsName(br->condition, block->name);
+            } else if (auto* bron = block->list[i]->dynCast<BrOn>()) {
+              isDirectCondBr = bron->name == block->name &&
+                               !SubtreeTargetsName(bron->ref, block->name) &&
+                               !SubtreeTargetsName(bron->desc, block->name);
+            }
+            if (!isDirectCondBr) {
+              savedExitMap = activeTees;
+            } else {
+              capturedAfterDirectBr = true;
+            }
+          }
+          walkDom(block->list[i]);
+          if (i == firstBranchIdx && capturedAfterDirectBr) {
+            savedExitMap = activeTees;
+          }
+        }
+        if (block->type == Type::unreachable) {
+          activeTees.clear();
+        } else if (firstBranchIdx < block->list.size()) {
+          activeTees = std::move(savedExitMap);
+          for (Index i = firstBranchIdx; i < block->list.size(); i++) {
+            if (i == firstBranchIdx && capturedAfterDirectBr) {
+              continue;
+            }
+            EffectAnalyzer eff(options, wasm, block->list[i]);
+            eff.trap = false;
+            invalidateActiveByEffects(eff);
+          }
+        }
+        return;
+      }
+      if (auto* iff = curr->dynCast<If>()) {
+        walkDom(iff->condition);
+        auto afterCond = activeTees;
+        walkDom(iff->ifTrue);
+        if (iff->ifFalse) {
+          activeTees = afterCond;
+          walkDom(iff->ifFalse);
+        }
+        if (iff->type == Type::unreachable) {
+          activeTees.clear();
+        } else {
+          activeTees = std::move(afterCond);
+          bool thenExitsFunc =
+            iff->ifTrue->type == Type::unreachable &&
+            FindAll<Break>(iff->ifTrue).list.empty() &&
+            FindAll<Switch>(iff->ifTrue).list.empty() &&
+            FindAll<BrOn>(iff->ifTrue).list.empty();
+          if (!thenExitsFunc) {
+            EffectAnalyzer thenEff(options, wasm, iff->ifTrue);
+            thenEff.trap = false;
+            invalidateActiveByEffects(thenEff);
+          }
+          if (iff->ifFalse) {
+            bool elseExitsFunc =
+              iff->ifFalse->type == Type::unreachable &&
+              FindAll<Break>(iff->ifFalse).list.empty() &&
+              FindAll<Switch>(iff->ifFalse).list.empty() &&
+              FindAll<BrOn>(iff->ifFalse).list.empty();
+            if (!elseExitsFunc) {
+              EffectAnalyzer elseEff(options, wasm, iff->ifFalse);
+              elseEff.trap = false;
+              invalidateActiveByEffects(elseEff);
+            }
+          }
+        }
+        return;
+      }
+      if (auto* loop = curr->dynCast<Loop>()) {
+        EffectAnalyzer loopEff(options, wasm, loop->body);
+        loopEff.trap = false;
+        invalidateActiveByEffects(loopEff);
+        auto beforeLoop = activeTees;
+        currentLoopDepth++;
+        walkDom(loop->body);
+        currentLoopDepth--;
+        if (loop->type == Type::unreachable) {
+          activeTees.clear();
+        } else {
+          activeTees = std::move(beforeLoop);
+        }
+        return;
+      }
+      if (auto* tryy = curr->dynCast<Try>()) {
+        auto beforeTry = activeTees;
+        walkDom(tryy->body);
+        EffectAnalyzer bodyEff(options, wasm, tryy->body);
+        bodyEff.trap = false;
+        for (auto* cb : tryy->catchBodies) {
+          activeTees = beforeTry;
+          invalidateActiveByEffects(bodyEff);
+          walkDom(cb);
+        }
+        if (tryy->type == Type::unreachable) {
+          activeTees.clear();
+        } else {
+          activeTees = std::move(beforeTry);
+          EffectAnalyzer tryEff(options, wasm, tryy);
+          tryEff.trap = false;
+          invalidateActiveByEffects(tryEff);
+        }
+        return;
+      }
+      if (auto* tt = curr->dynCast<TryTable>()) {
+        auto beforeTry = activeTees;
+        walkDom(tt->body);
+        if (tt->type == Type::unreachable) {
+          activeTees.clear();
+        } else {
+          activeTees = std::move(beforeTry);
+          EffectAnalyzer ttEff(options, wasm, tt);
+          ttEff.trap = false;
+          invalidateActiveByEffects(ttEff);
+        }
+        return;
+      }
+      if (auto* br = curr->dynCast<Break>()) {
+        if (br->value) {
+          walkDom(br->value);
+        }
+        if (br->condition) {
+          walkDom(br->condition);
+        }
+        if (!br->condition) {
+          activeTees.clear();
+        }
+        return;
+      }
+      if (auto* bron = curr->dynCast<BrOn>()) {
+        walkDom(bron->ref);
+        if (bron->desc) {
+          walkDom(bron->desc);
+        }
+        return;
+      }
+      if (auto* sw = curr->dynCast<Switch>()) {
+        if (sw->value) {
+          walkDom(sw->value);
+        }
+        walkDom(sw->condition);
+        activeTees.clear();
+        return;
+      }
+      if (auto* ret = curr->dynCast<Return>()) {
+        if (ret->value) {
+          walkDom(ret->value);
+        }
+        activeTees.clear();
+        return;
+      }
+      if (auto* th = curr->dynCast<Throw>()) {
+        for (auto* op : th->operands) {
+          walkDom(op);
+        }
+        activeTees.clear();
+        return;
+      }
+      if (curr->is<Rethrow>() || curr->is<Unreachable>()) {
+        activeTees.clear();
+        return;
+      }
+      if (auto* lg = curr->dynCast<LocalGet>()) {
+        auto it = activeTees.find(lg->index);
+        if (it != activeTees.end() && it->second == currentLoopDepth) {
+          validReads[lg->index]++;
+        }
+        return;
+      }
+      if (auto* ls = curr->dynCast<LocalSet>()) {
+        walkDom(ls->value);
+        invalidateActiveByLocalWrite(ls->index);
+        if (ls->isTee() && isCandidate[ls->index] &&
+            writes[ls->index][0] == ls) {
+          activeTees[ls->index] = currentLoopDepth;
+        }
+        return;
+      }
+
+      for (auto* child : ChildIterator(curr)) {
+        walkDom(child);
+      }
+
+      bool idempotentCall = isIdempotent(curr, wasm);
+      ShallowEffectAnalyzer shallow(options, wasm, curr);
+      shallow.trap = false;
+      if (idempotentCall) {
+        if (auto* target = wasm.getFunctionOrNull(curr->cast<Call>()->target)) {
+          if (target->effects && target->effects->onlyTouchesInitGlobals) {
+            shallow.calls = false;
+            shallow.writesArray = false;
+            shallow.writesSharedArray = false;
+          }
+        }
+      }
+      if (shallow.hasNonTrapSideEffects()) {
+        invalidateActiveByEffects(shallow, curr);
+      }
+      if (shallow.branchesOut || curr->type == Type::unreachable) {
+        activeTees.clear();
+      }
+    };
+
+    walkDom(func->body);
+
+    std::vector<Index> domCandidates;
+    for (Index x = varBase; x < numLocals; x++) {
+      if (isCandidate[x] && validReads[x] == reads[x].size()) {
+        domCandidates.push_back(x);
+      }
+    }
+    if (domCandidates.empty()) {
+      break;
+    }
+
+    // Evaluate inner/later tees first (descending post-order of wx).
+    std::sort(domCandidates.begin(),
+              domCandidates.end(),
+              [&](Index a, Index b) {
+                return teePostOrder[a] > teePostOrder[b];
+              });
+
+    std::vector<Index> currentReadCount(numLocals, 0);
+    for (Index i = 0; i < numLocals; i++) {
+      currentReadCount[i] = reads[i].size();
+    }
+
+    std::unordered_set<Index> selectedLocals;
+    std::unordered_map<Index, Expression*> selectedValues;
+
+    for (Index x : domCandidates) {
+      Index k = currentReadCount[x];
+      if (k > 3) {
+        continue;
+      }
+      if (k > 0) {
+        bool readsSelected = false;
+        for (Index r : candRec[x].localsRead) {
+          if (selectedLocals.contains(r)) {
+            readsSelected = true;
+            break;
+          }
+        }
+        if (readsSelected) {
+          continue;
+        }
+        Type xType = func->getLocalType(x);
+        Type binType = ScopedDominatorCSE::getBinaryVarType(xType);
+        Index headerBytes = 0;
+        if (varTypeCounts[binType] == 1) {
+          if (xType.isRef() && !xType.getHeapType().isBasic()) {
+            headerBytes = 4;
+          } else if (options.shrinkLevel >= 2) {
+            headerBytes = 2;
+          }
+        }
+        Index estV = candEstBytes[x];
+        Index lhs = estV > 2 ? k * (estV - 2) : 0;
+        Index rhs = 2 + headerBytes;
+        if (lhs > rhs) {
+          continue;
+        }
+        if (lhs == rhs && !inConcreteParent[x]) {
+          continue;
+        }
+      }
+
+      selectedLocals.insert(x);
+      allUnCsedLocals.insert(x);
+      Expression* V = writes[x][0]->value;
+      selectedValues[x] = V;
+      Type binType =
+        ScopedDominatorCSE::getBinaryVarType(func->getLocalType(x));
+      if (varTypeCounts[binType] > 0) {
+        varTypeCounts[binType]--;
+      }
+      if (k > 0) {
+        for (auto* lg : FindAll<LocalGet>(V).list) {
+          currentReadCount[lg->index] += k;
+        }
+      }
+    }
+
+    if (selectedLocals.empty()) {
+      break;
+    }
+
+    struct UnCseReplacer : public PostWalker<UnCseReplacer> {
+      Module& wasm;
+      const std::unordered_set<Index>& selectedLocals;
+      const std::unordered_map<Index, Expression*>& selectedValues;
+
+      UnCseReplacer(
+        Module& wasm,
+        const std::unordered_set<Index>& selectedLocals,
+        const std::unordered_map<Index, Expression*>& selectedValues)
+        : wasm(wasm), selectedLocals(selectedLocals),
+          selectedValues(selectedValues) {}
+
+      void visitLocalGet(LocalGet* curr) {
+        auto it = selectedValues.find(curr->index);
+        if (it != selectedValues.end()) {
+          replaceCurrent(ExpressionManipulator::copy(it->second, wasm));
+        }
+      }
+
+      void visitLocalSet(LocalSet* curr) {
+        if (curr->isTee() && selectedLocals.contains(curr->index)) {
+          replaceCurrent(curr->value);
+        }
+      }
+    } replacer(wasm, selectedLocals, selectedValues);
+    replacer.walk(func->body);
+    anyChanged = true;
+  }
+
+  if (anyChanged && !allUnCsedLocals.empty()) {
+    // Strip the un-CSEd locals from func->vars and reindex local references.
+    Index numParams = func->getNumParams();
+    Index oldNumLocals = func->getNumLocals();
+    std::vector<Index> oldToNew(oldNumLocals, 0);
+    std::vector<Index> newToOld;
+    newToOld.reserve(oldNumLocals);
+    for (Index i = 0; i < numParams; i++) {
+      oldToNew[i] = i;
+      newToOld.push_back(i);
+    }
+    std::vector<Type> newVars;
+    newVars.reserve(func->vars.size());
+    for (Index v = numParams; v < oldNumLocals; v++) {
+      if (allUnCsedLocals.contains(v)) {
+        continue;
+      }
+      Index newIdx = numParams + newVars.size();
+      oldToNew[v] = newIdx;
+      newToOld.push_back(v);
+      newVars.push_back(func->vars[v - numParams]);
+    }
+    func->vars = std::move(newVars);
+
+    struct LocalReindexer : public PostWalker<LocalReindexer> {
+      const std::vector<Index>& oldToNew;
+      LocalReindexer(const std::vector<Index>& oldToNew)
+        : oldToNew(oldToNew) {}
+      void visitLocalGet(LocalGet* curr) {
+        curr->index = oldToNew[curr->index];
+      }
+      void visitLocalSet(LocalSet* curr) {
+        curr->index = oldToNew[curr->index];
+      }
+    } reindexer(oldToNew);
+    reindexer.walk(func->body);
+
+    if (!func->localNames.empty()) {
+      auto oldLocalNames = std::move(func->localNames);
+      func->localNames.clear();
+      func->localIndices.clear();
+      for (Index newIdx = 0; newIdx < newToOld.size(); newIdx++) {
+        auto it = oldLocalNames.find(newToOld[newIdx]);
+        if (it != oldLocalNames.end()) {
+          func->localNames[newIdx] = it->second;
+          func->localIndices[it->second] = newIdx;
+        }
+      }
+    }
+  }
+
+  return anyChanged;
+}
+
 } // anonymous namespace
 
 struct LocalCSE : public WalkerPass<PostWalker<LocalCSE>> {
@@ -1969,6 +2676,9 @@ struct LocalCSE : public WalkerPass<PostWalker<LocalCSE>> {
     if (options.shrinkLevel > 0) {
       bool changed = forwardStructNewFields(func, *getModule(), options);
       if (unaliasSingleFieldProjectionLocals(func, *getModule(), options)) {
+        changed = true;
+      }
+      if (unCseSingleWriteTees(func, *getModule(), options)) {
         changed = true;
       }
       if (changed) {

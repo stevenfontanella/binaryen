@@ -727,3 +727,104 @@
     )
   )
 )
+
+(module
+  ;; CHECK:      (type $S (struct (field i32)))
+  ;; SHRINK:      (type $S (struct (field i32)))
+  (type $S (struct (field i32)))
+
+  ;; CHECK:      (type $1 (func (result (ref null $S))))
+
+  ;; CHECK:      (type $2 (func (result i32)))
+
+  ;; CHECK:      (global $lazy (mut (ref null $S)) (ref.null none))
+  ;; SHRINK:      (type $1 (func (result (ref null $S))))
+
+  ;; SHRINK:      (type $2 (func (result i32)))
+
+  ;; SHRINK:      (global $lazy (mut (ref null $S)) (ref.null none))
+  (global $lazy (mut (ref null $S)) (ref.null none))
+
+  ;; CHECK:      (func $get_lazy (type $1) (result (ref null $S))
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (ref.is_null
+  ;; CHECK-NEXT:    (global.get $lazy)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (global.set $lazy
+  ;; CHECK-NEXT:     (struct.new $S
+  ;; CHECK-NEXT:      (i32.const 7)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (global.get $lazy)
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $get_lazy (type $1) (result (ref null $S))
+  ;; SHRINK-NEXT:  (if
+  ;; SHRINK-NEXT:   (ref.is_null
+  ;; SHRINK-NEXT:    (global.get $lazy)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (then
+  ;; SHRINK-NEXT:    (global.set $lazy
+  ;; SHRINK-NEXT:     (struct.new $S
+  ;; SHRINK-NEXT:      (i32.const 7)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (global.get $lazy)
+  ;; SHRINK-NEXT: )
+  (func $get_lazy (result (ref null $S))
+    (if
+      (ref.is_null
+        (global.get $lazy)
+      )
+      (then
+        (global.set $lazy
+          (struct.new $S
+            (i32.const 7)
+          )
+        )
+      )
+    )
+    (global.get $lazy)
+  )
+
+  ;; CHECK:      (func $uncse-overcsed-ref-tee (type $2) (result i32)
+  ;; CHECK-NEXT:  (local $t (ref null $S))
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (struct.get $S 0
+  ;; CHECK-NEXT:    (local.tee $t
+  ;; CHECK-NEXT:     (call $get_lazy)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (ref.is_null
+  ;; CHECK-NEXT:    (local.get $t)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $uncse-overcsed-ref-tee (type $2) (result i32)
+  ;; SHRINK-NEXT:  (i32.add
+  ;; SHRINK-NEXT:   (struct.get $S 0
+  ;; SHRINK-NEXT:    (call $get_lazy)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (ref.is_null
+  ;; SHRINK-NEXT:    (call $get_lazy)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $uncse-overcsed-ref-tee (result i32)
+    (local $t (ref null $S))
+    (i32.add
+      (struct.get $S 0
+        (local.tee $t
+          (call $get_lazy)
+        )
+      )
+      (ref.is_null
+        (local.get $t)
+      )
+    )
+  )
+)
