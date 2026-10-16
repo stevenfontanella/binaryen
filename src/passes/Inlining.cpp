@@ -603,6 +603,8 @@ enum class ParamStrategy : uint8_t {
   DirectDup,
   ReuseArgTee,
   ScratchTee,
+  PrologueSet,
+  PrologueReuseTee,
 };
 
 struct ByteBudgetSitePlan {
@@ -615,6 +617,7 @@ struct RankTables {
   std::unordered_map<Name, Index> funcRank;
   std::unordered_map<Name, Index> globalRank;
   std::unordered_map<HeapType, Index> typeRank;
+  std::unordered_set<HeapType> soleUseFuncTypes;
 
   Index getFuncRank(Name name) const {
     auto it = funcRank.find(name);
@@ -1347,7 +1350,8 @@ static void doDirectInlining(Module* module,
         arg->type != paramType) {
       arg->type = Type(paramType.getHeapType(), Nullable);
     }
-    if (plan.paramStrategies[p] == ParamStrategy::ScratchTee) {
+    if (plan.paramStrategies[p] == ParamStrategy::ScratchTee ||
+        plan.paramStrategies[p] == ParamStrategy::PrologueSet) {
       paramScratchLocals[p] = getScratchLocal(paramType);
     } else if (plan.paramStrategies[p] == ParamStrategy::DirectSingle &&
                bbInfo.paramNeedsExactHeapType[p] && !arg->is<RefNull>() &&
@@ -1435,6 +1439,18 @@ static void doDirectInlining(Module* module,
           }
           return;
         }
+        case ParamStrategy::PrologueSet: {
+          Index tmp = paramScratchLocals[p];
+          assert(tmp != Index(-1));
+          replaceCurrent(builder.makeLocalGet(tmp, paramType));
+          return;
+        }
+        case ParamStrategy::PrologueReuseTee: {
+          Index teeLocal = arg->cast<LocalSet>()->index;
+          replaceCurrent(
+            builder.makeLocalGet(teeLocal, into->getLocalType(teeLocal)));
+          return;
+        }
         case ParamStrategy::DropSilent:
           WASM_UNREACHABLE("unexpected get of silent-dropped param");
       }
@@ -1457,6 +1473,27 @@ static void doDirectInlining(Module* module,
             varLocalMap);
 
   updater.walk(contents);
+  std::vector<Expression*> prologue;
+  for (Index p = 0; p < numParams; ++p) {
+    if (plan.paramStrategies[p] == ParamStrategy::PrologueSet) {
+      prologue.push_back(
+        builder.makeLocalSet(paramScratchLocals[p], call->operands[p]));
+    } else if (plan.paramStrategies[p] == ParamStrategy::PrologueReuseTee) {
+      auto* ls = call->operands[p]->cast<LocalSet>();
+      prologue.push_back(builder.makeLocalSet(ls->index, ls->value));
+    }
+  }
+  if (!prologue.empty()) {
+    if (auto* b = contents->dynCast<Block>(); b && !b->name.is()) {
+      for (auto* item : b->list) {
+        prologue.push_back(item);
+      }
+      b->list.set(prologue);
+    } else {
+      prologue.push_back(contents);
+      contents = builder.makeBlock(prologue, contents->type);
+    }
+  }
   *action.callSite = contents;
 }
 
@@ -2250,6 +2287,10 @@ struct Inlining : public Pass {
       for (auto& [ht, info] : typeCounts) {
         weights[ht] = info.useCount;
         allTypes.push_back(ht);
+        if (ht.isSignature() && info.useCount == 1 &&
+            !ht.getDeclaredSuperType()) {
+          ranks.soleUseFuncTypes.insert(ht);
+        }
       }
       for (auto it = allTypes.rbegin(); it != allTypes.rend(); ++it) {
         if (auto sup = it->getSuperType()) {
@@ -2509,8 +2550,21 @@ struct Inlining : public Pass {
       }
     }
     int codeBodyBytes = localDeclBytes + totalExprBytes + 1;
-    bbInfo.savedFuncBytes =
-      1 + FunctionInfoScanner::getULEBSize(codeBodyBytes) + codeBodyBytes;
+    HeapType funcHT = func->type.getHeapType();
+    int funcSecBytes = ranks.getTypeIndexBytes(funcHT, /*isS33=*/false);
+    int soleSigBytes = 0;
+    if (ranks.soleUseFuncTypes.contains(funcHT)) {
+      soleSigBytes = 3;
+      for (auto pt : func->getParams()) {
+        soleSigBytes += ranks.getTypeBytes(pt);
+      }
+      if (func->getResults() != Type::none) {
+        soleSigBytes += 1 + ranks.getTypeBytes(func->getResults());
+      }
+    }
+    bbInfo.savedFuncBytes = funcSecBytes + soleSigBytes +
+                            FunctionInfoScanner::getULEBSize(codeBodyBytes) +
+                            codeBodyBytes;
     bbInfo.valid = true;
     return true;
   }
@@ -2551,6 +2605,7 @@ struct Inlining : public Pass {
       }
     }
 
+    std::vector<bool> mustPrologue(numParams, false);
     for (Index p = 0; p < numParams; ++p) {
       if (bbInfo.paramGetCount[p] == 0) {
         if (argEffects[p].hasUnremovableSideEffects()) {
@@ -2559,10 +2614,10 @@ struct Inlining : public Pass {
         continue;
       }
       if (bbInfo.paramInBranch[p] && argEffects[p].hasSideEffects()) {
-        return false;
+        mustPrologue[p] = true;
       }
       if (argEffects[p].invalidates(bbInfo.prefixEffectsBeforeFirstGet[p])) {
-        return false;
+        mustPrologue[p] = true;
       }
       for (Index q = p + 1; q < numParams; ++q) {
         if (bbInfo.paramGetCount[q] == 0) {
@@ -2570,7 +2625,7 @@ struct Inlining : public Pass {
         }
         if (bbInfo.firstReadOrd[q] < bbInfo.firstReadOrd[p]) {
           if (argEffects[p].invalidates(argEffects[q])) {
-            return false;
+            mustPrologue[p] = true;
           }
         }
       }
@@ -2588,7 +2643,7 @@ struct Inlining : public Pass {
     int callerLocalBytes =
       (caller->getNumLocals() + totalScratchCount + numParams >= 128) ? 3 : 2;
     plan.paramStrategies.resize(numParams);
-    int paramDelta = 0;
+    std::vector<int> paramDeltas(numParams, 0);
 
     for (Index p = 0; p < numParams; ++p) {
       Expression* arg = call->operands[p];
@@ -2597,7 +2652,11 @@ struct Inlining : public Pass {
 
       if (k == 0) {
         plan.paramStrategies[p] = ParamStrategy::DropSilent;
-        paramDelta -= ranks.getTreeBytes(arg);
+        paramDeltas[p] = -ranks.getTreeBytes(arg);
+        continue;
+      }
+
+      if (mustPrologue[p]) {
         continue;
       }
 
@@ -2607,11 +2666,11 @@ struct Inlining : public Pass {
               arg->type.getHeapType() != paramType.getHeapType()) ||
              (!bbInfo.paramAllowsNullBottom[p] && arg->type.isNull()))) {
           if (bbInfo.paramInBranch[p]) {
-            return false;
+            mustPrologue[p] = true;
+            continue;
           }
           plan.paramStrategies[p] = ParamStrategy::ScratchTee;
-          neededScratchByType[paramType]++;
-          paramDelta += callerLocalBytes;
+          paramDeltas[p] = callerLocalBytes;
         } else {
           plan.paramStrategies[p] = ParamStrategy::DirectSingle;
           if (arg->is<RefNull>() && !bbInfo.paramAllowsNullBottom[p] &&
@@ -2619,7 +2678,7 @@ struct Inlining : public Pass {
             int oldB = ranks.getExactShallowBytes(arg);
             int newB = 1 + ranks.getTypeIndexBytes(paramType.getHeapType(),
                                                    /*isS33=*/true);
-            paramDelta += (newB - oldB);
+            paramDeltas[p] = (newB - oldB);
           }
         }
         continue;
@@ -2643,7 +2702,7 @@ struct Inlining : public Pass {
           }
           if (!clobbered) {
             plan.paramStrategies[p] = ParamStrategy::DirectDup;
-            paramDelta += int(k - 1) * ranks.getExactShallowBytes(lg);
+            paramDeltas[p] = int(k - 1) * ranks.getExactShallowBytes(lg);
             chosen = true;
           }
         } else if (auto* ra = arg->dynCast<RefAs>();
@@ -2659,7 +2718,7 @@ struct Inlining : public Pass {
           int treeB = 1 + ranks.getExactShallowBytes(lg);
           if (!clobbered && int(k - 1) * treeB <= int(k) * callerLocalBytes) {
             plan.paramStrategies[p] = ParamStrategy::DirectDup;
-            paramDelta += int(k - 1) * treeB;
+            paramDeltas[p] = int(k - 1) * treeB;
             chosen = true;
           }
         } else if (arg->is<Const>() || arg->is<RefNull>() ||
@@ -2675,7 +2734,7 @@ struct Inlining : public Pass {
           }
           if (int(k) * newB - oldB <= int(k) * callerLocalBytes) {
             plan.paramStrategies[p] = ParamStrategy::DirectDup;
-            paramDelta += int(k) * newB - oldB;
+            paramDeltas[p] = int(k) * newB - oldB;
             chosen = true;
           }
         }
@@ -2701,7 +2760,7 @@ struct Inlining : public Pass {
             if (!conflict) {
               plan.paramStrategies[p] = ParamStrategy::ReuseArgTee;
               int getB = 1 + FunctionInfoScanner::getULEBSize(ls->index);
-              paramDelta += int(k - 1) * getB;
+              paramDeltas[p] = int(k - 1) * getB;
               chosen = true;
             }
           }
@@ -2710,11 +2769,77 @@ struct Inlining : public Pass {
 
       if (!chosen) {
         if (bbInfo.paramInBranch[p]) {
-          return false;
+          mustPrologue[p] = true;
+          continue;
         }
         plan.paramStrategies[p] = ParamStrategy::ScratchTee;
+        paramDeltas[p] = int(k) * callerLocalBytes;
+      }
+    }
+
+    for (Index p = numParams; p > 0;) {
+      --p;
+      if (!mustPrologue[p]) {
+        continue;
+      }
+      for (Index r = 0; r < p; ++r) {
+        if (bbInfo.paramGetCount[r] > 0 && !mustPrologue[r] &&
+            argEffects[r].invalidates(argEffects[p])) {
+          mustPrologue[r] = true;
+        }
+      }
+    }
+
+    int paramDelta = 0;
+    for (Index p = 0; p < numParams; ++p) {
+      Index k = bbInfo.paramGetCount[p];
+      Type paramType = callee->getLocalType(p);
+      if (!mustPrologue[p]) {
+        if (k > 0 && plan.paramStrategies[p] == ParamStrategy::ScratchTee) {
+          neededScratchByType[paramType]++;
+        }
+        paramDelta += paramDeltas[p];
+        continue;
+      }
+
+      Expression* arg = call->operands[p];
+      bool chosen = false;
+      if (auto* ls = arg->dynCast<LocalSet>(); ls && ls->isTee()) {
+        Type teeLocalType = caller->getLocalType(ls->index);
+        bool teeTypeOk =
+          Type::isSubType(teeLocalType, paramType) &&
+          (!bbInfo.paramNeedsExactHeapType[p] ||
+           teeLocalType.getHeapType() == paramType.getHeapType()) &&
+          (bbInfo.paramAllowsNullBottom[p] || !teeLocalType.isNull());
+        if (teeTypeOk) {
+          bool conflict = false;
+          for (Index q = 0; q < numParams; ++q) {
+            if (q == p || bbInfo.paramGetCount[q] == 0) {
+              continue;
+            }
+            if (q > p && argEffects[q].localsWritten.contains(ls->index)) {
+              conflict = true;
+              break;
+            }
+            if (q < p && !mustPrologue[q] &&
+                (argEffects[q].localsWritten.contains(ls->index) ||
+                 argEffects[q].localsRead.contains(ls->index))) {
+              conflict = true;
+              break;
+            }
+          }
+          if (!conflict) {
+            plan.paramStrategies[p] = ParamStrategy::PrologueReuseTee;
+            int getB = 1 + FunctionInfoScanner::getULEBSize(ls->index);
+            paramDelta += int(k) * getB;
+            chosen = true;
+          }
+        }
+      }
+      if (!chosen) {
+        plan.paramStrategies[p] = ParamStrategy::PrologueSet;
         neededScratchByType[paramType]++;
-        paramDelta += int(k) * callerLocalBytes;
+        paramDelta += int(k + 1) * callerLocalBytes;
       }
     }
 

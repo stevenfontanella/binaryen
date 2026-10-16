@@ -460,6 +460,35 @@ void propagateEffects(
     return e;
   };
 
+  auto extractArrayGetOperands =
+    [&](Expression* e, Expression*& refOut, Expression*& idxOut) -> bool {
+    e = unwrapRefAsNonNull(e);
+    if (auto* ag = e->dynCast<ArrayGet>()) {
+      refOut = ag->ref;
+      idxOut = ag->index;
+      return true;
+    }
+    if (auto* call = e->dynCast<Call>()) {
+      if (call->operands.size() == 2) {
+        auto* target = module.getFunctionOrNull(call->target);
+        if (target && !target->imported() && target->getNumParams() == 2 &&
+            target->body) {
+          Expression* tBody = unwrapRefAsNonNull(target->body);
+          if (auto* ag = tBody->dynCast<ArrayGet>()) {
+            auto* p0 = unwrapRefAsNonNull(ag->ref)->dynCast<LocalGet>();
+            auto* p1 = ag->index->dynCast<LocalGet>();
+            if (p0 && p1 && p0->index == 0 && p1->index == 1) {
+              refOut = call->operands[0];
+              idxOut = call->operands[1];
+              return true;
+            }
+          }
+        }
+      }
+    }
+    return false;
+  };
+
   auto isCachedFactoryFunc = [&](Function* f) -> bool {
     if (!f->getResults().isRef() || !f->body) {
       return false;
@@ -495,14 +524,15 @@ void propagateEffects(
     }
     Expression* setStmt = b->list[b->list.size() - 2];
     if (f->getNumParams() == 1 && f->getParams() == Type::i32) {
-      auto* ag = brOn->ref->dynCast<ArrayGet>();
+      Expression* agRef = nullptr;
+      Expression* agIdx = nullptr;
       auto* as = setStmt->dynCast<ArraySet>();
-      if (!ag || !as) {
+      if (!extractArrayGetOperands(brOn->ref, agRef, agIdx) || !as) {
         return false;
       }
-      auto* gg1 = ag->ref->dynCast<GlobalGet>();
-      auto* lg1 = ag->index->dynCast<LocalGet>();
-      auto* gg2 = as->ref->dynCast<GlobalGet>();
+      auto* gg1 = unwrapRefAsNonNull(agRef)->dynCast<GlobalGet>();
+      auto* lg1 = agIdx->dynCast<LocalGet>();
+      auto* gg2 = unwrapRefAsNonNull(as->ref)->dynCast<GlobalGet>();
       auto* lg2 = as->index->dynCast<LocalGet>();
       auto* lt = as->value->dynCast<LocalSet>();
       if (!gg1 || !lg1 || !gg2 || !lg2 || !lt || !lt->isTee()) {
@@ -525,15 +555,21 @@ void propagateEffects(
              !cg->imported() && cg->mutable_ && cg->init->is<RefNull>() &&
              mutableGlobalFuncCount[gg1->name] == 1;
     }
-    if (f->getNumParams() == 2 && b->list.size() == 3) {
-      auto* ag = brOn->ref->dynCast<ArrayGet>();
+    if (f->getNumParams() == 2 && b->list.size() >= 3) {
+      for (Index i = 1; i + 2 < b->list.size(); i++) {
+        if (!b->list[i]->is<If>()) {
+          return false;
+        }
+      }
+      Expression* agRef = nullptr;
+      Expression* agIdx = nullptr;
       auto* as = setStmt->dynCast<ArraySet>();
-      if (!ag || !as) {
+      if (!extractArrayGetOperands(brOn->ref, agRef, agIdx) || !as) {
         return false;
       }
-      auto* lgArr1 = ag->ref->dynCast<LocalGet>();
-      auto* lgIdx1 = ag->index->dynCast<LocalGet>();
-      auto* lgArr2 = as->ref->dynCast<LocalGet>();
+      auto* lgArr1 = unwrapRefAsNonNull(agRef)->dynCast<LocalGet>();
+      auto* lgIdx1 = agIdx->dynCast<LocalGet>();
+      auto* lgArr2 = unwrapRefAsNonNull(as->ref)->dynCast<LocalGet>();
       auto* lgIdx2 = as->index->dynCast<LocalGet>();
       auto* lt = as->value->dynCast<LocalSet>();
       return lgArr1 && lgIdx1 && lgArr2 && lgIdx2 && lt && lt->isTee() &&

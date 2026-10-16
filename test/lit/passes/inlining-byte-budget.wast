@@ -5,8 +5,9 @@
 ;; 2. Direct duplication and scratch-local tee reuse for multi-use parameters.
 ;; 3. Local variable remapping into reusable caller scratch locals.
 ;; 4. Rejection of multi-caller helpers when total site growth >= saved function bytes.
+;; 5. Sole-use signature deletion credit and PrologueSet / PrologueReuseTee fallback.
 
-;; RUN: foreach %s %t wasm-opt -all --pass-arg=inlining-byte-budget@1 --inlining --shrink-level=2 -S -o - | filecheck %s
+;; RUN: foreach %s %t wasm-opt -all --generate-global-effects --pass-arg=inlining-byte-budget@1 --inlining --shrink-level=2 -S -o - | filecheck %s
 
 (module
  ;; CHECK:      (type $0 (func (param i32 i32 i32)))
@@ -57,32 +58,54 @@
  ;; CHECK:      (export "caller" (func $caller))
 
  ;; CHECK:      (func $unprofitable (type $2) (param $x i32) (result i32)
- ;; CHECK-NEXT:  (i32.add
- ;; CHECK-NEXT:   (i32.mul
- ;; CHECK-NEXT:    (local.get $x)
- ;; CHECK-NEXT:    (i32.const 12345)
+ ;; CHECK-NEXT:  (i32.or
+ ;; CHECK-NEXT:   (i32.add
+ ;; CHECK-NEXT:    (i32.mul
+ ;; CHECK-NEXT:     (local.get $x)
+ ;; CHECK-NEXT:     (i32.const 12345)
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:    (i32.xor
+ ;; CHECK-NEXT:     (local.get $x)
+ ;; CHECK-NEXT:     (i32.const 67890)
+ ;; CHECK-NEXT:    )
  ;; CHECK-NEXT:   )
- ;; CHECK-NEXT:   (i32.xor
- ;; CHECK-NEXT:    (local.get $x)
- ;; CHECK-NEXT:    (i32.const 67890)
- ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (i32.const 13579)
  ;; CHECK-NEXT:  )
  ;; CHECK-NEXT: )
  (func $unprofitable (param $x i32) (result i32)
+  (i32.or
+   (i32.add
+    (i32.mul
+     (local.get $x)
+     (i32.const 12345)
+    )
+    (i32.xor
+     (local.get $x)
+     (i32.const 67890)
+    )
+   )
+   (i32.const 13579)
+  )
+ )
+
+ ;; Out-of-order parameter read where caller passes a side-effecting call and a local.tee:
+ ;; uses PrologueSet / PrologueReuseTee to preserve evaluation order.
+ (func $prologue-order (param $a i32) (param $b i32) (param $c i32) (param $d i32) (result i32)
   (i32.add
-   (i32.mul
-    (local.get $x)
-    (i32.const 12345)
+   (i32.sub
+    (local.get $b)
+    (local.get $a)
    )
    (i32.xor
-    (local.get $x)
-    (i32.const 67890)
+    (local.get $d)
+    (local.get $c)
    )
   )
  )
 
  ;; CHECK:      (func $caller (type $3) (param $p0 i32) (param $p1 i32) (result i32)
- ;; CHECK-NEXT:  (local $2 i32)
+ ;; CHECK-NEXT:  (local $t i32)
+ ;; CHECK-NEXT:  (local $3 i32)
  ;; CHECK-NEXT:  (i32.add
  ;; CHECK-NEXT:   (i32.add
  ;; CHECK-NEXT:    (i32.sub
@@ -101,45 +124,79 @@
  ;; CHECK-NEXT:      (local.get $p0)
  ;; CHECK-NEXT:     )
  ;; CHECK-NEXT:     (i32.add
- ;; CHECK-NEXT:      (local.tee $2
+ ;; CHECK-NEXT:      (local.tee $3
  ;; CHECK-NEXT:       (call $prod)
  ;; CHECK-NEXT:      )
- ;; CHECK-NEXT:      (local.get $2)
+ ;; CHECK-NEXT:      (local.get $3)
  ;; CHECK-NEXT:     )
  ;; CHECK-NEXT:    )
  ;; CHECK-NEXT:    (i32.add
  ;; CHECK-NEXT:     (i32.add
  ;; CHECK-NEXT:      (block (result i32)
- ;; CHECK-NEXT:       (local.set $2
+ ;; CHECK-NEXT:       (local.set $3
  ;; CHECK-NEXT:        (i32.add
  ;; CHECK-NEXT:         (local.get $p0)
  ;; CHECK-NEXT:         (local.get $p1)
  ;; CHECK-NEXT:        )
  ;; CHECK-NEXT:       )
  ;; CHECK-NEXT:       (i32.mul
- ;; CHECK-NEXT:        (local.get $2)
- ;; CHECK-NEXT:        (local.get $2)
+ ;; CHECK-NEXT:        (local.get $3)
+ ;; CHECK-NEXT:        (local.get $3)
  ;; CHECK-NEXT:       )
  ;; CHECK-NEXT:      )
  ;; CHECK-NEXT:      (block (result i32)
- ;; CHECK-NEXT:       (local.set $2
+ ;; CHECK-NEXT:       (local.set $3
  ;; CHECK-NEXT:        (i32.add
  ;; CHECK-NEXT:         (local.get $p1)
  ;; CHECK-NEXT:         (local.get $p0)
  ;; CHECK-NEXT:        )
  ;; CHECK-NEXT:       )
  ;; CHECK-NEXT:       (i32.mul
- ;; CHECK-NEXT:        (local.get $2)
- ;; CHECK-NEXT:        (local.get $2)
+ ;; CHECK-NEXT:        (local.get $3)
+ ;; CHECK-NEXT:        (local.get $3)
  ;; CHECK-NEXT:       )
  ;; CHECK-NEXT:      )
  ;; CHECK-NEXT:     )
  ;; CHECK-NEXT:     (i32.add
- ;; CHECK-NEXT:      (call $unprofitable
- ;; CHECK-NEXT:       (local.get $p0)
+ ;; CHECK-NEXT:      (i32.add
+ ;; CHECK-NEXT:       (call $unprofitable
+ ;; CHECK-NEXT:        (local.get $p0)
+ ;; CHECK-NEXT:       )
+ ;; CHECK-NEXT:       (call $unprofitable
+ ;; CHECK-NEXT:        (local.get $p1)
+ ;; CHECK-NEXT:       )
  ;; CHECK-NEXT:      )
- ;; CHECK-NEXT:      (call $unprofitable
- ;; CHECK-NEXT:       (local.get $p1)
+ ;; CHECK-NEXT:      (i32.add
+ ;; CHECK-NEXT:       (block (result i32)
+ ;; CHECK-NEXT:        (local.set $t
+ ;; CHECK-NEXT:         (call $prod)
+ ;; CHECK-NEXT:        )
+ ;; CHECK-NEXT:        (i32.add
+ ;; CHECK-NEXT:         (i32.sub
+ ;; CHECK-NEXT:          (call $prod)
+ ;; CHECK-NEXT:          (local.get $t)
+ ;; CHECK-NEXT:         )
+ ;; CHECK-NEXT:         (i32.xor
+ ;; CHECK-NEXT:          (local.get $p1)
+ ;; CHECK-NEXT:          (local.get $p0)
+ ;; CHECK-NEXT:         )
+ ;; CHECK-NEXT:        )
+ ;; CHECK-NEXT:       )
+ ;; CHECK-NEXT:       (block (result i32)
+ ;; CHECK-NEXT:        (local.set $3
+ ;; CHECK-NEXT:         (call $prod)
+ ;; CHECK-NEXT:        )
+ ;; CHECK-NEXT:        (i32.add
+ ;; CHECK-NEXT:         (i32.sub
+ ;; CHECK-NEXT:          (call $prod)
+ ;; CHECK-NEXT:          (local.get $3)
+ ;; CHECK-NEXT:         )
+ ;; CHECK-NEXT:         (i32.xor
+ ;; CHECK-NEXT:          (local.get $p1)
+ ;; CHECK-NEXT:          (local.get $t)
+ ;; CHECK-NEXT:         )
+ ;; CHECK-NEXT:        )
+ ;; CHECK-NEXT:       )
  ;; CHECK-NEXT:      )
  ;; CHECK-NEXT:     )
  ;; CHECK-NEXT:    )
@@ -147,6 +204,7 @@
  ;; CHECK-NEXT:  )
  ;; CHECK-NEXT: )
  (func $caller (export "caller") (param $p0 i32) (param $p1 i32) (result i32)
+  (local $t i32)
   (i32.add
    (i32.add
     (call $permuted
@@ -179,11 +237,29 @@
       )
      )
      (i32.add
-      (call $unprofitable
-       (local.get $p0)
+      (i32.add
+       (call $unprofitable
+        (local.get $p0)
+       )
+       (call $unprofitable
+        (local.get $p1)
+       )
       )
-      (call $unprofitable
-       (local.get $p1)
+      (i32.add
+       (call $prologue-order
+        (local.tee $t
+         (call $prod)
+        )
+        (call $prod)
+        (local.get $p0)
+        (local.get $p1)
+       )
+       (call $prologue-order
+        (call $prod)
+        (call $prod)
+        (local.get $t)
+        (local.get $p1)
+       )
       )
      )
     )
