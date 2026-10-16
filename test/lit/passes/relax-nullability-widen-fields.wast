@@ -147,3 +147,76 @@
     )
   )
 )
+
+(module
+  (rec
+    ;; CHECK:      (rec
+    ;; CHECK-NEXT:  (type $ObjRoot (sub (struct (field anyref))))
+
+    ;; CHECK:       (type $VtRoot (sub (struct (field anyref))))
+    (type $VtRoot (sub (struct (field structref))))
+    (type $VtNull (sub $VtRoot (struct (field nullref))))
+    (type $VtSub1 (sub $VtRoot (struct (field (ref $VtRoot)))))
+    (type $VtSub2 (sub $VtSub1 (struct (field (ref $VtSub1)))))
+    (type $ObjRoot (sub (struct (field (ref null $VtRoot)))))
+    ;; $ObjSub1 has no direct struct.get on field 0, so its field 0 widens to
+    ;; (ref null $VtRoot) even though sibling $ObjSub2 has a narrow struct.get.
+    ;; CHECK:       (type $ObjSub2 (sub $ObjRoot (struct (field (ref null $VtRoot)))))
+
+    ;; CHECK:       (type $ObjSub1 (sub $ObjRoot (struct (field anyref))))
+    (type $ObjSub1 (sub $ObjRoot (struct (field (ref $VtSub1)))))
+    (type $ObjSub2 (sub $ObjRoot (struct (field (ref $VtSub2)))))
+  )
+
+  ;; CHECK:       (type $4 (func (param (ref null $ObjRoot) (ref null $ObjSub2) (ref null $VtRoot)) (result (ref null $VtRoot))))
+
+  ;; CHECK:      (type $5 (func))
+
+  ;; CHECK:      (export "entry2" (func $entry2))
+
+  ;; CHECK:      (func $use-covariant (type $4) (param $o1 (ref null $ObjRoot)) (param $o2 (ref null $ObjSub2)) (param $vn (ref null $VtRoot)) (result (ref null $VtRoot))
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (struct.get $ObjRoot 0
+  ;; CHECK-NEXT:    (local.get $o1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (local.get $vn)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (struct.get $ObjSub2 0
+  ;; CHECK-NEXT:   (local.get $o2)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $use-covariant (param $o1 (ref null $ObjSub1)) (param $o2 (ref null $ObjSub2)) (param $vn (ref null $VtNull)) (result (ref null $VtSub1))
+    (drop
+      (struct.get $ObjRoot 0
+        (local.get $o1)
+      )
+    )
+    (drop
+      (local.get $vn)
+    )
+    (struct.get $ObjSub2 0
+      (local.get $o2)
+    )
+  )
+
+  ;; CHECK:      (func $entry2 (type $5)
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $use-covariant
+  ;; CHECK-NEXT:    (ref.null none)
+  ;; CHECK-NEXT:    (ref.null none)
+  ;; CHECK-NEXT:    (ref.null none)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $entry2 (export "entry2")
+    (drop
+      (call $use-covariant
+        (ref.null none)
+        (ref.null none)
+        (ref.null none)
+      )
+    )
+  )
+)

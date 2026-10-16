@@ -14622,11 +14622,8 @@
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (i32.or
   ;; CHECK-NEXT:    (local.get $x)
-  ;; CHECK-NEXT:    (i32.or
-  ;; CHECK-NEXT:     (local.tee $x
-  ;; CHECK-NEXT:      (i32.const 1)
-  ;; CHECK-NEXT:     )
-  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:    (local.tee $x
+  ;; CHECK-NEXT:     (i32.const 1)
   ;; CHECK-NEXT:    )
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )

@@ -1047,6 +1047,14 @@
   ;; (ref null $Base) and canonicalizes the struct.get to $Base.
   ;; CHECK:      (type $2 (func (param anyref) (result i32)))
 
+  ;; CHECK:      (type $3 (func (param (ref null $Base)) (result (ref null $Base))))
+
+  ;; CHECK:      (type $4 (func (param (ref null $Base)) (result i32)))
+
+  ;; CHECK:      (export "relax-unstripped-cast" (func $relax-unstripped-cast))
+
+  ;; CHECK:      (export "caller-named-block" (func $caller-named-block))
+
   ;; CHECK:      (func $relax-unstripped-cast (type $2) (param $a anyref) (result i32)
   ;; CHECK-NEXT:  (struct.get $Base 0
   ;; CHECK-NEXT:   (ref.cast (ref null $Base)
@@ -1055,6 +1063,14 @@
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
   ;; NO_TNH:      (type $2 (func (param anyref) (result i32)))
+
+  ;; NO_TNH:      (type $3 (func (param (ref null $Base)) (result (ref $Base))))
+
+  ;; NO_TNH:      (type $4 (func (param (ref null $Base)) (result i32)))
+
+  ;; NO_TNH:      (export "relax-unstripped-cast" (func $relax-unstripped-cast))
+
+  ;; NO_TNH:      (export "caller-named-block" (func $caller-named-block))
 
   ;; NO_TNH:      (func $relax-unstripped-cast (type $2) (param $a anyref) (result i32)
   ;; NO_TNH-NEXT:  (struct.get $Sub 0
@@ -1067,6 +1083,69 @@
     (struct.get $Sub 0
       (ref.cast (ref $Sub)
         (local.get $a)
+      )
+    )
+  )
+
+  ;; CHECK:      (func $callee-named-block (type $3) (param $x (ref null $Base)) (result (ref null $Base))
+  ;; CHECK-NEXT:  (block $b (result (ref null $Base))
+  ;; CHECK-NEXT:   (br_on_non_null $b
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; NO_TNH:      (func $callee-named-block (type $3) (param $x (ref null $Base)) (result (ref $Base))
+  ;; NO_TNH-NEXT:  (ref.as_non_null
+  ;; NO_TNH-NEXT:   (block $b (result (ref null $Base))
+  ;; NO_TNH-NEXT:    (br_on_non_null $b
+  ;; NO_TNH-NEXT:     (local.get $x)
+  ;; NO_TNH-NEXT:    )
+  ;; NO_TNH-NEXT:    (local.get $x)
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT: )
+  (func $callee-named-block (param $x (ref null $Base)) (result (ref $Base))
+    (ref.as_non_null
+      (block $b (result (ref null $Base))
+        (br_on_non_null $b
+          (local.get $x)
+        )
+        (local.get $x)
+      )
+    )
+  )
+
+  ;; CHECK:      (func $caller-named-block (type $4) (param $x (ref null $Base)) (result i32)
+  ;; CHECK-NEXT:  (struct.get $Base 0
+  ;; CHECK-NEXT:   (block $outer (result (ref null $Base))
+  ;; CHECK-NEXT:    (br $outer
+  ;; CHECK-NEXT:     (call $callee-named-block
+  ;; CHECK-NEXT:      (local.get $x)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; NO_TNH:      (func $caller-named-block (type $4) (param $x (ref null $Base)) (result i32)
+  ;; NO_TNH-NEXT:  (struct.get $Base 0
+  ;; NO_TNH-NEXT:   (block $outer (result (ref $Base))
+  ;; NO_TNH-NEXT:    (br $outer
+  ;; NO_TNH-NEXT:     (call $callee-named-block
+  ;; NO_TNH-NEXT:      (local.get $x)
+  ;; NO_TNH-NEXT:     )
+  ;; NO_TNH-NEXT:    )
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT: )
+  (func $caller-named-block (export "caller-named-block") (param $x (ref null $Base)) (result i32)
+    (struct.get $Base 0
+      (block $outer (result (ref $Base))
+        (br $outer
+          (call $callee-named-block
+            (local.get $x)
+          )
+        )
       )
     )
   )

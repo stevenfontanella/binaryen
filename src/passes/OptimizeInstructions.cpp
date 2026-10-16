@@ -893,10 +893,13 @@ struct OptimizeInstructions
       return replaceCurrent(ret);
     }
     // finally, try more expensive operations on the curr in
-    // the case that they have no side effects
-    if (!effects(curr->left).hasSideEffects()) {
-      if (ExpressionAnalyzer::equal(curr->left, curr->right)) {
-        if (auto* ret = optimizeBinaryWithEqualEffectlessChildren(curr)) {
+    // the case that they have no side effects (or tee+get of the same local
+    // when folding directly to the left tee).
+    if ((!effects(curr->left).hasSideEffects() &&
+         ExpressionAnalyzer::equal(curr->left, curr->right)) ||
+        areMatchingTeeAndGet(curr->left, curr->right)) {
+      if (auto* ret = optimizeBinaryWithEqualEffectlessChildren(curr)) {
+        if (ret == curr->left || !effects(curr->left).hasSideEffects()) {
           return replaceCurrent(ret);
         }
       }
@@ -1858,7 +1861,9 @@ struct OptimizeInstructions
     //      (ref.cast      ;; now non-nullable
     //
     // Either way we trap here, but refining the type may have benefits later.
-    if (ref->type.isNullable()) {
+    // Under trapsNeverHappen, keep the nullable cast so local/block/return
+    // types are not forced back to non-nullable.
+    if (!getPassOptions().trapsNeverHappen && ref->type.isNullable()) {
       if (auto* cast = ref->dynCast<RefCast>()) {
         // Note that we must be the last child of the parent, otherwise effects
         // in the middle may need to remain:
