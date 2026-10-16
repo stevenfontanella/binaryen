@@ -5249,12 +5249,29 @@ struct OutlineExpressions : public Pass {
   }
 
   bool isNonMutatingWrapper(Function* wFunc, int depth = 0) {
-    if (!wFunc || wFunc->imported() || depth > 4) {
+    if (!wFunc || depth > 4) {
       return false;
     }
-    if (wFunc->effects && wFunc->effects->isIdempotent &&
-        wFunc->effects->onlyTouchesInitGlobals && !wFunc->effects->throws()) {
-      return true;
+    if (wFunc->effects) {
+      if (wFunc->effects->isIdempotent &&
+          wFunc->effects->onlyTouchesInitGlobals && !wFunc->effects->throws()) {
+        return true;
+      }
+      if (!wFunc->effects->hasSideEffects() && !wFunc->effects->throws()) {
+        return true;
+      }
+    }
+    if (wFunc->imported()) {
+      if (wFunc->module == "wasm:js-string") {
+        if (wFunc->base == "equals" || wFunc->base == "test") {
+          return true;
+        }
+        if (getPassOptions().ignoreImplicitTraps &&
+            wFunc->base != "intoCharCodeArray") {
+          return true;
+        }
+      }
+      return false;
     }
     EffectAnalyzer wEff(getPassOptions(), *wasm, wFunc);
     wEff.localsRead.clear();
@@ -5400,11 +5417,17 @@ struct OutlineExpressions : public Pass {
     if (!opEff.hasAnything()) {
       return true;
     }
-    if (!wFunc || wFunc->imported()) {
+    if (!wFunc) {
       return false;
     }
     if (isNonMutatingWrapper(wFunc)) {
       return !opEff.branchesOut && !opEff.hasExternalBreakTargets();
+    }
+    if (wFunc->effects) {
+      return !opEff.invalidates(*wFunc->effects);
+    }
+    if (wFunc->imported()) {
+      return false;
     }
     EffectAnalyzer wEff(getPassOptions(), *wasm, wFunc);
     wEff.localsRead.clear();
@@ -5417,7 +5440,8 @@ struct OutlineExpressions : public Pass {
                              Function* wFunc,
                              LocalGet*& outGet) {
     outGet = nullptr;
-    if (!wFunc || wFunc->imported()) {
+    if (!wFunc ||
+        (wFunc->imported() && !wFunc->effects && !isNonMutatingWrapper(wFunc))) {
       return false;
     }
     TreeLayout layout;
@@ -6172,6 +6196,344 @@ struct OutlineExpressions : public Pass {
       }
     }
 
+    struct UnaryOuterOp {
+      enum Kind : uint8_t {
+        None = 0,
+        KStructGet,
+        KRefCast,
+        KRefTest,
+        KRefIsNull,
+        KEqZInt32,
+      } kind = None;
+      HeapType structType;
+      Index fieldIdx = 0;
+      bool signed_ = false;
+      Type resultType = Type::none;
+      Type castType = Type::none;
+
+      bool operator==(const UnaryOuterOp& o) const {
+        return kind == o.kind && structType == o.structType &&
+               fieldIdx == o.fieldIdx && signed_ == o.signed_ &&
+               resultType == o.resultType && castType == o.castType;
+      }
+      bool operator<(const UnaryOuterOp& o) const {
+        if (kind != o.kind) {
+          return kind < o.kind;
+        }
+        if (structType != o.structType) {
+          return structType.getID() < o.structType.getID();
+        }
+        if (fieldIdx != o.fieldIdx) {
+          return fieldIdx < o.fieldIdx;
+        }
+        if (signed_ != o.signed_) {
+          return signed_ < o.signed_;
+        }
+        if (resultType != o.resultType) {
+          return resultType.getID() < o.resultType.getID();
+        }
+        return castType.getID() < o.castType.getID();
+      }
+    };
+
+    auto matchUnaryOuterOp = [&](Expression* u,
+                                 UnaryOuterOp& outOp,
+                                 Expression*& outInner) -> bool {
+      if (!u || u->type == Type::unreachable || !u->type.isSingle()) {
+        return false;
+      }
+      if (auto* sg = u->dynCast<StructGet>()) {
+        if (sg->order != MemoryOrder::Unordered ||
+            sg->ref->type == Type::unreachable || !sg->ref->type.isStruct()) {
+          return false;
+        }
+        outOp = {UnaryOuterOp::KStructGet,
+                 sg->ref->type.getHeapType(),
+                 sg->index,
+                 sg->signed_,
+                 sg->type,
+                 Type::none};
+        outInner = sg->ref;
+        return true;
+      }
+      if (auto* rc = u->dynCast<RefCast>()) {
+        if (rc->desc || rc->ref->type == Type::unreachable ||
+            !rc->type.isRef() || rc->type.isNull()) {
+          return false;
+        }
+        outOp = {UnaryOuterOp::KRefCast,
+                 HeapType(HeapType::ext),
+                 0,
+                 false,
+                 rc->type,
+                 rc->type};
+        outInner = rc->ref;
+        return true;
+      }
+      if (auto* rt = u->dynCast<RefTest>()) {
+        if (rt->ref->type == Type::unreachable || !rt->castType.isRef() ||
+            rt->castType.isNull()) {
+          return false;
+        }
+        outOp = {UnaryOuterOp::KRefTest,
+                 HeapType(HeapType::ext),
+                 0,
+                 false,
+                 rt->type,
+                 rt->castType};
+        outInner = rt->ref;
+        return true;
+      }
+      if (auto* rin = u->dynCast<RefIsNull>()) {
+        if (rin->value->type == Type::unreachable ||
+            !rin->value->type.isRef()) {
+          return false;
+        }
+        outOp = {UnaryOuterOp::KRefIsNull,
+                 HeapType(HeapType::ext),
+                 0,
+                 false,
+                 rin->type,
+                 Type::none};
+        outInner = rin->value;
+        return true;
+      }
+      if (auto* un = u->dynCast<Unary>()) {
+        if (un->op != EqZInt32 || un->value->type != Type::i32) {
+          return false;
+        }
+        outOp = {UnaryOuterOp::KEqZInt32,
+                 HeapType(HeapType::ext),
+                 0,
+                 false,
+                 un->type,
+                 Type::none};
+        outInner = un->value;
+        return true;
+      }
+      return false;
+    };
+
+    auto isCompatibleWithUnaryOp = [&](Type innerType,
+                                       const UnaryOuterOp& op) -> bool {
+      if (innerType == Type::unreachable || !innerType.isSingle()) {
+        return false;
+      }
+      switch (op.kind) {
+        case UnaryOuterOp::KStructGet:
+          return innerType.isStruct() &&
+                 HeapType::isSubType(innerType.getHeapType(), op.structType) &&
+                 innerType.getHeapType().getStruct().fields[op.fieldIdx].type ==
+                   op.resultType;
+        case UnaryOuterOp::KRefCast: {
+          if (!innerType.isRef() || innerType.isNull() ||
+              innerType.getHeapType().getTop() !=
+                op.castType.getHeapType().getTop()) {
+            return false;
+          }
+          Type glb = Type::getGreatestLowerBound(op.castType, innerType);
+          return glb != Type::unreachable && !glb.isNull() &&
+                 Type::isSubType(glb, op.resultType);
+        }
+        case UnaryOuterOp::KRefTest: {
+          if (!innerType.isRef() || innerType.isNull() ||
+              innerType.getHeapType().getTop() !=
+                op.castType.getHeapType().getTop()) {
+            return false;
+          }
+          Type glb = Type::getGreatestLowerBound(op.castType, innerType);
+          return glb != Type::unreachable && !glb.isNull();
+        }
+        case UnaryOuterOp::KRefIsNull:
+          return innerType.isRef();
+        case UnaryOuterOp::KEqZInt32:
+          return innerType == Type::i32;
+        case UnaryOuterOp::None:
+          return false;
+      }
+      return false;
+    };
+
+    auto getUnaryOpBytes = [&](const UnaryOuterOp& op) -> unsigned {
+      switch (op.kind) {
+        case UnaryOuterOp::KStructGet:
+        case UnaryOuterOp::KRefCast:
+        case UnaryOuterOp::KRefTest:
+          return 4;
+        case UnaryOuterOp::KRefIsNull:
+        case UnaryOuterOp::KEqZInt32:
+          return 1;
+        case UnaryOuterOp::None:
+          return 0;
+      }
+      return 0;
+    };
+
+    auto buildUnaryOuterOp = [&](const UnaryOuterOp& op,
+                                 Expression* inner) -> Expression* {
+      switch (op.kind) {
+        case UnaryOuterOp::KStructGet:
+          return builder.makeStructGet(op.fieldIdx,
+                                       inner,
+                                       MemoryOrder::Unordered,
+                                       op.resultType,
+                                       op.signed_);
+        case UnaryOuterOp::KRefCast:
+          return builder.makeRefCast(inner, op.castType);
+        case UnaryOuterOp::KRefTest:
+          return builder.makeRefTest(inner, op.castType);
+        case UnaryOuterOp::KRefIsNull:
+          return builder.makeRefIsNull(inner);
+        case UnaryOuterOp::KEqZInt32:
+          return builder.makeUnary(EqZInt32, inner);
+        case UnaryOuterOp::None:
+          WASM_UNREACHABLE("invalid unary op");
+      }
+      WASM_UNREACHABLE("invalid unary op");
+    };
+
+    struct ExprReplacer
+      : public PostWalker<ExprReplacer,
+                          UnifiedExpressionVisitor<ExprReplacer>> {
+      const std::unordered_map<Expression*, Expression*>& repMap;
+      ExprReplacer(const std::unordered_map<Expression*, Expression*>& repMap)
+        : repMap(repMap) {}
+      void visitExpression(Expression* curr) {
+        auto it = repMap.find(curr);
+        if (it != repMap.end()) {
+          replaceCurrent(it->second);
+        }
+      }
+    };
+
+    // Part A3: 100%-caller in-place unary outer-op absorption when all call
+    // sites of a non-imported, non-escaped function wFunc are the sole operand
+    // of the same unary outer op U (StructGet, RefCast, RefTest, RefIsNull,
+    // Unary(EqZInt32)).
+    {
+      struct ParentUnaryInfo {
+        Function* caller;
+        Expression* uExpr;
+        UnaryOuterOp op;
+      };
+      std::unordered_map<Call*, ParentUnaryInfo> parentUnaryOf;
+      struct UnaryParentScanner
+        : public PostWalker<UnaryParentScanner,
+                            UnifiedExpressionVisitor<UnaryParentScanner>> {
+        Function* caller;
+        const std::unordered_set<Expression*>& touchedCalls;
+        decltype(matchUnaryOuterOp)& matchOp;
+        std::unordered_map<Call*, ParentUnaryInfo>& parentUnaryOf;
+        UnaryParentScanner(
+          Function* caller,
+          const std::unordered_set<Expression*>& touchedCalls,
+          decltype(matchUnaryOuterOp)& matchOp,
+          std::unordered_map<Call*, ParentUnaryInfo>& parentUnaryOf)
+          : caller(caller), touchedCalls(touchedCalls), matchOp(matchOp),
+            parentUnaryOf(parentUnaryOf) {}
+        void visitExpression(Expression* curr) {
+          UnaryOuterOp uOp;
+          Expression* inner = nullptr;
+          if (matchOp(curr, uOp, inner)) {
+            if (auto* wCall = inner->dynCast<Call>()) {
+              if (!wCall->isReturn && !touchedCalls.count(wCall)) {
+                parentUnaryOf[wCall] = {caller, curr, uOp};
+              }
+            }
+          }
+        }
+      };
+
+      for (auto& f : wasm->functions) {
+        if (f->imported()) {
+          continue;
+        }
+        UnaryParentScanner(f.get(), touchedCalls, matchUnaryOuterOp, parentUnaryOf)
+          .walk(f->body);
+      }
+
+      std::unordered_map<Function*,
+                         std::unordered_map<Expression*, Expression*>>
+        funcA3Replacements;
+
+      for (auto& f : wasm->functions) {
+        if (f->imported()) {
+          continue;
+        }
+        Function* wFunc = f.get();
+        if (disallowedTargets.count(wFunc->name) ||
+            modifiedCallees.count(wFunc) ||
+            calleesWithStaleCallSites.count(wFunc) ||
+            !wFunc->getResults().isSingle() ||
+            wFunc->body->type == Type::unreachable) {
+          continue;
+        }
+        auto it = callsByTarget.find(wFunc->name);
+        if (it == callsByTarget.end() || it->second.size() < 2) {
+          continue;
+        }
+        const auto& sites = it->second;
+        Index r = wFunc->getNumParams();
+        UnaryOuterOp commonOp;
+        bool valid = true;
+        for (Index i = 0; i < sites.size(); i++) {
+          const auto& s = sites[i];
+          Call* wCall = s.call;
+          if (s.caller == wFunc || wCall->isReturn ||
+              touchedCalls.count(wCall) || wCall->operands.size() != r) {
+            valid = false;
+            break;
+          }
+          for (Index wi = 0; wi < r; wi++) {
+            if (wCall->operands[wi]->type == Type::unreachable ||
+                !Type::isSubType(wCall->operands[wi]->type,
+                                 wFunc->getLocalType(wi))) {
+              valid = false;
+              break;
+            }
+          }
+          if (!valid) {
+            break;
+          }
+          auto pIt = parentUnaryOf.find(wCall);
+          if (pIt == parentUnaryOf.end()) {
+            valid = false;
+            break;
+          }
+          if (i == 0) {
+            commonOp = pIt->second.op;
+            if (!isCompatibleWithUnaryOp(wFunc->body->type, commonOp)) {
+              valid = false;
+              break;
+            }
+          } else if (!(pIt->second.op == commonOp)) {
+            valid = false;
+            break;
+          }
+        }
+        if (!valid || hasReturnOrTailCall(wFunc->body)) {
+          continue;
+        }
+
+        wFunc->body = buildUnaryOuterOp(commonOp, wFunc->body);
+        wFunc->setResults(commonOp.resultType);
+        for (const auto& s : sites) {
+          const auto& pInfo = parentUnaryOf[s.call];
+          s.call->type = commonOp.resultType;
+          funcA3Replacements[pInfo.caller][pInfo.uExpr] = s.call;
+          touchedCalls.insert(s.call);
+          modifiedFuncs.insert(pInfo.caller);
+        }
+        modifiedCallees.insert(wFunc);
+        modifiedFuncs.insert(wFunc);
+        anyChanged = true;
+      }
+
+      for (auto& [caller, repMap] : funcA3Replacements) {
+        ExprReplacer(repMap).walk(caller->body);
+      }
+    }
+
     // Step 1B: Reuse existing 0-var wrapper-forwarding helpers $H matching
     // (call $callee (local.get 0) ... (call $w (local.get k) ...) ...).
     {
@@ -6231,13 +6593,12 @@ struct OutlineExpressions : public Pass {
             paramSources.push_back({j, nullptr, 0});
           } else if (auto* wCall = op->dynCast<Call>()) {
             Index wArity = wCall->operands.size();
-            if (wCall->isReturn || (wArity > 1 && j != m - 1) ||
-                wCall->target == h->name || wCall->target == target->name) {
+            if (wCall->isReturn || wCall->target == h->name) {
               validForwarder = false;
               break;
             }
             Function* wFunc = wasm->getFunctionOrNull(wCall->target);
-            if (!wFunc || wFunc->imported() || modifiedCallees.count(wFunc) ||
+            if (!wFunc || modifiedCallees.count(wFunc) ||
                 wFunc->getNumParams() != wArity ||
                 !wFunc->getResults().isSingle() ||
                 !Type::isSubType(wFunc->getResults(),
@@ -6472,16 +6833,12 @@ struct OutlineExpressions : public Pass {
           Index m = c->operands.size();
           for (Index k = 0; k < m; k++) {
             auto* wCall = c->operands[k]->dynCast<Call>();
-            if (!wCall || wCall->isReturn || touchedCalls.count(wCall) ||
-                wCall->target == callee->name) {
+            if (!wCall || wCall->isReturn || touchedCalls.count(wCall)) {
               continue;
             }
             Index wArity = wCall->operands.size();
-            if (wArity > 1 && k != m - 1) {
-              continue;
-            }
             Function* wFunc = wasm->getFunctionOrNull(wCall->target);
-            if (!wFunc || wFunc->imported() || modifiedCallees.count(wFunc) ||
+            if (!wFunc || modifiedCallees.count(wFunc) ||
                 wFunc->getNumParams() != wArity ||
                 !wFunc->getResults().isSingle() ||
                 !Type::isSubType(wFunc->getResults(),
@@ -6535,13 +6892,15 @@ struct OutlineExpressions : public Pass {
         Index k = pKey.paramIdx;
         Index wArity = wFunc->getNumParams();
         std::vector<CallSiteInfo> active;
+        std::unordered_set<Expression*> plannedTouched;
         for (const auto& s : sites) {
-          if (touchedCalls.count(s.call)) {
+          if (touchedCalls.count(s.call) || plannedTouched.count(s.call)) {
             continue;
           }
           auto* wCall = s.call->operands[k]->dynCast<Call>();
           if (!wCall || touchedCalls.count(wCall) ||
-              wCall->target != pKey.wName || wCall->operands.size() != wArity) {
+              plannedTouched.count(wCall) || wCall->target != pKey.wName ||
+              wCall->operands.size() != wArity) {
             continue;
           }
           bool wArgsOk = true;
@@ -6557,6 +6916,8 @@ struct OutlineExpressions : public Pass {
             continue;
           }
           active.push_back(s);
+          plannedTouched.insert(s.call);
+          plannedTouched.insert(wCall);
         }
         if (active.size() < 5) {
           continue;
@@ -6635,6 +6996,316 @@ struct OutlineExpressions : public Pass {
           modifiedFuncs.insert(s.caller);
         }
         anyChanged = true;
+      }
+    }
+
+    // Part B2: Unary outer-op existing 0-var helper reuse + partial-caller
+    // specialization for U(call $callee ...).
+    if (getPassOptions().shrinkLevel > 0) {
+      struct UnaryGroupKey {
+        Name calleeName;
+        UnaryOuterOp op;
+        bool operator<(const UnaryGroupKey& o) const {
+          if (calleeName != o.calleeName) {
+            return calleeName < o.calleeName;
+          }
+          return op < o.op;
+        }
+      };
+      struct UnaryForwarder {
+        Function* helper;
+        Function* target;
+        Call* innerCall;
+        UnaryOuterOp op;
+      };
+      std::map<UnaryGroupKey, std::vector<UnaryForwarder>> unaryHelpersByKey;
+      std::unordered_set<Function*> allUnaryHelpers;
+
+      for (auto& f : wasm->functions) {
+        if (f->imported() || f->getNumVars() != 0) {
+          continue;
+        }
+        Function* h = f.get();
+        if (modifiedCallees.count(h)) {
+          continue;
+        }
+        UnaryOuterOp uOp;
+        Expression* inner = nullptr;
+        if (!matchUnaryOuterOp(h->body, uOp, inner) ||
+            h->getResults() != uOp.resultType) {
+          continue;
+        }
+        auto* innerCall = inner->dynCast<Call>();
+        if (!innerCall || innerCall->isReturn || innerCall->target == h->name) {
+          continue;
+        }
+        Function* target = wasm->getFunctionOrNull(innerCall->target);
+        if (!target || modifiedCallees.count(target)) {
+          continue;
+        }
+        Index P = target->getNumParams();
+        if (innerCall->operands.size() != P || h->getNumParams() != P ||
+            !isCompatibleWithUnaryOp(target->getResults(), uOp)) {
+          continue;
+        }
+        bool validForwarder = true;
+        for (Index j = 0; j < P; j++) {
+          auto* lg = innerCall->operands[j]->dynCast<LocalGet>();
+          if (!lg || lg->index != j ||
+              !Type::isSubType(h->getLocalType(j), target->getLocalType(j))) {
+            validForwarder = false;
+            break;
+          }
+        }
+        if (!validForwarder) {
+          continue;
+        }
+        unsigned uBytes = getUnaryOpBytes(uOp);
+        unsigned targetCallBytes = getFuncCallBytes(target);
+        unsigned hCallBytes = getFuncCallBytes(h);
+        if (uBytes + targetCallBytes <= hCallBytes) {
+          continue;
+        }
+        unaryHelpersByKey[{target->name, uOp}].push_back(
+          {h, target, innerCall, uOp});
+        allUnaryHelpers.insert(h);
+      }
+
+      struct UnaryCallSite {
+        Function* caller;
+        Expression* uExpr;
+        Call* call;
+      };
+      std::map<UnaryGroupKey, std::vector<UnaryCallSite>> partialUnaryGroups;
+      std::unordered_map<Function*,
+                         std::unordered_map<Expression*, Expression*>>
+        funcB2Replacements;
+
+      struct UnaryCallCollector
+        : public PostWalker<UnaryCallCollector,
+                            UnifiedExpressionVisitor<UnaryCallCollector>> {
+        Function* caller;
+        Module& wasm;
+        bool doPartial;
+        const std::unordered_set<Name>& disallowedTargets;
+        const std::unordered_set<Function*>& modifiedCallees;
+        std::unordered_set<Expression*>& touchedCalls;
+        std::unordered_set<Function*>& modifiedFuncs;
+        decltype(matchUnaryOuterOp)& matchOp;
+        decltype(isCompatibleWithUnaryOp)& isCompat;
+        std::map<UnaryGroupKey, std::vector<UnaryForwarder>>& unaryHelpersByKey;
+        std::map<UnaryGroupKey, std::vector<UnaryCallSite>>& partialUnaryGroups;
+        std::unordered_map<Function*,
+                           std::unordered_map<Expression*, Expression*>>&
+          funcB2Replacements;
+        bool& anyChanged;
+
+        UnaryCallCollector(
+          Function* caller,
+          Module& wasm,
+          bool doPartial,
+          const std::unordered_set<Name>& disallowedTargets,
+          const std::unordered_set<Function*>& modifiedCallees,
+          std::unordered_set<Expression*>& touchedCalls,
+          std::unordered_set<Function*>& modifiedFuncs,
+          decltype(matchUnaryOuterOp)& matchOp,
+          decltype(isCompatibleWithUnaryOp)& isCompat,
+          std::map<UnaryGroupKey, std::vector<UnaryForwarder>>&
+            unaryHelpersByKey,
+          std::map<UnaryGroupKey, std::vector<UnaryCallSite>>&
+            partialUnaryGroups,
+          std::unordered_map<Function*,
+                             std::unordered_map<Expression*, Expression*>>&
+            funcB2Replacements,
+          bool& anyChanged)
+          : caller(caller), wasm(wasm), doPartial(doPartial),
+            disallowedTargets(disallowedTargets),
+            modifiedCallees(modifiedCallees), touchedCalls(touchedCalls),
+            modifiedFuncs(modifiedFuncs), matchOp(matchOp), isCompat(isCompat),
+            unaryHelpersByKey(unaryHelpersByKey),
+            partialUnaryGroups(partialUnaryGroups),
+            funcB2Replacements(funcB2Replacements), anyChanged(anyChanged) {}
+
+        void visitExpression(Expression* curr) {
+          UnaryOuterOp uOp;
+          Expression* inner = nullptr;
+          if (!matchOp(curr, uOp, inner)) {
+            return;
+          }
+          auto* c = inner->dynCast<Call>();
+          if (!c || c->isReturn || touchedCalls.count(c)) {
+            return;
+          }
+          Function* callee = wasm.getFunctionOrNull(c->target);
+          if (!callee || modifiedCallees.count(callee)) {
+            return;
+          }
+          Index P = callee->getNumParams();
+          if (c->operands.size() != P ||
+              !isCompat(callee->getResults(), uOp)) {
+            return;
+          }
+          for (Index j = 0; j < P; j++) {
+            if (c->operands[j]->type == Type::unreachable ||
+                !Type::isSubType(c->operands[j]->type,
+                                 callee->getLocalType(j))) {
+              return;
+            }
+          }
+
+          UnaryGroupKey key{callee->name, uOp};
+          auto hIt = unaryHelpersByKey.find(key);
+          if (hIt != unaryHelpersByKey.end()) {
+            for (auto& uf : hIt->second) {
+              if (caller == uf.helper) {
+                continue;
+              }
+              bool typesMatch = true;
+              bool needsWiden = false;
+              for (Index p = 0; p < P; p++) {
+                Type argType = c->operands[p]->type;
+                Type hParamType = uf.helper->getLocalType(p);
+                if (!Type::isSubType(argType, hParamType)) {
+                  if (!disallowedTargets.count(uf.helper->name) &&
+                      Type::isSubType(argType, callee->getLocalType(p))) {
+                    needsWiden = true;
+                  } else {
+                    typesMatch = false;
+                    break;
+                  }
+                }
+              }
+              if (!typesMatch) {
+                continue;
+              }
+              if (needsWiden) {
+                std::vector<Type> widenedParams(P);
+                for (Index p = 0; p < P; p++) {
+                  Type lub = Type::getLeastUpperBound(
+                    uf.helper->getLocalType(p), c->operands[p]->type);
+                  widenedParams[p] = lub;
+                  uf.innerCall->operands[p]->cast<LocalGet>()->type = lub;
+                }
+                uf.helper->setParams(Type(widenedParams));
+                modifiedFuncs.insert(uf.helper);
+              }
+              c->target = uf.helper->name;
+              c->type = uOp.resultType;
+              funcB2Replacements[caller][curr] = c;
+              touchedCalls.insert(c);
+              modifiedFuncs.insert(caller);
+              anyChanged = true;
+              return;
+            }
+          }
+
+          if (doPartial && P <= 6) {
+            partialUnaryGroups[key].push_back({caller, curr, c});
+          }
+        }
+      };
+
+      bool doPartialB2 = getPassOptions().shrinkLevel > 0;
+      for (auto& f : wasm->functions) {
+        if (f->imported() || allUnaryHelpers.count(f.get())) {
+          continue;
+        }
+        UnaryCallCollector(f.get(),
+                           *wasm,
+                           doPartialB2,
+                           disallowedTargets,
+                           modifiedCallees,
+                           touchedCalls,
+                           modifiedFuncs,
+                           matchUnaryOuterOp,
+                           isCompatibleWithUnaryOp,
+                           unaryHelpersByKey,
+                           partialUnaryGroups,
+                           funcB2Replacements,
+                           anyChanged)
+          .walk(f->body);
+      }
+
+      if (doPartialB2 && !partialUnaryGroups.empty()) {
+        std::vector<std::pair<UnaryGroupKey, std::vector<UnaryCallSite>>>
+          sortedUnaryGroups(partialUnaryGroups.begin(),
+                            partialUnaryGroups.end());
+        std::sort(sortedUnaryGroups.begin(),
+                  sortedUnaryGroups.end(),
+                  [](const auto& a, const auto& b) {
+                    if (a.second.size() != b.second.size()) {
+                      return a.second.size() > b.second.size();
+                    }
+                    return a.first < b.first;
+                  });
+
+        for (auto& [uKey, sites] : sortedUnaryGroups) {
+          Function* callee = wasm->getFunction(uKey.calleeName);
+          Index P = callee->getNumParams();
+          unsigned uBytes = getUnaryOpBytes(uKey.op);
+          unsigned calleeCallBytes = getFuncCallBytes(callee);
+          if (uBytes + calleeCallBytes <= 3) {
+            continue;
+          }
+          std::vector<UnaryCallSite> active;
+          for (const auto& s : sites) {
+            if (touchedCalls.count(s.call) ||
+                s.call->target != uKey.calleeName ||
+                s.call->operands.size() != P) {
+              continue;
+            }
+            bool argsOk = true;
+            for (Index j = 0; j < P; j++) {
+              if (s.call->operands[j]->type == Type::unreachable ||
+                  !Type::isSubType(s.call->operands[j]->type,
+                                   callee->getLocalType(j))) {
+                argsOk = false;
+                break;
+              }
+            }
+            if (argsOk) {
+              active.push_back(s);
+            }
+          }
+          unsigned savedBytes =
+            unsigned(active.size()) * (uBytes + calleeCallBytes - 3);
+          unsigned helperCost =
+            9 + 2 * unsigned(P) + calleeCallBytes + uBytes;
+          if (savedBytes <= helperCost) {
+            continue;
+          }
+
+          std::vector<Type> newParams(P);
+          std::vector<Expression*> forwardArgs(P);
+          for (Index j = 0; j < P; j++) {
+            newParams[j] = callee->getLocalType(j);
+            forwardArgs[j] = builder.makeLocalGet(j, newParams[j]);
+          }
+          Expression* innerCall = builder.makeCall(
+            callee->name, forwardArgs, callee->getResults(), false);
+          Expression* newBody = buildUnaryOuterOp(uKey.op, innerCall);
+          Name newName = Names::getValidFunctionName(*wasm, "outlined_u");
+          Function* newFunc = wasm->addFunction(Builder::makeFunction(
+            newName,
+            Signature(Type(newParams), uKey.op.resultType),
+            {},
+            newBody));
+          ReFinalize().walkFunctionInModule(newFunc, wasm);
+          initHelperEffects(newFunc);
+
+          for (const auto& s : active) {
+            s.call->target = newName;
+            s.call->type = uKey.op.resultType;
+            funcB2Replacements[s.caller][s.uExpr] = s.call;
+            touchedCalls.insert(s.call);
+            modifiedFuncs.insert(s.caller);
+          }
+          anyChanged = true;
+        }
+      }
+
+      for (auto& [caller, repMap] : funcB2Replacements) {
+        ExprReplacer(repMap).walk(caller->body);
       }
     }
 
