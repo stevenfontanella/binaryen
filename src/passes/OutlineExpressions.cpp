@@ -1313,6 +1313,8 @@ struct OutlineExpressions : public Pass {
 
     auto mode = getMode();
 
+    unCseCallRefTargets();
+
     constHoles = false;
     for (Index round = 0; round < MaxRounds; round++) {
       if (!runRound(mode)) {
@@ -1327,6 +1329,11 @@ struct OutlineExpressions : public Pass {
       }
     }
     foldCallRefDispatch(true);
+    for (Index round = 0; round < 2; round++) {
+      if (!sinkWrapperCalls()) {
+        break;
+      }
+    }
 
     if (!scratchGlobals.empty()) {
       for (auto& func : wasm->functions) {
@@ -2192,7 +2199,8 @@ struct OutlineExpressions : public Pass {
   // baked in. (The helpers of trees that write a local are blocks that end in
   // a read of the local, which we do not try to recognize.)
   void noteExistingHelper(Function* func, Site& site) {
-    if (!site.written.empty() || !site.internalLocals.empty() ||
+    if (!site.written.empty() ||
+        func->vars.size() != site.internalLocals.size() ||
         func->getResults() != getHelperResults(&site)) {
       return;
     }
@@ -2210,6 +2218,14 @@ struct OutlineExpressions : public Pass {
         return;
       }
       i++;
+    }
+    for (Index j = 0; j < site.internalLocals.size(); j++) {
+      Index expectedIdx = func->getNumParams() + j;
+      if (site.internalLocals[j] != expectedIdx ||
+          func->getLocalType(expectedIdx) !=
+            site.func->getLocalType(site.internalLocals[j])) {
+        return;
+      }
     }
     if (key.helper) {
       // We already have a helper for this key. This function can just call it
@@ -2389,7 +2405,15 @@ struct OutlineExpressions : public Pass {
       bool unwrapTee = false;
     };
     std::unordered_map<Expression*, RepInfo> replacements;
+    std::unordered_set<LocalSet*> innerTeesToUnwrap;
     CallRefReplacer(Module& wasm) : wasm(wasm) {}
+
+    void visitLocalSet(LocalSet* curr) {
+      if (innerTeesToUnwrap.count(curr)) {
+        assert(curr->isTee());
+        replaceCurrent(curr->value);
+      }
+    }
 
     void visitCallRef(CallRef* curr) {
       auto it = replacements.find(curr);
@@ -2403,7 +2427,7 @@ struct OutlineExpressions : public Pass {
       for (Index i = 0; i < numArgs; i++) {
         args[i] = curr->operands[i];
       }
-      if (info.unwrapTee) {
+      if (info.unwrapTee && args[0]->is<LocalSet>()) {
         auto* tee = args[0]->cast<LocalSet>();
         assert(tee->isTee());
         args[0] = tee->value;
@@ -2413,11 +2437,43 @@ struct OutlineExpressions : public Pass {
     }
   };
 
-  static bool buildInlineTargetSkel(Expression* e,
-                                    Index recvLocal,
-                                    SmallVector<uint32_t, 16>& out,
-                                    unsigned& tBytes,
-                                    unsigned& numRecvGets) {
+  static bool isPureVtableBodyExpr(Expression* e) {
+    if (!e || e->type == Type::unreachable) {
+      return false;
+    }
+    if (e->is<LocalGet>() || e->is<Const>()) {
+      return true;
+    }
+    if (auto* sg = e->dynCast<StructGet>()) {
+      return sg->ref && sg->ref->type.isStruct() &&
+             isPureVtableBodyExpr(sg->ref);
+    }
+    if (auto* rc = e->dynCast<RefCast>()) {
+      return !rc->desc && rc->ref && isPureVtableBodyExpr(rc->ref);
+    }
+    if (auto* ra = e->dynCast<RefAs>()) {
+      return ra->op == RefAsNonNull && ra->value &&
+             isPureVtableBodyExpr(ra->value);
+    }
+    if (auto* ag = e->dynCast<ArrayGet>()) {
+      return ag->ref && ag->ref->type.isArray() && ag->index &&
+             isPureVtableBodyExpr(ag->ref) && isPureVtableBodyExpr(ag->index);
+    }
+    return false;
+  }
+
+  bool isPureVtableHelper(Name name) {
+    Function* f = wasm->getFunctionOrNull(name);
+    if (!f || f->imported() || f->getNumParams() != 1 || !f->vars.empty() ||
+        !f->getResults().isSingle() || !f->getResults().isRef()) {
+      return false;
+    }
+    return isPureVtableBodyExpr(f->body);
+  }
+
+  bool isPureVtableLookupOnLocal(Expression* e,
+                                 Index recvLocal,
+                                 Index& numGets) {
     if (!e || e->type == Type::unreachable) {
       return false;
     }
@@ -2425,10 +2481,528 @@ struct OutlineExpressions : public Pass {
       if (lg->index != recvLocal) {
         return false;
       }
-      out.push_back(1);
-      tBytes += 2;
-      numRecvGets++;
+      numGets++;
       return true;
+    }
+    if (auto* sg = e->dynCast<StructGet>()) {
+      return sg->ref && sg->ref->type.isStruct() &&
+             isPureVtableLookupOnLocal(sg->ref, recvLocal, numGets);
+    }
+    if (auto* rc = e->dynCast<RefCast>()) {
+      return !rc->desc && rc->ref &&
+             isPureVtableLookupOnLocal(rc->ref, recvLocal, numGets);
+    }
+    if (auto* ra = e->dynCast<RefAs>()) {
+      return ra->op == RefAsNonNull && ra->value &&
+             isPureVtableLookupOnLocal(ra->value, recvLocal, numGets);
+    }
+    if (auto* call = e->dynCast<Call>()) {
+      return !call->isReturn && call->operands.size() == 1 &&
+             isPureVtableHelper(call->target) &&
+             isPureVtableLookupOnLocal(call->operands[0], recvLocal, numGets);
+    }
+    return false;
+  }
+
+  struct TreeLayout {
+    std::unordered_map<Expression*, Expression*> parent;
+    std::unordered_map<Expression*, Index> depth;
+    std::unordered_map<Expression*, Index> preOrder;
+    std::unordered_map<Expression*, Index> postOrder;
+
+    void build(Expression* root) {
+      parent.clear();
+      depth.clear();
+      preOrder.clear();
+      postOrder.clear();
+      if (!root) {
+        return;
+      }
+      struct Frame {
+        Expression* expr;
+        Expression* par;
+        Index d;
+        bool visited;
+      };
+      std::vector<Frame> stack;
+      stack.push_back({root, nullptr, 0, false});
+      Index pre = 0;
+      Index post = 0;
+      while (!stack.empty()) {
+        auto& top = stack.back();
+        Expression* e = top.expr;
+        if (!top.visited) {
+          top.visited = true;
+          parent[e] = top.par;
+          depth[e] = top.d;
+          preOrder[e] = pre++;
+          ChildIterator it(e);
+          std::vector<Expression*> children(it.begin(), it.end());
+          for (auto rit = children.rbegin(); rit != children.rend(); ++rit) {
+            if (*rit) {
+              stack.push_back({*rit, e, top.d + 1, false});
+            }
+          }
+        } else {
+          postOrder[e] = post++;
+          stack.pop_back();
+        }
+      }
+    }
+
+    bool isDescendant(Expression* node, Expression* anc) const {
+      auto itN = preOrder.find(node);
+      auto itA = preOrder.find(anc);
+      if (itN == preOrder.end() || itA == preOrder.end()) {
+        return false;
+      }
+      return itA->second <= itN->second &&
+             postOrder.at(node) <= postOrder.at(anc);
+    }
+
+    Expression* getLCA(Expression* a, Expression* b) const {
+      if (!a || !b) {
+        return nullptr;
+      }
+      Index da = depth.at(a);
+      Index db = depth.at(b);
+      while (da > db) {
+        a = parent.at(a);
+        da--;
+      }
+      while (db > da) {
+        b = parent.at(b);
+        db--;
+      }
+      while (a != b) {
+        a = parent.at(a);
+        b = parent.at(b);
+      }
+      return a;
+    }
+
+    bool hasLoopBetween(Expression* node, Expression* anc) const {
+      Expression* curr = node;
+      while (curr && curr != anc) {
+        if (curr->is<Loop>()) {
+          return true;
+        }
+        curr = parent.at(curr);
+      }
+      return false;
+    }
+
+    bool isUnconditionalFrom(Expression* node, Expression* anc) const {
+      Expression* curr = node;
+      while (curr && curr != anc) {
+        Expression* par = parent.at(curr);
+        if (!par) {
+          return false;
+        }
+        if (auto* iff = par->dynCast<If>()) {
+          if (iff->condition != curr) {
+            return false;
+          }
+        } else if (par->is<Loop>() || par->is<Try>() || par->is<TryTable>()) {
+          return false;
+        } else if (auto* blk = par->dynCast<Block>()) {
+          for (auto* item : blk->list) {
+            if (item == curr) {
+              break;
+            }
+            if (!FindAll<Break>(item).list.empty() ||
+                !FindAll<Switch>(item).list.empty() ||
+                !FindAll<BrOn>(item).list.empty() ||
+                !FindAll<Return>(item).list.empty()) {
+              return false;
+            }
+          }
+        }
+        curr = par;
+      }
+      return curr == anc;
+    }
+  };
+
+  void unCseCallRefTargets() {
+    for (auto& f : wasm->functions) {
+      if (f->imported()) {
+        continue;
+      }
+      Function* func = f.get();
+      if (FindAll<CallRef>(func->body).list.empty()) {
+        continue;
+      }
+
+      bool funcChanged = false;
+      TreeLayout layout;
+      layout.build(func->body);
+
+      // Step 1A: Propagate LCA-safe single-write copy tees
+      // (local.tee $x (local.get $y)) on non-param locals $x.
+      {
+        Index numLocals = func->getNumLocals();
+        std::vector<SmallVector<LocalSet*, 2>> writes(numLocals);
+        std::vector<SmallVector<LocalGet*, 4>> reads(numLocals);
+        for (auto* ls : FindAll<LocalSet>(func->body).list) {
+          writes[ls->index].push_back(ls);
+        }
+        for (auto* lg : FindAll<LocalGet>(func->body).list) {
+          reads[lg->index].push_back(lg);
+        }
+
+        std::unordered_map<Index, Index> copyTarget;
+        std::unordered_set<LocalSet*> teesToUnwrap;
+        for (Index x = func->getVarIndexBase(); x < numLocals; x++) {
+          if (writes[x].size() != 1 || reads[x].empty()) {
+            continue;
+          }
+          LocalSet* wx = writes[x][0];
+          if (!wx->isTee()) {
+            continue;
+          }
+          auto* innerLg = wx->value->dynCast<LocalGet>();
+          if (!innerLg || innerLg->index == x) {
+            continue;
+          }
+          Index y = innerLg->index;
+          if (func->getLocalType(x) != func->getLocalType(y)) {
+            continue;
+          }
+          Expression* lca = wx;
+          Index wxPre = layout.preOrder.at(wx);
+          bool orderOk = true;
+          for (auto* gx : reads[x]) {
+            if (layout.preOrder.at(gx) <= wxPre) {
+              orderOk = false;
+              break;
+            }
+            lca = layout.getLCA(lca, gx);
+          }
+          if (!orderOk || !lca || !layout.isUnconditionalFrom(wx, lca)) {
+            continue;
+          }
+          bool ySafe = true;
+          for (auto* wy : writes[y]) {
+            if (layout.isDescendant(wy, lca)) {
+              if (layout.preOrder.at(wy) > wxPre ||
+                  layout.hasLoopBetween(wy, lca)) {
+                ySafe = false;
+                break;
+              }
+              for (auto* gx : reads[x]) {
+                if (layout.hasLoopBetween(gx, lca)) {
+                  ySafe = false;
+                  break;
+                }
+              }
+              if (!ySafe) {
+                break;
+              }
+            }
+          }
+          if (!ySafe) {
+            continue;
+          }
+          copyTarget[x] = y;
+          teesToUnwrap.insert(wx);
+        }
+
+        if (!copyTarget.empty()) {
+          // Resolve chains x -> y -> z.
+          for (auto& [x, y] : copyTarget) {
+            Index curr = y;
+            while (copyTarget.count(curr)) {
+              curr = copyTarget[curr];
+            }
+            y = curr;
+          }
+          struct CopyPropagator : public PostWalker<CopyPropagator> {
+            const std::unordered_map<Index, Index>& copyTarget;
+            const std::unordered_set<LocalSet*>& teesToUnwrap;
+            CopyPropagator(const std::unordered_map<Index, Index>& copyTarget,
+                           const std::unordered_set<LocalSet*>& teesToUnwrap)
+              : copyTarget(copyTarget), teesToUnwrap(teesToUnwrap) {}
+            void visitLocalGet(LocalGet* curr) {
+              auto it = copyTarget.find(curr->index);
+              if (it != copyTarget.end()) {
+                curr->index = it->second;
+              }
+            }
+            void visitLocalSet(LocalSet* curr) {
+              if (teesToUnwrap.count(curr)) {
+                replaceCurrent(curr->value);
+              }
+            }
+          };
+          CopyPropagator(copyTarget, teesToUnwrap).walk(func->body);
+          funcChanged = true;
+          layout.build(func->body);
+        }
+      }
+
+      // Step 1B: Un-CSE hoisted vtable locals $v where $v is written once via
+      // (struct.get $vt slot0 (local.tee $v V($x))) as cr0->target and read
+      // only via (struct.get $vt sloti (local.get $v)) as cri->target on the
+      // same receiver local $x.
+      {
+        Index numLocals = func->getNumLocals();
+        std::vector<SmallVector<LocalSet*, 2>> writes(numLocals);
+        std::vector<SmallVector<LocalGet*, 4>> reads(numLocals);
+        for (auto* ls : FindAll<LocalSet>(func->body).list) {
+          writes[ls->index].push_back(ls);
+        }
+        for (auto* lg : FindAll<LocalGet>(func->body).list) {
+          reads[lg->index].push_back(lg);
+        }
+
+        for (Index v = func->getVarIndexBase(); v < numLocals; v++) {
+          if (writes[v].size() != 1 || reads[v].empty()) {
+            continue;
+          }
+          LocalSet* wv = writes[v][0];
+          if (!wv->isTee()) {
+            continue;
+          }
+          Expression* wvPar = layout.parent[wv];
+          auto* sg0 = wvPar ? wvPar->dynCast<StructGet>() : nullptr;
+          if (!sg0 || sg0->ref != wv) {
+            continue;
+          }
+          Expression* sg0Par = layout.parent[sg0];
+          auto* cr0 = sg0Par ? sg0Par->dynCast<CallRef>() : nullptr;
+          if (!cr0 || cr0->target != sg0 || cr0->isReturn ||
+              cr0->operands.empty()) {
+            continue;
+          }
+          // Determine receiver local $x from cr0->operands[0].
+          Expression* op0 = cr0->operands[0];
+          Index recvLocal = Index(-1);
+          if (auto* lg0 = op0->dynCast<LocalGet>()) {
+            recvLocal = lg0->index;
+          } else if (auto* tee0 = op0->dynCast<LocalSet>()) {
+            if (tee0->isTee()) {
+              recvLocal = tee0->index;
+            }
+          }
+          if (recvLocal == Index(-1) || recvLocal == v) {
+            continue;
+          }
+          // Check that cr0's later operands do not write recvLocal.
+          bool writtenInCr0Args = false;
+          for (Index i = 1; i < cr0->operands.size(); i++) {
+            for (auto* ls : FindAll<LocalSet>(cr0->operands[i]).list) {
+              if (ls->index == recvLocal) {
+                writtenInCr0Args = true;
+                break;
+              }
+            }
+          }
+          if (writtenInCr0Args) {
+            continue;
+          }
+          Index numRecvGets = 0;
+          if (!isPureVtableLookupOnLocal(wv->value, recvLocal, numRecvGets) ||
+              numRecvGets != 1) {
+            continue;
+          }
+
+          SmallVector<StructGet*, 4> readStructGets;
+          Expression* lca = cr0;
+          Index wvPre = layout.preOrder.at(wv);
+          bool readsOk = true;
+          for (auto* gv : reads[v]) {
+            if (layout.preOrder.at(gv) <= wvPre) {
+              readsOk = false;
+              break;
+            }
+            Expression* gvPar = layout.parent[gv];
+            auto* sgi = gvPar ? gvPar->dynCast<StructGet>() : nullptr;
+            if (!sgi || sgi->ref != gv) {
+              readsOk = false;
+              break;
+            }
+            Expression* sgiPar = layout.parent[sgi];
+            auto* cri = sgiPar ? sgiPar->dynCast<CallRef>() : nullptr;
+            if (!cri || cri->target != sgi || cri->isReturn ||
+                cri->operands.empty()) {
+              readsOk = false;
+              break;
+            }
+            auto* lgi = cri->operands[0]->dynCast<LocalGet>();
+            if (!lgi || lgi->index != recvLocal) {
+              readsOk = false;
+              break;
+            }
+            for (Index i = 1; i < cri->operands.size(); i++) {
+              for (auto* ls : FindAll<LocalSet>(cri->operands[i]).list) {
+                if (ls->index == recvLocal) {
+                  readsOk = false;
+                  break;
+                }
+              }
+            }
+            if (!readsOk) {
+              break;
+            }
+            readStructGets.push_back(sgi);
+            lca = layout.getLCA(lca, cri);
+          }
+          if (!readsOk || !lca || !layout.isUnconditionalFrom(op0, lca)) {
+            continue;
+          }
+
+          // Ensure recvLocal is not overwritten inside lca after op0.
+          Index op0Pre = layout.preOrder.at(op0);
+          bool recvSafe = true;
+          for (auto* wx : writes[recvLocal]) {
+            if (wx == op0) {
+              continue;
+            }
+            if (layout.isDescendant(wx, lca)) {
+              if (layout.preOrder.at(wx) > op0Pre ||
+                  layout.hasLoopBetween(wx, lca)) {
+                recvSafe = false;
+                break;
+              }
+              for (auto* gv : reads[v]) {
+                if (layout.hasLoopBetween(gv, lca)) {
+                  recvSafe = false;
+                  break;
+                }
+              }
+              if (!recvSafe) {
+                break;
+              }
+            }
+          }
+          if (!recvSafe) {
+            continue;
+          }
+
+          Expression* vExpr = wv->value;
+          sg0->ref = vExpr;
+          for (auto* sgi : readStructGets) {
+            sgi->ref = ExpressionManipulator::copy(vExpr, *wasm);
+          }
+          funcChanged = true;
+        }
+      }
+
+      if (funcChanged) {
+        ReFinalize().walkFunctionInModule(func, wasm);
+        if (func->effects) {
+          func->effects =
+            std::make_unique<EffectAnalyzer>(getPassOptions(), *wasm, func);
+        }
+      }
+    }
+  }
+
+  static bool isPureReceiverExpr(Expression* e,
+                                 LocalSet*& outTee,
+                                 Index& numTees) {
+    if (!e || e->type == Type::unreachable) {
+      return false;
+    }
+    if (e->is<LocalGet>()) {
+      return true;
+    }
+    if (auto* ls = e->dynCast<LocalSet>()) {
+      if (!ls->isTee() || numTees >= 1) {
+        return false;
+      }
+      outTee = ls;
+      numTees++;
+      return true;
+    }
+    if (auto* sg = e->dynCast<StructGet>()) {
+      return sg->ref && sg->ref->type.isStruct() &&
+             isPureReceiverExpr(sg->ref, outTee, numTees);
+    }
+    if (auto* rc = e->dynCast<RefCast>()) {
+      return !rc->desc && rc->ref &&
+             isPureReceiverExpr(rc->ref, outTee, numTees);
+    }
+    if (auto* ra = e->dynCast<RefAs>()) {
+      return ra->op == RefAsNonNull && ra->value &&
+             isPureReceiverExpr(ra->value, outTee, numTees);
+    }
+    return false;
+  }
+
+  static bool matchesCoupledReceiver(Expression* a0, Expression* targetSub) {
+    if (!a0 || !targetSub) {
+      return false;
+    }
+    if (auto* ls = a0->dynCast<LocalSet>()) {
+      if (!ls->isTee()) {
+        return false;
+      }
+      if (auto* lg = targetSub->dynCast<LocalGet>()) {
+        if (lg->index == ls->index) {
+          return true;
+        }
+        if (auto* innerLg = ls->value->dynCast<LocalGet>()) {
+          if (lg->index == innerLg->index) {
+            return true;
+          }
+        }
+      }
+      return false;
+    }
+    if (auto* lgA = a0->dynCast<LocalGet>()) {
+      auto* lgB = targetSub->dynCast<LocalGet>();
+      return lgB && lgA->index == lgB->index;
+    }
+    if (auto* sgA = a0->dynCast<StructGet>()) {
+      auto* sgB = targetSub->dynCast<StructGet>();
+      if (!sgB || sgA->index != sgB->index || sgA->signed_ != sgB->signed_ ||
+          !sgA->ref || !sgB->ref || !sgA->ref->type.isStruct() ||
+          !sgB->ref->type.isStruct() ||
+          sgA->ref->type.getHeapType() != sgB->ref->type.getHeapType()) {
+        return false;
+      }
+      return matchesCoupledReceiver(sgA->ref, sgB->ref);
+    }
+    if (auto* rcA = a0->dynCast<RefCast>()) {
+      auto* rcB = targetSub->dynCast<RefCast>();
+      if (!rcB || rcA->desc || rcB->desc || rcA->type != rcB->type) {
+        return false;
+      }
+      return matchesCoupledReceiver(rcA->ref, rcB->ref);
+    }
+    if (auto* raA = a0->dynCast<RefAs>()) {
+      auto* raB = targetSub->dynCast<RefAs>();
+      if (!raB || raA->op != raB->op) {
+        return false;
+      }
+      return matchesCoupledReceiver(raA->value, raB->value);
+    }
+    return false;
+  }
+
+  bool buildInlineTargetSkel(Expression* e,
+                             Expression* a0,
+                             Type parentDemanded,
+                             Type& demandedByTarget,
+                             std::unordered_map<Name, uint32_t>& callIds,
+                             const std::unordered_set<Name>& disallowedHelpers,
+                             SmallVector<uint32_t, 16>& out,
+                             unsigned& siteTargetBytes,
+                             unsigned& helperTargetBytes,
+                             unsigned& numRecvMatches) {
+    if (!e || e->type == Type::unreachable) {
+      return false;
+    }
+    if (matchesCoupledReceiver(a0, e)) {
+      out.push_back(1);
+      siteTargetBytes += unsigned(Measurer::measure(e));
+      helperTargetBytes += 2;
+      demandedByTarget =
+        Type::getGreatestLowerBound(demandedByTarget, parentDemanded);
+      numRecvMatches++;
+      return demandedByTarget != Type::none && !demandedByTarget.isNull();
     }
     if (auto* sg = e->dynCast<StructGet>()) {
       if (!sg->ref || sg->ref->type == Type::unreachable ||
@@ -2441,9 +3015,19 @@ struct OutlineExpressions : public Pass {
       out.push_back(sg->signed_ ? 1 : 0);
       out.push_back(uint32_t(htId));
       out.push_back(uint32_t(htId >> 32));
-      tBytes += 4;
-      return buildInlineTargetSkel(
-        sg->ref, recvLocal, out, tBytes, numRecvGets);
+      siteTargetBytes += 4;
+      helperTargetBytes += 4;
+      Type childDemanded(sg->ref->type.getHeapType(), Nullable);
+      return buildInlineTargetSkel(sg->ref,
+                                   a0,
+                                   childDemanded,
+                                   demandedByTarget,
+                                   callIds,
+                                   disallowedHelpers,
+                                   out,
+                                   siteTargetBytes,
+                                   helperTargetBytes,
+                                   numRecvMatches);
     }
     if (auto* rc = e->dynCast<RefCast>()) {
       if (rc->desc || !rc->ref || rc->ref->type == Type::unreachable) {
@@ -2453,9 +3037,19 @@ struct OutlineExpressions : public Pass {
       out.push_back(3);
       out.push_back(uint32_t(tId));
       out.push_back(uint32_t(tId >> 32));
-      tBytes += 4;
-      return buildInlineTargetSkel(
-        rc->ref, recvLocal, out, tBytes, numRecvGets);
+      siteTargetBytes += 4;
+      helperTargetBytes += 4;
+      Type childDemanded(rc->ref->type.getHeapType().getTop(), Nullable);
+      return buildInlineTargetSkel(rc->ref,
+                                   a0,
+                                   childDemanded,
+                                   demandedByTarget,
+                                   callIds,
+                                   disallowedHelpers,
+                                   out,
+                                   siteTargetBytes,
+                                   helperTargetBytes,
+                                   numRecvMatches);
     }
     if (auto* ra = e->dynCast<RefAs>()) {
       if (ra->op != RefAsNonNull || !ra->value ||
@@ -2463,9 +3057,22 @@ struct OutlineExpressions : public Pass {
         return false;
       }
       out.push_back(4);
-      tBytes += 1;
-      return buildInlineTargetSkel(
-        ra->value, recvLocal, out, tBytes, numRecvGets);
+      siteTargetBytes += 1;
+      helperTargetBytes += 1;
+      Type childDemanded =
+        parentDemanded.isRef()
+          ? Type(parentDemanded.getHeapType(), Nullable)
+          : Type(ra->value->type.getHeapType().getTop(), Nullable);
+      return buildInlineTargetSkel(ra->value,
+                                   a0,
+                                   childDemanded,
+                                   demandedByTarget,
+                                   callIds,
+                                   disallowedHelpers,
+                                   out,
+                                   siteTargetBytes,
+                                   helperTargetBytes,
+                                   numRecvMatches);
     }
     if (auto* ag = e->dynCast<ArrayGet>()) {
       if (!ag->ref || ag->ref->type == Type::unreachable ||
@@ -2477,11 +3084,29 @@ struct OutlineExpressions : public Pass {
       out.push_back(ag->signed_ ? 1 : 0);
       out.push_back(uint32_t(htId));
       out.push_back(uint32_t(htId >> 32));
-      tBytes += 4;
-      return buildInlineTargetSkel(
-               ag->ref, recvLocal, out, tBytes, numRecvGets) &&
-             buildInlineTargetSkel(
-               ag->index, recvLocal, out, tBytes, numRecvGets);
+      siteTargetBytes += 4;
+      helperTargetBytes += 4;
+      Type refDemanded(ag->ref->type.getHeapType(), Nullable);
+      return buildInlineTargetSkel(ag->ref,
+                                   a0,
+                                   refDemanded,
+                                   demandedByTarget,
+                                   callIds,
+                                   disallowedHelpers,
+                                   out,
+                                   siteTargetBytes,
+                                   helperTargetBytes,
+                                   numRecvMatches) &&
+             buildInlineTargetSkel(ag->index,
+                                   a0,
+                                   Type::i32,
+                                   demandedByTarget,
+                                   callIds,
+                                   disallowedHelpers,
+                                   out,
+                                   siteTargetBytes,
+                                   helperTargetBytes,
+                                   numRecvMatches);
     }
     if (auto* c = e->dynCast<Const>()) {
       if (c->value.type != Type::i32) {
@@ -2489,10 +3114,83 @@ struct OutlineExpressions : public Pass {
       }
       out.push_back(6);
       out.push_back(uint32_t(c->value.geti32()));
-      tBytes += getShallowBytes(c);
+      unsigned b = getShallowBytes(c);
+      siteTargetBytes += b;
+      helperTargetBytes += b;
       return true;
     }
+    if (auto* call = e->dynCast<Call>()) {
+      if (call->isReturn || call->operands.size() != 1 ||
+          disallowedHelpers.count(call->target) ||
+          !isPureVtableHelper(call->target)) {
+        return false;
+      }
+      Function* callee = wasm->getFunction(call->target);
+      uint32_t id =
+        callIds.try_emplace(call->target, uint32_t(callIds.size() + 1))
+          .first->second;
+      out.push_back(7);
+      out.push_back(id);
+      siteTargetBytes += 3;
+      helperTargetBytes += 3;
+      return buildInlineTargetSkel(call->operands[0],
+                                   a0,
+                                   callee->getLocalType(0),
+                                   demandedByTarget,
+                                   callIds,
+                                   disallowedHelpers,
+                                   out,
+                                   siteTargetBytes,
+                                   helperTargetBytes,
+                                   numRecvMatches);
+    }
     return false;
+  }
+
+  static Expression* replaceCoupledReceiverInCopy(Expression* orig,
+                                                  Expression* copy,
+                                                  Expression* a0,
+                                                  Index paramIdx,
+                                                  Type paramType,
+                                                  Module& wasm) {
+    if (matchesCoupledReceiver(a0, orig)) {
+      return Builder(wasm).makeLocalGet(paramIdx, paramType);
+    }
+    if (auto* sgO = orig->dynCast<StructGet>()) {
+      auto* sgC = copy->cast<StructGet>();
+      sgC->ref = replaceCoupledReceiverInCopy(
+        sgO->ref, sgC->ref, a0, paramIdx, paramType, wasm);
+      return sgC;
+    }
+    if (auto* rcO = orig->dynCast<RefCast>()) {
+      auto* rcC = copy->cast<RefCast>();
+      rcC->ref = replaceCoupledReceiverInCopy(
+        rcO->ref, rcC->ref, a0, paramIdx, paramType, wasm);
+      return rcC;
+    }
+    if (auto* raO = orig->dynCast<RefAs>()) {
+      auto* raC = copy->cast<RefAs>();
+      raC->value = replaceCoupledReceiverInCopy(
+        raO->value, raC->value, a0, paramIdx, paramType, wasm);
+      return raC;
+    }
+    if (auto* agO = orig->dynCast<ArrayGet>()) {
+      auto* agC = copy->cast<ArrayGet>();
+      agC->ref = replaceCoupledReceiverInCopy(
+        agO->ref, agC->ref, a0, paramIdx, paramType, wasm);
+      agC->index = replaceCoupledReceiverInCopy(
+        agO->index, agC->index, a0, paramIdx, paramType, wasm);
+      return agC;
+    }
+    if (auto* cO = orig->dynCast<Call>()) {
+      auto* cC = copy->cast<Call>();
+      for (Index i = 0; i < cO->operands.size(); i++) {
+        cC->operands[i] = replaceCoupledReceiverInCopy(
+          cO->operands[i], cC->operands[i], a0, paramIdx, paramType, wasm);
+      }
+      return cC;
+    }
+    return copy;
   }
 
   bool foldCallRefDispatch(bool allowInlinePart2 = true) {
@@ -2549,19 +3247,24 @@ struct OutlineExpressions : public Pass {
       Function* func;
       CallRef* cr;
       HeapType sigHt;
-      Index recvLocal;
-      bool isTeeOfRecv;
-      unsigned numTargetGets;
-      unsigned targetBytes;
+      Index teeLocal;
+      LocalSet* teeExpr;
+      bool isDirectTee;
+      unsigned numTeeGetsInTarget;
+      unsigned siteTargetBytes;
+      unsigned helperTargetBytes;
+      Type demandedByTarget;
     };
 
     // Part 1: (helperName, sigHeapTypeID) -> sites
     std::map<std::pair<Name, uint64_t>, std::vector<CRSite>> part1Groups;
+    std::map<std::pair<Name, uint64_t>, Function*> existingPart1Helpers;
     // Part 2: (sigHeapTypeID, numArgs, skel) -> sites
-    std::map<std::tuple<uint64_t, Index, std::vector<uint32_t>>,
-             std::vector<CRSite>>
-      part2Groups;
+    using Part2Key = std::tuple<uint64_t, Index, std::vector<uint32_t>>;
+    std::map<Part2Key, std::vector<CRSite>> part2Groups;
+    std::map<Part2Key, Function*> existingPart2Helpers;
 
+    std::unordered_map<Name, uint32_t> callIds;
     std::unordered_map<Function*, std::vector<Index>> funcLocalReads;
 
     for (auto& f : wasm->functions) {
@@ -2586,9 +3289,6 @@ struct OutlineExpressions : public Pass {
             !cr->target->type.isSignature()) {
           continue;
         }
-        if (isDispatchHelperBody(func, cr)) {
-          continue;
-        }
         bool hasUnreachableOp = false;
         for (auto* op : cr->operands) {
           if (op->type == Type::unreachable) {
@@ -2606,51 +3306,111 @@ struct OutlineExpressions : public Pass {
           continue;
         }
 
-        // Determine candidate receiver local(s) from operands[0].
-        SmallVector<Index, 2> candLocals;
-        Expression* a0 = cr->operands[0];
-        if (auto* lg = a0->dynCast<LocalGet>()) {
-          candLocals.push_back(lg->index);
-        } else if (auto* tee = a0->dynCast<LocalSet>()) {
-          if (tee->isTee()) {
-            candLocals.push_back(tee->index);
-            if (auto* innerLg = tee->value->dynCast<LocalGet>()) {
-              candLocals.push_back(innerLg->index);
+        if (isDispatchHelperBody(func, cr)) {
+          if (!disallowedHelpers.count(func->name) &&
+              func->getResults() == sig.results) {
+            bool paramsMatch = true;
+            for (Index i = 1; i < sig.params.size(); i++) {
+              if (func->getLocalType(i) != sig.params[i]) {
+                paramsMatch = false;
+                break;
+              }
             }
-          }
-        }
-        if (candLocals.empty()) {
-          continue;
-        }
-
-        auto isWrittenInLaterArgs = [&](Index loc) -> bool {
-          for (Index i = 1; i < cr->operands.size(); i++) {
-            for (auto* ls : FindAll<LocalSet>(cr->operands[i]).list) {
-              if (ls->index == loc) {
-                return true;
+            if (paramsMatch) {
+              Expression* a0 = cr->operands[0];
+              if (auto* targetCall = cr->target->dynCast<Call>()) {
+                if (!targetCall->isReturn &&
+                    targetCall->operands.size() == 1 &&
+                    matchesCoupledReceiver(a0, targetCall->operands[0])) {
+                  existingPart1Helpers.try_emplace(
+                    {targetCall->target, sigHt.getID()}, func);
+                }
+              } else if (allowInlinePart2 && (cr->target->is<StructGet>() ||
+                                              cr->target->is<RefCast>())) {
+                SmallVector<uint32_t, 16> skel;
+                unsigned sBytes = 0, hBytes = 0, nMatches = 0;
+                Type demanded = sig.params[0];
+                if (buildInlineTargetSkel(cr->target,
+                                          a0,
+                                          sig.params[0],
+                                          demanded,
+                                          callIds,
+                                          disallowedHelpers,
+                                          skel,
+                                          sBytes,
+                                          hBytes,
+                                          nMatches) &&
+                    nMatches > 0) {
+                  std::vector<uint32_t> skelVec(skel.begin(), skel.end());
+                  existingPart2Helpers.try_emplace(
+                    {sigHt.getID(),
+                     Index(cr->operands.size()),
+                     std::move(skelVec)},
+                    func);
+                }
               }
             }
           }
-          return false;
+          continue;
+        }
+
+        Expression* a0 = cr->operands[0];
+        LocalSet* teeExpr = nullptr;
+        Index numTees = 0;
+        if (!isPureReceiverExpr(a0, teeExpr, numTees)) {
+          continue;
+        }
+        bool isCompoundReceiver = !a0->is<LocalGet>() && !a0->is<LocalSet>();
+
+        // Check that later operands do not clobber any local read in a0 or
+        // have side effects if a0 is a compound receiver (e.g. StructGet).
+        bool laterArgsSafe = true;
+        std::unordered_set<Index> a0Locals;
+        for (auto* lg : FindAll<LocalGet>(a0).list) {
+          a0Locals.insert(lg->index);
+        }
+        if (teeExpr) {
+          a0Locals.insert(teeExpr->index);
+        }
+        for (Index i = 1; i < cr->operands.size(); i++) {
+          for (auto* ls : FindAll<LocalSet>(cr->operands[i]).list) {
+            if (a0Locals.count(ls->index)) {
+              laterArgsSafe = false;
+              break;
+            }
+          }
+          if (!laterArgsSafe) {
+            break;
+          }
+          if (isCompoundReceiver &&
+              EffectAnalyzer(getPassOptions(), *wasm, cr->operands[i])
+                .hasAnything()) {
+            laterArgsSafe = false;
+            break;
+          }
+        }
+        if (!laterArgsSafe) {
+          continue;
+        }
+
+        auto countTeeGets = [&](Expression* targetExpr) -> unsigned {
+          if (!teeExpr) {
+            return 0;
+          }
+          unsigned cnt = 0;
+          for (auto* lg : FindAll<LocalGet>(targetExpr).list) {
+            if (lg->index == teeExpr->index) {
+              cnt++;
+            }
+          }
+          return cnt;
         };
 
         if (auto* targetCall = cr->target->dynCast<Call>()) {
           if (targetCall->isReturn || targetCall->operands.size() != 1) {
             continue;
           }
-          auto* tLg = targetCall->operands[0]->dynCast<LocalGet>();
-          if (!tLg) {
-            continue;
-          }
-          Index recvLocal = tLg->index;
-          bool matchCand = false;
-          for (Index cLoc : candLocals) {
-            if (cLoc == recvLocal) {
-              matchCand = true;
-              break;
-            }
-          }
-          if (!matchCand || isWrittenInLaterArgs(recvLocal)) {
+          if (!matchesCoupledReceiver(a0, targetCall->operands[0])) {
             continue;
           }
           Function* h = wasm->getFunctionOrNull(targetCall->target);
@@ -2665,41 +3425,59 @@ struct OutlineExpressions : public Pass {
               !Type::isSubType(a0->type, param0Type)) {
             continue;
           }
-          bool isTeeOfRecv =
-            a0->is<LocalSet>() && a0->cast<LocalSet>()->index == recvLocal;
+          unsigned tGets = countTeeGets(cr->target);
+          bool isDirectTee = (a0 == teeExpr) && tGets > 0;
+          unsigned sBytes = unsigned(Measurer::measure(cr->target));
           part1Groups[{h->name, sigHt.getID()}].push_back(
-            {func, cr, sigHt, recvLocal, isTeeOfRecv, 1, 5});
+            {func,
+             cr,
+             sigHt,
+             teeExpr ? teeExpr->index : Index(-1),
+             tGets > 0 ? teeExpr : nullptr,
+             isDirectTee,
+             tGets,
+             sBytes,
+             5,
+             param0Type});
         } else if (allowInlinePart2 &&
                    (cr->target->is<StructGet>() || cr->target->is<RefCast>())) {
-          for (Index recvLocal : candLocals) {
-            if (isWrittenInLaterArgs(recvLocal)) {
-              continue;
-            }
-            SmallVector<uint32_t, 16> skel;
-            unsigned tBytes = 0;
-            unsigned numGets = 0;
-            if (!buildInlineTargetSkel(
-                  cr->target, recvLocal, skel, tBytes, numGets) ||
-                numGets == 0) {
-              continue;
-            }
-            Type recvLocalType = func->getLocalType(recvLocal);
-            Type param0Type =
-              Type::getGreatestLowerBound(sig.params[0], recvLocalType);
-            if (param0Type == Type::none || param0Type.isNull() ||
-                !Type::isSubType(a0->type, param0Type)) {
-              continue;
-            }
-            bool isTeeOfRecv =
-              a0->is<LocalSet>() && a0->cast<LocalSet>()->index == recvLocal;
-            std::vector<uint32_t> skelVec(skel.begin(), skel.end());
-            part2Groups[{sigHt.getID(),
-                         Index(cr->operands.size()),
-                         std::move(skelVec)}]
-              .push_back(
-                {func, cr, sigHt, recvLocal, isTeeOfRecv, numGets, tBytes});
-            break;
+          SmallVector<uint32_t, 16> skel;
+          unsigned sBytes = 0;
+          unsigned hBytes = 0;
+          unsigned numMatches = 0;
+          Type demanded = sig.params[0];
+          if (!buildInlineTargetSkel(cr->target,
+                                     a0,
+                                     sig.params[0],
+                                     demanded,
+                                     callIds,
+                                     disallowedHelpers,
+                                     skel,
+                                     sBytes,
+                                     hBytes,
+                                     numMatches) ||
+              numMatches == 0) {
+            continue;
           }
+          if (!Type::isSubType(a0->type, demanded)) {
+            continue;
+          }
+          unsigned tGets = countTeeGets(cr->target);
+          bool isDirectTee = (a0 == teeExpr) && tGets > 0;
+          std::vector<uint32_t> skelVec(skel.begin(), skel.end());
+          part2Groups[{sigHt.getID(),
+                       Index(cr->operands.size()),
+                       std::move(skelVec)}]
+            .push_back({func,
+                        cr,
+                        sigHt,
+                        teeExpr ? teeExpr->index : Index(-1),
+                        tGets > 0 ? teeExpr : nullptr,
+                        isDirectTee,
+                        tGets,
+                        sBytes,
+                        hBytes,
+                        demanded});
         }
       }
     }
@@ -2726,12 +3504,21 @@ struct OutlineExpressions : public Pass {
 
       unsigned siteSavings = 0;
       for (const auto& s : sites) {
-        unsigned sv = 5;
-        if (s.isTeeOfRecv &&
-            funcLocalReads[s.func][s.recvLocal] == s.numTargetGets) {
+        unsigned sv = s.siteTargetBytes;
+        if (s.teeExpr &&
+            funcLocalReads[s.func][s.teeLocal] == s.numTeeGetsInTarget) {
           sv += 2;
         }
         siteSavings += sv;
+      }
+
+      auto exIt = existingPart1Helpers.find(keyPair);
+      if (exIt != existingPart1Helpers.end() &&
+          exIt->second->getLocalType(0) == param0Type) {
+        for (const auto& s : sites) {
+          acceptedSites.push_back({s, exIt->second->name});
+        }
+        continue;
       }
 
       bool canModifyInPlace =
@@ -2745,7 +3532,6 @@ struct OutlineExpressions : public Pass {
         if (siteSavings <= hCost) {
           continue;
         }
-        // Update LocalGet(0) types inside h->body to param0Type.
         for (auto* lg : FindAll<LocalGet>(h->body).list) {
           assert(lg->index == 0);
           lg->type = param0Type;
@@ -2799,25 +3585,21 @@ struct OutlineExpressions : public Pass {
 
     // Process Part 2 groups.
     for (auto& [keyTuple, sites] : part2Groups) {
-      if (sites.size() < 2) {
-        continue;
-      }
       HeapType sigHt = sites[0].sigHt;
       Signature sig = sigHt.getSignature();
       Index nArgs = sig.params.size();
-      unsigned tBytes = sites[0].targetBytes;
+      unsigned hTargetBytes = sites[0].helperTargetBytes;
 
-      // Find common param0Type across sites.
-      Type recvType = sites[0].func->getLocalType(sites[0].recvLocal);
-      Type param0Type = Type::getGreatestLowerBound(sig.params[0], recvType);
+      Type param0Type = sites[0].demandedByTarget;
+      for (const auto& s : sites) {
+        param0Type = Type::getGreatestLowerBound(param0Type, s.demandedByTarget);
+      }
       if (param0Type == Type::none || param0Type.isNull()) {
         continue;
       }
       bool allTypeOk = true;
       for (const auto& s : sites) {
-        if (!Type::isSubType(s.cr->operands[0]->type, param0Type) ||
-            !Type::isSubType(param0Type,
-                             s.func->getLocalType(s.recvLocal))) {
+        if (!Type::isSubType(s.cr->operands[0]->type, param0Type)) {
           allTypeOk = false;
           break;
         }
@@ -2826,27 +3608,51 @@ struct OutlineExpressions : public Pass {
         continue;
       }
 
+      auto exIt = existingPart2Helpers.find(keyTuple);
+      if (exIt != existingPart2Helpers.end() &&
+          Type::isSubType(param0Type, exIt->second->getLocalType(0))) {
+        Type exParam0 = exIt->second->getLocalType(0);
+        bool exOk = true;
+        for (const auto& s : sites) {
+          if (!Type::isSubType(s.cr->operands[0]->type, exParam0)) {
+            exOk = false;
+            break;
+          }
+        }
+        if (exOk) {
+          for (const auto& s : sites) {
+            acceptedSites.push_back({s, exIt->second->name});
+          }
+          continue;
+        }
+      }
+
+      if (sites.size() < 2) {
+        continue;
+      }
+
       unsigned siteSavings = 0;
       for (const auto& s : sites) {
-        unsigned sv = tBytes;
-        if (s.isTeeOfRecv &&
-            funcLocalReads[s.func][s.recvLocal] == s.numTargetGets) {
+        unsigned sv = s.siteTargetBytes;
+        if (s.teeExpr &&
+            funcLocalReads[s.func][s.teeLocal] == s.numTeeGetsInTarget) {
           sv += 2;
         }
         siteSavings += sv;
       }
-      unsigned hCost = 9 + 2 * nArgs + tBytes;
+      unsigned hCost = 9 + 2 * nArgs + hTargetBytes;
       if (siteSavings <= hCost) {
         continue;
       }
 
       Expression* targetCopy =
         ExpressionManipulator::copy(sites[0].cr->target, *wasm);
-      for (auto* lg : FindAll<LocalGet>(targetCopy).list) {
-        assert(lg->index == sites[0].recvLocal);
-        lg->index = 0;
-        lg->type = param0Type;
-      }
+      targetCopy = replaceCoupledReceiverInCopy(sites[0].cr->target,
+                                                targetCopy,
+                                                sites[0].cr->operands[0],
+                                                0,
+                                                param0Type,
+                                                *wasm);
       std::vector<Type> newParams(nArgs);
       newParams[0] = param0Type;
       for (Index i = 1; i < nArgs; i++) {
@@ -2876,25 +3682,37 @@ struct OutlineExpressions : public Pass {
     std::unordered_map<Function*, std::unordered_map<Index, Index>>
       removedReads;
     for (const auto& ps : acceptedSites) {
-      removedReads[ps.site.func][ps.site.recvLocal] += ps.site.numTargetGets;
+      if (ps.site.teeExpr) {
+        removedReads[ps.site.func][ps.site.teeLocal] +=
+          ps.site.numTeeGetsInTarget;
+      }
     }
 
     std::unordered_map<
       Function*,
       std::unordered_map<Expression*, CallRefReplacer::RepInfo>>
       funcReplacements;
+    std::unordered_map<Function*, std::unordered_set<LocalSet*>>
+      funcInnerTees;
     for (const auto& ps : acceptedSites) {
       const auto& s = ps.site;
-      bool unwrapTee =
-        s.isTeeOfRecv &&
-        funcLocalReads[s.func][s.recvLocal] ==
-          removedReads[s.func][s.recvLocal];
-      funcReplacements[s.func][s.cr] = {ps.helperName, unwrapTee};
+      bool canUnwrap =
+        s.teeExpr &&
+        funcLocalReads[s.func][s.teeLocal] ==
+          removedReads[s.func][s.teeLocal];
+      funcReplacements[s.func][s.cr] = {ps.helperName,
+                                        canUnwrap && s.isDirectTee};
+      if (canUnwrap && !s.isDirectTee) {
+        funcInnerTees[s.func].insert(s.teeExpr);
+      }
     }
 
     for (auto& [func, reps] : funcReplacements) {
       CallRefReplacer replacer(*wasm);
       replacer.replacements = std::move(reps);
+      if (auto it = funcInnerTees.find(func); it != funcInnerTees.end()) {
+        replacer.innerTeesToUnwrap = std::move(it->second);
+      }
       replacer.walk(func->body);
       ReFinalize().walkFunctionInModule(func, wasm);
       if (func->effects) {
@@ -2903,6 +3721,452 @@ struct OutlineExpressions : public Pass {
       }
     }
     return true;
+  }
+
+  bool canMoveWrapperPast(Function* wFunc, Expression* laterOp) {
+    EffectAnalyzer opEff(getPassOptions(), *wasm, laterOp);
+    if (!opEff.hasAnything()) {
+      return true;
+    }
+    if (!wFunc || wFunc->imported()) {
+      return false;
+    }
+    EffectAnalyzer wEff(getPassOptions(), *wasm, wFunc);
+    if (!wEff.invalidates(opEff)) {
+      return true;
+    }
+    // Many constant-pool / string-literal wrappers (like $0, $1, $3) lazily
+    // populate a private cache array/global on first miss, while laterOp is a
+    // pure call-free read (e.g. struct.get of a field).
+    if (!opEff.hasSideEffects() && !opEff.calls && !opEff.throws() &&
+        FindAll<StructSet>(wFunc->body).list.empty()) {
+      bool globalsDisjoint = true;
+      for (auto* gg : FindAll<GlobalGet>(laterOp).list) {
+        if (wEff.globalsWritten.count(gg->name)) {
+          globalsDisjoint = false;
+          break;
+        }
+      }
+      if (globalsDisjoint &&
+          (FindAll<ArrayGet>(laterOp).list.empty() ||
+           FindAll<ArraySet>(wFunc->body).list.empty())) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool isSingleEntryReadSafe(Function* callee,
+                             Index paramIdx,
+                             Function* wFunc,
+                             LocalGet*& outGet) {
+    outGet = nullptr;
+    if (!wFunc || wFunc->imported()) {
+      return false;
+    }
+    EffectAnalyzer wEff(getPassOptions(), *wasm, wFunc);
+    if (wEff.hasAnything()) {
+      return false;
+    }
+    TreeLayout layout;
+    layout.build(callee->body);
+    auto allGets = FindAll<LocalGet>(callee->body).list;
+    LocalGet* targetGet = nullptr;
+    for (auto* lg : allGets) {
+      if (lg->index == paramIdx) {
+        if (targetGet) {
+          return false;
+        }
+        targetGet = lg;
+      }
+    }
+    if (!targetGet || !layout.isUnconditionalFrom(targetGet, callee->body)) {
+      return false;
+    }
+    outGet = targetGet;
+    return true;
+  }
+
+  bool sinkWrapperCalls() {
+    std::unordered_set<Name> disallowedTargets;
+    for (auto& ex : wasm->exports) {
+      if (ex->kind == ExternalKind::Function) {
+        disallowedTargets.insert(*ex->getInternalName());
+      }
+    }
+    for (auto& seg : wasm->elementSegments) {
+      for (auto* expr : seg->data) {
+        for (auto* rf : FindAll<RefFunc>(expr).list) {
+          disallowedTargets.insert(rf->func);
+        }
+      }
+    }
+    for (auto& g : wasm->globals) {
+      if (!g->imported() && g->init) {
+        for (auto* rf : FindAll<RefFunc>(g->init).list) {
+          disallowedTargets.insert(rf->func);
+        }
+      }
+    }
+
+    struct CallSiteInfo {
+      Function* caller;
+      Call* call;
+    };
+    std::unordered_map<Name, std::vector<CallSiteInfo>> callsByTarget;
+    for (auto& f : wasm->functions) {
+      if (f->imported()) {
+        continue;
+      }
+      Function* caller = f.get();
+      for (auto* rf : FindAll<RefFunc>(caller->body).list) {
+        disallowedTargets.insert(rf->func);
+      }
+      for (auto* c : FindAll<Call>(caller->body).list) {
+        callsByTarget[c->target].push_back({caller, c});
+      }
+    }
+
+    Builder builder(*wasm);
+    std::unordered_set<Function*> modifiedFuncs;
+    std::unordered_set<Function*> modifiedCallees;
+    std::unordered_set<Expression*> touchedCalls;
+    bool anyChanged = false;
+
+    // Part A: In-place wrapper sinking when 100% of callers of a non-escaped
+    // function pass (call $w X_k) at parameter k.
+    for (auto& f : wasm->functions) {
+      if (f->imported()) {
+        continue;
+      }
+      Function* callee = f.get();
+      if (disallowedTargets.count(callee->name) ||
+          modifiedCallees.count(callee) || callee->getNumParams() == 0) {
+        continue;
+      }
+      auto it = callsByTarget.find(callee->name);
+      if (it == callsByTarget.end() || it->second.size() < 2) {
+        continue;
+      }
+      auto& sites = it->second;
+      Index N = sites.size();
+      bool validSites = true;
+      for (const auto& s : sites) {
+        if (s.caller == callee || touchedCalls.count(s.call) ||
+            s.call->operands.size() != callee->getNumParams()) {
+          validSites = false;
+          break;
+        }
+        for (auto* op : s.call->operands) {
+          if (op->type == Type::unreachable) {
+            validSites = false;
+            break;
+          }
+        }
+        if (!validSites) {
+          break;
+        }
+      }
+      if (!validSites) {
+        continue;
+      }
+
+      std::vector<Index> localReads(callee->getNumLocals(), 0);
+      std::vector<Index> localWrites(callee->getNumLocals(), 0);
+      for (auto* lg : FindAll<LocalGet>(callee->body).list) {
+        localReads[lg->index]++;
+      }
+      for (auto* ls : FindAll<LocalSet>(callee->body).list) {
+        localWrites[ls->index]++;
+      }
+
+      Index m = callee->getNumParams();
+      std::vector<Type> currentParams(m);
+      for (Index k = 0; k < m; k++) {
+        currentParams[k] = callee->getLocalType(k);
+      }
+      bool calleeModified = false;
+
+      for (Index revK = 0; revK < m; revK++) {
+        Index k = m - 1 - revK;
+        if (localReads[k] == 0) {
+          continue;
+        }
+        auto* firstW = sites[0].call->operands[k]->dynCast<Call>();
+        if (!firstW || firstW->isReturn || firstW->operands.size() != 1 ||
+            firstW->target == callee->name ||
+            firstW->operands[0]->type == Type::unreachable) {
+          continue;
+        }
+        Name wName = firstW->target;
+        Function* wFunc = wasm->getFunctionOrNull(wName);
+        if (!wFunc || modifiedCallees.count(wFunc)) {
+          continue;
+        }
+        Type wInputType = wFunc->getParams();
+        Type wResultType = wFunc->getResults();
+        if (!wInputType.isSingle() || !wResultType.isSingle() ||
+            !Type::isSubType(wResultType, currentParams[k])) {
+          continue;
+        }
+
+        bool allMatch = true;
+        for (const auto& s : sites) {
+          auto* wCall = s.call->operands[k]->dynCast<Call>();
+          if (!wCall || touchedCalls.count(wCall) || wCall->isReturn ||
+              wCall->target != wName || wCall->operands.size() != 1 ||
+              wCall->operands[0]->type == Type::unreachable ||
+              !Type::isSubType(wCall->operands[0]->type, wInputType)) {
+            allMatch = false;
+            break;
+          }
+          for (Index j = k + 1; j < m; j++) {
+            if (!canMoveWrapperPast(wFunc, s.call->operands[j])) {
+              allMatch = false;
+              break;
+            }
+          }
+          if (!allMatch) {
+            break;
+          }
+        }
+        if (!allMatch) {
+          continue;
+        }
+
+        Type oldParamType = currentParams[k];
+        LocalGet* singleGet = nullptr;
+        bool directSub = localWrites[k] == 0 && localReads[k] == 1 &&
+                         isSingleEntryReadSafe(callee, k, wFunc, singleGet);
+        unsigned costBytes = 3;
+        if (!directSub) {
+          if (wInputType == oldParamType) {
+            costBytes = 7;
+          } else if (oldParamType.isDefaultable()) {
+            costBytes = 9;
+          } else {
+            continue;
+          }
+        }
+        if (3 * N <= costBytes) {
+          continue;
+        }
+
+        // Apply in-place sinking on callee and all N call sites.
+        currentParams[k] = wInputType;
+        if (directSub) {
+          struct SingleGetReplacer : public PostWalker<SingleGetReplacer> {
+            LocalGet* target;
+            Expression* rep;
+            SingleGetReplacer(LocalGet* target, Expression* rep)
+              : target(target), rep(rep) {}
+            void visitLocalGet(LocalGet* curr) {
+              if (curr == target) {
+                replaceCurrent(rep);
+              }
+            }
+          };
+          Expression* wCallExpr = builder.makeCall(
+            wName, {builder.makeLocalGet(k, wInputType)}, wResultType);
+          SingleGetReplacer(singleGet, wCallExpr).walk(callee->body);
+        } else if (wInputType == oldParamType) {
+          Expression* setExpr = builder.makeLocalSet(
+            k,
+            builder.makeCall(
+              wName, {builder.makeLocalGet(k, wInputType)}, wResultType));
+          callee->body = builder.makeSequence(setExpr, callee->body);
+        } else {
+          Index tmpLocal = Builder::addVar(callee, oldParamType);
+          for (auto* lg : FindAll<LocalGet>(callee->body).list) {
+            if (lg->index == k) {
+              lg->index = tmpLocal;
+            }
+          }
+          for (auto* ls : FindAll<LocalSet>(callee->body).list) {
+            if (ls->index == k) {
+              ls->index = tmpLocal;
+            }
+          }
+          Expression* setExpr = builder.makeLocalSet(
+            tmpLocal,
+            builder.makeCall(
+              wName, {builder.makeLocalGet(k, wInputType)}, wResultType));
+          callee->body = builder.makeSequence(setExpr, callee->body);
+        }
+
+        for (const auto& s : sites) {
+          auto* wCall = s.call->operands[k]->cast<Call>();
+          touchedCalls.insert(s.call);
+          touchedCalls.insert(wCall);
+          s.call->operands[k] = wCall->operands[0];
+          modifiedFuncs.insert(s.caller);
+        }
+        modifiedCallees.insert(callee);
+        modifiedCallees.insert(wFunc);
+        calleeModified = true;
+        anyChanged = true;
+      }
+
+      if (calleeModified) {
+        callee->setParams(Type(currentParams));
+        modifiedFuncs.insert(callee);
+      }
+    }
+
+    // Part B: Partial wrapper specialization when shrinkLevel > 0 and a subset
+    // M >= 6 of callers of callee pass (call $w X_k) at parameter k.
+    if (getPassOptions().shrinkLevel > 0) {
+      struct PartialKey {
+        Name calleeName;
+        Index paramIdx;
+        Name wName;
+        bool operator<(const PartialKey& o) const {
+          return std::tie(calleeName, paramIdx, wName) <
+                 std::tie(o.calleeName, o.paramIdx, o.wName);
+        }
+      };
+      std::map<PartialKey, std::vector<CallSiteInfo>> partialGroups;
+
+      for (auto& f : wasm->functions) {
+        if (f->imported()) {
+          continue;
+        }
+        Function* caller = f.get();
+        for (auto* c : FindAll<Call>(caller->body).list) {
+          if (c->isReturn || touchedCalls.count(c)) {
+            continue;
+          }
+          Function* callee = wasm->getFunctionOrNull(c->target);
+          if (!callee || callee->imported() || modifiedCallees.count(callee) ||
+              c->operands.size() != callee->getNumParams()) {
+            continue;
+          }
+          bool hasUnreachable = false;
+          for (auto* op : c->operands) {
+            if (op->type == Type::unreachable) {
+              hasUnreachable = true;
+              break;
+            }
+          }
+          if (hasUnreachable) {
+            continue;
+          }
+          Index m = c->operands.size();
+          for (Index k = 0; k < m; k++) {
+            auto* wCall = c->operands[k]->dynCast<Call>();
+            if (!wCall || wCall->isReturn || touchedCalls.count(wCall) ||
+                wCall->operands.size() != 1 ||
+                wCall->operands[0]->type == Type::unreachable) {
+              continue;
+            }
+            Function* wFunc = wasm->getFunctionOrNull(wCall->target);
+            if (!wFunc || modifiedCallees.count(wFunc) ||
+                !wFunc->getParams().isSingle() ||
+                !wFunc->getResults().isSingle() ||
+                !Type::isSubType(wFunc->getResults(),
+                                 callee->getLocalType(k)) ||
+                !Type::isSubType(wCall->operands[0]->type,
+                                 wFunc->getParams())) {
+              continue;
+            }
+            bool laterSafe = true;
+            for (Index j = k + 1; j < m; j++) {
+              if (!canMoveWrapperPast(wFunc, c->operands[j])) {
+                laterSafe = false;
+                break;
+              }
+            }
+            if (!laterSafe) {
+              continue;
+            }
+            partialGroups[{callee->name, k, wCall->target}].push_back(
+              {caller, c});
+          }
+        }
+      }
+
+      // Sort candidate groups by descending site count so the largest wins are
+      // applied first.
+      std::vector<std::pair<PartialKey, std::vector<CallSiteInfo>>> sortedGroups(
+        partialGroups.begin(), partialGroups.end());
+      std::sort(sortedGroups.begin(),
+                sortedGroups.end(),
+                [](const auto& a, const auto& b) {
+                  if (a.second.size() != b.second.size()) {
+                    return a.second.size() > b.second.size();
+                  }
+                  return a.first < b.first;
+                });
+
+      for (auto& [pKey, sites] : sortedGroups) {
+        Function* callee = wasm->getFunction(pKey.calleeName);
+        Function* wFunc = wasm->getFunction(pKey.wName);
+        Index k = pKey.paramIdx;
+        std::vector<CallSiteInfo> active;
+        for (const auto& s : sites) {
+          if (touchedCalls.count(s.call)) {
+            continue;
+          }
+          auto* wCall = s.call->operands[k]->dynCast<Call>();
+          if (!wCall || touchedCalls.count(wCall) ||
+              wCall->target != pKey.wName || wCall->operands.size() != 1 ||
+              !Type::isSubType(wCall->operands[0]->type, wFunc->getParams())) {
+            continue;
+          }
+          active.push_back(s);
+        }
+        if (active.size() < 6) {
+          continue;
+        }
+        Index m = callee->getNumParams();
+        unsigned savedBytes = 3 * unsigned(active.size());
+        unsigned helperCost = 15 + 2 * unsigned(m);
+        if (savedBytes <= helperCost + 6) {
+          continue;
+        }
+
+        std::vector<Type> newParams(m);
+        for (Index j = 0; j < m; j++) {
+          newParams[j] =
+            (j == k) ? wFunc->getParams() : callee->getLocalType(j);
+        }
+        std::vector<Expression*> forwardArgs(m);
+        for (Index j = 0; j < m; j++) {
+          Expression* lg = builder.makeLocalGet(j, newParams[j]);
+          if (j == k) {
+            forwardArgs[j] =
+              builder.makeCall(wFunc->name, {lg}, wFunc->getResults());
+          } else {
+            forwardArgs[j] = lg;
+          }
+        }
+        Expression* newBody = builder.makeCall(
+          callee->name, forwardArgs, callee->getResults(), false);
+        Name newName = Names::getValidFunctionName(*wasm, "outlined_w");
+        Function* newFunc = wasm->addFunction(Builder::makeFunction(
+          newName, Signature(Type(newParams), callee->getResults()), {}, newBody));
+        ReFinalize().walkFunctionInModule(newFunc, wasm);
+
+        for (const auto& s : active) {
+          auto* wCall = s.call->operands[k]->cast<Call>();
+          s.call->target = newName;
+          s.call->operands[k] = wCall->operands[0];
+          touchedCalls.insert(s.call);
+          touchedCalls.insert(wCall);
+          modifiedFuncs.insert(s.caller);
+        }
+        anyChanged = true;
+      }
+    }
+
+    for (Function* func : modifiedFuncs) {
+      ReFinalize().walkFunctionInModule(func, wasm);
+      if (func->effects) {
+        func->effects =
+          std::make_unique<EffectAnalyzer>(getPassOptions(), *wasm, func);
+      }
+    }
+    return anyChanged;
   }
 };
 

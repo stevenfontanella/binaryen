@@ -232,7 +232,7 @@
 
   ;; CHECK:      (type $7 (func (param i32) (result (ref $obj))))
 
-  ;; CHECK:      (type $8 (func (param (ref null $obj) i32) (result i32)))
+  ;; CHECK:      (type $8 (func (param i32 i32) (result i32)))
 
   ;; CHECK:      (import "env" "f" (func $f (type $6) (param anyref i32 i32 i32) (result i32)))
   (import "env" "f" (func $f (param anyref i32 i32 i32) (result i32)))
@@ -371,9 +371,7 @@
   ;; CHECK:      (func $vcall1 (type $1) (param $x i32) (result i32)
   ;; CHECK-NEXT:  (local $r (ref null $obj))
   ;; CHECK-NEXT:  (call $get_vmethod
-  ;; CHECK-NEXT:   (call $make_obj
-  ;; CHECK-NEXT:    (local.get $x)
-  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.get $x)
   ;; CHECK-NEXT:   (i32.const 10)
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
@@ -388,9 +386,7 @@
   ;; CHECK:      (func $vcall2 (type $1) (param $x i32) (result i32)
   ;; CHECK-NEXT:  (local $r (ref null $obj))
   ;; CHECK-NEXT:  (call $get_vmethod
-  ;; CHECK-NEXT:   (call $make_obj
-  ;; CHECK-NEXT:    (local.get $x)
-  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.get $x)
   ;; CHECK-NEXT:   (i32.const 20)
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
@@ -405,9 +401,7 @@
   ;; CHECK:      (func $vcall3 (type $1) (param $x i32) (result i32)
   ;; CHECK-NEXT:  (local $r (ref null $obj))
   ;; CHECK-NEXT:  (call $get_vmethod
-  ;; CHECK-NEXT:   (call $make_obj
-  ;; CHECK-NEXT:    (local.get $x)
-  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.get $x)
   ;; CHECK-NEXT:   (i32.const 30)
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
@@ -421,13 +415,19 @@
   )
 
   ;; Folding call_ref into an existing single-purpose target helper in-place.
-  ;; CHECK:      (func $get_vmethod (type $8) (param $r (ref null $obj)) (param $1 i32) (result i32)
+  ;; CHECK:      (func $get_vmethod (type $8) (param $r i32) (param $1 i32) (result i32)
+  ;; CHECK-NEXT:  (local $2 (ref null $obj))
+  ;; CHECK-NEXT:  (local.set $2
+  ;; CHECK-NEXT:   (call $make_obj
+  ;; CHECK-NEXT:    (local.get $r)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
   ;; CHECK-NEXT:  (call_ref $vmethod
-  ;; CHECK-NEXT:   (local.get $r)
+  ;; CHECK-NEXT:   (local.get $2)
   ;; CHECK-NEXT:   (local.get $1)
   ;; CHECK-NEXT:   (struct.get $vt 0
   ;; CHECK-NEXT:    (struct.get $obj 0
-  ;; CHECK-NEXT:     (local.get $r)
+  ;; CHECK-NEXT:     (local.get $2)
   ;; CHECK-NEXT:    )
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
@@ -438,9 +438,7 @@
   ;; CHECK:      (func $vfold1 (type $1) (param $x i32) (result i32)
   ;; CHECK-NEXT:  (local $r (ref null $obj))
   ;; CHECK-NEXT:  (call $get_vmethod
-  ;; CHECK-NEXT:   (call $make_obj
-  ;; CHECK-NEXT:    (local.get $x)
-  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.get $x)
   ;; CHECK-NEXT:   (i32.const 40)
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
@@ -455,9 +453,7 @@
   ;; CHECK:      (func $vfold2 (type $1) (param $x i32) (result i32)
   ;; CHECK-NEXT:  (local $r (ref null $obj))
   ;; CHECK-NEXT:  (call $get_vmethod
-  ;; CHECK-NEXT:   (call $make_obj
-  ;; CHECK-NEXT:    (local.get $x)
-  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.get $x)
   ;; CHECK-NEXT:   (i32.const 50)
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
