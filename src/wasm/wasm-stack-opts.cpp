@@ -280,15 +280,21 @@ void StackIROptimizer::local2Stack() {
 #endif
                   insts[setIndex] = nullptr;
                   insts[getIndex] = nullptr;
-                  // Continuing on from here, replace this on the stack
-                  // with a null, representing a regular value. We
-                  // keep possible values above us active - they may
-                  // be optimized later, as they would be pushed after
-                  // us, and used before us, so there is no conflict.
-                  values[j] = null;
-                  optimized = true;
-                  break;
+                } else {
+                  // The local value is still needed for other gets (or for
+                  // validation dominance), so we cannot remove the set, but we
+                  // can turn the set into a tee and remove this get.
+                  insts[setIndex]->type = func->getLocalType(set->index);
+                  insts[getIndex] = nullptr;
                 }
+                // Continuing on from here, replace this on the stack
+                // with a null, representing a regular value. We
+                // keep possible values above us active - they may
+                // be optimized later, as they would be pushed after
+                // us, and used before us, so there is no conflict.
+                values[j] = null;
+                optimized = true;
+                break;
               }
             }
             // We failed here. Can we look some more?

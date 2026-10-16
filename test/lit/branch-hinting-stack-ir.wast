@@ -9,7 +9,6 @@
  ;; CHECK:      (type $0 (func))
 
  ;; CHECK:      (func $empty-if (type $0)
- ;; CHECK-NEXT:  (local $1 i32)
  ;; CHECK-NEXT:  (local $scratch i32)
  ;; CHECK-NEXT:  (@metadata.code.branch_hint "\00")
  ;; CHECK-NEXT:  (if

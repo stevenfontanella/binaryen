@@ -125,7 +125,7 @@ public:
   void emitFunctionEnd();
   void emitUnreachable();
   void emitUnreachableLocalSet(Index index);
-  void mapLocalsAndEmitHeader();
+  void mapLocalsAndEmitHeader(const std::vector<bool>* usedLocals = nullptr);
 
   MappedLocals mappedLocals;
 

@@ -315,8 +315,7 @@
   ;; CHECK-NEXT:  (local $d f64)
   ;; CHECK-NEXT:  local.get $d
   ;; CHECK-NEXT:  call $f64-to-int
-  ;; CHECK-NEXT:  local.set $i
-  ;; CHECK-NEXT:  local.get $i
+  ;; CHECK-NEXT:  local.tee $i
   ;; CHECK-NEXT:  f64.convert_i32_s
   ;; CHECK-NEXT:  local.set $d
   ;; CHECK-NEXT:  local.get $i
@@ -1149,11 +1148,10 @@
   ;; CHECK-NEXT:  (local $temp i32)
   ;; CHECK-NEXT:  i32.const 1
   ;; CHECK-NEXT:  call $local-to-stack
-  ;; CHECK-NEXT:  local.set $temp
+  ;; CHECK-NEXT:  local.tee $temp
   ;; CHECK-NEXT:  i32.const 2
   ;; CHECK-NEXT:  call $local-to-stack
   ;; CHECK-NEXT:  drop
-  ;; CHECK-NEXT:  local.get $temp
   ;; CHECK-NEXT:  local.get $temp
   ;; CHECK-NEXT:  i32.add
   ;; CHECK-NEXT: )
@@ -1261,11 +1259,10 @@
   ;; CHECK-NEXT:  drop
   ;; CHECK-NEXT:  i32.const 3
   ;; CHECK-NEXT:  call $local-to-stack-multi-4
-  ;; CHECK-NEXT:  local.set $temp2
+  ;; CHECK-NEXT:  local.tee $temp2
   ;; CHECK-NEXT:  i32.const 4
   ;; CHECK-NEXT:  call $local-to-stack-multi-4
   ;; CHECK-NEXT:  drop
-  ;; CHECK-NEXT:  local.get $temp2
   ;; CHECK-NEXT:  local.get $temp2
   ;; CHECK-NEXT:  i32.add
   ;; CHECK-NEXT: )
@@ -1288,11 +1285,10 @@
   ;; CHECK-NEXT:  (local $temp2 i32)
   ;; CHECK-NEXT:  i32.const 1
   ;; CHECK-NEXT:  call $local-to-stack-multi-4
-  ;; CHECK-NEXT:  local.set $temp1
+  ;; CHECK-NEXT:  local.tee $temp1
   ;; CHECK-NEXT:  i32.const 2
   ;; CHECK-NEXT:  call $local-to-stack-multi-4
   ;; CHECK-NEXT:  drop
-  ;; CHECK-NEXT:  local.get $temp1
   ;; CHECK-NEXT:  local.get $temp1
   ;; CHECK-NEXT:  i32.add
   ;; CHECK-NEXT:  drop

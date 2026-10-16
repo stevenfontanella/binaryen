@@ -3238,7 +3238,8 @@ void BinaryInstWriter::emitUnreachableLocalSet(Index index) {
   visitLocalSet(&set);
 }
 
-void BinaryInstWriter::mapLocalsAndEmitHeader() {
+void BinaryInstWriter::mapLocalsAndEmitHeader(
+  const std::vector<bool>* usedLocals) {
   assert(func && "BinaryInstWriter: function is not set");
   // Map params
   for (Index i = 0; i < func->getNumParams(); i++) {
@@ -3286,8 +3287,11 @@ void BinaryInstWriter::mapLocalsAndEmitHeader() {
     return;
   }
 
-  for (auto type : func->vars) {
-    for (const auto& t : type) {
+  for (Index i = func->getVarIndexBase(); i < func->getNumLocals(); i++) {
+    if (usedLocals && !(*usedLocals)[i]) {
+      continue;
+    }
+    for (const auto& t : func->getLocalType(i)) {
       noteLocalType(t);
     }
   }
@@ -3330,6 +3334,9 @@ void BinaryInstWriter::mapLocalsAndEmitHeader() {
 
   // Map the IR index pairs to indices.
   for (Index i = func->getVarIndexBase(); i < func->getNumLocals(); i++) {
+    if (usedLocals && !(*usedLocals)[i]) {
+      continue;
+    }
     Index j = 0;
     for (const auto& type : func->getLocalType(i)) {
       mappedLocals[{i, j++}] = nextFreeIndex[type]++;
@@ -3722,7 +3729,18 @@ void StackIRToBinaryWriter::write() {
   if (func->prologLocation) {
     parent.writeDebugLocation(*func->prologLocation);
   }
-  writer.mapLocalsAndEmitHeader();
+  std::vector<bool> usedLocals(func->getNumLocals(), false);
+  for (auto* inst : stackIR) {
+    if (!inst) {
+      continue;
+    }
+    if (auto* get = inst->origin->dynCast<LocalGet>()) {
+      usedLocals[get->index] = true;
+    } else if (auto* set = inst->origin->dynCast<LocalSet>()) {
+      usedLocals[set->index] = true;
+    }
+  }
+  writer.mapLocalsAndEmitHeader(&usedLocals);
   // Stack to track indices of catches within a try
   SmallVector<Index, 4> catchIndexStack;
   for (auto* inst : stackIR) {
@@ -3741,7 +3759,15 @@ void StackIRToBinaryWriter::write() {
         if (sourceMap) {
           parent.writeSourceMapLocation(inst->origin, func);
         }
+        auto* set = inst->origin->dynCast<LocalSet>();
+        bool tempTee = set && !set->isTee() && inst->type.isConcrete();
+        if (tempTee) {
+          set->makeTee(inst->type);
+        }
         writer.visit(inst->origin);
+        if (tempTee) {
+          set->makeSet();
+        }
         break;
       }
       case StackInst::TryEnd:

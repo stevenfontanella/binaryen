@@ -3848,7 +3848,15 @@ printStackInst(StackInst* inst, std::ostream& o, Function* func) {
     case StackInst::IfBegin:
     case StackInst::LoopBegin:
     case StackInst::TryBegin: {
+      auto* set = inst->origin->dynCast<LocalSet>();
+      bool tempTee = set && !set->isTee() && inst->type.isConcrete();
+      if (tempTee) {
+        set->makeTee(inst->type);
+      }
       PrintExpressionContents(printer).visit(inst->origin);
+      if (tempTee) {
+        set->makeSet();
+      }
       break;
     }
     case StackInst::BlockEnd:
@@ -3907,7 +3915,15 @@ static std::ostream& printStackIR(StackIR* ir, PrintSExpression& printer) {
         }
 
         doIndent();
+        auto* set = inst->origin->dynCast<LocalSet>();
+        bool tempTee = set && !set->isTee() && inst->type.isConcrete();
+        if (tempTee) {
+          set->makeTee(inst->type);
+        }
         PrintExpressionContents(printer).visit(inst->origin);
+        if (tempTee) {
+          set->makeSet();
+        }
         break;
       }
       case StackInst::TryBegin:

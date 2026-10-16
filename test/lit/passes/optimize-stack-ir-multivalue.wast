@@ -41,9 +41,6 @@
   ;; ROUNDTRIP:      (type $6 (func (param f64) (result i32 anyref anyref)))
 
   ;; ROUNDTRIP:      (func $multivalue-return (type $0) (result i32 f64 anyref)
-  ;; ROUNDTRIP-NEXT:  (local $temp i32)
-  ;; ROUNDTRIP-NEXT:  (local $1 f64)
-  ;; ROUNDTRIP-NEXT:  (local $2 anyref)
   ;; ROUNDTRIP-NEXT:  call $multivalue-return
   ;; ROUNDTRIP-NEXT: )
   (func $multivalue-return (result i32 f64 anyref)
@@ -117,9 +114,6 @@
   ;; CHECK-NEXT:  tuple.make 4
   ;; CHECK-NEXT: )
   ;; ROUNDTRIP:      (func $multivalue-return-extra (type $4) (result i32 f64 anyref eqref)
-  ;; ROUNDTRIP-NEXT:  (local $temp i32)
-  ;; ROUNDTRIP-NEXT:  (local $1 f64)
-  ;; ROUNDTRIP-NEXT:  (local $2 anyref)
   ;; ROUNDTRIP-NEXT:  (local $scratch (tuple i32 f64 anyref))
   ;; ROUNDTRIP-NEXT:  call $multivalue-return
   ;; ROUNDTRIP-NEXT:  ref.null none
@@ -435,14 +429,9 @@
   ;; CHECK-NEXT:  call $multiple-multivalue-return
   ;; CHECK-NEXT: )
   ;; ROUNDTRIP:      (func $multiple-multivalue-return (type $2) (param $0 i32) (param $1 f64) (param $2 anyref)
-  ;; ROUNDTRIP-NEXT:  (local $temp3 i32)
-  ;; ROUNDTRIP-NEXT:  (local $temp2 i32)
-  ;; ROUNDTRIP-NEXT:  (local $5 f64)
-  ;; ROUNDTRIP-NEXT:  (local $6 f64)
-  ;; ROUNDTRIP-NEXT:  (local $7 anyref)
   ;; ROUNDTRIP-NEXT:  (local $scratch (tuple i32 f64 anyref))
-  ;; ROUNDTRIP-NEXT:  (local $scratch_9 (tuple i32 f64))
-  ;; ROUNDTRIP-NEXT:  (local $scratch_10 (tuple i32 f64 anyref))
+  ;; ROUNDTRIP-NEXT:  (local $scratch_4 (tuple i32 f64))
+  ;; ROUNDTRIP-NEXT:  (local $scratch_5 (tuple i32 f64 anyref))
   ;; ROUNDTRIP-NEXT:  call $multivalue-return
   ;; ROUNDTRIP-NEXT:  call $multiple-multivalue-return
   ;; ROUNDTRIP-NEXT:  call $multivalue-return-too-short
@@ -520,13 +509,11 @@
   ;; CHECK-NEXT: )
   ;; ROUNDTRIP:      (func $multiple-multivalue-return-local-reuse (type $2) (param $0 i32) (param $1 f64) (param $2 anyref)
   ;; ROUNDTRIP-NEXT:  (local $temp3 i32)
-  ;; ROUNDTRIP-NEXT:  (local $temp2 i32)
-  ;; ROUNDTRIP-NEXT:  (local $5 f64)
-  ;; ROUNDTRIP-NEXT:  (local $6 f64)
-  ;; ROUNDTRIP-NEXT:  (local $7 anyref)
+  ;; ROUNDTRIP-NEXT:  (local $4 f64)
+  ;; ROUNDTRIP-NEXT:  (local $5 anyref)
   ;; ROUNDTRIP-NEXT:  (local $scratch (tuple i32 f64 anyref))
-  ;; ROUNDTRIP-NEXT:  (local $scratch_9 f64)
-  ;; ROUNDTRIP-NEXT:  (local $scratch_10 i32)
+  ;; ROUNDTRIP-NEXT:  (local $scratch_7 f64)
+  ;; ROUNDTRIP-NEXT:  (local $scratch_8 i32)
   ;; ROUNDTRIP-NEXT:  call $multivalue-return
   ;; ROUNDTRIP-NEXT:  local.tee $scratch
   ;; ROUNDTRIP-NEXT:  tuple.extract 3 0
@@ -534,15 +521,15 @@
   ;; ROUNDTRIP-NEXT:  tuple.extract 3 1
   ;; ROUNDTRIP-NEXT:  local.get $scratch
   ;; ROUNDTRIP-NEXT:  tuple.extract 3 2
-  ;; ROUNDTRIP-NEXT:  local.set $7
   ;; ROUNDTRIP-NEXT:  local.set $5
+  ;; ROUNDTRIP-NEXT:  local.set $4
   ;; ROUNDTRIP-NEXT:  local.tee $temp3
+  ;; ROUNDTRIP-NEXT:  local.get $4
   ;; ROUNDTRIP-NEXT:  local.get $5
-  ;; ROUNDTRIP-NEXT:  local.get $7
   ;; ROUNDTRIP-NEXT:  call $multiple-multivalue-return
   ;; ROUNDTRIP-NEXT:  local.get $temp3
+  ;; ROUNDTRIP-NEXT:  local.get $4
   ;; ROUNDTRIP-NEXT:  local.get $5
-  ;; ROUNDTRIP-NEXT:  local.get $7
   ;; ROUNDTRIP-NEXT:  call $multiple-multivalue-return
   ;; ROUNDTRIP-NEXT: )
   (func $multiple-multivalue-return-local-reuse (param i32 f64 anyref)

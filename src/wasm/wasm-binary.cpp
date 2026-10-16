@@ -1080,8 +1080,13 @@ void WasmBinaryWriter::writeNames() {
     Index checked = 0;
     auto check = [&](Function* curr) {
       auto numLocals = curr->getNumLocals();
+      auto iter = funcMappedLocals.find(curr->name);
       for (Index i = 0; i < numLocals; ++i) {
         if (curr->hasLocalName(i)) {
+          if (iter != funcMappedLocals.end() &&
+              !iter->second.contains({i, 0})) {
+            continue;
+          }
           functionsWithLocalNames.push_back({checked, curr});
           break;
         }
@@ -1107,7 +1112,11 @@ void WasmBinaryWriter::writeNames() {
             auto iter = funcMappedLocals.find(func->name);
             if (iter != funcMappedLocals.end()) {
               // TODO: handle multivalue
-              indexInBinary = iter->second[{indexInFunc, 0}];
+              auto mapIter = iter->second.find({indexInFunc, 0});
+              if (mapIter == iter->second.end()) {
+                continue;
+              }
+              indexInBinary = mapIter->second;
             } else {
               // No data on funcMappedLocals. That is only possible if we are an
               // imported function, where there are no locals to map, and in

@@ -58,6 +58,7 @@
 
 #include "ir/child-typer.h"
 #include "ir/eh-utils.h"
+#include "ir/find_all.h"
 #include "ir/names.h"
 #include "ir/principal-type.h"
 #include "ir/properties.h"
@@ -147,6 +148,40 @@ MaybeResult<IRBuilder::HoistedVal> IRBuilder::hoistLastValue(bool greedy) {
   // with another function type in the module. Avoid this problem by
   // generalizing the scratch local type eagerly.
   auto type = expr->type.asWrittenGivenFeatures(wasm.features);
+  if (auto* tee = expr->dynCast<LocalSet>();
+      tee && tee->isTee() && type.isSingle() &&
+      func->getLocalType(tee->index) == type) {
+    bool modified = false;
+    for (size_t i = valIndex + 1; i < stack.size(); ++i) {
+      for (auto* set : FindAll<LocalSet>(stack[i]).list) {
+        if (set->index == tee->index) {
+          modified = true;
+          break;
+        }
+      }
+      if (modified) {
+        break;
+      }
+    }
+    if (!modified) {
+      tee->makeSet();
+      auto* get = builder.makeLocalGet(tee->index, type);
+      pushSynthetic(get);
+      if (!greedy) {
+        bool hasPrecedingValue = false;
+        for (int i = 0; i < valIndex; ++i) {
+          if (stack[i]->type != Type::none) {
+            hasPrecedingValue = true;
+            break;
+          }
+        }
+        if (!hasPrecedingValue) {
+          hoistIndex = stack.size() - 1;
+        }
+      }
+      return HoistedVal{Index(hoistIndex), get};
+    }
+  }
   auto scratchIdx = addScratchLocal(type);
   CHECK_ERR(scratchIdx);
   expr = builder.makeLocalSet(*scratchIdx, expr);

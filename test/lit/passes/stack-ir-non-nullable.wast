@@ -8,8 +8,7 @@
  ;; CHECK:      (func $if (type $1) (param $param (ref eq)) (result (ref eq))
  ;; CHECK-NEXT:  (local $temp (ref eq))
  ;; CHECK-NEXT:  local.get $param
- ;; CHECK-NEXT:  local.set $temp
- ;; CHECK-NEXT:  local.get $temp
+ ;; CHECK-NEXT:  local.tee $temp
  ;; CHECK-NEXT:  i32.const 0
  ;; CHECK-NEXT:  ref.i31
  ;; CHECK-NEXT:  ref.eq
@@ -163,8 +162,7 @@
  ;; CHECK:      (func $if-wrong-extra-set (type $1) (param $param (ref eq)) (result (ref eq))
  ;; CHECK-NEXT:  (local $temp (ref eq))
  ;; CHECK-NEXT:  local.get $param
- ;; CHECK-NEXT:  local.set $temp
- ;; CHECK-NEXT:  local.get $temp
+ ;; CHECK-NEXT:  local.tee $temp
  ;; CHECK-NEXT:  i32.const 0
  ;; CHECK-NEXT:  ref.i31
  ;; CHECK-NEXT:  ref.eq
@@ -557,15 +555,13 @@
  ;; CHECK-NEXT:  i32.const 0
  ;; CHECK-NEXT:  if
  ;; CHECK-NEXT:   local.get $param
- ;; CHECK-NEXT:   local.set $temp
- ;; CHECK-NEXT:   local.get $temp
+ ;; CHECK-NEXT:   local.tee $temp
  ;; CHECK-NEXT:   drop
  ;; CHECK-NEXT:   local.get $temp
  ;; CHECK-NEXT:   drop
  ;; CHECK-NEXT:  else
  ;; CHECK-NEXT:   local.get $param
- ;; CHECK-NEXT:   local.set $temp
- ;; CHECK-NEXT:   local.get $temp
+ ;; CHECK-NEXT:   local.tee $temp
  ;; CHECK-NEXT:   drop
  ;; CHECK-NEXT:   local.get $temp
  ;; CHECK-NEXT:   drop
@@ -625,8 +621,7 @@
  ;; CHECK-NEXT:   drop
  ;; CHECK-NEXT:  else
  ;; CHECK-NEXT:   local.get $param
- ;; CHECK-NEXT:   local.set $temp
- ;; CHECK-NEXT:   local.get $temp
+ ;; CHECK-NEXT:   local.tee $temp
  ;; CHECK-NEXT:   drop
  ;; CHECK-NEXT:   local.get $temp
  ;; CHECK-NEXT:   drop
@@ -674,8 +669,7 @@
  ;; CHECK-NEXT:  i32.const 0
  ;; CHECK-NEXT:  if
  ;; CHECK-NEXT:   local.get $param
- ;; CHECK-NEXT:   local.set $temp
- ;; CHECK-NEXT:   local.get $temp
+ ;; CHECK-NEXT:   local.tee $temp
  ;; CHECK-NEXT:   drop
  ;; CHECK-NEXT:   local.get $temp
  ;; CHECK-NEXT:   drop
@@ -876,10 +870,9 @@
  ;; CHECK:      (func $nesting-relevant (type $0) (param $param (ref eq))
  ;; CHECK-NEXT:  (local $temp (ref eq))
  ;; CHECK-NEXT:  local.get $param
- ;; CHECK-NEXT:  local.set $temp
+ ;; CHECK-NEXT:  local.tee $temp
  ;; CHECK-NEXT:  local.get $temp
  ;; CHECK-NEXT:  drop
- ;; CHECK-NEXT:  local.get $temp
  ;; CHECK-NEXT:  drop
  ;; CHECK-NEXT: )
  (func $nesting-relevant (param $param (ref eq))
@@ -954,12 +947,10 @@
  ;; CHECK:      (func $nesting-covered-but-ended (type $0) (param $param (ref eq))
  ;; CHECK-NEXT:  (local $temp (ref eq))
  ;; CHECK-NEXT:  local.get $param
- ;; CHECK-NEXT:  local.set $temp
- ;; CHECK-NEXT:  local.get $temp
+ ;; CHECK-NEXT:  local.tee $temp
  ;; CHECK-NEXT:  drop
  ;; CHECK-NEXT:  local.get $param
- ;; CHECK-NEXT:  local.set $temp
- ;; CHECK-NEXT:  local.get $temp
+ ;; CHECK-NEXT:  local.tee $temp
  ;; CHECK-NEXT:  drop
  ;; CHECK-NEXT:  local.get $temp
  ;; CHECK-NEXT:  drop
@@ -992,8 +983,7 @@
  ;; CHECK:      (func $two-covers (type $1) (param $param (ref eq)) (result (ref eq))
  ;; CHECK-NEXT:  (local $temp (ref eq))
  ;; CHECK-NEXT:  local.get $param
- ;; CHECK-NEXT:  local.set $temp
- ;; CHECK-NEXT:  local.get $temp
+ ;; CHECK-NEXT:  local.tee $temp
  ;; CHECK-NEXT:  i32.const 0
  ;; CHECK-NEXT:  ref.i31
  ;; CHECK-NEXT:  ref.eq
