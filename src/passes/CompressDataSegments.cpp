@@ -73,8 +73,9 @@ struct CompressDataSegments : public Pass {
     Index off;
     Index n;
     Index w;
+    bool zigzag;
     bool operator==(const Slice& o) const {
-      return off == o.off && n == o.n && w == o.w;
+      return off == o.off && n == o.n && w == o.w && zigzag == o.zigzag;
     }
     bool operator<(const Slice& o) const {
       if (off != o.off) {
@@ -83,7 +84,10 @@ struct CompressDataSegments : public Pass {
       if (n != o.n) {
         return n < o.n;
       }
-      return w < o.w;
+      if (w != o.w) {
+        return w < o.w;
+      }
+      return zigzag < o.zigzag;
     }
   };
 
@@ -446,8 +450,8 @@ struct CompressDataSegments : public Pass {
     }
   }
 
-  static void
-  transformSlice(std::vector<uint8_t>& buf, Index off, Index n, Index w) {
+  static void transformSlice(
+    std::vector<uint8_t>& buf, Index off, Index n, Index w, bool zigzag) {
     if (n == 0 || w <= 1) {
       return;
     }
@@ -459,6 +463,12 @@ struct CompressDataSegments : public Pass {
         v |= uint64_t(buf[off + i * w + b]) << (8 * b);
       }
       uint64_t d = v - prev;
+      if (zigzag) {
+        int64_t sdiff = (w == 2)   ? int16_t(d)
+                        : (w == 4) ? int32_t(d)
+                                   : int64_t(d);
+        d = (uint64_t(sdiff) << 1) ^ uint64_t(sdiff >> 63);
+      }
       prev = v;
       for (Index b = 0; b < w; b++) {
         tmp[size_t(b) * n + i] = uint8_t((d >> (8 * b)) & 0xFF);
@@ -490,12 +500,12 @@ struct CompressDataSegments : public Pass {
     }
 
     std::vector<Slice> slices;
-    auto addResolved = [&](const NewSite& site, Index w) -> bool {
+    auto addResolved = [&](const NewSite& site, Index w, bool zigzag) -> bool {
       if (site.curr->offset->is<Const>() && site.curr->size->is<Const>()) {
         uint32_t off = site.curr->offset->cast<Const>()->value.geti32();
         uint32_t n = site.curr->size->cast<Const>()->value.geti32();
         if (n > 0) {
-          slices.push_back({off, n, w});
+          slices.push_back({off, n, w, zigzag});
         }
         return true;
       }
@@ -522,7 +532,7 @@ struct CompressDataSegments : public Pass {
           uint32_t off = offExpr->cast<Const>()->value.geti32();
           uint32_t n = nExpr->cast<Const>()->value.geti32();
           if (n > 0) {
-            slices.push_back({off, n, w});
+            slices.push_back({off, n, w, zigzag});
           }
         }
         return true;
@@ -535,7 +545,7 @@ struct CompressDataSegments : public Pass {
                                  ? add->right->cast<Const>()->value.geti32()
                                  : add->left->cast<Const>()->value.geti32();
             if (colBase >= 4) {
-              slices.push_back({colBase, singleTableCount, w});
+              slices.push_back({colBase, singleTableCount, w, zigzag});
               return true;
             }
           }
@@ -545,8 +555,10 @@ struct CompressDataSegments : public Pass {
     };
 
     for (auto& site : segUses.news) {
-      Index w = site.curr->type.getHeapType().getArray().element.getByteSize();
-      if (!addResolved(site, w) && w > 1) {
+      auto element = site.curr->type.getHeapType().getArray().element;
+      Index w = element.getByteSize();
+      bool zigzag = !element.type.isFloat();
+      if (!addResolved(site, w, zigzag) && w > 1) {
         return std::nullopt;
       }
     }
@@ -568,7 +580,7 @@ struct CompressDataSegments : public Pass {
     std::vector<uint8_t> bytes(segment.data.begin(), segment.data.end());
     for (auto& s : slices) {
       if (s.w > 1) {
-        transformSlice(bytes, s.off, s.n, s.w);
+        transformSlice(bytes, s.off, s.n, s.w, s.zigzag);
       }
     }
     return bytes;
@@ -747,10 +759,25 @@ struct CompressDataSegments : public Pass {
                                         : builder.makeConst(int32_t(8))),
                 byte)),
             builder.makeBreak(byteLabel, nullptr, get(k))}))});
+    Expression* delta = get(v, valueType);
+    if (!element.type.isFloat()) {
+      delta = builder.makeBinary(
+        wide ? XorInt64 : XorInt32,
+        builder.makeBinary(wide ? ShrUInt64 : ShrUInt32,
+                           get(v, valueType),
+                           wide ? builder.makeConst(int64_t(1))
+                                : builder.makeConst(int32_t(1))),
+        builder.makeBinary(
+          wide ? SubInt64 : SubInt32,
+          wide ? builder.makeConst(int64_t(0)) : builder.makeConst(int32_t(0)),
+          builder.makeBinary(wide ? AndInt64 : AndInt32,
+                             get(v, valueType),
+                             wide ? builder.makeConst(int64_t(1))
+                                  : builder.makeConst(int32_t(1)))));
+    }
     Expression* value = builder.makeLocalTee(
       acc,
-      builder.makeBinary(
-        wide ? AddInt64 : AddInt32, get(acc, valueType), get(v, valueType)),
+      builder.makeBinary(wide ? AddInt64 : AddInt32, get(acc, valueType), delta),
       valueType);
     if (element.type == Type::f32) {
       value = builder.makeUnary(ReinterpretInt32, value);

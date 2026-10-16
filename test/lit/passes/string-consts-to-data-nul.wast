@@ -104,7 +104,7 @@
 
   ;; CHECK:      (global $string.consts$sp (mut i32) (i32.const 9))
 
-  ;; CHECK:      (data $string.consts "Paa\00bb\00zz\00col-ok\00slot\06\07")
+  ;; CHECK:      (data $string.consts "Paa\00bb\00zz\00col-ok\00slot\n\07")
 
   ;; CHECK:      (export "col" (func $read-column))
 
@@ -548,7 +548,7 @@
 ;; CHECK-NEXT:     (local.set $5
 ;; CHECK-NEXT:      (i32.add
 ;; CHECK-NEXT:       (local.get $5)
-;; CHECK-NEXT:       (i32.const 3)
+;; CHECK-NEXT:       (i32.const 2)
 ;; CHECK-NEXT:      )
 ;; CHECK-NEXT:     )
 ;; CHECK-NEXT:     (loop $copy

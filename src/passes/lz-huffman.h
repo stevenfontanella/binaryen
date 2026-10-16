@@ -27,20 +27,22 @@
 //
 //   0: a run of narrow literals, 1 byte per unit (all units < 256)
 //   1: a run of wide literals, 2 bytes per unit, little-endian
-//   2: a match of length + 3 units, 1 byte distance - 1 follows
-//   3: a match of length + 3 units, 2 bytes distance - 1 follow
+//   2: a match of length + 2 units, 1 byte distance - 1 follows
+//   3: a match of length + 2 units, 2 bytes distance - 1 follow
 //
 // The bytes of the token stream are then entropy-coded: each byte belongs to
 // one of eight classes (token, extra length, narrow literal, wide literal low
 // and high byte, short distance, long distance low and high byte), and each
 // class gets its own canonical Huffman code with code lengths of at most 15
-// bits. The segment then holds, per used class, the number of codes of each
-// length (15 bytes) followed by the symbols in canonical order, and after the
-// tables one bit stream of the codes in token order (packed LSB-first, each
-// code written from its most significant bit). The decoder reads a code bit
-// by bit, as in zlib's puff.c, directly from the tables in the segment, so no
-// decoding tables are built at runtime. When the bit stream plus the tables
-// would not be smaller than the plain bytes, the plain bytes are kept.
+// bits (or is emitted as raw 8-bit bytes when a Huffman table would not pay
+// for itself). The segment then holds, per Huffman-coded class, the number of
+// codes of each length (15 bytes) followed by the symbols in canonical order,
+// and after the tables one bit stream of the codes in token order (packed
+// LSB-first, each code written from its most significant bit). The decoder
+// reads a code bit by bit, as in zlib's puff.c, directly from the tables in
+// the segment, so no decoding tables are built at runtime. When the bit stream
+// plus the tables would not be smaller than the plain bytes, the plain bytes
+// are kept.
 //
 // The LZ77 parse is optimal for a cost model: the first parse uses byte
 // costs, and when the result is Huffman-coded the parse is repeated with the
@@ -79,13 +81,15 @@ enum Table : uint8_t {
 using Symbol = std::pair<Table, uint8_t>;
 
 static constexpr Index MaxCodeLength = 15;
-static constexpr Index MinMatch = 3;
+static constexpr Index MinMatch = 2;
+static constexpr Index RawByteOffset = Index(-8);
 
 struct Segment {
   std::vector<char> data;
   // Whether the bytes are Huffman-coded.
   bool huffman = false;
-  // The offset of the table of each class in the data (unused: 0).
+  // The offset of the table of each class in the data (unused: 0, raw 8-bit:
+  // RawByteOffset).
   std::array<Index, NumTables> tableOffsets{};
   // The bit offset of the first code.
   Index firstBit = 0;
@@ -98,8 +102,8 @@ struct Encoder {
   std::vector<uint16_t> units;
   // Whether to find matches (otherwise only literal runs are emitted).
   bool compress = true;
-  // 0: never Huffman-code, 1: always, 2: when smaller (by more than the
-  // decoder's size).
+  // 0: never Huffman-code, 1: always, 2: when smaller (per table and overall,
+  // by more than the decoder's size).
   int huffman = 2;
   // The size of the symbol decoder, which the plain layout saves.
   Index decoderSize = 100;
@@ -111,79 +115,41 @@ struct Encoder {
   static constexpr Index MaxDistance = 65536;
   static constexpr Index HashBits = 17;
   static constexpr Index MaxChain = 1024;
+  static constexpr Index MaxChain2 = 64;
 
   struct Match {
     Index length = 0;
     Index distance = 0;
   };
 
-  // The match candidates kept per position: matches found walking the hash
-  // chain from the nearest to the farthest position, each longer than the
-  // previous one (so they are ordered by increasing distance and length).
-  static constexpr Index MaxCandidates = 8;
-  using Candidates = std::array<Match, MaxCandidates>;
-
-  // Finds, for every position, the candidate matches.
-  void findMatches(std::vector<Candidates>& matches) {
-    Index n = units.size();
-    matches.assign(n, Candidates{});
-    if (n < MinMatch) {
-      return;
-    }
-    std::vector<Index> head(Index(1) << HashBits, Index(-1));
-    std::vector<Index> prev(n, Index(-1));
-    auto hash = [&](Index i) {
-      uint32_t h = units[i] * 0x9E3779B1u ^ units[i + 1] * 0x85EBCA77u ^
-                   units[i + 2] * 0xC2B2AE3Du;
-      return h >> (32 - HashBits);
-    };
-    for (Index i = 0; i + MinMatch <= n; i++) {
-      auto h = hash(i);
-      Index maxLength = std::min(MaxMatch, n - i);
-      Index j = head[h];
-      Index chain = 0;
-      auto& candidates = matches[i];
-      Index numCandidates = 0;
-      Index bestLength = MinMatch - 1;
-      while (j != Index(-1) && chain++ < MaxChain) {
-        Index distance = i - j;
-        if (distance > MaxDistance) {
-          break;
-        }
-        Index length = 0;
-        while (length < maxLength && units[j + length] == units[i + length]) {
-          length++;
-        }
-        if (length > bestLength) {
-          bestLength = length;
-          // When the list is full, the longest match replaces the last one.
-          if (numCandidates == MaxCandidates) {
-            numCandidates--;
-          }
-          candidates[numCandidates++] = {length, distance};
-          if (length == maxLength) {
-            break;
-          }
-        }
-        j = prev[j];
-      }
-      prev[i] = head[h];
-      head[h] = i;
-    }
-  }
+  // The match candidates kept per position, ordered by increasing length.
+  static constexpr Index MaxCandidates = 12;
+  struct Candidates {
+    std::array<Match, MaxCandidates> data{};
+    Index size = 0;
+  };
 
   // The cost of each symbol in the parse, in bits. The first parse uses 8 bits
   // per byte; later parses use the code lengths of the previous Huffman code.
   struct CostModel {
     std::array<std::array<Index, 256>, NumTables> cost;
-    // The cost of the token that starts a run of literals.
-    Index literalRun;
+    // The cost of the token that starts a narrow or wide run of literals.
+    Index narrowRun = 8;
+    Index wideRun = 8;
 
     CostModel() {
       for (auto& table : cost) {
         table.fill(8);
       }
-      literalRun = 8;
+    }
+
+    Index distCost(Index distance) const {
+      distance--;
+      if (distance < ShortDistance) {
+        return cost[ShortDistTable][distance];
+      }
+      return cost[DistLoTable][distance & 0xFF] +
+             cost[DistHiTable][distance >> 8];
     }
 
     Index matchCost(Index length, Index distance) const {
@@ -197,67 +163,256 @@ struct Encoder {
           cost[TokenTable][(distance <= ShortDistance ? 2 : 3) | (63 << 2)] +
           cost[ExtraTable][tokenLength - 63];
       }
-      distance--;
-      if (distance < ShortDistance) {
-        bits += cost[ShortDistTable][distance];
-      } else {
-        bits +=
-          cost[DistLoTable][distance & 0xFF] + cost[DistHiTable][distance >> 8];
-      }
-      return bits;
-    }
-
-    Index literalCost(uint16_t unit) const {
-      if (unit < 256) {
-        return cost[NarrowTable][unit];
-      }
-      return cost[WideLoTable][unit & 0xFF] + cost[WideHiTable][unit >> 8];
+      return bits + distCost(distance);
     }
   };
 
+  struct HashChains {
+    std::vector<Index> first2;
+    std::vector<Index> prev2;
+    std::vector<Index> first3;
+    std::vector<Index> prev3;
+  };
+
+  HashChains buildChains() const {
+    Index n = units.size();
+    HashChains chains;
+    if (n < MinMatch) {
+      return chains;
+    }
+    chains.first2.assign(n, Index(-1));
+    chains.prev2.assign(n, Index(-1));
+    chains.first3.assign(n, Index(-1));
+    chains.prev3.assign(n, Index(-1));
+    std::vector<Index> head2(Index(1) << HashBits, Index(-1));
+    std::vector<Index> head3(Index(1) << HashBits, Index(-1));
+    auto hash2 = [&](Index i) {
+      uint32_t h = units[i] * 0x9E3779B1u ^ units[i + 1] * 0x85EBCA77u;
+      return h >> (32 - HashBits);
+    };
+    auto hash3 = [&](Index i) {
+      uint32_t h = units[i] * 0x9E3779B1u ^ units[i + 1] * 0x85EBCA77u ^
+                   units[i + 2] * 0xC2B2AE3Du;
+      return h >> (32 - HashBits);
+    };
+    for (Index i = 0; i + MinMatch <= n; i++) {
+      auto h2 = hash2(i);
+      chains.first2[i] = head2[h2];
+      chains.prev2[i] = head2[h2];
+      head2[h2] = i;
+      if (i + 3 <= n) {
+        auto h3 = hash3(i);
+        chains.first3[i] = head3[h3];
+        chains.prev3[i] = head3[h3];
+        head3[h3] = i;
+      }
+    }
+    return chains;
+  }
+
+  // Finds, for every position, the candidate matches. When a Huffman cost
+  // model is provided, also retains matches with cheaper distance codes.
+  void findMatches(const HashChains& chains,
+                   std::vector<Candidates>& matches,
+                   const CostModel* model = nullptr) {
+    Index n = units.size();
+    matches.assign(n, Candidates{});
+    if (n < MinMatch) {
+      return;
+    }
+    for (Index i = 0; i + MinMatch <= n; i++) {
+      Index maxLength = std::min(MaxMatch, n - i);
+      auto& candidates = matches[i];
+      Index bestLength = MinMatch - 1;
+
+      Index j2 = chains.first2[i];
+      if (model) {
+        Index chain2 = 0;
+        Index bestDist2 = 0;
+        Index bestCost2 = Index(-1);
+        Index firstLen = 0;
+        Index firstDist = 0;
+        while (j2 != Index(-1) && chain2++ < MaxChain2) {
+          Index distance = i - j2;
+          if (distance > MaxDistance) {
+            break;
+          }
+          if (units[j2] == units[i] && units[j2 + 1] == units[i + 1]) {
+            Index cost = model->matchCost(2, distance);
+            if (cost < bestCost2) {
+              bestCost2 = cost;
+              bestDist2 = distance;
+            }
+            if (firstLen == 0) {
+              Index length = 2;
+              while (length < maxLength &&
+                     units[j2 + length] == units[i + length]) {
+                length++;
+              }
+              firstLen = length;
+              firstDist = distance;
+            }
+          }
+          j2 = chains.prev2[j2];
+        }
+        if (bestDist2 != 0) {
+          candidates.data[candidates.size++] = {2, bestDist2};
+          bestLength = 2;
+          if (firstLen > 2) {
+            candidates.data[candidates.size++] = {firstLen, firstDist};
+            bestLength = firstLen;
+          }
+        }
+      } else {
+        Index chain2 = 0;
+        while (j2 != Index(-1) && chain2++ < MaxChain2) {
+          Index distance = i - j2;
+          if (distance > MaxDistance) {
+            break;
+          }
+          if (units[j2] == units[i] && units[j2 + 1] == units[i + 1]) {
+            Index length = 2;
+            while (length < maxLength &&
+                   units[j2 + length] == units[i + length]) {
+              length++;
+            }
+            bestLength = length;
+            candidates.data[candidates.size++] = {length, distance};
+            break;
+          }
+          j2 = chains.prev2[j2];
+        }
+      }
+
+      if (i + 3 <= n) {
+        Index j = chains.first3[i];
+        Index chain = 0;
+        while (j != Index(-1) && chain++ < MaxChain) {
+          Index distance = i - j;
+          if (distance > MaxDistance) {
+            break;
+          }
+          Index length = 0;
+          while (length < maxLength && units[j + length] == units[i + length]) {
+            length++;
+          }
+          if (length > bestLength) {
+            bestLength = length;
+            // When the list is full, the longest match replaces the last one.
+            if (candidates.size == MaxCandidates) {
+              candidates.size--;
+            }
+            candidates.data[candidates.size++] = {length, distance};
+            if (length == maxLength) {
+              break;
+            }
+          } else if (model && length >= 3) {
+            Index dc = model->distCost(distance);
+            bool isShort = distance <= ShortDistance;
+            bool dominated = false;
+            for (Index c = 0; c < candidates.size; c++) {
+              auto& cand = candidates.data[c];
+              if (cand.length >= length &&
+                  (cand.distance <= ShortDistance) == isShort &&
+                  model->distCost(cand.distance) <= dc) {
+                dominated = true;
+                break;
+              }
+            }
+            if (!dominated) {
+              bool updated = false;
+              for (Index c = 0; c < candidates.size; c++) {
+                auto& cand = candidates.data[c];
+                if (cand.length == length &&
+                    model->matchCost(length, distance) <
+                      model->matchCost(length, cand.distance)) {
+                  cand.distance = distance;
+                  updated = true;
+                  break;
+                }
+              }
+              if (!updated && candidates.size < MaxCandidates) {
+                Index pos = candidates.size++;
+                while (pos > 0 && candidates.data[pos - 1].length > length) {
+                  candidates.data[pos] = candidates.data[pos - 1];
+                  pos--;
+                }
+                candidates.data[pos] = {length, distance};
+              }
+            }
+          }
+          j = chains.prev3[j];
+        }
+      }
+    }
+  }
+
   // Optimal parsing, backwards, of the units into literals and matches under
-  // the given cost model. Two states: after a literal (a literal run is open)
-  // and after a match (a literal needs a new run token).
+  // the given cost model. Three states: after a narrow literal, after a wide
+  // literal, and after a match (where a literal needs a new run token).
   std::vector<Symbol> parse(const std::vector<Candidates>& matches,
                             const CostModel& model) {
     Index n = units.size();
-    std::vector<Index> costAfterLiteral(n + 1, 0), costAfterMatch(n + 1, 0);
+    std::vector<Index> costAfterNarrow(n + 1, 0), costAfterWide(n + 1, 0),
+      costAfterMatch(n + 1, 0);
     // The chosen match at each position for each state; length 0 is a
     // literal.
-    std::vector<Match> choiceAfterLiteral(n), choiceAfterMatch(n);
+    std::vector<Match> choiceAfterNarrow(n), choiceAfterWide(n),
+      choiceAfterMatch(n);
     for (Index i = n; i > 0;) {
       i--;
       Match bestMatch;
       Index bestCost = Index(-1);
-      // The candidates are ordered by increasing distance and length, so for
-      // each length the first candidate that is long enough has the smallest
-      // distance.
       auto& candidates = matches[i];
-      Index k = 0;
-      for (Index length = MinMatch; k < MaxCandidates; length++) {
-        while (k < MaxCandidates && candidates[k].length < length) {
-          k++;
-        }
-        if (k == MaxCandidates) {
-          break;
-        }
-        Index cost = model.matchCost(length, candidates[k].distance) +
-                     costAfterMatch[i + length];
-        if (cost < bestCost) {
-          bestCost = cost;
-          bestMatch = {length, candidates[k].distance};
+      if (candidates.size > 0) {
+        Index maxCandLen = candidates.data[candidates.size - 1].length;
+        Index k = 0;
+        for (Index length = MinMatch; length <= maxCandLen; length++) {
+          while (k < candidates.size && candidates.data[k].length < length) {
+            k++;
+          }
+          for (Index m = k; m < candidates.size; m++) {
+            Index cost = model.matchCost(length, candidates.data[m].distance) +
+                         costAfterMatch[i + length];
+            if (cost < bestCost) {
+              bestCost = cost;
+              bestMatch = {length, candidates.data[m].distance};
+            }
+          }
         }
       }
-      Index literal = model.literalCost(units[i]) + costAfterLiteral[i + 1];
-      if (literal <= bestCost) {
-        costAfterLiteral[i] = literal;
-        choiceAfterLiteral[i] = Match();
+      bool isWide = units[i] >= 256;
+      Index wideUnitCost = model.cost[WideLoTable][units[i] & 0xFF] +
+                           model.cost[WideHiTable][units[i] >> 8];
+      Index narrowUnitCost = isWide ? 0 : model.cost[NarrowTable][units[i]];
+      Index inNarrow =
+        isWide ? (wideUnitCost + model.wideRun + costAfterWide[i + 1])
+               : (narrowUnitCost + costAfterNarrow[i + 1]);
+      Index inWide =
+        isWide ? (wideUnitCost + costAfterWide[i + 1])
+               : (narrowUnitCost + model.narrowRun + costAfterNarrow[i + 1]);
+      if (!isWide && i + 1 < n && units[i + 1] >= 256) {
+        inWide = std::min(inWide, wideUnitCost + costAfterWide[i + 1]);
+      }
+      Index fromMatch =
+        isWide ? (wideUnitCost + model.wideRun + costAfterWide[i + 1])
+               : (narrowUnitCost + model.narrowRun + costAfterNarrow[i + 1]);
+      if (inNarrow <= bestCost) {
+        costAfterNarrow[i] = inNarrow;
+        choiceAfterNarrow[i] = Match();
       } else {
-        costAfterLiteral[i] = bestCost;
-        choiceAfterLiteral[i] = bestMatch;
+        costAfterNarrow[i] = bestCost;
+        choiceAfterNarrow[i] = bestMatch;
       }
-      if (literal + model.literalRun <= bestCost) {
-        costAfterMatch[i] = literal + model.literalRun;
+      if (inWide <= bestCost) {
+        costAfterWide[i] = inWide;
+        choiceAfterWide[i] = Match();
+      } else {
+        costAfterWide[i] = bestCost;
+        choiceAfterWide[i] = bestMatch;
+      }
+      if (fromMatch <= bestCost) {
+        costAfterMatch[i] = fromMatch;
         choiceAfterMatch[i] = Match();
       } else {
         costAfterMatch[i] = bestCost;
@@ -311,12 +466,14 @@ struct Encoder {
       }
       pending.clear();
     };
-    bool afterLiteral = false;
+    int state = 0; // 0: match, 1: narrow, 2: wide
     for (Index i = 0; i < n;) {
-      auto& choice = afterLiteral ? choiceAfterLiteral[i] : choiceAfterMatch[i];
+      auto& choice = (state == 0)   ? choiceAfterMatch[i]
+                     : (state == 1) ? choiceAfterNarrow[i]
+                                    : choiceAfterWide[i];
       if (choice.length == 0) {
         pending.push_back(units[i]);
-        afterLiteral = true;
+        state = (units[i] >= 256) ? 2 : 1;
         i++;
         continue;
       }
@@ -329,7 +486,7 @@ struct Encoder {
         out.emplace_back(DistLoTable, uint8_t(distance & 0xFF));
         out.emplace_back(DistHiTable, uint8_t(distance >> 8));
       }
-      afterLiteral = false;
+      state = 0;
       i += choice.length;
     }
     flushLiterals();
@@ -341,15 +498,20 @@ struct Encoder {
   static constexpr Index MaxParses = 5;
 
   Segment encode() {
+    HashChains chains;
     std::vector<Candidates> matches;
     if (compress) {
-      findMatches(matches);
+      chains = buildChains();
+      findMatches(chains, matches);
     } else {
       matches.assign(units.size(), Candidates{});
     }
     CostModel model;
     Segment best;
     for (Index pass = 0; pass < MaxParses; pass++) {
+      if (pass > 0 && compress) {
+        findMatches(chains, matches, &model);
+      }
       auto symbols = parse(matches, model);
       auto segment = packSymbols(symbols);
       bool better = pass == 0 || segment.data.size() < best.data.size();
@@ -366,6 +528,10 @@ struct Encoder {
       // Derive the bit costs from the code lengths. Unused symbols cost a bit
       // more than the longest used code of their class.
       for (Index table = 0; table < NumTables; table++) {
+        if (segment.tableOffsets[table] == RawByteOffset) {
+          model.cost[table].fill(8);
+          continue;
+        }
         auto& lengths = lengthsOf[table];
         Index unused = 8;
         if (!lengths.empty()) {
@@ -376,16 +542,25 @@ struct Encoder {
           model.cost[table][symbol] = length ? length : unused;
         }
       }
-      // A literal run costs the average literal run token.
-      Index literalRunBits = 0, literalRuns = 0;
+      // A literal run costs the average literal run token of its width.
+      Index narrowBits = 0, narrowRuns = 0;
+      Index wideBits = 0, wideRuns = 0;
       for (auto& symbol : symbols) {
         if (symbol.first == TokenTable && (symbol.second & 3) < 2) {
-          literalRunBits += model.cost[TokenTable][symbol.second];
-          literalRuns++;
+          if ((symbol.second & 3) == 0) {
+            narrowBits += model.cost[TokenTable][symbol.second];
+            narrowRuns++;
+          } else {
+            wideBits += model.cost[TokenTable][symbol.second];
+            wideRuns++;
+          }
         }
       }
-      if (literalRuns) {
-        model.literalRun = (literalRunBits + literalRuns / 2) / literalRuns;
+      if (narrowRuns) {
+        model.narrowRun = (narrowBits + narrowRuns / 2) / narrowRuns;
+      }
+      if (wideRuns) {
+        model.wideRun = (wideBits + wideRuns / 2) / wideRuns;
       }
     }
     return best;
@@ -486,13 +661,30 @@ struct Encoder {
     std::array<std::array<uint32_t, 256>, NumTables> codes{};
     for (Index table = 0; table < NumTables; table++) {
       lengths[table] = computeCodeLengths(counts[table]);
+      Index used = 0;
+      uint64_t huffBits = 0, rawBits = 0;
+      for (Index symbol = 0; symbol < 256; symbol++) {
+        if (counts[table][symbol]) {
+          used++;
+          huffBits += counts[table][symbol] * lengths[table][symbol];
+          rawBits += counts[table][symbol] * 8;
+        }
+      }
+      if (used == 0) {
+        // Unused class.
+        continue;
+      }
+      if (huffman == 2 && (MaxCodeLength + used) * 8 + huffBits >= rawBits) {
+        coded.tableOffsets[table] = RawByteOffset;
+        lengths[table].assign(256, 8);
+        for (Index symbol = 0; symbol < 256; symbol++) {
+          codes[table][symbol] = symbol;
+        }
+        continue;
+      }
       std::array<Index, MaxCodeLength + 1> lengthCounts{};
       for (auto length : lengths[table]) {
         lengthCounts[length]++;
-      }
-      if (lengthCounts[0] == 256) {
-        // Unused class.
-        continue;
       }
       coded.tableOffsets[table] = coded.data.size();
       for (Index length = 1; length <= MaxCodeLength; length++) {
@@ -583,6 +775,9 @@ inline std::optional<SymbolDecoder> findSymbolDecoder(Module& module,
         getGlobal = curr->name;
       }
       void visitGlobalSet(GlobalSet* curr) {
+        if (setGlobal.is() && setGlobal != curr->name) {
+          bad = true;
+        }
         globalSets++;
         setGlobal = curr->name;
       }
@@ -609,7 +804,8 @@ inline std::optional<SymbolDecoder> findSymbolDecoder(Module& module,
     };
     Scanner scanner(i8ArrayType);
     scanner.walk(func->body);
-    if (scanner.bad || scanner.globalGets != 1 || scanner.globalSets != 1 ||
+    if (scanner.bad || scanner.globalGets != 1 ||
+        (scanner.globalSets != 1 && scanner.globalSets != 2) ||
         scanner.getGlobal != scanner.setGlobal || scanner.loops != 1 ||
         scanner.arrayGets != 3 || !scanner.hasMaxLen) {
       return std::nullopt;
@@ -710,11 +906,26 @@ makeSymbolDecoder(Module& module, HeapType i8ArrayType, Index firstBit) {
        builder.makeReturn(byteAt(add(
          get(index), builder.makeBinary(SubInt32, get(code), get(first)))))}));
   Name label("next");
+  auto* raw = builder.makeIf(
+    builder.makeBinary(LtSInt32, get(t), builder.makeConst(0)),
+    builder.makeBlock(
+      {builder.makeBreak(
+         label,
+         nullptr,
+         builder.makeLocalTee(t, add(get(t), builder.makeConst(1)), i32)),
+       builder.makeGlobalSet(names.bitsGlobal, get(pos)),
+       builder.makeReturn(get(code))}));
   auto* loop = builder.makeLoop(
     label,
     builder.makeBlock(
-      {builder.makeLocalSet(code, builder.makeBinary(OrInt32, get(code), bit)),
+      {builder.makeLocalSet(
+         code,
+         builder.makeBinary(
+           OrInt32,
+           builder.makeBinary(ShlInt32, get(code), builder.makeConst(1)),
+           bit)),
        builder.makeLocalSet(pos, add(get(pos), builder.makeConst(1))),
+       raw,
        builder.makeLocalSet(count, byteAt(get(t))),
        builder.makeLocalSet(t, add(get(t), builder.makeConst(1))),
        found,
@@ -723,8 +934,6 @@ makeSymbolDecoder(Module& module, HeapType i8ArrayType, Index firstBit) {
                             builder.makeBinary(ShlInt32,
                                                add(get(first), get(count)),
                                                builder.makeConst(1))),
-       builder.makeLocalSet(
-         code, builder.makeBinary(ShlInt32, get(code), builder.makeConst(1))),
        builder.makeBreak(label)}));
   auto* body = builder.makeBlock(
     {builder.makeLocalSet(pos, builder.makeGlobalGet(names.bitsGlobal, i32)),

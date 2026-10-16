@@ -111,7 +111,7 @@
   ;; CHECK-NEXT:  (i32.const 2)
   ;; CHECK-NEXT: ))
 
-  ;; CHECK:      (data $string.consts ",foo\00h\e9llo!\00\t\e5e,g\18\00\00foo \n\0e\r \00\e5e,g\06\01\06\108\00only-in-code\00")
+  ;; CHECK:      (data $string.consts ",foo\00h\e9llo!\00\t\e5e,g\18\00\00foo \n\0e\02\05\02\r\n\01\n\108\00only-in-code\00")
 
   ;; CHECK:      (export "exported" (global $exported))
   (export "exported" (global $exported))
@@ -330,7 +330,7 @@
 ;; CHECK-NEXT:  (local.set $0
 ;; CHECK-NEXT:   (array.new_data $1 $string.consts
 ;; CHECK-NEXT:    (i32.const 0)
-;; CHECK-NEXT:    (i32.const 52)
+;; CHECK-NEXT:    (i32.const 49)
 ;; CHECK-NEXT:   )
 ;; CHECK-NEXT:  )
 ;; CHECK-NEXT:  (local.set $1
@@ -534,7 +534,7 @@
 ;; CHECK-NEXT:     (local.set $5
 ;; CHECK-NEXT:      (i32.add
 ;; CHECK-NEXT:       (local.get $5)
-;; CHECK-NEXT:       (i32.const 3)
+;; CHECK-NEXT:       (i32.const 2)
 ;; CHECK-NEXT:      )
 ;; CHECK-NEXT:     )
 ;; CHECK-NEXT:     (loop $copy

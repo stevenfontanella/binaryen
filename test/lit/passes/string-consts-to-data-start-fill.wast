@@ -188,7 +188,7 @@
 
   ;; CHECK:      (global $string.consts$sp (mut i32) (i32.const 11))
 
-  ;; CHECK:      (data $string.consts "|alpha\00code\00delta\00epsilon\00beta\00z\06\04\\one\00two\00three\00u1\00u2\00u3\00\0e9\02 \02\18\06\05\18gamma\00")
+  ;; CHECK:      (data $string.consts "|alpha\00code\00delta\00epsilon\00beta\00z\n\04\\one\00two\00three\00u1\00u2\00u3\00\129\06 \06\18\n\05\18gamma\00")
 
   ;; CHECK:      (export "code" (func $code))
 
@@ -746,7 +746,7 @@
 ;; CHECK-NEXT:     (local.set $5
 ;; CHECK-NEXT:      (i32.add
 ;; CHECK-NEXT:       (local.get $5)
-;; CHECK-NEXT:       (i32.const 3)
+;; CHECK-NEXT:       (i32.const 2)
 ;; CHECK-NEXT:      )
 ;; CHECK-NEXT:     )
 ;; CHECK-NEXT:     (loop $copy
