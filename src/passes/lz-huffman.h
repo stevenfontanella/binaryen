@@ -115,8 +115,10 @@ struct Encoder {
   static constexpr Index ShortDistance = 256;
   static constexpr Index MaxDistance = 65536;
   static constexpr Index HashBits = 17;
-  static constexpr Index MaxChain = 1024;
-  static constexpr Index MaxChain2 = 64;
+  static constexpr Index MaxChain = 2048;
+  static constexpr Index MaxChain2 = 128;
+  static constexpr Index CostScale = 16;
+  static constexpr Index TableEntryBits = 8;
 
   struct Match {
     Index length = 0;
@@ -124,7 +126,7 @@ struct Encoder {
   };
 
   // The match candidates kept per position, ordered by increasing length.
-  static constexpr Index MaxCandidates = 12;
+  static constexpr Index MaxCandidates = 16;
   struct Candidates {
     std::array<Match, MaxCandidates> data{};
     Index size = 0;
@@ -135,14 +137,15 @@ struct Encoder {
     return {uint8_t(d & 0xFF), uint8_t(d >> 8)};
   }
 
-  // The cost of each symbol in the parse, in bits. The first parse uses 8 bits
-  // per byte; later parses use the code lengths of the previous Huffman code.
+  // The cost of each symbol in the parse, in 1/CostScale bits. The first parse
+  // uses 8 bits per byte; later parses use the code lengths of the previous
+  // Huffman code plus the amortized 1-byte table-entry cost.
   struct CostModel {
     std::array<std::array<Index, 256>, NumTables> cost;
 
     CostModel() {
       for (auto& table : cost) {
-        table.fill(8);
+        table.fill(8 * CostScale);
       }
     }
 
@@ -375,7 +378,8 @@ struct Encoder {
   std::vector<Symbol> parse(const std::vector<Candidates>& matches,
                             std::vector<uint16_t>& approxPrevWide,
                             std::vector<uint16_t>& approxNextWide,
-                            const CostModel& model) {
+                            const CostModel& model,
+                            bool hasWide) {
     Index n = units.size();
     std::vector<Index> costAfterNarrow(n + 1, 0), costAfterWide(n + 1, 0),
       costAfterMatch(n + 1, 0);
@@ -409,24 +413,28 @@ struct Encoder {
         }
       }
 
-      uint16_t prevW = approxPrevWide[i];
-      Index restorePenalty = 0;
-      if (units[i] < 256 && approxNextWide[i] >= 256) {
-        Index costViaCur = model.wideCost(approxNextWide[i], units[i]);
-        Index costViaPrev = model.wideCost(approxNextWide[i], prevW);
-        if (costViaCur > costViaPrev) {
-          restorePenalty = costViaCur - costViaPrev;
-        }
-      }
-      Index wideUnit = model.wideCost(units[i], prevW) + restorePenalty;
+      Index cWideNew = Index(-1), cWideSame = Index(-1);
       Index nextLenW = runLenWide[i + 1];
-      Index cWideNew = model.runTokenCost(1, 1) + wideUnit + costAfterWide[i + 1];
-      Index cWideSame =
-        (nextLenW == MaxTokenLength - 1)
-          ? (wideUnit + costAfterWide[i + 1] + model.runTokenCost(1, 1))
-          : (wideUnit + costAfterWide[i + 1] +
-             model.runTokenCost(1, nextLenW + 2) -
-             model.runTokenCost(1, nextLenW + 1));
+      if (hasWide) {
+        uint16_t prevW = approxPrevWide[i];
+        Index restorePenalty = 0;
+        if (units[i] < 256 && approxNextWide[i] >= 256) {
+          Index costViaCur = model.wideCost(approxNextWide[i], units[i]);
+          Index costViaPrev = model.wideCost(approxNextWide[i], prevW);
+          if (costViaCur > costViaPrev) {
+            restorePenalty = costViaCur - costViaPrev;
+          }
+        }
+        Index wideUnit = model.wideCost(units[i], prevW) + restorePenalty;
+        cWideNew =
+          model.runTokenCost(1, 1) + wideUnit + costAfterWide[i + 1];
+        cWideSame =
+          (nextLenW == MaxTokenLength - 1)
+            ? (wideUnit + costAfterWide[i + 1] + model.runTokenCost(1, 1))
+            : (wideUnit + costAfterWide[i + 1] +
+               model.runTokenCost(1, nextLenW + 2) -
+               model.runTokenCost(1, nextLenW + 1));
+      }
 
       Index cNarSame = Index(-1), cNarNew = Index(-1);
       Index nextLenN = runLenNarrow[i + 1];
@@ -443,7 +451,7 @@ struct Encoder {
 
       costAfterWide[i] = bestCost;
       choiceAfterWide[i] = bestMatch;
-      if (cWideSame <= costAfterWide[i]) {
+      if (hasWide && cWideSame <= costAfterWide[i]) {
         costAfterWide[i] = cWideSame;
         choiceAfterWide[i] = Match();
         isWideAfterWide[i] = 1;
@@ -458,7 +466,7 @@ struct Encoder {
 
       costAfterNarrow[i] = bestCost;
       choiceAfterNarrow[i] = bestMatch;
-      if (cWideNew <= costAfterNarrow[i]) {
+      if (hasWide && cWideNew <= costAfterNarrow[i]) {
         costAfterNarrow[i] = cWideNew;
         choiceAfterNarrow[i] = Match();
         isWideAfterNarrow[i] = 1;
@@ -473,7 +481,7 @@ struct Encoder {
 
       costAfterMatch[i] = bestCost;
       choiceAfterMatch[i] = bestMatch;
-      if (cWideNew <= costAfterMatch[i]) {
+      if (hasWide && cWideNew <= costAfterMatch[i]) {
         costAfterMatch[i] = cWideNew;
         choiceAfterMatch[i] = Match();
         isWideAfterMatch[i] = 1;
@@ -556,19 +564,21 @@ struct Encoder {
     }
     flushLiterals();
 
-    uint16_t runningWide = 0;
-    for (Index i = 0; i < n; i++) {
-      approxPrevWide[i] = runningWide;
-      if (emittedWide[i] && units[i] >= 256) {
-        runningWide = units[i];
+    if (hasWide) {
+      uint16_t runningWide = 0;
+      for (Index i = 0; i < n; i++) {
+        approxPrevWide[i] = runningWide;
+        if (emittedWide[i] && units[i] >= 256) {
+          runningWide = units[i];
+        }
       }
-    }
-    runningWide = 0;
-    for (Index i = n; i > 0;) {
-      i--;
-      approxNextWide[i] = runningWide;
-      if (emittedWide[i] && units[i] >= 256) {
-        runningWide = units[i];
+      runningWide = 0;
+      for (Index i = n; i > 0;) {
+        i--;
+        approxNextWide[i] = runningWide;
+        if (emittedWide[i] && units[i] >= 256) {
+          runningWide = units[i];
+        }
       }
     }
     return out;
@@ -587,21 +597,25 @@ struct Encoder {
     } else {
       matches.assign(units.size(), Candidates{});
     }
+    bool hasWide = std::any_of(
+      units.begin(), units.end(), [](uint16_t u) { return u >= 256; });
     std::vector<uint16_t> approxPrevWide(units.size(), 0);
     std::vector<uint16_t> approxNextWide(units.size(), 0);
-    uint16_t runningWide = 0;
-    for (size_t i = 0; i < units.size(); i++) {
-      approxPrevWide[i] = runningWide;
-      if (units[i] >= 256) {
-        runningWide = units[i];
+    if (hasWide) {
+      uint16_t runningWide = 0;
+      for (size_t i = 0; i < units.size(); i++) {
+        approxPrevWide[i] = runningWide;
+        if (units[i] >= 256) {
+          runningWide = units[i];
+        }
       }
-    }
-    runningWide = 0;
-    for (size_t i = units.size(); i > 0;) {
-      i--;
-      approxNextWide[i] = runningWide;
-      if (units[i] >= 256) {
-        runningWide = units[i];
+      runningWide = 0;
+      for (size_t i = units.size(); i > 0;) {
+        i--;
+        approxNextWide[i] = runningWide;
+        if (units[i] >= 256) {
+          runningWide = units[i];
+        }
       }
     }
     CostModel model;
@@ -610,7 +624,8 @@ struct Encoder {
       if (pass > 0 && compress) {
         findMatches(chains, matches, &model);
       }
-      auto symbols = parse(matches, approxPrevWide, approxNextWide, model);
+      auto symbols =
+        parse(matches, approxPrevWide, approxNextWide, model, hasWide);
       auto segment = packSymbols(symbols);
       bool better = pass == 0 || segment.data.size() < best.data.size();
       if (!segment.huffman || !compress) {
@@ -623,21 +638,35 @@ struct Encoder {
       if (better) {
         best = segment;
       }
-      // Derive the bit costs from the code lengths. Unused symbols cost a bit
-      // more than the longest used code of their class.
+      std::array<std::array<Index, 256>, NumTables> counts{};
+      for (auto& symbol : symbols) {
+        counts[symbol.first][symbol.second]++;
+      }
+      // Derive the bit costs from the code lengths plus the amortized 1-byte
+      // canonical Huffman table symbol entry cost. Unused symbols cost the
+      // longest code length plus the 8-bit table entry penalty.
       for (Index table = 0; table < NumTables; table++) {
         if (segment.tableOffsets[table] == RawByteOffset) {
-          model.cost[table].fill(8);
+          model.cost[table].fill(8 * CostScale);
           continue;
         }
         auto& lengths = lengthsOf[table];
-        Index unused = 8;
+        Index unused = 8 * CostScale;
         if (!lengths.empty()) {
-          unused = *std::max_element(lengths.begin(), lengths.end()) + 2;
+          unused = (*std::max_element(lengths.begin(), lengths.end()) +
+                    TableEntryBits) *
+                   CostScale;
         }
         for (Index symbol = 0; symbol < 256; symbol++) {
           Index length = lengths.empty() ? 0 : lengths[symbol];
-          model.cost[table][symbol] = length ? length : unused;
+          if (length) {
+            model.cost[table][symbol] =
+              length * CostScale +
+              (TableEntryBits * CostScale) /
+                std::max<Index>(1, counts[table][symbol]);
+          } else {
+            model.cost[table][symbol] = unused;
+          }
         }
       }
     }

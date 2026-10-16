@@ -98,7 +98,7 @@
 
   ;; CHECK:      (global $segments$data (mut (ref null $i8)) (ref.null none))
 
-  ;; CHECK:      (global $lz$bits (mut i32) (i32.const 680))
+  ;; CHECK:      (global $lz$bits (mut i32) (i32.const 664))
 
   ;; CHECK:      (memory $0 1)
 
@@ -110,7 +110,7 @@
   (data $active (i32.const 0) "xyzxyzxyzxyzxyzxyzxyzxyzxyzxyzxyzxyz")
 
 
-  ;; CHECK:      (data $segments "\00\00\03\n\00\00\00\00\00\00\00\00\00\00\00\04n\82\02\08\0c\12\1a\1e$&DJ\00\00\01\07\0e\00\00\00\00\00\00\00\00\00\00\00\02 bclo\ff\03\10!,?@HWader\c2\f0\00\03\02\00\00\00\00\00\00\00\00\00\00\00\00\00\02\14\13\1f7\8e\99W\9e~m\17^\a2r P<\a2T\02\0b(\b3\11\ff\ed\8b\dc\a3\0f")
+  ;; CHECK:      (data $segments "\00\01\01\n\00\00\00\00\00\00\00\00\00\00\00\04\82\08\0c\16\1a\1e$&DJn\00\00\01\07\0e\00\00\00\00\00\00\00\00\00\00\00\02 bclo\ff\03\10!,?@HWader\c2\f0\00\04\00\00\00\00\00\00\00\00\00\00\00\00\00\00\02\14\1f;\8e\99W\9e~m\17^\a2\b2!P<\a2\94\82\01\8a\c0c\bf]\9e{\d4")
 
   ;; CHECK:      (func $bytes (type $6) (param $off i32) (param $n i32) (result (ref $i8))
   ;; CHECK-NEXT:  (call $segments$slice
@@ -366,7 +366,7 @@
 ;; CHECK-NEXT:  (local.set $0
 ;; CHECK-NEXT:   (array.new_data $i8 $segments
 ;; CHECK-NEXT:    (i32.const 0)
-;; CHECK-NEXT:    (i32.const 112)
+;; CHECK-NEXT:    (i32.const 109)
 ;; CHECK-NEXT:   )
 ;; CHECK-NEXT:  )
 ;; CHECK-NEXT:  (local.set $1
@@ -422,7 +422,7 @@
 ;; CHECK-NEXT:       (local.get $3)
 ;; CHECK-NEXT:       (call $lz$symbol
 ;; CHECK-NEXT:        (local.get $0)
-;; CHECK-NEXT:        (i32.const 28)
+;; CHECK-NEXT:        (i32.const 27)
 ;; CHECK-NEXT:       )
 ;; CHECK-NEXT:      )
 ;; CHECK-NEXT:      (local.set $3
@@ -468,7 +468,7 @@
 ;; CHECK-NEXT:       (local.set $6
 ;; CHECK-NEXT:        (call $lz$symbol
 ;; CHECK-NEXT:         (local.get $0)
-;; CHECK-NEXT:         (i32.const 65)
+;; CHECK-NEXT:         (i32.const 64)
 ;; CHECK-NEXT:        )
 ;; CHECK-NEXT:       )
 ;; CHECK-NEXT:      )

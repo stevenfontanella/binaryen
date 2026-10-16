@@ -84,9 +84,9 @@
 
   ;; CHECK:      (global $string.consts$table (mut (ref null $1)) (ref.null none))
 
-  ;; CHECK:      (global $lz$bits (mut i32) (i32.const 1200))
+  ;; CHECK:      (global $lz$bits (mut i32) (i32.const 1192))
 
-  ;; CHECK:      (data $string.consts "\00\01\06\00\00\00\00\00\00\00\00\00\00\00\00\fe\02\n\r\14\1bD\02\00\00\00\00\00\00\00\00\00\00\00\00\00\00\0b\ff\00\01\03\06\00\00\00\00\00\00\00\00\00\00\00ofhl\00\t\n e\e9\01\02\00\00\00\00\00\00\00\00\00\00\00\00\00\f2e\c7\01\02\00\00\00\00\00\00\00\00\00\00\00\00\00f\01#\01\02\00\00\00\00\00\00\00\00\00\00\00\00\00\03\05\10\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\a8\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\01\17\94?a\da\97\b0>9\b7\04\0b4\14")
+  ;; CHECK:      (data $string.consts "\00\01\06\00\00\00\00\00\00\00\00\00\00\00\00\fe\04\n\r\14\1fD\02\00\00\00\00\00\00\00\00\00\00\00\00\00\00\0b\ff\00\01\03\06\00\00\00\00\00\00\00\00\00\00\00o\00hl\t\n ef\e9\01\02\00\00\00\00\00\00\00\00\00\00\00\00\00\f2e\c7\01\02\00\00\00\00\00\00\00\00\00\00\00\00\00f\01#\02\00\00\00\00\00\00\00\00\00\00\00\00\00\00\03\10\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\a8\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\01?\90?\a1\cb\9b0\9e\9c\ab\83\01\1a\12")
 
   ;; CHECK:      (export "col" (func $read-column))
 
@@ -338,7 +338,7 @@
 ;; CHECK-NEXT:  (local.set $0
 ;; CHECK-NEXT:   (array.new_data $2 $string.consts
 ;; CHECK-NEXT:    (i32.const 0)
-;; CHECK-NEXT:    (i32.const 164)
+;; CHECK-NEXT:    (i32.const 163)
 ;; CHECK-NEXT:   )
 ;; CHECK-NEXT:  )
 ;; CHECK-NEXT:  (local.set $1
@@ -456,12 +456,12 @@
 ;; CHECK-NEXT:        (i32.or
 ;; CHECK-NEXT:         (call $lz$symbol
 ;; CHECK-NEXT:          (local.get $0)
-;; CHECK-NEXT:          (i32.const 118)
+;; CHECK-NEXT:          (i32.const 117)
 ;; CHECK-NEXT:         )
 ;; CHECK-NEXT:         (i32.shl
 ;; CHECK-NEXT:          (call $lz$symbol
 ;; CHECK-NEXT:           (local.get $0)
-;; CHECK-NEXT:           (i32.const 134)
+;; CHECK-NEXT:           (i32.const 133)
 ;; CHECK-NEXT:          )
 ;; CHECK-NEXT:          (i32.const 8)
 ;; CHECK-NEXT:         )
