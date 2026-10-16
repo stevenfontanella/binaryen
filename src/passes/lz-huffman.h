@@ -69,6 +69,7 @@ enum Table : uint8_t {
   TokenTable,
   ExtraTable,
   NarrowTable,
+  NarrowTable2,
   WideLoTable,
   WideHiTable,
   ShortDistTable,
@@ -84,6 +85,7 @@ static constexpr Index MaxCodeLength = 15;
 static constexpr Index MinMatch = 2;
 static constexpr Index RawByteOffset = Index(-8);
 static constexpr Index WideDeltaBias = 128;
+static constexpr Index NarrowCtxThreshold = 96;
 
 struct Segment {
   std::vector<char> data;
@@ -108,6 +110,9 @@ struct Encoder {
   int huffman = 2;
   // The size of the symbol decoder, which the plain layout saves.
   Index decoderSize = 100;
+  // Whether to split narrow literals into two Huffman tables by previous unit
+  // (< NarrowCtxThreshold vs >= NarrowCtxThreshold).
+  bool splitNarrow = true;
 
   // The largest length a token can hold: 63 + one extra byte.
   static constexpr Index MaxTokenLength = 63 + 255;
@@ -159,8 +164,10 @@ struct Encoder {
       return cost[TokenTable][kind | (63 << 2)] + cost[ExtraTable][length - 63];
     }
 
-    Index narrowCost(uint16_t unit) const {
-      return cost[NarrowTable][unit & 0xFF];
+    Index narrowCost(uint16_t unit, uint16_t prev, bool splitNarrow) const {
+      Table table = (splitNarrow && prev >= NarrowCtxThreshold) ? NarrowTable2
+                                                                : NarrowTable;
+      return cost[table][unit & 0xFF];
     }
 
     Index wideCost(uint16_t unit, uint16_t prev) const {
@@ -413,9 +420,13 @@ struct Encoder {
         }
       }
 
+      bool canWide =
+        hasWide && (units[i] >= NarrowCtxThreshold || i + 1 == n ||
+                    choiceAfterWide[i + 1].length != 0 ||
+                    isWideAfterWide[i + 1]);
       Index cWideNew = Index(-1), cWideSame = Index(-1);
       Index nextLenW = runLenWide[i + 1];
-      if (hasWide) {
+      if (canWide) {
         uint16_t prevW = approxPrevWide[i];
         Index restorePenalty = 0;
         if (units[i] < 256 && approxNextWide[i] >= 256) {
@@ -439,7 +450,8 @@ struct Encoder {
       Index cNarSame = Index(-1), cNarNew = Index(-1);
       Index nextLenN = runLenNarrow[i + 1];
       if (units[i] < 256) {
-        Index narUnit = model.narrowCost(units[i]);
+        uint16_t prevUnit = i == 0 ? 0 : units[i - 1];
+        Index narUnit = model.narrowCost(units[i], prevUnit, splitNarrow);
         cNarNew = model.runTokenCost(0, 1) + narUnit + costAfterNarrow[i + 1];
         cNarSame =
           (nextLenN == MaxTokenLength - 1)
@@ -451,7 +463,7 @@ struct Encoder {
 
       costAfterWide[i] = bestCost;
       choiceAfterWide[i] = bestMatch;
-      if (hasWide && cWideSame <= costAfterWide[i]) {
+      if (canWide && cWideSame <= costAfterWide[i]) {
         costAfterWide[i] = cWideSame;
         choiceAfterWide[i] = Match();
         isWideAfterWide[i] = 1;
@@ -466,7 +478,7 @@ struct Encoder {
 
       costAfterNarrow[i] = bestCost;
       choiceAfterNarrow[i] = bestMatch;
-      if (hasWide && cWideNew <= costAfterNarrow[i]) {
+      if (canWide && cWideNew <= costAfterNarrow[i]) {
         costAfterNarrow[i] = cWideNew;
         choiceAfterNarrow[i] = Match();
         isWideAfterNarrow[i] = 1;
@@ -481,7 +493,7 @@ struct Encoder {
 
       costAfterMatch[i] = bestCost;
       choiceAfterMatch[i] = bestMatch;
-      if (hasWide && cWideNew <= costAfterMatch[i]) {
+      if (canWide && cWideNew <= costAfterMatch[i]) {
         costAfterMatch[i] = cWideNew;
         choiceAfterMatch[i] = Match();
         isWideAfterMatch[i] = 1;
@@ -505,7 +517,7 @@ struct Encoder {
       }
     };
     uint16_t prevWide = 0;
-    std::vector<std::pair<uint16_t, bool>> pending;
+    std::vector<std::pair<Index, bool>> pending;
     auto flushLiterals = [&]() {
       Index count = pending.size();
       Index i = 0;
@@ -518,14 +530,19 @@ struct Encoder {
         }
         emitToken(wide ? 1 : 0, j - i);
         for (Index k = i; k < j; k++) {
-          uint16_t u = pending[k].first;
+          Index pos = pending[k].first;
+          uint16_t u = units[pos];
           if (wide) {
             auto [lo, hi] = encodeWide(u, prevWide);
             prevWide = u;
             out.emplace_back(WideLoTable, lo);
             out.emplace_back(WideHiTable, hi);
           } else {
-            out.emplace_back(NarrowTable, uint8_t(u));
+            uint16_t prev = pos == 0 ? 0 : units[pos - 1];
+            out.emplace_back(
+              (splitNarrow && prev >= NarrowCtxThreshold) ? NarrowTable2
+                                                          : NarrowTable,
+              uint8_t(u));
           }
         }
         i = j;
@@ -542,7 +559,7 @@ struct Encoder {
                   : (state == 1) ? isWideAfterNarrow[i]
                                  : isWideAfterWide[i];
       if (choice.length == 0) {
-        pending.push_back({units[i], wide});
+        pending.push_back({i, wide});
         if (wide) {
           emittedWide[i] = true;
         }
@@ -641,6 +658,15 @@ struct Encoder {
       std::array<std::array<Index, 256>, NumTables> counts{};
       for (auto& symbol : symbols) {
         counts[symbol.first][symbol.second]++;
+      }
+      if (segment.tableOffsets[NarrowTable2] ==
+          segment.tableOffsets[NarrowTable]) {
+        for (Index symbol = 0; symbol < 256; symbol++) {
+          Index merged =
+            counts[NarrowTable][symbol] + counts[NarrowTable2][symbol];
+          counts[NarrowTable][symbol] = merged;
+          counts[NarrowTable2][symbol] = merged;
+        }
       }
       // Derive the bit costs from the code lengths plus the amortized 1-byte
       // canonical Huffman table symbol entry cost. Unused symbols cost the
@@ -764,6 +790,50 @@ struct Encoder {
     for (auto& symbol : symbols) {
       counts[symbol.first][symbol.second]++;
     }
+    auto tableBitCost =
+      [&](const std::vector<uint64_t>& tableCounts) -> uint64_t {
+      auto lens = computeCodeLengths(tableCounts);
+      Index used = 0;
+      uint64_t huffBits = 0, rawBits = 0;
+      for (Index symbol = 0; symbol < 256; symbol++) {
+        if (tableCounts[symbol]) {
+          used++;
+          huffBits += tableCounts[symbol] * lens[symbol];
+          rawBits += tableCounts[symbol] * 8;
+        }
+      }
+      if (used == 0) {
+        return 0;
+      }
+      uint64_t codedBits = (MaxCodeLength + used) * 8 + huffBits;
+      return huffman == 2 ? std::min(codedBits, rawBits) : codedBits;
+    };
+    std::vector<uint64_t> mergedNarrow(256, 0);
+    bool anyNarrow1 = false, anyNarrow2 = false;
+    for (Index symbol = 0; symbol < 256; symbol++) {
+      mergedNarrow[symbol] =
+        counts[NarrowTable][symbol] + counts[NarrowTable2][symbol];
+      if (counts[NarrowTable][symbol]) {
+        anyNarrow1 = true;
+      }
+      if (counts[NarrowTable2][symbol]) {
+        anyNarrow2 = true;
+      }
+    }
+    bool foldNarrow2 = !splitNarrow || !anyNarrow1 || !anyNarrow2;
+    if (!foldNarrow2) {
+      uint64_t splitBits =
+        tableBitCost(counts[NarrowTable]) + tableBitCost(counts[NarrowTable2]);
+      uint64_t mergedBits = tableBitCost(mergedNarrow);
+      uint64_t decoderPenaltyBits = (huffman == 2) ? 10 * 8 : 0;
+      if (splitBits + decoderPenaltyBits >= mergedBits) {
+        foldNarrow2 = true;
+      }
+    }
+    if (foldNarrow2) {
+      counts[NarrowTable] = std::move(mergedNarrow);
+      counts[NarrowTable2].assign(256, 0);
+    }
     std::array<std::vector<uint8_t>, NumTables> lengths;
     std::array<std::array<uint32_t, 256>, NumTables> codes{};
     for (Index table = 0; table < NumTables; table++) {
@@ -810,6 +880,11 @@ struct Encoder {
         }
         code <<= 1;
       }
+    }
+    if (foldNarrow2) {
+      coded.tableOffsets[NarrowTable2] = coded.tableOffsets[NarrowTable];
+      lengths[NarrowTable2] = lengths[NarrowTable];
+      codes[NarrowTable2] = codes[NarrowTable];
     }
     coded.firstBit = coded.data.size() * 8;
     coded.lengths = lengths;
@@ -1156,13 +1231,17 @@ makeDecoder(Module& module, const Segment& segment, const DecoderOptions& o) {
     return builder.makeLocalSet(index,
                                 add(get(index), builder.makeConst(value)));
   };
+  bool splitNarrow =
+    segment.huffman &&
+    segment.tableOffsets[NarrowTable2] != segment.tableOffsets[NarrowTable];
+  auto readByteExpr = [&](Expression* tableOffset) -> Expression* {
+    return builder.makeCall(
+      o.symbols.func, {builder.makeLocalGet(src, i8Ref), tableOffset}, i32);
+  };
   auto readByte = [&](Table table) -> Expression* {
     if (segment.huffman) {
-      return builder.makeCall(
-        o.symbols.func,
-        {builder.makeLocalGet(src, i8Ref),
-         builder.makeConst(int32_t(segment.tableOffsets[table]))},
-        i32);
+      return readByteExpr(
+        builder.makeConst(int32_t(segment.tableOffsets[table])));
     }
     return builder.makeArrayGet(
       builder.makeLocalGet(src, i8Ref),
@@ -1181,6 +1260,9 @@ makeDecoder(Module& module, const Segment& segment, const DecoderOptions& o) {
       builder.makeBinary(ShlInt32, readByte(hi), builder.makeConst(8)));
   };
   auto setDst = [&](Expression* value) {
+    if (splitNarrow) {
+      value = builder.makeLocalTee(p, value, i32);
+    }
     return builder.makeArraySet(
       builder.makeLocalGet(dst, dstRef), get(q), value, MemoryOrder::Unordered);
   };
@@ -1216,7 +1298,15 @@ makeDecoder(Module& module, const Segment& segment, const DecoderOptions& o) {
     tok, builder.makeBinary(AndInt32, get(tok), builder.makeConst(3)));
 
   Name litLabel("lit");
-  Expression* setLiteral = setDst(readByte(NarrowTable));
+  Expression* narrowVal =
+    splitNarrow
+      ? readByteExpr(builder.makeSelect(
+          builder.makeBinary(
+            LtUInt32, get(p), builder.makeConst(int32_t(NarrowCtxThreshold))),
+          builder.makeConst(int32_t(segment.tableOffsets[NarrowTable])),
+          builder.makeConst(int32_t(segment.tableOffsets[NarrowTable2]))))
+      : readByte(NarrowTable);
+  Expression* setLiteral = setDst(narrowVal);
   if (!bytes) {
     Expression* wideVal = builder.makeLocalTee(
       wide,

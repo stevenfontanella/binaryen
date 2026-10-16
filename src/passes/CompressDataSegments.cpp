@@ -226,6 +226,7 @@ struct CompressDataSegments : public Pass {
     // Encode the concatenation.
     LZHuffman::Encoder encoder;
     encoder.huffman = huffman;
+    encoder.splitNarrow = false;
     Index plainBytes = 0;
     Index numSites = 0;
     for (auto& candidate : candidates) {
@@ -615,6 +616,7 @@ struct CompressDataSegments : public Pass {
   static bool isCompressible(const std::vector<uint8_t>& data) {
     LZHuffman::Encoder encoder;
     encoder.huffman = 1;
+    encoder.splitNarrow = false;
     for (auto byte : data) {
       encoder.units.push_back(byte);
     }
