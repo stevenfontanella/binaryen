@@ -34,6 +34,7 @@
 #include "ir/branch-hints.h"
 #include "ir/branch-utils.h"
 #include "ir/drop.h"
+#include "ir/effects.h"
 #include "ir/eh-utils.h"
 #include "ir/element-utils.h"
 #include "ir/find_all.h"
@@ -121,6 +122,7 @@ struct FunctionInfo {
   // inlining.
   bool hasParamDependentBranch;
   bool paramsUsedOnceInOrder;
+  bool trivialDropCall;
   TrivialInstruction trivialInstruction;
   InliningMode inliningMode;
   std::optional<uint8_t> toolchainInlineHint;
@@ -138,6 +140,7 @@ struct FunctionInfo {
     usedGlobally = false;
     hasParamDependentBranch = false;
     paramsUsedOnceInOrder = false;
+    trivialDropCall = false;
     trivialInstruction = TrivialInstruction::NotTrivial;
     inliningMode = InliningMode::Unknown;
     toolchainInlineHint = std::nullopt;
@@ -155,6 +158,7 @@ struct FunctionInfo {
     usedGlobally = other.usedGlobally;
     hasParamDependentBranch = other.hasParamDependentBranch;
     paramsUsedOnceInOrder = other.paramsUsedOnceInOrder;
+    trivialDropCall = other.trivialDropCall;
     trivialInstruction = other.trivialInstruction;
     inliningMode = other.inliningMode;
     toolchainInlineHint = other.toolchainInlineHint;
@@ -162,7 +166,7 @@ struct FunctionInfo {
   }
 
   // See pass.h for how defaults for these options were chosen.
-  bool worthFullInlining(PassOptions& options) {
+  bool worthFullInlining(PassOptions& options, bool byteBudgetMode = false) {
     // Until we have proper support for try-delegate, ignore such functions.
     // FIXME https://github.com/WebAssembly/binaryen/issues/3634
     if (hasTryDelegate) {
@@ -176,7 +180,9 @@ struct FunctionInfo {
       return true;
     }
     // If it's small enough that we always want to inline such things, do so.
-    if (size <= options.inlining.alwaysInlineMaxSize) {
+    if ((!byteBudgetMode || options.shrinkLevel == 0 || refs <= 1 ||
+         usedGlobally) &&
+        size <= options.inlining.alwaysInlineMaxSize) {
       return true;
     }
     // If it has one use, then inlining it would likely reduce code size, at
@@ -187,7 +193,8 @@ struct FunctionInfo {
     }
     // If the function calls another one in a way that always shrinks when
     // inlined, inline it in all optimization and shrink modes.
-    if (trivialInstruction == TrivialInstruction::Shrinks) {
+    if ((!byteBudgetMode || options.shrinkLevel == 0 || usedGlobally) &&
+        trivialInstruction == TrivialInstruction::Shrinks) {
       return true;
     }
     // When every parameter is read once in evaluation order with no local
@@ -195,8 +202,8 @@ struct FunctionInfo {
     // when replaced by the caller's argument expression. Inline into all
     // callers if eliminating the function saves more bytes than the duplicated
     // non-parameter body costs.
-    if (!usedGlobally && !hasLoops && paramsUsedOnceInOrder && refs >= 2 &&
-        options.shrinkLevel > 0 &&
+    if (!byteBudgetMode && !usedGlobally && !hasLoops &&
+        paramsUsedOnceInOrder && refs >= 2 && options.shrinkLevel > 0 &&
         (hasCalls || trivialInstruction != TrivialInstruction::MayNotShrink)) {
       if ((refs - 1) * nonParamBodyBytes <
           3 * refs + 2 * numParamGets + 5) {
@@ -251,6 +258,7 @@ struct FunctionInfo {
 };
 
 using NameInfoMap = std::unordered_map<Name, FunctionInfo>;
+using GlobalRefMap = std::unordered_map<Name, std::atomic<Index>>;
 
 struct FunctionInfoScanner
   : public WalkerPass<PostWalker<FunctionInfoScanner>> {
@@ -258,10 +266,11 @@ struct FunctionInfoScanner
 
   bool modifiesBinaryenIR() override { return false; }
 
-  FunctionInfoScanner(NameInfoMap& infos) : infos(infos) {}
+  FunctionInfoScanner(NameInfoMap& infos, GlobalRefMap* globalRefs = nullptr)
+    : infos(infos), globalRefs(globalRefs) {}
 
   std::unique_ptr<Pass> create() override {
-    return std::make_unique<FunctionInfoScanner>(infos);
+    return std::make_unique<FunctionInfoScanner>(infos, globalRefs);
   }
 
   void visitLoop(Loop* curr) {
@@ -283,6 +292,24 @@ struct FunctionInfoScanner
 
   void visitCallRef(CallRef* curr) {
     infos[getFunction()->name].hasCalls = true;
+  }
+
+  void visitGlobalGet(GlobalGet* curr) {
+    if (globalRefs) {
+      auto it = globalRefs->find(curr->name);
+      if (it != globalRefs->end()) {
+        it->second++;
+      }
+    }
+  }
+
+  void visitGlobalSet(GlobalSet* curr) {
+    if (globalRefs) {
+      auto it = globalRefs->find(curr->name);
+      if (it != globalRefs->end()) {
+        it->second++;
+      }
+    }
   }
 
   void visitTry(Try* curr) {
@@ -331,6 +358,15 @@ struct FunctionInfoScanner
   }
 
   void visitBrOn(BrOn* curr) { noteCondition(curr->ref); }
+
+  static int getULEBSize(uint64_t value) {
+    int size = 0;
+    do {
+      value >>= 7;
+      size++;
+    } while (value != 0);
+    return size;
+  }
 
   static int getSLEBSize(int64_t value) {
     int size = 0;
@@ -513,9 +549,11 @@ struct FunctionInfoScanner
     // TODO: Consider allowing drops, as at least in traps-never-happen mode
     //       they can usually be removed.
     auto* body = curr->body;
+    bool isDropCall = false;
     if (auto* drop = body->dynCast<Drop>()) {
       if (drop->value->is<Call>()) {
         body = drop->value;
+        isDropCall = true;
       }
     }
     // Skip control flow as those can be substantially larger (middle and end
@@ -540,6 +578,7 @@ struct FunctionInfoScanner
 
       if (shrinks && nextLocalGetIndex == curr->getNumParams()) {
         info.trivialInstruction = TrivialInstruction::Shrinks;
+        info.trivialDropCall = isDropCall;
         return;
       }
 
@@ -555,6 +594,266 @@ struct FunctionInfoScanner
 
 private:
   NameInfoMap& infos;
+  GlobalRefMap* globalRefs;
+};
+
+enum class ParamStrategy : uint8_t {
+  DropSilent,
+  DirectSingle,
+  DirectDup,
+  ReuseArgTee,
+  ScratchTee,
+};
+
+struct ByteBudgetSitePlan {
+  bool valid = false;
+  int siteDeltaBytes = 0;
+  std::vector<ParamStrategy> paramStrategies;
+};
+
+struct RankTables {
+  std::unordered_map<Name, Index> funcRank;
+  std::unordered_map<Name, Index> globalRank;
+  std::unordered_map<HeapType, Index> typeRank;
+
+  Index getFuncRank(Name name) const {
+    auto it = funcRank.find(name);
+    return it != funcRank.end() ? it->second : 200;
+  }
+
+  Index getGlobalRank(Name name) const {
+    auto it = globalRank.find(name);
+    return it != globalRank.end() ? it->second : 200;
+  }
+
+  Index getTypeRank(HeapType ht) const {
+    auto it = typeRank.find(ht);
+    return it != typeRank.end() ? it->second : 200;
+  }
+
+  int getFuncIndexBytes(Name name) const {
+    return FunctionInfoScanner::getULEBSize(getFuncRank(name));
+  }
+
+  int getGlobalIndexBytes(Name name) const {
+    return FunctionInfoScanner::getULEBSize(getGlobalRank(name));
+  }
+
+  int getTypeIndexBytes(HeapType ht, bool isS33) const {
+    if (ht.isBasic()) {
+      return 1;
+    }
+    Index rank = getTypeRank(ht);
+    if (isS33) {
+      return FunctionInfoScanner::getSLEBSize(int64_t(rank));
+    }
+    return FunctionInfoScanner::getULEBSize(rank);
+  }
+
+  int getTypeBytes(Type t) const {
+    if (t == Type::none || t == Type::unreachable) {
+      return 0;
+    }
+    if (t.isTuple()) {
+      int sum = 0;
+      for (auto elem : t) {
+        sum += getTypeBytes(elem);
+      }
+      return sum;
+    }
+    if (!t.isRef()) {
+      return 1;
+    }
+    HeapType ht = t.getHeapType();
+    if (ht.isBasic() && t.isNullable() && !t.isExact()) {
+      return 1;
+    }
+    return 1 + getTypeIndexBytes(ht, /*isS33=*/true);
+  }
+
+  int getExactShallowBytes(Expression* curr) const {
+    switch (curr->_id) {
+      case Expression::BlockId: {
+        auto* b = curr->cast<Block>();
+        if (!b->name.is()) {
+          return 0;
+        }
+        int bt = (b->type == Type::none || b->type == Type::unreachable)
+                   ? 1
+                   : getTypeBytes(b->type);
+        return 2 + bt;
+      }
+      case Expression::IfId: {
+        auto* iff = curr->cast<If>();
+        int bt = (iff->type == Type::none || iff->type == Type::unreachable)
+                   ? 1
+                   : getTypeBytes(iff->type);
+        return (iff->ifFalse ? 3 : 2) + bt;
+      }
+      case Expression::LoopId: {
+        auto* loop = curr->cast<Loop>();
+        int bt = (loop->type == Type::none || loop->type == Type::unreachable)
+                   ? 1
+                   : getTypeBytes(loop->type);
+        return 2 + bt;
+      }
+      case Expression::BreakId:
+        return 2;
+      case Expression::CallId:
+        return 1 + getFuncIndexBytes(curr->cast<Call>()->target);
+      case Expression::CallRefId:
+        return 2 + getTypeIndexBytes(
+                     curr->cast<CallRef>()->target->type.getHeapType(), false);
+      case Expression::CallIndirectId:
+        return 2 + getTypeIndexBytes(curr->cast<CallIndirect>()->heapType,
+                                     false);
+      case Expression::GlobalGetId:
+        return 1 + getGlobalIndexBytes(curr->cast<GlobalGet>()->name);
+      case Expression::GlobalSetId:
+        return 1 + getGlobalIndexBytes(curr->cast<GlobalSet>()->name);
+      case Expression::RefFuncId:
+        return 1 + getFuncIndexBytes(curr->cast<RefFunc>()->func);
+      case Expression::StringConstId:
+        return 3;
+      case Expression::LocalGetId:
+        return 1 +
+               FunctionInfoScanner::getULEBSize(curr->cast<LocalGet>()->index);
+      case Expression::LocalSetId:
+        return 1 +
+               FunctionInfoScanner::getULEBSize(curr->cast<LocalSet>()->index);
+      case Expression::LoadId:
+        return 2 +
+               FunctionInfoScanner::getULEBSize(curr->cast<Load>()->offset.addr);
+      case Expression::StoreId:
+        return 2 + FunctionInfoScanner::getULEBSize(
+                     curr->cast<Store>()->offset.addr);
+      case Expression::ConstId: {
+        auto* c = curr->cast<Const>();
+        switch (c->type.getBasic()) {
+          case Type::i32:
+            return 1 + FunctionInfoScanner::getSLEBSize(c->value.geti32());
+          case Type::i64:
+            return 1 + FunctionInfoScanner::getSLEBSize(c->value.geti64());
+          case Type::f32:
+            return 5;
+          case Type::f64:
+            return 9;
+          case Type::v128:
+            return 18;
+          default:
+            WASM_UNREACHABLE("unexpected const type");
+        }
+      }
+      case Expression::UnaryId: {
+        auto op = curr->cast<Unary>()->op;
+        if (op == TruncSatSFloat32ToInt32 || op == TruncSatUFloat32ToInt32 ||
+            op == TruncSatSFloat64ToInt32 || op == TruncSatUFloat64ToInt32 ||
+            op == TruncSatSFloat32ToInt64 || op == TruncSatUFloat32ToInt64 ||
+            op == TruncSatSFloat64ToInt64 || op == TruncSatUFloat64ToInt64) {
+          return 2;
+        }
+        return 1;
+      }
+      case Expression::BinaryId:
+      case Expression::DropId:
+      case Expression::ReturnId:
+      case Expression::NopId:
+      case Expression::UnreachableId:
+      case Expression::RefIsNullId:
+      case Expression::RefEqId:
+        return 1;
+      case Expression::RefAsId: {
+        auto op = curr->cast<RefAs>()->op;
+        return (op == AnyConvertExtern || op == ExternConvertAny) ? 2 : 1;
+      }
+      case Expression::SelectId:
+        return curr->type.isRef() ? 2 + getTypeBytes(curr->type) : 1;
+      case Expression::RefNullId:
+        return 1 + getTypeIndexBytes(curr->type.getHeapType(), /*isS33=*/true);
+      case Expression::ThrowId:
+      case Expression::RefI31Id:
+      case Expression::I31GetId:
+      case Expression::ArrayLenId:
+        return 2;
+      case Expression::StructNewId:
+        return 2 + getTypeIndexBytes(curr->type.getHeapType(), false);
+      case Expression::StructGetId: {
+        auto* sg = curr->cast<StructGet>();
+        return 2 + getTypeIndexBytes(sg->ref->type.getHeapType(), false) +
+               FunctionInfoScanner::getULEBSize(sg->index);
+      }
+      case Expression::StructSetId: {
+        auto* ss = curr->cast<StructSet>();
+        return 2 + getTypeIndexBytes(ss->ref->type.getHeapType(), false) +
+               FunctionInfoScanner::getULEBSize(ss->index);
+      }
+      case Expression::ArrayNewId:
+        return 2 + getTypeIndexBytes(curr->type.getHeapType(), false);
+      case Expression::ArrayGetId:
+        return 2 + getTypeIndexBytes(
+                     curr->cast<ArrayGet>()->ref->type.getHeapType(), false);
+      case Expression::ArraySetId:
+        return 2 + getTypeIndexBytes(
+                     curr->cast<ArraySet>()->ref->type.getHeapType(), false);
+      case Expression::ArrayFillId:
+        return 2 + getTypeIndexBytes(
+                     curr->cast<ArrayFill>()->ref->type.getHeapType(), false);
+      case Expression::RefCastId:
+        return 2 + getTypeIndexBytes(curr->type.getHeapType(), /*isS33=*/true);
+      case Expression::RefTestId:
+        return 2 + getTypeIndexBytes(curr->cast<RefTest>()->castType.getHeapType(),
+                                     /*isS33=*/true);
+      case Expression::ArrayNewFixedId: {
+        auto* anf = curr->cast<ArrayNewFixed>();
+        return 2 + getTypeIndexBytes(anf->type.getHeapType(), false) +
+               FunctionInfoScanner::getULEBSize(anf->values.size());
+      }
+      case Expression::ArrayCopyId: {
+        auto* ac = curr->cast<ArrayCopy>();
+        return 2 + getTypeIndexBytes(ac->destRef->type.getHeapType(), false) +
+               getTypeIndexBytes(ac->srcRef->type.getHeapType(), false);
+      }
+      case Expression::ArrayNewDataId:
+      case Expression::ArrayNewElemId:
+      case Expression::ArrayInitDataId:
+      case Expression::ArrayInitElemId:
+        return 6;
+      default:
+        return 2;
+    }
+  }
+
+  int getTreeBytes(Expression* root) const {
+    int total = 0;
+    struct TreeBytesScanner
+      : public PostWalker<TreeBytesScanner,
+                          UnifiedExpressionVisitor<TreeBytesScanner>> {
+      const RankTables& ranks;
+      int& total;
+      TreeBytesScanner(const RankTables& ranks, int& total)
+        : ranks(ranks), total(total) {}
+      void visitExpression(Expression* curr) {
+        total += ranks.getExactShallowBytes(curr);
+      }
+    } scanner(*this, total);
+    scanner.walk(root);
+    return total;
+  }
+};
+
+struct ByteBudgetFuncInfo {
+  bool valid = false;
+  int savedFuncBytes = 0;
+  int nonParamExprBytes = 0;
+  Index totalVarAccesses = 0;
+  std::vector<Index> paramGetCount;
+  std::vector<Index> firstReadOrd;
+  std::vector<bool> paramAllowsNullBottom;
+  std::vector<bool> paramNeedsExactHeapType;
+  std::vector<bool> paramInBranch;
+  std::vector<EffectAnalyzer> prefixEffectsBeforeFirstGet;
+  std::vector<Index> varReads;
+  std::vector<Index> varWrites;
 };
 
 struct InliningAction {
@@ -572,6 +871,10 @@ struct InliningAction {
   // This is set for constant-argument call sites, see
   // FunctionInfo::worthConstantArgInlining.
   bool forceFull = false;
+
+  bool useDirectInlining = false;
+  ByteBudgetSitePlan directPlan;
+  const ByteBudgetFuncInfo* bbFuncInfo = nullptr;
 
   InliningAction(Expression** callSite,
                  Function* contents,
@@ -593,6 +896,10 @@ struct InliningState {
   std::unordered_set<Name> constantGlobals;
   // function name => actions that can be performed in it
   std::unordered_map<Name, std::vector<InliningAction>> actionsForFunction;
+  // Byte-budget candidate analysis per function.
+  std::unordered_map<Name, ByteBudgetFuncInfo> byteBudgetInfos;
+  // Functions added to inlinableFunctions solely via byte-budget mode.
+  std::unordered_set<Name> byteBudgetOnlyFunctions;
 };
 
 struct Planner : public WalkerPass<TryDepthWalker<Planner>> {
@@ -988,6 +1295,171 @@ static void doCodeInlining(Module* module,
   }
 }
 
+using ScratchLocalPool = std::unordered_map<Type, std::vector<Index>>;
+
+static void doDirectInlining(Module* module,
+                             Function* into,
+                             const InliningAction& action,
+                             ScratchLocalPool& scratchPool) {
+  Function* from = action.contents;
+  auto* call = (*action.callSite)->cast<Call>();
+  const auto& plan = action.directPlan;
+  const auto& bbInfo = *action.bbFuncInfo;
+
+  Builder builder(*module);
+
+  std::unordered_set<Index> busyLocals;
+  for (auto* lg : FindAll<LocalGet>(call).list) {
+    busyLocals.insert(lg->index);
+  }
+  for (auto* ls : FindAll<LocalSet>(call).list) {
+    busyLocals.insert(ls->index);
+  }
+
+  std::unordered_set<Index> claimedByThisCall;
+  auto getScratchLocal = [&](Type t) -> Index {
+    auto& vec = scratchPool[t];
+    for (Index idx : vec) {
+      if (!busyLocals.contains(idx) && !claimedByThisCall.contains(idx)) {
+        claimedByThisCall.insert(idx);
+        return idx;
+      }
+    }
+    Index idx = builder.addVar(into, t);
+    vec.push_back(idx);
+    claimedByThisCall.insert(idx);
+    return idx;
+  };
+
+  Index numParams = from->getNumParams();
+  std::vector<Index> varLocalMap(from->vars.size(), Index(-1));
+  for (Index v = 0; v < from->vars.size(); ++v) {
+    if (bbInfo.varReads[v] > 0 || bbInfo.varWrites[v] > 0) {
+      varLocalMap[v] = getScratchLocal(from->vars[v]);
+    }
+  }
+
+  std::vector<Index> paramScratchLocals(numParams, Index(-1));
+  for (Index p = 0; p < numParams; ++p) {
+    Expression* arg = call->operands[p];
+    Type paramType = from->getLocalType(p);
+    if (arg->is<RefNull>() && !bbInfo.paramAllowsNullBottom[p] &&
+        arg->type != paramType) {
+      arg->type = Type(paramType.getHeapType(), Nullable);
+    }
+    if (plan.paramStrategies[p] == ParamStrategy::ScratchTee) {
+      paramScratchLocals[p] = getScratchLocal(paramType);
+    } else if (plan.paramStrategies[p] == ParamStrategy::DirectSingle &&
+               bbInfo.paramNeedsExactHeapType[p] && !arg->is<RefNull>() &&
+               arg->type.getHeapType() != paramType.getHeapType()) {
+      paramScratchLocals[p] = getScratchLocal(paramType);
+    }
+  }
+
+  auto* contents = ExpressionManipulator::copy(from->body, *module);
+  metadata::copyBetweenFunctions(from->body, contents, from, into);
+
+  struct DirectUpdater : public PostWalker<DirectUpdater> {
+    Module* module;
+    Function* into;
+    Function* from;
+    Call* call;
+    Builder& builder;
+    const ByteBudgetSitePlan& plan;
+    const std::vector<Index>& paramScratchLocals;
+    const std::vector<Index>& varLocalMap;
+    std::vector<Index> seenParamGets;
+
+    DirectUpdater(Module* module,
+                  Function* into,
+                  Function* from,
+                  Call* call,
+                  Builder& builder,
+                  const ByteBudgetSitePlan& plan,
+                  const std::vector<Index>& paramScratchLocals,
+                  const std::vector<Index>& varLocalMap)
+      : module(module), into(into), from(from), call(call), builder(builder),
+        plan(plan), paramScratchLocals(paramScratchLocals),
+        varLocalMap(varLocalMap), seenParamGets(from->getNumParams(), 0) {}
+
+    void visitLocalGet(LocalGet* curr) {
+      Index numParams = from->getNumParams();
+      if (curr->index >= numParams) {
+        Index v = curr->index - numParams;
+        assert(varLocalMap[v] != Index(-1));
+        curr->index = varLocalMap[v];
+        return;
+      }
+
+      Index p = curr->index;
+      Index seen = seenParamGets[p]++;
+      Expression* arg = call->operands[p];
+      Type paramType = from->getLocalType(p);
+
+      switch (plan.paramStrategies[p]) {
+        case ParamStrategy::DirectSingle: {
+          assert(seen == 0);
+          if (paramScratchLocals[p] != Index(-1)) {
+            replaceCurrent(
+              builder.makeLocalTee(paramScratchLocals[p], arg, paramType));
+          } else {
+            replaceCurrent(arg);
+          }
+          return;
+        }
+        case ParamStrategy::DirectDup: {
+          if (seen == 0) {
+            replaceCurrent(arg);
+          } else {
+            replaceCurrent(ExpressionManipulator::copy(arg, *module));
+          }
+          return;
+        }
+        case ParamStrategy::ReuseArgTee: {
+          if (seen == 0) {
+            replaceCurrent(arg);
+          } else {
+            Index teeLocal = arg->cast<LocalSet>()->index;
+            replaceCurrent(
+              builder.makeLocalGet(teeLocal, into->getLocalType(teeLocal)));
+          }
+          return;
+        }
+        case ParamStrategy::ScratchTee: {
+          Index tmp = paramScratchLocals[p];
+          assert(tmp != Index(-1));
+          if (seen == 0) {
+            replaceCurrent(builder.makeLocalTee(tmp, arg, paramType));
+          } else {
+            replaceCurrent(builder.makeLocalGet(tmp, paramType));
+          }
+          return;
+        }
+        case ParamStrategy::DropSilent:
+          WASM_UNREACHABLE("unexpected get of silent-dropped param");
+      }
+    }
+
+    void visitLocalSet(LocalSet* curr) {
+      Index numParams = from->getNumParams();
+      assert(curr->index >= numParams);
+      Index v = curr->index - numParams;
+      assert(varLocalMap[v] != Index(-1));
+      curr->index = varLocalMap[v];
+    }
+  } updater(module,
+            into,
+            from,
+            call,
+            builder,
+            plan,
+            paramScratchLocals,
+            varLocalMap);
+
+  updater.walk(contents);
+  *action.callSite = contents;
+}
+
 // Updates the outer function after we inline into it. This is a general
 // operation that does not depend on what we inlined, it just makes sure that we
 // refinalize everything, have no duplicate break labels, etc.
@@ -1040,10 +1512,15 @@ struct DoInlining : public Pass {
     const auto& actions = iter->second;
     assert(!actions.empty());
 
+    ScratchLocalPool scratchPool;
     // Inline all the code first, then update func once at the end (which saves
     // e.g. running ReFinalize after each action, of which there might be many).
-    for (auto action : actions) {
-      doCodeInlining(module, func, action, getPassOptions());
+    for (const auto& action : actions) {
+      if (action.useDirectInlining) {
+        doDirectInlining(module, func, action, scratchPool);
+      } else {
+        doCodeInlining(module, func, action, getPassOptions());
+      }
     }
     updateAfterInlining(module, func);
   }
@@ -1579,10 +2056,27 @@ struct Inlining : public Pass {
 
   // the information for each function. recomputed in each interaction
   NameInfoMap infos;
+  GlobalRefMap globalRefs;
 
   std::unique_ptr<FunctionSplitter> functionSplitter;
 
   Module* module = nullptr;
+
+  bool isByteBudgetMode() {
+    if (hasArgument("inlining-byte-budget")) {
+      auto val = getArgument("inlining-byte-budget", "");
+      return val.empty() || val != "0";
+    }
+    if (hasArgument("inlining") &&
+        getArgument("inlining", "") == "byte-budget") {
+      return true;
+    }
+    if (hasArgument("inlining-optimizing") &&
+        getArgument("inlining-optimizing", "") == "byte-budget") {
+      return true;
+    }
+    return false;
+  }
 
   void run(Module* module_) override {
     module = module_;
@@ -1661,13 +2155,20 @@ struct Inlining : public Pass {
 
   void prepare() {
     infos.clear();
+    globalRefs.clear();
     // fill in info, as we operate on it in parallel (each function to its own
     // entry)
     for (auto& func : module->functions) {
       infos.try_emplace(func->name);
     }
+    bool byteBudget = isByteBudgetMode();
+    if (byteBudget) {
+      for (auto& g : module->globals) {
+        globalRefs.try_emplace(g->name, 0);
+      }
+    }
     {
-      FunctionInfoScanner scanner(infos);
+      FunctionInfoScanner scanner(infos, byteBudget ? &globalRefs : nullptr);
       scanner.run(getPassRunner(), module);
       scanner.walkModuleCode(module);
     }
@@ -1689,15 +2190,577 @@ struct Inlining : public Pass {
     }
   }
 
+  RankTables computeRankTables() {
+    RankTables ranks;
+
+    Index nextFuncRank = 0;
+    std::vector<Name> definedFuncs;
+    definedFuncs.reserve(module->functions.size());
+    for (auto& func : module->functions) {
+      if (func->imported()) {
+        ranks.funcRank[func->name] = nextFuncRank++;
+      } else {
+        definedFuncs.push_back(func->name);
+      }
+    }
+    std::sort(definedFuncs.begin(),
+              definedFuncs.end(),
+              [&](const Name& a, const Name& b) {
+                Index ra = infos[a].refs.load();
+                Index rb = infos[b].refs.load();
+                if (ra != rb) {
+                  return ra > rb;
+                }
+                return a > b;
+              });
+    for (auto& name : definedFuncs) {
+      ranks.funcRank[name] = nextFuncRank++;
+    }
+
+    Index nextGlobalRank = 0;
+    std::vector<Name> definedGlobals;
+    definedGlobals.reserve(module->globals.size());
+    for (auto& g : module->globals) {
+      if (g->imported()) {
+        ranks.globalRank[g->name] = nextGlobalRank++;
+      } else {
+        definedGlobals.push_back(g->name);
+      }
+    }
+    std::sort(definedGlobals.begin(),
+              definedGlobals.end(),
+              [&](const Name& a, const Name& b) {
+                Index ra = globalRefs[a].load();
+                Index rb = globalRefs[b].load();
+                if (ra != rb) {
+                  return ra > rb;
+                }
+                return a < b;
+              });
+    for (auto& name : definedGlobals) {
+      ranks.globalRank[name] = nextGlobalRank++;
+    }
+
+    if (module->features.hasGC()) {
+      auto typeCounts = ModuleUtils::collectHeapTypeInfo(
+        *module, WorldMode::Open, ModuleUtils::TypeInclusion::BinaryTypes);
+      std::unordered_map<HeapType, double> weights;
+      std::vector<HeapType> allTypes;
+      allTypes.reserve(typeCounts.size());
+      for (auto& [ht, info] : typeCounts) {
+        weights[ht] = info.useCount;
+        allTypes.push_back(ht);
+      }
+      for (auto it = allTypes.rbegin(); it != allTypes.rend(); ++it) {
+        if (auto sup = it->getSuperType()) {
+          if (weights.contains(*sup)) {
+            weights[*sup] = std::max(weights[*sup], weights[*it] + 0.5);
+          }
+        }
+      }
+      std::stable_sort(allTypes.begin(),
+                       allTypes.end(),
+                       [&](const HeapType& a, const HeapType& b) {
+                         return weights[a] > weights[b];
+                       });
+      for (Index i = 0; i < allTypes.size(); ++i) {
+        ranks.typeRank[allTypes[i]] = i;
+      }
+    }
+
+    return ranks;
+  }
+
+  bool analyzeByteBudgetCandidate(Function* func,
+                                  const RankTables& ranks,
+                                  const PassOptions& options,
+                                  ByteBudgetFuncInfo& bbInfo) {
+    if (!func->body || func->imported() || func->noFullInline) {
+      return false;
+    }
+    Index numParams = func->getNumParams();
+    Index numVars = func->vars.size();
+    bbInfo.paramGetCount.assign(numParams, 0);
+    bbInfo.firstReadOrd.assign(numParams, 0);
+    bbInfo.paramAllowsNullBottom.assign(numParams, true);
+    bbInfo.paramNeedsExactHeapType.assign(numParams, false);
+    bbInfo.paramInBranch.assign(numParams, false);
+    bbInfo.prefixEffectsBeforeFirstGet.clear();
+    bbInfo.prefixEffectsBeforeFirstGet.reserve(numParams);
+    for (Index p = 0; p < numParams; ++p) {
+      bbInfo.prefixEffectsBeforeFirstGet.emplace_back(options, *module);
+    }
+    bbInfo.varReads.assign(numVars, 0);
+    bbInfo.varWrites.assign(numVars, 0);
+    bbInfo.nonParamExprBytes = 0;
+    bbInfo.totalVarAccesses = 0;
+
+    int totalExprBytes = 0;
+    Index nextReadOrd = 0;
+    EffectAnalyzer runningEffects(options, *module);
+
+    std::function<bool(Expression*, int, bool, bool)> walkExpr =
+      [&](Expression* curr,
+          int branchDepth,
+          bool allowNullBottomHere,
+          bool needsExactHeapTypeHere) -> bool {
+      if (!curr) {
+        return true;
+      }
+      if (curr->type == Type::unreachable) {
+        return false;
+      }
+      switch (curr->_id) {
+        case Expression::LoopId:
+        case Expression::TryId:
+        case Expression::TryTableId:
+        case Expression::ReturnId:
+        case Expression::BreakId:
+        case Expression::SwitchId:
+        case Expression::BrOnId:
+        case Expression::PopId:
+        case Expression::UnreachableId:
+        case Expression::ThrowId:
+        case Expression::RethrowId:
+        case Expression::ThrowRefId:
+        case Expression::TupleMakeId:
+        case Expression::TupleExtractId:
+        case Expression::ContNewId:
+        case Expression::ContBindId:
+        case Expression::SuspendId:
+        case Expression::ResumeId:
+        case Expression::ResumeThrowId:
+        case Expression::StackSwitchId:
+          return false;
+        case Expression::BlockId: {
+          auto* b = curr->cast<Block>();
+          if (b->name.is()) {
+            return false;
+          }
+          for (size_t i = 0; i < b->list.size(); ++i) {
+            bool isLast = (i + 1 == b->list.size());
+            if (!walkExpr(b->list[i],
+                          branchDepth,
+                          isLast ? allowNullBottomHere : true,
+                          isLast ? needsExactHeapTypeHere : false)) {
+              return false;
+            }
+          }
+          return true;
+        }
+        case Expression::IfId: {
+          auto* iff = curr->cast<If>();
+          if (!walkExpr(iff->condition, branchDepth, true, false)) {
+            return false;
+          }
+          if (!walkExpr(iff->ifTrue,
+                        branchDepth + 1,
+                        allowNullBottomHere,
+                        needsExactHeapTypeHere)) {
+            return false;
+          }
+          if (iff->ifFalse && !walkExpr(iff->ifFalse,
+                                        branchDepth + 1,
+                                        allowNullBottomHere,
+                                        needsExactHeapTypeHere)) {
+            return false;
+          }
+          int shallow = ranks.getExactShallowBytes(iff);
+          bbInfo.nonParamExprBytes += shallow;
+          totalExprBytes += shallow;
+          ShallowEffectAnalyzer sea(options, *module, iff);
+          if (options.trapsNeverHappen) {
+            sea.trap = false;
+            sea.implicitTrap = false;
+          }
+          sea.localsRead.clear();
+          sea.localsWritten.clear();
+          runningEffects.mergeIn(sea);
+          return true;
+        }
+        case Expression::LocalGetId: {
+          auto* lg = curr->cast<LocalGet>();
+          totalExprBytes += ranks.getExactShallowBytes(lg);
+          if (lg->index < numParams) {
+            Index p = lg->index;
+            if (bbInfo.paramGetCount[p] == 0) {
+              bbInfo.firstReadOrd[p] = nextReadOrd++;
+              bbInfo.prefixEffectsBeforeFirstGet[p].mergeIn(runningEffects);
+            }
+            bbInfo.paramGetCount[p]++;
+            if (!allowNullBottomHere) {
+              bbInfo.paramAllowsNullBottom[p] = false;
+            }
+            if (needsExactHeapTypeHere) {
+              bbInfo.paramNeedsExactHeapType[p] = true;
+            }
+            if (branchDepth > 0) {
+              bbInfo.paramInBranch[p] = true;
+            }
+          } else {
+            Index v = lg->index - numParams;
+            if (bbInfo.varWrites[v] == 0 || branchDepth > 0) {
+              return false;
+            }
+            bbInfo.varReads[v]++;
+            bbInfo.totalVarAccesses++;
+          }
+          return true;
+        }
+        case Expression::LocalSetId: {
+          auto* ls = curr->cast<LocalSet>();
+          if (ls->index < numParams || branchDepth > 0) {
+            return false;
+          }
+          if (!walkExpr(ls->value, branchDepth, true, false)) {
+            return false;
+          }
+          Index v = ls->index - numParams;
+          bbInfo.varWrites[v]++;
+          bbInfo.totalVarAccesses++;
+          totalExprBytes += ranks.getExactShallowBytes(ls);
+          return true;
+        }
+        default:
+          break;
+      }
+
+      if (auto* c = curr->dynCast<Call>()) {
+        if (c->isReturn || c->target == func->name) {
+          return false;
+        }
+      } else if (auto* ci = curr->dynCast<CallIndirect>()) {
+        if (ci->isReturn) {
+          return false;
+        }
+      } else if (auto* cr = curr->dynCast<CallRef>()) {
+        if (cr->isReturn) {
+          return false;
+        }
+      }
+
+      for (auto* child : ChildIterator(curr)) {
+        bool childNeedsExactHT = false;
+        if ((curr->is<StructSet>() && child == curr->cast<StructSet>()->ref) ||
+            (curr->is<ArrayGet>() && child == curr->cast<ArrayGet>()->ref) ||
+            (curr->is<ArraySet>() && child == curr->cast<ArraySet>()->ref) ||
+            (curr->is<ArrayFill>() && child == curr->cast<ArrayFill>()->ref) ||
+            (curr->is<ArrayCopy>() &&
+             (child == curr->cast<ArrayCopy>()->destRef ||
+              child == curr->cast<ArrayCopy>()->srcRef)) ||
+            (curr->is<CallRef>() && child == curr->cast<CallRef>()->target)) {
+          childNeedsExactHT = true;
+        }
+        bool childAllowNullBottom = false;
+        if (!childNeedsExactHT) {
+          if (curr->is<Call>() || curr->is<ArrayNewFixed>() ||
+              curr->is<GlobalSet>() || curr->is<RefIsNull>() ||
+              curr->is<RefEq>() || curr->is<Drop>() ||
+              (curr->is<CallIndirect>() &&
+               child != curr->cast<CallIndirect>()->target) ||
+              (curr->is<CallRef>() && child != curr->cast<CallRef>()->target) ||
+              (curr->is<StructNew>() &&
+               child != curr->cast<StructNew>()->desc) ||
+              (curr->is<StructSet>() &&
+               child == curr->cast<StructSet>()->value) ||
+              (curr->is<ArrayNew>() && child == curr->cast<ArrayNew>()->init) ||
+              (curr->is<ArraySet>() &&
+               child == curr->cast<ArraySet>()->value)) {
+            childAllowNullBottom = true;
+          }
+        }
+        if (!walkExpr(
+              child, branchDepth, childAllowNullBottom, childNeedsExactHT)) {
+          return false;
+        }
+      }
+
+      int shallow = ranks.getExactShallowBytes(curr);
+      bbInfo.nonParamExprBytes += shallow;
+      totalExprBytes += shallow;
+
+      ShallowEffectAnalyzer sea(options, *module, curr);
+      if (options.trapsNeverHappen) {
+        sea.trap = false;
+        sea.implicitTrap = false;
+      }
+      sea.localsRead.clear();
+      sea.localsWritten.clear();
+      runningEffects.mergeIn(sea);
+      return true;
+    };
+
+    if (!walkExpr(func->body,
+                  /*branchDepth=*/0,
+                  /*allowNullBottomHere=*/false,
+                  /*needsExactHeapTypeHere=*/false)) {
+      return false;
+    }
+
+    int localDeclBytes = 1;
+    if (!func->vars.empty()) {
+      std::unordered_map<Type, Index> varCounts;
+      for (auto vt : func->vars) {
+        varCounts[vt]++;
+      }
+      for (auto& [vt, cnt] : varCounts) {
+        localDeclBytes +=
+          FunctionInfoScanner::getULEBSize(cnt) + ranks.getTypeBytes(vt);
+      }
+    }
+    int codeBodyBytes = localDeclBytes + totalExprBytes + 1;
+    bbInfo.savedFuncBytes =
+      1 + FunctionInfoScanner::getULEBSize(codeBodyBytes) + codeBodyBytes;
+    bbInfo.valid = true;
+    return true;
+  }
+
+  bool evalByteBudgetCallSite(
+    Call* call,
+    Function* callee,
+    Function* caller,
+    const ByteBudgetFuncInfo& bbInfo,
+    const RankTables& ranks,
+    const PassOptions& options,
+    ByteBudgetSitePlan& plan,
+    std::unordered_map<Type, Index>& callerMaxScratch) {
+    if (call->isReturn || call->type == Type::unreachable) {
+      return false;
+    }
+    Index numParams = callee->getNumParams();
+    if (call->operands.size() != numParams) {
+      return false;
+    }
+
+    std::vector<EffectAnalyzer> argEffects;
+    argEffects.reserve(numParams);
+    for (Index p = 0; p < numParams; ++p) {
+      Expression* arg = call->operands[p];
+      if (arg->type == Type::unreachable) {
+        return false;
+      }
+      argEffects.emplace_back(options, *module, arg);
+      if (argEffects[p].branchesOut ||
+          argEffects[p].hasExternalBreakTargets() ||
+          argEffects[p].danglingPop || argEffects[p].mayNotReturn) {
+        return false;
+      }
+      if (options.trapsNeverHappen) {
+        argEffects[p].trap = false;
+        argEffects[p].implicitTrap = false;
+      }
+    }
+
+    for (Index p = 0; p < numParams; ++p) {
+      if (bbInfo.paramGetCount[p] == 0) {
+        if (argEffects[p].hasUnremovableSideEffects()) {
+          return false;
+        }
+        continue;
+      }
+      if (bbInfo.paramInBranch[p] && argEffects[p].hasSideEffects()) {
+        return false;
+      }
+      if (argEffects[p].invalidates(bbInfo.prefixEffectsBeforeFirstGet[p])) {
+        return false;
+      }
+      for (Index q = p + 1; q < numParams; ++q) {
+        if (bbInfo.paramGetCount[q] == 0) {
+          continue;
+        }
+        if (bbInfo.firstReadOrd[q] < bbInfo.firstReadOrd[p]) {
+          if (argEffects[p].invalidates(argEffects[q])) {
+            return false;
+          }
+        }
+      }
+    }
+
+    std::unordered_map<Type, Index> neededScratchByType;
+    Index totalScratchCount = 0;
+    for (Index v = 0; v < callee->vars.size(); ++v) {
+      if (bbInfo.varReads[v] > 0 || bbInfo.varWrites[v] > 0) {
+        neededScratchByType[callee->vars[v]]++;
+        totalScratchCount++;
+      }
+    }
+
+    int callerLocalBytes =
+      (caller->getNumLocals() + totalScratchCount + numParams >= 128) ? 3 : 2;
+    plan.paramStrategies.resize(numParams);
+    int paramDelta = 0;
+
+    for (Index p = 0; p < numParams; ++p) {
+      Expression* arg = call->operands[p];
+      Index k = bbInfo.paramGetCount[p];
+      Type paramType = callee->getLocalType(p);
+
+      if (k == 0) {
+        plan.paramStrategies[p] = ParamStrategy::DropSilent;
+        paramDelta -= ranks.getTreeBytes(arg);
+        continue;
+      }
+
+      if (k == 1) {
+        if (!arg->is<RefNull>() &&
+            ((bbInfo.paramNeedsExactHeapType[p] &&
+              arg->type.getHeapType() != paramType.getHeapType()) ||
+             (!bbInfo.paramAllowsNullBottom[p] && arg->type.isNull()))) {
+          if (bbInfo.paramInBranch[p]) {
+            return false;
+          }
+          plan.paramStrategies[p] = ParamStrategy::ScratchTee;
+          neededScratchByType[paramType]++;
+          paramDelta += callerLocalBytes;
+        } else {
+          plan.paramStrategies[p] = ParamStrategy::DirectSingle;
+          if (arg->is<RefNull>() && !bbInfo.paramAllowsNullBottom[p] &&
+              arg->type != paramType) {
+            int oldB = ranks.getExactShallowBytes(arg);
+            int newB = 1 + ranks.getTypeIndexBytes(paramType.getHeapType(),
+                                                   /*isS33=*/true);
+            paramDelta += (newB - oldB);
+          }
+        }
+        continue;
+      }
+
+      bool exactHTOk =
+        (!bbInfo.paramNeedsExactHeapType[p] || arg->is<RefNull>() ||
+         arg->type.getHeapType() == paramType.getHeapType()) &&
+        (bbInfo.paramAllowsNullBottom[p] || arg->is<RefNull>() ||
+         !arg->type.isNull());
+      bool chosen = false;
+
+      if (exactHTOk) {
+        if (auto* lg = arg->dynCast<LocalGet>()) {
+          bool clobbered = false;
+          for (Index q = 0; q < numParams; ++q) {
+            if (q != p && argEffects[q].localsWritten.contains(lg->index)) {
+              clobbered = true;
+              break;
+            }
+          }
+          if (!clobbered) {
+            plan.paramStrategies[p] = ParamStrategy::DirectDup;
+            paramDelta += int(k - 1) * ranks.getExactShallowBytes(lg);
+            chosen = true;
+          }
+        } else if (auto* ra = arg->dynCast<RefAs>();
+                   ra && ra->op == RefAsNonNull && ra->value->is<LocalGet>()) {
+          auto* lg = ra->value->cast<LocalGet>();
+          bool clobbered = false;
+          for (Index q = 0; q < numParams; ++q) {
+            if (q != p && argEffects[q].localsWritten.contains(lg->index)) {
+              clobbered = true;
+              break;
+            }
+          }
+          int treeB = 1 + ranks.getExactShallowBytes(lg);
+          if (!clobbered && int(k - 1) * treeB <= int(k) * callerLocalBytes) {
+            plan.paramStrategies[p] = ParamStrategy::DirectDup;
+            paramDelta += int(k - 1) * treeB;
+            chosen = true;
+          }
+        } else if (arg->is<Const>() || arg->is<RefNull>() ||
+                   (arg->is<GlobalGet>() &&
+                    !module->getGlobal(arg->cast<GlobalGet>()->name)
+                       ->mutable_)) {
+          int oldB = ranks.getExactShallowBytes(arg);
+          int newB = oldB;
+          if (arg->is<RefNull>() && !bbInfo.paramAllowsNullBottom[p] &&
+              arg->type != paramType) {
+            newB = 1 + ranks.getTypeIndexBytes(paramType.getHeapType(),
+                                               /*isS33=*/true);
+          }
+          if (int(k) * newB - oldB <= int(k) * callerLocalBytes) {
+            plan.paramStrategies[p] = ParamStrategy::DirectDup;
+            paramDelta += int(k) * newB - oldB;
+            chosen = true;
+          }
+        }
+      }
+
+      if (!chosen && exactHTOk && !bbInfo.paramInBranch[p]) {
+        if (auto* ls = arg->dynCast<LocalSet>(); ls && ls->isTee()) {
+          Type teeLocalType = caller->getLocalType(ls->index);
+          bool teeTypeOk =
+            Type::isSubType(teeLocalType, paramType) &&
+            (!bbInfo.paramNeedsExactHeapType[p] ||
+             teeLocalType.getHeapType() == paramType.getHeapType()) &&
+            (bbInfo.paramAllowsNullBottom[p] || !teeLocalType.isNull());
+          if (teeTypeOk) {
+            bool conflict = false;
+            for (Index q = 0; q < numParams; ++q) {
+              if (q != p && (argEffects[q].localsWritten.contains(ls->index) ||
+                             argEffects[q].localsRead.contains(ls->index))) {
+                conflict = true;
+                break;
+              }
+            }
+            if (!conflict) {
+              plan.paramStrategies[p] = ParamStrategy::ReuseArgTee;
+              int getB = 1 + FunctionInfoScanner::getULEBSize(ls->index);
+              paramDelta += int(k - 1) * getB;
+              chosen = true;
+            }
+          }
+        }
+      }
+
+      if (!chosen) {
+        if (bbInfo.paramInBranch[p]) {
+          return false;
+        }
+        plan.paramStrategies[p] = ParamStrategy::ScratchTee;
+        neededScratchByType[paramType]++;
+        paramDelta += int(k) * callerLocalBytes;
+      }
+    }
+
+    for (auto& [vt, need] : neededScratchByType) {
+      callerMaxScratch[vt] = std::max(callerMaxScratch[vt], need);
+    }
+
+    int callInstBytes = 1 + ranks.getFuncIndexBytes(callee->name);
+    plan.siteDeltaBytes = bbInfo.nonParamExprBytes +
+                          int(bbInfo.totalVarAccesses) * callerLocalBytes -
+                          callInstBytes + paramDelta;
+    plan.valid = true;
+    return true;
+  }
+
   void iteration(std::unordered_set<Function*>& inlinedInto) {
     // decide which to inline
     InliningState state;
     auto& options = getPassOptions();
+    bool byteBudget = isByteBudgetMode();
+    RankTables ranks;
+    if (byteBudget) {
+      ranks = computeRankTables();
+    }
+
     ModuleUtils::iterDefinedFunctions(*module, [&](Function* func) {
       InliningMode inliningMode = getInliningMode(func->name);
       assert(inliningMode != InliningMode::Unknown);
       if (inliningMode != InliningMode::Uninlineable) {
         state.inlinableFunctions[func->name] = inliningMode;
+      }
+      if (byteBudget) {
+        auto& info = infos[func->name];
+        if (!info.usedGlobally && !info.hasTryDelegate && !func->noFullInline &&
+            info.toolchainInlineHint != CodeAnnotation::NeverInline &&
+            info.refs >= 1) {
+          ByteBudgetFuncInfo bbInfo;
+          if (analyzeByteBudgetCandidate(func, ranks, options, bbInfo)) {
+            state.byteBudgetInfos[func->name] = std::move(bbInfo);
+            if (!state.inlinableFunctions.contains(func->name)) {
+              info.inliningMode = InliningMode::Full;
+              state.inlinableFunctions[func->name] = InliningMode::Full;
+              state.byteBudgetOnlyFunctions.insert(func->name);
+            }
+          }
+        }
       }
       // Functions that are not fully inlined everywhere may still be worth
       // fully inlining at call sites with constant arguments. That is only
@@ -1732,6 +2795,89 @@ struct Inlining : public Pass {
     // function and then inline it as well).
     Planner(&state).run(getPassRunner(), module);
 
+    std::unordered_set<Name> rejectedByteBudgetFunctions;
+    if (byteBudget && !state.byteBudgetInfos.empty()) {
+      struct SiteRef {
+        Function* caller;
+        InliningAction* action;
+      };
+      std::unordered_map<Name, std::vector<SiteRef>> sitesByCallee;
+      for (auto callerName : funcNames) {
+        auto* callerFunc = module->getFunction(callerName);
+        for (auto& action : state.actionsForFunction[callerName]) {
+          Name calleeName = action.contents->name;
+          if (state.byteBudgetInfos.contains(calleeName)) {
+            sitesByCallee[calleeName].push_back({callerFunc, &action});
+          }
+        }
+      }
+
+      for (auto& [calleeName, bbInfo] : state.byteBudgetInfos) {
+        auto& sites = sitesByCallee[calleeName];
+        bool isByteBudgetOnly =
+          state.byteBudgetOnlyFunctions.contains(calleeName);
+        if (sites.size() != infos[calleeName].refs) {
+          if (isByteBudgetOnly) {
+            rejectedByteBudgetFunctions.insert(calleeName);
+          }
+          continue;
+        }
+
+        auto* calleeFunc = module->getFunction(calleeName);
+        bool allValid = true;
+        int totalSiteDeltaBytes = 0;
+        std::vector<ByteBudgetSitePlan> plans(sites.size());
+        std::unordered_map<Function*, std::unordered_map<Type, Index>>
+          callerMaxScratch;
+        for (size_t i = 0; i < sites.size(); ++i) {
+          auto* call = (*sites[i].action->callSite)->cast<Call>();
+          if (!evalByteBudgetCallSite(call,
+                                      calleeFunc,
+                                      sites[i].caller,
+                                      bbInfo,
+                                      ranks,
+                                      options,
+                                      plans[i],
+                                      callerMaxScratch[sites[i].caller])) {
+            allValid = false;
+            break;
+          }
+          totalSiteDeltaBytes += plans[i].siteDeltaBytes;
+        }
+
+        if (!allValid) {
+          if (isByteBudgetOnly) {
+            rejectedByteBudgetFunctions.insert(calleeName);
+          }
+          continue;
+        }
+
+        for (auto& [callerFunc, scratchByType] : callerMaxScratch) {
+          std::unordered_set<Type> existingVarTypes(callerFunc->vars.begin(),
+                                                    callerFunc->vars.end());
+          for (auto& [vt, need] : scratchByType) {
+            if (need > 0 && !existingVarTypes.contains(vt)) {
+              totalSiteDeltaBytes +=
+                FunctionInfoScanner::getULEBSize(need) + ranks.getTypeBytes(vt);
+            }
+          }
+        }
+
+        if (isByteBudgetOnly && bbInfo.savedFuncBytes <= totalSiteDeltaBytes) {
+          rejectedByteBudgetFunctions.insert(calleeName);
+          continue;
+        }
+
+        // Profitable (or already inlined via worthFullInlining and valid for
+        // direct substitution): attach direct inlining plans.
+        for (size_t i = 0; i < sites.size(); ++i) {
+          sites[i].action->useDirectInlining = true;
+          sites[i].action->directPlan = std::move(plans[i]);
+          sites[i].action->bbFuncInfo = &bbInfo;
+        }
+      }
+    }
+
     // Choose which inlinings to perform. We do this sequentially so that we
     // can consider interactions between them, and avoid nondeterminism.
     ChosenActions chosenActions;
@@ -1750,6 +2896,10 @@ struct Inlining : public Pass {
       }
       for (auto& action : state.actionsForFunction[name]) {
         auto* inlinedFunction = action.contents;
+        Name inlinedName = inlinedFunction->name;
+        if (rejectedByteBudgetFunctions.contains(inlinedName)) {
+          continue;
+        }
         // if we've inlined into a function, don't inline it in this iteration,
         // avoid risk of races
         // note that we do not risk stalling progress, as each iteration() will
@@ -1757,7 +2907,6 @@ struct Inlining : public Pass {
         if (inlinedInto.contains(inlinedFunction)) {
           continue;
         }
-        Name inlinedName = inlinedFunction->name;
         if (!isUnderSizeLimit(func->name, inlinedName)) {
           continue;
         }
@@ -1786,6 +2935,42 @@ struct Inlining : public Pass {
         inlinedUses[inlinedName]++;
         inlinedInto.insert(func);
         assert(inlinedUses[inlinedName] <= infos[inlinedName].refs);
+      }
+    }
+
+    // Enforce all-or-nothing inlining for multi-caller functions selected only
+    // via byteBudgetMode: if any call site was skipped in this iteration (e.g.
+    // due to inlinedUses/inlinedInto ordering conflicts), defer all call sites
+    // of that function to the next iteration so it is never partially inlined.
+    if (byteBudget && !state.byteBudgetOnlyFunctions.empty()) {
+      std::unordered_set<Name> incompleteCallee;
+      for (auto& [calleeName, count] : inlinedUses) {
+        if (state.byteBudgetOnlyFunctions.contains(calleeName) &&
+            count != infos[calleeName].refs) {
+          incompleteCallee.insert(calleeName);
+        }
+      }
+      if (!incompleteCallee.empty()) {
+        for (auto calleeName : incompleteCallee) {
+          inlinedUses.erase(calleeName);
+        }
+        inlinedInto.clear();
+        for (auto it = chosenActions.begin(); it != chosenActions.end();) {
+          auto& vec = it->second;
+          vec.erase(std::remove_if(vec.begin(),
+                                   vec.end(),
+                                   [&](const InliningAction& a) {
+                                     return incompleteCallee.contains(
+                                       a.contents->name);
+                                   }),
+                    vec.end());
+          if (vec.empty()) {
+            it = chosenActions.erase(it);
+          } else {
+            inlinedInto.insert(module->getFunction(it->first));
+            ++it;
+          }
+        }
       }
     }
 
@@ -1830,7 +3015,8 @@ struct Inlining : public Pass {
     }
 
     // Check if the function itself is worth inlining as it is.
-    if (!func->noFullInline && info.worthFullInlining(getPassOptions())) {
+    if (!func->noFullInline &&
+        info.worthFullInlining(getPassOptions(), isByteBudgetMode())) {
       return info.inliningMode = InliningMode::Full;
     }
 
