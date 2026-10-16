@@ -126,6 +126,18 @@ HeapType getHighestDefiningAncestor(HeapType ht, Index index) {
   return ht;
 }
 
+// Return the highest declared struct ancestor of `ht` that has `fields[index]`.
+HeapType getHighestFieldAncestor(HeapType ht, Index index) {
+  while (auto super = ht.getDeclaredSuperType()) {
+    if (super->isStruct() && index < super->getStruct().fields.size()) {
+      ht = *super;
+    } else {
+      break;
+    }
+  }
+  return ht;
+}
+
 using SigParamHTMap =
   std::unordered_map<HeapType, std::vector<std::optional<HeapType>>>;
 using FuncParamHTMap =
@@ -395,13 +407,16 @@ struct DemandAnalyzer : public ChildTyper<DemandAnalyzer> {
             localAcceptsNull = localType.isNullable();
           }
           if (useSigParamsForSet) {
+            bool found = false;
             if (funcParamHTs) {
               auto it = funcParamHTs->find(func);
               if (it != funcParamHTs->end() && set->index < it->second.size() &&
                   it->second[set->index]) {
                 valReq = *it->second[set->index];
+                found = true;
               }
-            } else if (sigParamHTs) {
+            }
+            if (!found && sigParamHTs) {
               auto it = sigParamHTs->find(func->type.getHeapType());
               if (it != sigParamHTs->end() && set->index < it->second.size() &&
                   it->second[set->index]) {
@@ -463,6 +478,16 @@ struct DemandAnalyzer : public ChildTyper<DemandAnalyzer> {
       return;
     }
     if (auto* call = curr->dynCast<Call>()) {
+      if (Intrinsics(wasm).isCallWithoutEffects(call)) {
+        for (auto* op : call->operands) {
+          walk(op,
+               op->type.isRef()
+                 ? std::optional<HeapType>(op->type.getHeapType())
+                 : std::nullopt,
+               op->type.isRef() && op->type.isNullable());
+        }
+        return;
+      }
       auto* callee = wasm.getFunction(call->target);
       if (funcResultDemands && call->type.isRef() && !call->isReturn) {
         auto origRes = callee->getResults();
@@ -555,22 +580,26 @@ struct DemandAnalyzer : public ChildTyper<DemandAnalyzer> {
       if (block->list.empty()) {
         return;
       }
+      std::optional<HeapType> tailReq;
+      bool tailNull = false;
+      if (block->type.isRef()) {
+        tailReq = reqHT;
+        tailNull = reqHT ? acceptsNull : block->type.isNullable();
+        if (block->name.is()) {
+          tailReq = block->type.getHeapType();
+          tailNull = block->type.isNullable() && tailNull;
+          labelTypes[block->name] = *tailReq;
+          labelAcceptsNull[block->name] = tailNull;
+        } else if (!tailReq) {
+          tailReq = block->type.getHeapType();
+        }
+      }
       for (size_t i = 0; i + 1 < block->list.size(); ++i) {
         walk(block->list[i], std::nullopt, false);
       }
       if (!block->type.isRef()) {
         walk(block->list.back(), std::nullopt, false);
         return;
-      }
-      std::optional<HeapType> tailReq = reqHT;
-      bool tailNull = reqHT ? acceptsNull : block->type.isNullable();
-      if (block->name.is()) {
-        tailReq = block->type.getHeapType();
-        tailNull = block->type.isNullable() && tailNull;
-        labelTypes[block->name] = *tailReq;
-        labelAcceptsNull[block->name] = tailNull;
-      } else if (!tailReq) {
-        tailReq = block->type.getHeapType();
       }
       walk(block->list.back(), tailReq, tailNull);
       return;
@@ -630,6 +659,14 @@ struct DemandAnalyzer : public ChildTyper<DemandAnalyzer> {
           valNull = labelAcceptsNull[br->name];
         } else if (br->value->type.isRef()) {
           valReq = br->value->type.getHeapType();
+        }
+        if (br->condition && br->type.isRef()) {
+          HeapType flowReq = reqHT ? *reqHT : br->type.getHeapType();
+          bool flowNull = reqHT ? acceptsNull : br->type.isNullable();
+          if (!valReq || HeapType::isSubType(flowReq, *valReq)) {
+            valReq = flowReq;
+          }
+          valNull = valNull && flowNull;
         }
         walk(br->value, valReq, valNull);
       }
@@ -916,6 +953,20 @@ struct FunctionRelaxer
         }
       }
       break;
+    }
+    if (auto* cast = (*exprp)->dynCast<RefCast>()) {
+      if (!cast->desc && !cast->type.isExact() && !demandedHT.isBasic() &&
+          cast->ref->type.isRef() && !cast->ref->type.isNull() &&
+          HeapType::isSubType(cast->type.getHeapType(), demandedHT)) {
+        Nullability targetNull =
+          (stripRefAs && acceptsNull) ? Nullable : cast->type.getNullability();
+        Type oldType = cast->type;
+        cast->type = Type(demandedHT, targetNull);
+        cast->finalize();
+        if (cast->type != oldType) {
+          stripped = true;
+        }
+      }
     }
     if (stripped && demandsNonNull && (*exprp)->type.isRef() &&
         (*exprp)->type.isNullable()) {
@@ -1378,6 +1429,7 @@ struct FunctionRelaxer
         }
       }
     }
+    ReFinalize().walkFunctionInModule(func, getModule());
   }
 
   struct Typer : public ChildTyper<Typer> {
@@ -1388,6 +1440,13 @@ struct FunctionRelaxer
       : ChildTyper(*parent.getModule(), parent.getFunction()), parent(parent) {}
 
     using ChildTyper<Typer>::note;
+
+    void visitCall(Call* curr) {
+      if (Intrinsics(wasm).isCallWithoutEffects(curr)) {
+        return;
+      }
+      ChildTyper<Typer>::visitCall(curr);
+    }
 
     void visitStructGet(StructGet* curr) {
       if (!curr->ref->type.isStruct()) {
@@ -1892,6 +1951,595 @@ void scanFunctionConsumers(Module& wasm,
   } fallback(scanner);
   fallback.walk(func->body);
 }
+
+struct FieldKey {
+  HeapType anc;
+  Index index;
+  bool operator==(const FieldKey& o) const {
+    return anc == o.anc && index == o.index;
+  }
+};
+
+struct FieldKeyHash {
+  size_t operator()(const FieldKey& k) const {
+    auto h = std::hash<HeapType>{}(k.anc);
+    rehash(h, k.index);
+    return h;
+  }
+};
+
+struct FieldDemandState {
+  HeapType baseHT;
+  HeapType allowedHT;
+  bool canWidenHT = true;
+  bool acceptsNull = true;
+  bool pinned = false;
+
+  void require(HeapType reqHT, bool reqNull) {
+    if (pinned) {
+      return;
+    }
+    if (!reqNull) {
+      acceptsNull = false;
+    }
+    if (!canWidenHT) {
+      return;
+    }
+    if (!HeapType::isSubType(baseHT, reqHT)) {
+      canWidenHT = false;
+      allowedHT = baseHT;
+    } else if (HeapType::isSubType(reqHT, allowedHT)) {
+      allowedHT = reqHT;
+    }
+  }
+
+  void mergeIn(const FieldDemandState& o) {
+    if (o.pinned) {
+      pin();
+      return;
+    }
+    if (!o.acceptsNull) {
+      acceptsNull = false;
+    }
+    if (!o.canWidenHT) {
+      canWidenHT = false;
+      allowedHT = baseHT;
+    } else if (canWidenHT) {
+      require(o.allowedHT, true);
+    }
+  }
+
+  void pin() {
+    pinned = true;
+    canWidenHT = false;
+    allowedHT = baseHT;
+    acceptsNull = false;
+  }
+};
+
+struct FuncFieldDemandSummary {
+  struct FieldReq {
+    FieldKey key;
+    HeapType reqHT;
+    bool reqNull;
+  };
+  struct ArrayReq {
+    HeapType arrHT;
+    HeapType reqHT;
+    bool reqNull;
+  };
+  struct GlobalReq {
+    Name name;
+    HeapType reqHT;
+    bool reqNull;
+  };
+  std::vector<FieldReq> fieldReqs;
+  std::vector<FieldKey> pinnedFields;
+  std::vector<ArrayReq> arrayReqs;
+  std::vector<HeapType> pinnedArrays;
+  std::vector<GlobalReq> pureGlobalReqs;
+  std::unordered_map<Name, Index> totalGlobalGets;
+  std::unordered_map<Name, Index> validArrayGlobalGets;
+};
+
+struct FieldAndArrayDemandWalker
+  : public ChildTyper<FieldAndArrayDemandWalker> {
+  const std::unordered_set<Name>& pureGlobalCandidates;
+  FuncFieldDemandSummary& out;
+  std::unordered_map<Name, HeapType> labelTypes;
+  std::unordered_map<Name, bool> labelAcceptsNull;
+  std::optional<HeapType> bodyReq;
+  bool bodyAcceptsNull = true;
+
+  FieldAndArrayDemandWalker(
+    Module& wasm,
+    Function* func,
+    const std::unordered_set<Name>& pureGlobalCandidates,
+    FuncFieldDemandSummary& out)
+    : ChildTyper(wasm, func), pureGlobalCandidates(pureGlobalCandidates),
+      out(out) {
+    if (func) {
+      auto results = func->getResults();
+      if (results.isRef()) {
+        bodyReq = results.getHeapType();
+        bodyAcceptsNull = results.isNullable();
+      }
+    }
+  }
+
+  void note(Expression** childp, Constraints constraints) {
+    auto* child = *childp;
+    if (constraints.size() == 1) {
+      if (auto* type = std::get_if<Type>(&constraints[0])) {
+        if (type->isRef() && !type->isExact()) {
+          walk(child, type->getHeapType(), type->isNullable());
+          return;
+        } else if (type->isRef() && type->isExact()) {
+          walk(child,
+               child->type.isRef()
+                 ? std::optional<HeapType>(child->type.getHeapType())
+                 : std::nullopt,
+               false);
+          return;
+        } else if (!type->isRef()) {
+          walk(child, std::nullopt, false);
+          return;
+        }
+      } else if (auto* ref = std::get_if<VarRef>(&constraints[0])) {
+        bool nullOk = false;
+        if (auto* null = std::get_if<Nullability>(&ref->null)) {
+          nullOk = (*null == Nullable);
+        }
+        walk(child,
+             child->type.isRef()
+               ? std::optional<HeapType>(child->type.getHeapType())
+               : std::nullopt,
+             nullOk);
+        return;
+      }
+    }
+    if (child->type.isRef()) {
+      walk(child, child->type.getHeapType(), false);
+    } else {
+      walk(child, std::nullopt, false);
+    }
+  }
+
+  Type getLabelType(Name label) { WASM_UNREACHABLE("unexpected branch"); }
+
+  void noteUnknown() {}
+
+  void visitStructSet(StructSet* curr) {
+    if (!curr->ref->type.isStruct()) {
+      walk(curr->ref, std::nullopt, false);
+      walk(curr->value, std::nullopt, false);
+      return;
+    }
+    auto anc =
+      getHighestDefiningAncestor(curr->ref->type.getHeapType(), curr->index);
+    ChildTyper<FieldAndArrayDemandWalker>::visitStructSet(curr, anc);
+  }
+
+  void visitRefIsNull(RefIsNull* curr) {
+    if (curr->value->type.isRef()) {
+      walk(curr->value, curr->value->type.getHeapType().getTop(), true);
+    } else {
+      walk(curr->value, std::nullopt, false);
+    }
+  }
+
+  void visitRefEq(RefEq* curr) {
+    if (curr->left->type.isRef()) {
+      walk(curr->left,
+           HeapTypes::eq.getBasic(curr->left->type.getHeapType().getShared()),
+           true);
+    } else {
+      walk(curr->left, std::nullopt, false);
+    }
+    if (curr->right->type.isRef()) {
+      walk(curr->right,
+           HeapTypes::eq.getBasic(curr->right->type.getHeapType().getShared()),
+           true);
+    } else {
+      walk(curr->right, std::nullopt, false);
+    }
+  }
+
+  void visitDrop(Drop* curr) {
+    if (curr->value->type.isRef()) {
+      walk(curr->value, curr->value->type.getHeapType().getTop(), true);
+    } else {
+      walk(curr->value, std::nullopt, false);
+    }
+  }
+
+  void visitRefTest(RefTest* curr) {
+    if (curr->castType.isExact() && !wasm.features.hasCustomDescriptors()) {
+      if (curr->ref->type.isRef()) {
+        walk(curr->ref, curr->ref->type.getHeapType(), true);
+      } else {
+        walk(curr->ref, std::nullopt, false);
+      }
+      return;
+    }
+    ChildTyper<FieldAndArrayDemandWalker>::visitRefTest(curr);
+  }
+
+  void walk(Expression* curr,
+            std::optional<HeapType> reqHT,
+            bool acceptsNull = true) {
+    if (auto* sget = curr->dynCast<StructGet>()) {
+      if (sget->type.isRef() && sget->ref->type.isStruct()) {
+        HeapType anc =
+          getHighestFieldAncestor(sget->ref->type.getHeapType(), sget->index);
+        HeapType effHT = reqHT ? *reqHT : sget->type.getHeapType();
+        bool effNull = reqHT ? acceptsNull : sget->type.isNullable();
+        out.fieldReqs.push_back({{anc, sget->index}, effHT, effNull});
+      }
+      if (sget->ref->type.isStruct()) {
+        auto defAnc = getHighestDefiningAncestor(sget->ref->type.getHeapType(),
+                                                 sget->index);
+        walk(sget->ref, defAnc, true);
+      } else {
+        walk(sget->ref, std::nullopt, false);
+      }
+      return;
+    }
+    if (auto* aget = curr->dynCast<ArrayGet>()) {
+      if (aget->type.isRef() && aget->ref->type.isArray()) {
+        HeapType arrHT = aget->ref->type.getHeapType();
+        HeapType effHT = reqHT ? *reqHT : aget->type.getHeapType();
+        bool effNull = reqHT ? acceptsNull : aget->type.isNullable();
+        if (auto* gget = aget->ref->dynCast<GlobalGet>()) {
+          if (pureGlobalCandidates.count(gget->name)) {
+            out.validArrayGlobalGets[gget->name]++;
+            out.pureGlobalReqs.push_back({gget->name, effHT, effNull});
+          } else {
+            out.arrayReqs.push_back({arrHT, effHT, effNull});
+          }
+        } else {
+          out.arrayReqs.push_back({arrHT, effHT, effNull});
+        }
+      }
+      if (aget->ref->type.isArray()) {
+        walk(aget->ref, aget->ref->type.getHeapType(), true);
+      } else {
+        walk(aget->ref, std::nullopt, false);
+      }
+      walk(aget->index, std::nullopt, false);
+      return;
+    }
+    if (auto* alen = curr->dynCast<ArrayLen>()) {
+      if (auto* gget = alen->ref->dynCast<GlobalGet>()) {
+        if (pureGlobalCandidates.count(gget->name)) {
+          out.validArrayGlobalGets[gget->name]++;
+        }
+      }
+      if (alen->ref->type.isRef()) {
+        walk(alen->ref, HeapType::array, true);
+      } else {
+        walk(alen->ref, std::nullopt, false);
+      }
+      return;
+    }
+    if (auto* gget = curr->dynCast<GlobalGet>()) {
+      if (pureGlobalCandidates.count(gget->name)) {
+        out.totalGlobalGets[gget->name]++;
+      }
+      return;
+    }
+    if (auto* acopy = curr->dynCast<ArrayCopy>()) {
+      if (acopy->destRef->type.isArray() && acopy->srcRef->type.isArray()) {
+        HeapType destHT = acopy->destRef->type.getHeapType();
+        HeapType srcHT = acopy->srcRef->type.getHeapType();
+        if (destHT != srcHT) {
+          out.pinnedArrays.push_back(destHT);
+          out.pinnedArrays.push_back(srcHT);
+        }
+      }
+      ChildTyper<FieldAndArrayDemandWalker>::visitArrayCopy(acopy);
+      return;
+    }
+    if (auto* armw = curr->dynCast<ArrayRMW>()) {
+      if (armw->ref->type.isArray()) {
+        out.pinnedArrays.push_back(armw->ref->type.getHeapType());
+      }
+      ChildTyper<FieldAndArrayDemandWalker>::visitArrayRMW(armw);
+      return;
+    }
+    if (auto* acx = curr->dynCast<ArrayCmpxchg>()) {
+      if (acx->ref->type.isArray()) {
+        out.pinnedArrays.push_back(acx->ref->type.getHeapType());
+      }
+      ChildTyper<FieldAndArrayDemandWalker>::visitArrayCmpxchg(acx);
+      return;
+    }
+    if (auto* srmw = curr->dynCast<StructRMW>()) {
+      if (srmw->ref->type.isStruct()) {
+        out.pinnedFields.push_back(
+          {getHighestFieldAncestor(srmw->ref->type.getHeapType(), srmw->index),
+           srmw->index});
+      }
+      ChildTyper<FieldAndArrayDemandWalker>::visitStructRMW(srmw);
+      return;
+    }
+    if (auto* scx = curr->dynCast<StructCmpxchg>()) {
+      if (scx->ref->type.isStruct()) {
+        out.pinnedFields.push_back(
+          {getHighestFieldAncestor(scx->ref->type.getHeapType(), scx->index),
+           scx->index});
+      }
+      ChildTyper<FieldAndArrayDemandWalker>::visitStructCmpxchg(scx);
+      return;
+    }
+    if (auto* swait = curr->dynCast<StructWait>()) {
+      if (swait->ref->type.isStruct()) {
+        out.pinnedFields.push_back(
+          {getHighestFieldAncestor(swait->ref->type.getHeapType(),
+                                   swait->index),
+           swait->index});
+      }
+      ChildTyper<FieldAndArrayDemandWalker>::visitStructWait(swait);
+      return;
+    }
+    if (curr->is<LocalGet>()) {
+      return;
+    }
+    if (auto* set = curr->dynCast<LocalSet>()) {
+      Type localType = func->getLocalType(set->index);
+      if (localType.isRef() && !localType.isExact()) {
+        walk(set->value, localType.getHeapType(), localType.isNullable());
+      } else {
+        walk(set->value,
+             localType.isRef()
+               ? std::optional<HeapType>(localType.getHeapType())
+               : std::nullopt,
+             false);
+      }
+      return;
+    }
+    if (auto* as = curr->dynCast<RefAs>()) {
+      if (as->op == RefAsNonNull) {
+        walk(as->value,
+             reqHT ? reqHT
+                   : (as->type.isRef()
+                        ? std::optional<HeapType>(as->type.getHeapType())
+                        : std::nullopt),
+             true);
+        return;
+      }
+    }
+    if (auto* cast = curr->dynCast<RefCast>()) {
+      if (cast->desc) {
+        walk(cast->desc,
+             cast->desc->type.isRef()
+               ? std::optional<HeapType>(cast->desc->type.getHeapType())
+               : std::nullopt,
+             cast->desc->type.isNullable());
+      }
+      if (!cast->ref->type.isRef()) {
+        walk(cast->ref, std::nullopt, false);
+        return;
+      }
+      if ((cast->type.isExact() && !wasm.features.hasCustomDescriptors()) ||
+          cast->desc) {
+        walk(cast->ref, cast->ref->type.getHeapType(), true);
+        return;
+      }
+      walk(cast->ref, cast->ref->type.getHeapType().getTop(), true);
+      return;
+    }
+    if (auto* call = curr->dynCast<Call>()) {
+      if (Intrinsics(wasm).isCallWithoutEffects(call)) {
+        for (auto* op : call->operands) {
+          walk(op,
+               op->type.isRef()
+                 ? std::optional<HeapType>(op->type.getHeapType())
+                 : std::nullopt,
+               op->type.isRef() && op->type.isNullable());
+        }
+        return;
+      }
+      auto* callee = wasm.getFunction(call->target);
+      auto params = callee->getParams();
+      for (size_t i = 0; i < call->operands.size(); ++i) {
+        std::optional<HeapType> argReq;
+        bool argNull = false;
+        if (i < params.size() && params[i].isRef()) {
+          argReq = params[i].getHeapType();
+          argNull = !params[i].isExact() && params[i].isNullable();
+        }
+        walk(call->operands[i], argReq, argNull);
+      }
+      return;
+    }
+    if (auto* callRef = curr->dynCast<CallRef>()) {
+      if (!callRef->target->type.isSignature()) {
+        for (auto* op : callRef->operands) {
+          walk(op,
+               op->type.isRef()
+                 ? std::optional<HeapType>(op->type.getHeapType())
+                 : std::nullopt,
+               false);
+        }
+        walk(callRef->target, std::nullopt, false);
+        return;
+      }
+      HeapType sigHT = callRef->target->type.getHeapType();
+      auto params = sigHT.getSignature().params;
+      for (size_t i = 0; i < callRef->operands.size(); ++i) {
+        std::optional<HeapType> argReq;
+        bool argNull = false;
+        if (i < params.size() && params[i].isRef()) {
+          argReq = params[i].getHeapType();
+          argNull = !params[i].isExact() && params[i].isNullable();
+        }
+        walk(callRef->operands[i], argReq, argNull);
+      }
+      walk(callRef->target, sigHT, true);
+      return;
+    }
+    if (auto* block = curr->dynCast<Block>()) {
+      if (block->list.empty()) {
+        return;
+      }
+      std::optional<HeapType> tailReq;
+      bool tailNull = false;
+      if (block->type.isRef()) {
+        tailReq = reqHT;
+        tailNull = reqHT ? acceptsNull : block->type.isNullable();
+        if (block->name.is() || block->type.isExact()) {
+          tailReq = block->type.getHeapType();
+          tailNull = !block->type.isExact() && block->type.isNullable() && tailNull;
+          if (block->name.is()) {
+            labelTypes[block->name] = *tailReq;
+            labelAcceptsNull[block->name] = tailNull;
+          }
+        } else if (!tailReq) {
+          tailReq = block->type.getHeapType();
+        }
+      }
+      for (size_t i = 0; i + 1 < block->list.size(); ++i) {
+        walk(block->list[i], std::nullopt, false);
+      }
+      if (!block->type.isRef()) {
+        walk(block->list.back(), std::nullopt, false);
+        return;
+      }
+      walk(block->list.back(), tailReq, tailNull);
+      return;
+    }
+    if (auto* iff = curr->dynCast<If>()) {
+      walk(iff->condition, std::nullopt, false);
+      std::optional<HeapType> armReq;
+      bool armNull = false;
+      if (iff->type.isRef()) {
+        if (iff->type.isExact()) {
+          armReq = iff->type.getHeapType();
+          armNull = false;
+        } else {
+          armReq = reqHT ? reqHT
+                         : std::optional<HeapType>(iff->type.getHeapType());
+          armNull = reqHT ? acceptsNull : iff->type.isNullable();
+        }
+      }
+      walk(iff->ifTrue, armReq, armNull);
+      if (iff->ifFalse) {
+        walk(iff->ifFalse, armReq, armNull);
+      }
+      return;
+    }
+    if (auto* loop = curr->dynCast<Loop>()) {
+      std::optional<HeapType> loopReq =
+        loop->type.isRef() ? std::optional<HeapType>(loop->type.getHeapType())
+                           : std::nullopt;
+      bool loopNull =
+        loop->type.isRef() && !loop->type.isExact() && loop->type.isNullable() &&
+        (reqHT ? acceptsNull : true);
+      walk(loop->body, loopReq, loopNull);
+      return;
+    }
+    if (auto* try_ = curr->dynCast<Try>()) {
+      std::optional<HeapType> tryReq =
+        try_->type.isRef() ? std::optional<HeapType>(try_->type.getHeapType())
+                           : std::nullopt;
+      bool tryNull =
+        try_->type.isRef() && !try_->type.isExact() && try_->type.isNullable() &&
+        (reqHT ? acceptsNull : true);
+      walk(try_->body, tryReq, tryNull);
+      for (auto* catchBody : try_->catchBodies) {
+        walk(catchBody, tryReq, tryNull);
+      }
+      return;
+    }
+    if (auto* tryTable = curr->dynCast<TryTable>()) {
+      std::optional<HeapType> tryReq =
+        tryTable->type.isRef()
+          ? std::optional<HeapType>(tryTable->type.getHeapType())
+          : std::nullopt;
+      bool tryNull = tryTable->type.isRef() && !tryTable->type.isExact() &&
+                     tryTable->type.isNullable() && (reqHT ? acceptsNull : true);
+      walk(tryTable->body, tryReq, tryNull);
+      return;
+    }
+    if (auto* br = curr->dynCast<Break>()) {
+      if (br->condition) {
+        walk(br->condition, std::nullopt, false);
+      }
+      if (br->value) {
+        std::optional<HeapType> valReq;
+        bool valNull = false;
+        if (auto it = labelTypes.find(br->name); it != labelTypes.end()) {
+          valReq = it->second;
+          valNull = labelAcceptsNull[br->name];
+        } else if (br->value->type.isRef()) {
+          valReq = br->value->type.getHeapType();
+        }
+        if (br->condition && br->type.isRef()) {
+          HeapType flowReq = reqHT ? *reqHT : br->type.getHeapType();
+          bool flowNull = reqHT ? acceptsNull : br->type.isNullable();
+          if (!valReq || HeapType::isSubType(flowReq, *valReq)) {
+            valReq = flowReq;
+          }
+          valNull = valNull && flowNull;
+        }
+        walk(br->value, valReq, valNull);
+      }
+      return;
+    }
+    if (auto* sw = curr->dynCast<Switch>()) {
+      walk(sw->condition, std::nullopt, false);
+      if (sw->value) {
+        walk(sw->value,
+             sw->value->type.isRef()
+               ? std::optional<HeapType>(sw->value->type.getHeapType())
+               : std::nullopt,
+             false);
+      }
+      return;
+    }
+    if (auto* brOn = curr->dynCast<BrOn>()) {
+      if (brOn->desc) {
+        walk(brOn->desc,
+             brOn->desc->type.isRef()
+               ? std::optional<HeapType>(brOn->desc->type.getHeapType())
+               : std::nullopt,
+             false);
+      }
+      walk(brOn->ref,
+           brOn->ref->type.isRef()
+             ? std::optional<HeapType>(brOn->ref->type.getHeapType())
+             : std::nullopt,
+           false);
+      return;
+    }
+    if (auto* sel = curr->dynCast<Select>()) {
+      walk(sel->condition, std::nullopt, false);
+      std::optional<HeapType> armReq;
+      bool armNull = false;
+      if (sel->type.isRef()) {
+        if (sel->type.isExact()) {
+          armReq = sel->type.getHeapType();
+          armNull = false;
+        } else {
+          armReq = reqHT ? reqHT
+                         : std::optional<HeapType>(sel->type.getHeapType());
+          armNull = reqHT ? acceptsNull : sel->type.isNullable();
+        }
+      }
+      walk(sel->ifTrue, armReq, armNull);
+      walk(sel->ifFalse, armReq, armNull);
+      return;
+    }
+    if (auto* ret = curr->dynCast<Return>()) {
+      if (ret->value) {
+        walk(ret->value, bodyReq, bodyAcceptsNull);
+      }
+      return;
+    }
+    visit(curr);
+  }
+};
 
 struct RelaxNullability : public Pass {
   // Signatures and locals change, and all casts are revisited.
@@ -2557,17 +3205,397 @@ struct RelaxNullability : public Pass {
     }
   }
 
-  void run(Module* module) override {
-    if (!getPassOptions().trapsNeverHappen) {
-      // Without this assumption removing casts changes behavior.
-      return;
+  bool widenFieldsAndArrays(Module* module) {
+    std::unordered_set<HeapType> fixed;
+    for (auto type :
+         ModuleUtils::getPublicHeapTypes(*module, getPassOptions().worldMode)) {
+      fixed.insert(type);
+    }
+    for (auto& tag : module->tags) {
+      fixed.insert(tag->type);
+      for (Type t : tag->params()) {
+        if (t.isRef()) {
+          fixed.insert(t.getHeapType());
+        }
+      }
+      for (Type t : tag->results()) {
+        if (t.isRef()) {
+          fixed.insert(t.getHeapType());
+        }
+      }
+    }
+    for (auto func : Intrinsics(*module).getJSCalledFunctions()) {
+      fixed.insert(module->getFunction(func)->type.getHeapType());
     }
 
-    bool widenTypes =
-      getPassOptions().shrinkLevel >= 2 || !getPassOptions().optimizeLevel;
+    std::unordered_set<Name> exportedGlobals;
+    for (auto& exp : module->exports) {
+      if (exp->kind == ExternalKind::Global) {
+        exportedGlobals.insert(*exp->getInternalName());
+      }
+    }
 
-    // 1. Relax and widen the parameters and results of private functions.
-    std::unordered_set<HeapType> fixed;
+    auto allTypes = ModuleUtils::collectHeapTypes(*module);
+    SubTypes subTypes(allTypes);
+
+    std::unordered_map<FieldKey, FieldDemandState, FieldKeyHash>
+      fieldCandidates;
+    for (auto A : allTypes) {
+      if (!A.isStruct()) {
+        continue;
+      }
+      const auto& aFields = A.getStruct().fields;
+      for (Index fi = 0; fi < aFields.size(); ++fi) {
+        if (getHighestFieldAncestor(A, fi) != A) {
+          continue;
+        }
+        const auto& family = subTypes.getSubTypes(A);
+        bool valid = true;
+        HeapType baseHT = aFields[fi].type.isRef()
+                            ? aFields[fi].type.getHeapType()
+                            : HeapType(HeapType::any);
+        for (auto U : family) {
+          if (fixed.count(U) || U.isShared() || U.getDescriptorType() ||
+              U.getDescribedType()) {
+            valid = false;
+            break;
+          }
+          const auto& uFields = U.getStruct().fields;
+          if (fi >= uFields.size()) {
+            valid = false;
+            break;
+          }
+          const auto& f = uFields[fi];
+          if (f.isPacked() || !f.type.isRef() || f.type.isExact() ||
+              f.type.isNull() || f.mutable_ != aFields[fi].mutable_) {
+            valid = false;
+            break;
+          }
+          HeapType uHT = f.type.getHeapType();
+          if (!HeapType::isSubType(uHT, baseHT) ||
+              uHT.getTop() != baseHT.getTop()) {
+            valid = false;
+            break;
+          }
+        }
+        if (valid) {
+          fieldCandidates.emplace(
+            FieldKey{A, fi},
+            FieldDemandState{baseHT, baseHT.getTop(), true, true, false});
+        }
+      }
+    }
+
+    std::unordered_map<HeapType, FieldDemandState> arrayCandidates;
+    for (auto arrHT : allTypes) {
+      if (!arrHT.isArray() || fixed.count(arrHT) || arrHT.isShared() ||
+          arrHT.getDescriptorType() || arrHT.getDescribedType()) {
+        continue;
+      }
+      if (arrHT.getDeclaredSuperType() ||
+          !subTypes.getImmediateSubTypes(arrHT).empty()) {
+        continue;
+      }
+      const auto& elem = arrHT.getArray().element;
+      if (elem.isPacked() || !elem.type.isRef() || elem.type.isExact() ||
+          elem.type.isNull()) {
+        continue;
+      }
+      HeapType baseHT = elem.type.getHeapType();
+      arrayCandidates.emplace(
+        arrHT, FieldDemandState{baseHT, baseHT.getTop(), true, true, false});
+    }
+
+    if (fieldCandidates.empty() && arrayCandidates.empty()) {
+      return false;
+    }
+
+    std::unordered_set<Name> pureGlobalCandidateSet;
+    std::unordered_map<Name, FieldDemandState> pureGlobalCandidates;
+    for (auto& g : module->globals) {
+      if (g->imported() || g->mutable_ || exportedGlobals.count(g->name) ||
+          !g->init) {
+        continue;
+      }
+      if (auto* anew = g->init->dynCast<ArrayNewFixed>()) {
+        if (!anew->type.isArray() || !g->type.isArray() || g->type.isExact()) {
+          continue;
+        }
+        HeapType arrHT = anew->type.getHeapType();
+        if (g->type.getHeapType() != arrHT || !arrayCandidates.count(arrHT) ||
+            arrHT.getArray().element.mutable_ != Immutable) {
+          continue;
+        }
+        HeapType baseHT = arrHT.getArray().element.type.getHeapType();
+        pureGlobalCandidateSet.insert(g->name);
+        pureGlobalCandidates.emplace(
+          g->name,
+          FieldDemandState{baseHT, baseHT.getTop(), true, true, false});
+      }
+    }
+
+    ModuleUtils::ParallelFunctionAnalysis<FuncFieldDemandSummary> summaries(
+      *module, [&](Function* func, FuncFieldDemandSummary& summary) {
+        if (!func->imported()) {
+          FieldAndArrayDemandWalker walker(
+            *module, func, pureGlobalCandidateSet, summary);
+          walker.walk(func->body, walker.bodyReq, walker.bodyAcceptsNull);
+        }
+      });
+
+    FuncFieldDemandSummary moduleRootSummary;
+    {
+      FieldAndArrayDemandWalker rootWalker(
+        *module, nullptr, pureGlobalCandidateSet, moduleRootSummary);
+      for (auto& g : module->globals) {
+        if (!g->imported() && g->init) {
+          rootWalker.walk(g->init,
+                          g->type.isRef()
+                            ? std::optional<HeapType>(g->type.getHeapType())
+                            : std::nullopt,
+                          g->type.isRef() && !g->type.isExact() &&
+                            g->type.isNullable());
+        }
+      }
+      for (auto& seg : module->elementSegments) {
+        for (auto* expr : seg->data) {
+          rootWalker.walk(expr,
+                          seg->type.isRef()
+                            ? std::optional<HeapType>(seg->type.getHeapType())
+                            : std::nullopt,
+                          seg->type.isRef() && !seg->type.isExact() &&
+                            seg->type.isNullable());
+        }
+      }
+    }
+
+    std::unordered_map<Name, Index> totalGlobalGets;
+    std::unordered_map<Name, Index> validArrayGlobalGets;
+    auto mergeSummary = [&](const FuncFieldDemandSummary& sum) {
+      for (const auto& k : sum.pinnedFields) {
+        if (auto it = fieldCandidates.find(k); it != fieldCandidates.end()) {
+          it->second.pin();
+        }
+      }
+      for (const auto& r : sum.fieldReqs) {
+        if (auto it = fieldCandidates.find(r.key);
+            it != fieldCandidates.end()) {
+          it->second.require(r.reqHT, r.reqNull);
+        }
+      }
+      for (const auto& arrHT : sum.pinnedArrays) {
+        if (auto it = arrayCandidates.find(arrHT);
+            it != arrayCandidates.end()) {
+          it->second.pin();
+        }
+      }
+      for (const auto& r : sum.arrayReqs) {
+        if (auto it = arrayCandidates.find(r.arrHT);
+            it != arrayCandidates.end()) {
+          it->second.require(r.reqHT, r.reqNull);
+        }
+      }
+      for (const auto& r : sum.pureGlobalReqs) {
+        if (auto it = pureGlobalCandidates.find(r.name);
+            it != pureGlobalCandidates.end()) {
+          it->second.require(r.reqHT, r.reqNull);
+        }
+      }
+      for (const auto& [name, count] : sum.totalGlobalGets) {
+        totalGlobalGets[name] += count;
+      }
+      for (const auto& [name, count] : sum.validArrayGlobalGets) {
+        validArrayGlobalGets[name] += count;
+      }
+    };
+
+    for (const auto& [_, sum] : summaries.map) {
+      mergeSummary(sum);
+    }
+    mergeSummary(moduleRootSummary);
+
+    for (const auto& [gName, gState] : pureGlobalCandidates) {
+      HeapType arrHT = module->getGlobal(gName)->type.getHeapType();
+      if (auto it = arrayCandidates.find(arrHT); it != arrayCandidates.end()) {
+        if (validArrayGlobalGets[gName] > 0) {
+          it->second.mergeIn(gState);
+        }
+      }
+    }
+
+    using StructUpdateMap =
+      std::unordered_map<HeapType, std::vector<std::pair<Index, Type>>>;
+    using ArrayUpdateMap = std::unordered_map<HeapType, Type>;
+    StructUpdateMap structUpdates;
+    ArrayUpdateMap arrayUpdates;
+
+    for (const auto& [key, state] : fieldCandidates) {
+      if (state.pinned) {
+        continue;
+      }
+      const auto& family = subTypes.getSubTypes(key.anc);
+      Type aOldFT = key.anc.getStruct().fields[key.index].type;
+      bool canUnifyToAllowed =
+        state.canWidenHT && (state.acceptsNull || !aOldFT.isNullable());
+      for (auto U : family) {
+        Type oldFT = U.getStruct().fields[key.index].type;
+        Nullability newNull =
+          (oldFT.isNullable() || state.acceptsNull) ? Nullable : NonNullable;
+        HeapType newHT =
+          canUnifyToAllowed ? state.allowedHT : oldFT.getHeapType();
+        Type newFT(newHT, newNull);
+        if (newFT != oldFT) {
+          structUpdates[U].push_back({key.index, newFT});
+        }
+      }
+    }
+
+    for (const auto& [arrHT, state] : arrayCandidates) {
+      if (state.pinned) {
+        continue;
+      }
+      Type oldET = arrHT.getArray().element.type;
+      Nullability newNull =
+        (oldET.isNullable() || state.acceptsNull) ? Nullable : NonNullable;
+      HeapType newHT = state.canWidenHT ? state.allowedHT : oldET.getHeapType();
+      Type newET(newHT, newNull);
+      if (newET != oldET) {
+        arrayUpdates[arrHT] = newET;
+      }
+    }
+
+    bool anyModified = false;
+    GlobalTypeRewriter::TypeMap oldToNew;
+    if (!structUpdates.empty() || !arrayUpdates.empty()) {
+      class FieldAndArrayRewriter : public GlobalTypeRewriter {
+        const StructUpdateMap& structUpdates;
+        const ArrayUpdateMap& arrayUpdates;
+
+      public:
+        TypeMap& outMap;
+
+        FieldAndArrayRewriter(Module& wasm,
+                              const StructUpdateMap& structUpdates,
+                              const ArrayUpdateMap& arrayUpdates,
+                              WorldMode worldMode,
+                              TypeMap& outMap)
+          : GlobalTypeRewriter(wasm, worldMode), structUpdates(structUpdates),
+            arrayUpdates(arrayUpdates), outMap(outMap) {
+          outMap = rebuildTypes(getSortedTypes(getPrivatePredecessors()));
+          mapTypes(outMap);
+        }
+
+        void modifyStruct(HeapType oldType, Struct& struct_) override {
+          auto it = structUpdates.find(oldType);
+          if (it != structUpdates.end()) {
+            for (const auto& [fi, newType] : it->second) {
+              struct_.fields[fi].type = getTempType(newType);
+            }
+          }
+        }
+
+        void modifyArray(HeapType oldType, Array& array) override {
+          auto it = arrayUpdates.find(oldType);
+          if (it != arrayUpdates.end()) {
+            array.element.type = getTempType(it->second);
+          }
+        }
+      } rewriter(*module,
+                 structUpdates,
+                 arrayUpdates,
+                 getPassOptions().worldMode,
+                 oldToNew);
+      anyModified = true;
+    }
+
+    auto mapNewHT = [&](HeapType ht) {
+      if (auto it = oldToNew.find(ht); it != oldToNew.end()) {
+        return it->second;
+      }
+      return ht;
+    };
+
+    // Check if any pure immutable array global can switch to an existing wider
+    // immutable array HeapType when its shared array type remained narrower.
+    auto curTypes = ModuleUtils::collectHeapTypes(*module);
+    SubTypes curSubTypes(curTypes);
+    std::unordered_map<Type, HeapType> existingImmArrayHT;
+    for (auto ht : curTypes) {
+      if (ht.isArray() && !ht.isShared() && !ht.getDescriptorType() &&
+          !ht.getDescribedType() && !ht.getDeclaredSuperType() &&
+          curSubTypes.getImmediateSubTypes(ht).empty()) {
+        const auto& elem = ht.getArray().element;
+        if (!elem.isPacked() && elem.mutable_ == Immutable &&
+            elem.type.isRef() && !elem.type.isExact()) {
+          existingImmArrayHT.try_emplace(elem.type, ht);
+        }
+      }
+    }
+
+    std::unordered_set<Name> retargetedGlobals;
+    for (const auto& [gName, gState] : pureGlobalCandidates) {
+      if (gState.pinned || totalGlobalGets[gName] == 0 ||
+          totalGlobalGets[gName] != validArrayGlobalGets[gName]) {
+        continue;
+      }
+      Global* g = module->getGlobal(gName);
+      HeapType curArrHT = g->type.getHeapType();
+      Type curET = curArrHT.getArray().element.type;
+      Nullability wantNull =
+        (curET.isNullable() || gState.acceptsNull) ? Nullable : NonNullable;
+      HeapType wantHT =
+        gState.canWidenHT ? mapNewHT(gState.allowedHT) : curET.getHeapType();
+      Type wantET(wantHT, wantNull);
+      if (wantET != curET && Type::isSubType(curET, wantET)) {
+        auto it = existingImmArrayHT.find(wantET);
+        if (it == existingImmArrayHT.end() && wantHT.isBasic()) {
+          Type rootET(getRootAncestor(curET.getHeapType()), wantNull);
+          if (rootET != curET && Type::isSubType(curET, rootET) &&
+              Type::isSubType(rootET, wantET)) {
+            it = existingImmArrayHT.find(rootET);
+          }
+        }
+        if (it != existingImmArrayHT.end()) {
+          HeapType targetArrHT = it->second;
+          g->type = g->type.with(targetArrHT);
+          auto* anew = g->init->cast<ArrayNewFixed>();
+          anew->type = anew->type.with(targetArrHT);
+          retargetedGlobals.insert(gName);
+          anyModified = true;
+        }
+      }
+    }
+
+    if (anyModified) {
+      ModuleUtils::ParallelFunctionAnalysis<int, Mutable>(
+        *module, [&](Function* func, int&) {
+          if (func->imported()) {
+            return;
+          }
+          if (!retargetedGlobals.empty()) {
+            for (auto* gget : FindAll<GlobalGet>(func->body).list) {
+              if (retargetedGlobals.count(gget->name)) {
+                gget->type = module->getGlobal(gget->name)->type;
+              }
+            }
+          }
+          ReFinalize().walkFunctionInModule(func, module);
+        });
+    }
+
+    return anyModified;
+  }
+
+  void collectModuleEscapeAndSigInfo(
+    Module* module,
+    const std::vector<HeapType>& types,
+    std::unordered_set<HeapType>& fixed,
+    std::unordered_map<HeapType, std::vector<Function*>>& sigFuncs,
+    std::unordered_set<Name>& escapedFuncs,
+    std::unordered_map<Function*, std::vector<Call*>>& callsTo,
+    std::unordered_set<Name>& hasReturnCall,
+    std::unordered_set<HeapType>& sigUsedAsRef) {
+    fixed.clear();
     for (auto type :
          ModuleUtils::getPublicHeapTypes(*module, getPassOptions().worldMode)) {
       fixed.insert(type);
@@ -2579,17 +3607,14 @@ struct RelaxNullability : public Pass {
       fixed.insert(module->getFunction(func)->type.getHeapType());
     }
 
-    auto types = ModuleUtils::collectHeapTypes(*module);
-    SubTypes subTypes(types);
-
-    std::unordered_map<HeapType, std::vector<Function*>> sigFuncs;
+    sigFuncs.clear();
     for (auto& func : module->functions) {
       if (!func->imported()) {
         sigFuncs[func->type.getHeapType()].push_back(func.get());
       }
     }
 
-    std::unordered_set<Name> escapedFuncs;
+    escapedFuncs.clear();
     if (module->start.is()) {
       escapedFuncs.insert(module->start);
     }
@@ -2652,8 +3677,8 @@ struct RelaxNullability : public Pass {
         }
       });
 
-    std::unordered_map<Function*, std::vector<Call*>> callsTo;
-    std::unordered_set<Name> hasReturnCall;
+    callsTo.clear();
+    hasReturnCall.clear();
     for (auto& [func, scan] : callScanner.map) {
       if (scan.hasTailCall) {
         hasReturnCall.insert(func->name);
@@ -2674,7 +3699,7 @@ struct RelaxNullability : public Pass {
     // param, local, global, or struct field) that has no `ref.func` in the
     // module (such as in unit tests) treats its functions as escaped so
     // `call_ref $sig` stays synchronized with them.
-    std::unordered_set<HeapType> sigUsedAsRef;
+    sigUsedAsRef.clear();
     auto noteValueType = [&](Type t) {
       for (auto elem : t) {
         if (elem.isRef() && elem.getHeapType().isSignature()) {
@@ -2719,6 +3744,26 @@ struct RelaxNullability : public Pass {
         }
       }
     }
+  }
+
+  void relaxSignaturesAndLocals(Module* module, bool widenTypes) {
+    auto types = ModuleUtils::collectHeapTypes(*module);
+    SubTypes subTypes(types);
+
+    std::unordered_set<HeapType> fixed;
+    std::unordered_map<HeapType, std::vector<Function*>> sigFuncs;
+    std::unordered_set<Name> escapedFuncs;
+    std::unordered_map<Function*, std::vector<Call*>> callsTo;
+    std::unordered_set<Name> hasReturnCall;
+    std::unordered_set<HeapType> sigUsedAsRef;
+    collectModuleEscapeAndSigInfo(module,
+                                  types,
+                                  fixed,
+                                  sigFuncs,
+                                  escapedFuncs,
+                                  callsTo,
+                                  hasReturnCall,
+                                  sigUsedAsRef);
 
     std::vector<HeapType> candidateSigs;
     std::unordered_set<HeapType> candidateSigSet;
@@ -2738,7 +3783,7 @@ struct RelaxNullability : public Pass {
         auto sig = type.getSignature();
         std::vector<std::optional<HeapType>> paramHTs(sig.params.size());
         for (size_t i = 0; i < sig.params.size(); ++i) {
-          if (sig.params[i].isRef()) {
+          if (sig.params[i].isRef() && !sig.params[i].isExact()) {
             paramHTs[i] = sig.params[i].getHeapType();
           }
         }
@@ -2756,7 +3801,7 @@ struct RelaxNullability : public Pass {
         auto params = func->getParams();
         std::vector<std::optional<HeapType>> paramHTs(params.size());
         for (size_t i = 0; i < params.size(); ++i) {
-          if (params[i].isRef()) {
+          if (params[i].isRef() && !params[i].isExact()) {
             paramHTs[i] = params[i].getHeapType();
           }
         }
@@ -2791,7 +3836,7 @@ struct RelaxNullability : public Pass {
                                     func,
                                     &curSigParamHTs,
                                     allowParams,
-                                    verifyOnly,
+                                    round > 0,
                                     &curFuncParamHTs,
                                     &curFuncResultDemands,
                                     &candidateSigSet);
@@ -3020,12 +4065,59 @@ struct RelaxNullability : public Pass {
     // 2 + 3. Relax locals, un-alias cast temporaries, and fix up casts in
     // every function.
     FunctionRelaxer(widenTypes).run(getPassRunner(), module);
+  }
 
-    // 4. Whole-signature reference generalization for remaining 1-use private
+  void runGeneralizeSignatures(Module* module) {
+    auto types = ModuleUtils::collectHeapTypes(*module);
+    std::unordered_set<HeapType> fixed;
+    std::unordered_map<HeapType, std::vector<Function*>> sigFuncs;
+    std::unordered_set<Name> escapedFuncs;
+    std::unordered_map<Function*, std::vector<Call*>> callsTo;
+    std::unordered_set<Name> hasReturnCall;
+    std::unordered_set<HeapType> sigUsedAsRef;
+    collectModuleEscapeAndSigInfo(module,
+                                  types,
+                                  fixed,
+                                  sigFuncs,
+                                  escapedFuncs,
+                                  callsTo,
+                                  hasReturnCall,
+                                  sigUsedAsRef);
+    generalizeSignatures(
+      module, escapedFuncs, hasReturnCall, fixed, sigUsedAsRef);
+  }
+
+  void run(Module* module) override {
+    if (!getPassOptions().trapsNeverHappen) {
+      // Without this assumption removing casts changes behavior.
+      return;
+    }
+
+    bool widenTypes =
+      getPassOptions().shrinkLevel >= 2 || !getPassOptions().optimizeLevel;
+    bool widenFields =
+      widenTypes &&
+      getPassOptions().worldMode == WorldMode::Closed &&
+      (hasArgument("relax-nullability-widen-fields") ||
+       hasArgument("relax-nullability-merge-signatures"));
+
+    // 1 + 2 + 3. Relax and widen function signatures, locals, and casts.
+    relaxSignaturesAndLocals(module, widenTypes);
+
+    // 4. Widen private struct reference fields and array globals if enabled.
+    if (widenFields && widenFieldsAndArrays(module)) {
+      relaxSignaturesAndLocals(module, widenTypes);
+    }
+
+    // 5. Whole-signature reference generalization for remaining private
     // signatures where profitable.
     if (widenTypes) {
-      generalizeSignatures(
-        module, escapedFuncs, hasReturnCall, fixed, sigUsedAsRef);
+      runGeneralizeSignatures(module);
+    }
+
+    // 6. Second pass of field/array widening after signature generalization.
+    if (widenFields && widenFieldsAndArrays(module)) {
+      FunctionRelaxer(widenTypes).run(getPassRunner(), module);
     }
   }
 };

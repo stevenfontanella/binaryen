@@ -1029,3 +1029,45 @@
     )
   )
 )
+
+(module
+  (rec
+    ;; CHECK:      (rec
+    ;; CHECK-NEXT:  (type $Base (sub (struct (field i32))))
+    ;; NO_TNH:      (rec
+    ;; NO_TNH-NEXT:  (type $Base (sub (struct (field i32))))
+    (type $Base (sub (struct (field i32))))
+    ;; CHECK:       (type $Sub (sub $Base (struct (field i32) (field i64))))
+    ;; NO_TNH:       (type $Sub (sub $Base (struct (field i32) (field i64))))
+    (type $Sub (sub $Base (struct (field i32) (field i64))))
+  )
+
+  ;; An unstripped ref.cast from anyref to (ref $Sub) whose result is only used
+  ;; to read field 0 (defined on $Base) relaxes its cast target to
+  ;; (ref null $Base) and canonicalizes the struct.get to $Base.
+  ;; CHECK:      (type $2 (func (param anyref) (result i32)))
+
+  ;; CHECK:      (func $relax-unstripped-cast (type $2) (param $a anyref) (result i32)
+  ;; CHECK-NEXT:  (struct.get $Base 0
+  ;; CHECK-NEXT:   (ref.cast (ref null $Base)
+  ;; CHECK-NEXT:    (local.get $a)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; NO_TNH:      (type $2 (func (param anyref) (result i32)))
+
+  ;; NO_TNH:      (func $relax-unstripped-cast (type $2) (param $a anyref) (result i32)
+  ;; NO_TNH-NEXT:  (struct.get $Sub 0
+  ;; NO_TNH-NEXT:   (ref.cast (ref $Sub)
+  ;; NO_TNH-NEXT:    (local.get $a)
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT: )
+  (func $relax-unstripped-cast (export "relax-unstripped-cast") (param $a anyref) (result i32)
+    (struct.get $Sub 0
+      (ref.cast (ref $Sub)
+        (local.get $a)
+      )
+    )
+  )
+)
