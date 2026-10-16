@@ -2856,6 +2856,9 @@
   )
 )
 
+
+;; 0-arg wrapper sinking, 100%-caller constant parameter sinking, and partial
+;; constant-argument specialization.
 ;; CHECK:      (func $outlined (type $8) (param $0 (ref null $Obj)) (result i32)
 ;; CHECK-NEXT:  (call_ref $sig1
 ;; CHECK-NEXT:   (local.get $0)
@@ -2899,5 +2902,256 @@
 ;; SHRINK-NEXT:     (local.get $0)
 ;; SHRINK-NEXT:    )
 ;; SHRINK-NEXT:   )
+;; SHRINK-NEXT:  )
+;; SHRINK-NEXT: )
+(module
+  ;; CHECK:      (type $0 (func (param i32) (result i32)))
+
+  ;; CHECK:      (type $1 (func (result i32)))
+
+  ;; CHECK:      (type $2 (func (param i32 i32) (result i32)))
+
+  ;; CHECK:      (type $3 (func (param i32 i32 i32) (result i32)))
+
+  ;; CHECK:      (global $g i32 (i32.const 42))
+  ;; SHRINK:      (type $0 (func (param i32) (result i32)))
+
+  ;; SHRINK:      (type $1 (func (result i32)))
+
+  ;; SHRINK:      (type $2 (func (param i32 i32 i32) (result i32)))
+
+  ;; SHRINK:      (global $g i32 (i32.const 42))
+  (global $g i32 (i32.const 42))
+
+  ;; CHECK:      (func $zero_arg_wrap (type $1) (result i32)
+  ;; CHECK-NEXT:  (global.get $g)
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $zero_arg_wrap (type $1) (result i32)
+  ;; SHRINK-NEXT:  (global.get $g)
+  ;; SHRINK-NEXT: )
+  (func $zero_arg_wrap (result i32)
+    (global.get $g)
+  )
+
+  ;; CHECK:      (func $callee_0arg (type $0) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (call $zero_arg_wrap)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $callee_0arg (type $0) (param $x i32) (result i32)
+  ;; SHRINK-NEXT:  (i32.add
+  ;; SHRINK-NEXT:   (local.get $x)
+  ;; SHRINK-NEXT:   (call $zero_arg_wrap)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $callee_0arg (param $x i32) (param $w i32) (result i32)
+    (i32.add (local.get $x) (local.get $w))
+  )
+
+  ;; CHECK:      (func $callee_const_sink (type $2) (param $x i32) (param $c i32) (result i32)
+  ;; CHECK-NEXT:  (i32.sub
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (local.get $c)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $callee_const_sink (type $0) (param $x i32) (result i32)
+  ;; SHRINK-NEXT:  (i32.sub
+  ;; SHRINK-NEXT:   (local.get $x)
+  ;; SHRINK-NEXT:   (i32.const 100000)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $callee_const_sink (param $x i32) (param $c i32) (result i32)
+    (i32.sub (local.get $x) (local.get $c))
+  )
+
+  ;; CHECK:      (func $callee_partial (type $3) (param $x i32) (param $c1 i32) (param $c2 i32) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (i32.mul
+  ;; CHECK-NEXT:    (local.get $c1)
+  ;; CHECK-NEXT:    (local.get $c2)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $callee_partial (type $2) (param $x i32) (param $c1 i32) (param $c2 i32) (result i32)
+  ;; SHRINK-NEXT:  (i32.add
+  ;; SHRINK-NEXT:   (local.get $x)
+  ;; SHRINK-NEXT:   (i32.mul
+  ;; SHRINK-NEXT:    (local.get $c1)
+  ;; SHRINK-NEXT:    (local.get $c2)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $callee_partial (param $x i32) (param $c1 i32) (param $c2 i32) (result i32)
+    (i32.add
+      (local.get $x)
+      (i32.mul (local.get $c1) (local.get $c2))
+    )
+  )
+
+  ;; CHECK:      (func $user1 (type $0) (param $a i32) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (call $callee_0arg
+  ;; CHECK-NEXT:    (local.get $a)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (call $callee_const_sink
+  ;; CHECK-NEXT:     (local.get $a)
+  ;; CHECK-NEXT:     (i32.const 100000)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (call $callee_partial
+  ;; CHECK-NEXT:     (local.get $a)
+  ;; CHECK-NEXT:     (i32.const 100000)
+  ;; CHECK-NEXT:     (global.get $g)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $user1 (type $0) (param $a i32) (result i32)
+  ;; SHRINK-NEXT:  (i32.add
+  ;; SHRINK-NEXT:   (call $callee_0arg
+  ;; SHRINK-NEXT:    (local.get $a)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (i32.add
+  ;; SHRINK-NEXT:    (call $callee_const_sink
+  ;; SHRINK-NEXT:     (local.get $a)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (call $outlined_c
+  ;; SHRINK-NEXT:     (local.get $a)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $user1 (param $a i32) (result i32)
+    (i32.add
+      (call $callee_0arg (local.get $a) (call $zero_arg_wrap))
+      (i32.add
+        (call $callee_const_sink (local.get $a) (i32.const 100000))
+        (call $callee_partial (local.get $a) (i32.const 100000) (global.get $g))
+      )
+    )
+  )
+
+  ;; CHECK:      (func $user2 (type $0) (param $b i32) (result i32)
+  ;; CHECK-NEXT:  (i32.sub
+  ;; CHECK-NEXT:   (call $callee_0arg
+  ;; CHECK-NEXT:    (i32.eqz
+  ;; CHECK-NEXT:     (local.get $b)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.sub
+  ;; CHECK-NEXT:    (call $callee_const_sink
+  ;; CHECK-NEXT:     (i32.eqz
+  ;; CHECK-NEXT:      (local.get $b)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.const 100000)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (call $callee_partial
+  ;; CHECK-NEXT:     (i32.eqz
+  ;; CHECK-NEXT:      (local.get $b)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.const 100000)
+  ;; CHECK-NEXT:     (global.get $g)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $user2 (type $0) (param $b i32) (result i32)
+  ;; SHRINK-NEXT:  (i32.sub
+  ;; SHRINK-NEXT:   (call $callee_0arg
+  ;; SHRINK-NEXT:    (i32.eqz
+  ;; SHRINK-NEXT:     (local.get $b)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (i32.sub
+  ;; SHRINK-NEXT:    (call $callee_const_sink
+  ;; SHRINK-NEXT:     (i32.eqz
+  ;; SHRINK-NEXT:      (local.get $b)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (call $outlined_c
+  ;; SHRINK-NEXT:     (i32.eqz
+  ;; SHRINK-NEXT:      (local.get $b)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $user2 (param $b i32) (result i32)
+    (i32.sub
+      (call $callee_0arg (i32.eqz (local.get $b)) (call $zero_arg_wrap))
+      (i32.sub
+        (call $callee_const_sink (i32.eqz (local.get $b)) (i32.const 100000))
+        (call $callee_partial (i32.eqz (local.get $b)) (i32.const 100000) (global.get $g))
+      )
+    )
+  )
+
+  ;; CHECK:      (func $user3 (type $0) (param $c i32) (result i32)
+  ;; CHECK-NEXT:  (i32.xor
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (call $callee_partial
+  ;; CHECK-NEXT:     (i32.clz
+  ;; CHECK-NEXT:      (local.get $c)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.const 100000)
+  ;; CHECK-NEXT:     (global.get $g)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (call $callee_partial
+  ;; CHECK-NEXT:     (i32.popcnt
+  ;; CHECK-NEXT:      (local.get $c)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.const 100000)
+  ;; CHECK-NEXT:     (global.get $g)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (call $callee_partial
+  ;; CHECK-NEXT:    (i32.ctz
+  ;; CHECK-NEXT:     (local.get $c)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.const 7)
+  ;; CHECK-NEXT:    (i32.const 9)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $user3 (type $0) (param $c i32) (result i32)
+  ;; SHRINK-NEXT:  (i32.xor
+  ;; SHRINK-NEXT:   (i32.add
+  ;; SHRINK-NEXT:    (call $outlined_c
+  ;; SHRINK-NEXT:     (i32.clz
+  ;; SHRINK-NEXT:      (local.get $c)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (call $outlined_c
+  ;; SHRINK-NEXT:     (i32.popcnt
+  ;; SHRINK-NEXT:      (local.get $c)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (call $callee_partial
+  ;; SHRINK-NEXT:    (i32.ctz
+  ;; SHRINK-NEXT:     (local.get $c)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (i32.const 7)
+  ;; SHRINK-NEXT:    (i32.const 9)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $user3 (param $c i32) (result i32)
+    (i32.xor
+      (i32.add
+        (call $callee_partial (i32.clz (local.get $c)) (i32.const 100000) (global.get $g))
+        (call $callee_partial (i32.popcnt (local.get $c)) (i32.const 100000) (global.get $g))
+      )
+      (call $callee_partial (i32.ctz (local.get $c)) (i32.const 7) (i32.const 9))
+    )
+  )
+)
+;; SHRINK:      (func $outlined_c (type $0) (param $0 i32) (result i32)
+;; SHRINK-NEXT:  (call $callee_partial
+;; SHRINK-NEXT:   (local.get $0)
+;; SHRINK-NEXT:   (i32.const 100000)
+;; SHRINK-NEXT:   (global.get $g)
 ;; SHRINK-NEXT:  )
 ;; SHRINK-NEXT: )

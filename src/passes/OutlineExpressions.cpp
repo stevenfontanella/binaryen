@@ -384,6 +384,15 @@ struct Site {
     return false;
   }
 
+  bool isWrittenLocal(Index idx) const {
+    for (auto& w : written) {
+      if (w.index == idx) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   Expression* getSliceExpr(Index idx) const {
     Expression* e = expr->cast<Block>()->list[sliceOffset + idx];
     if (trailingSet && idx == sliceLen - 1) {
@@ -435,7 +444,177 @@ struct NodeInfo {
 struct FunctionInfo {
   // A deque so that pointers to sites remain valid as we add more.
   std::deque<Site> sites;
+  // Demanded types for LocalGet nodes when canonicalizing local holes.
+  std::unordered_map<LocalGet*, Type> demandedTypes;
 };
+
+Type getChildDemandedType(Module& wasm, Expression* parent, Expression* child) {
+  if (!parent || !child || child->type == Type::unreachable ||
+      !child->type.isRef() || child->type.isNull()) {
+    return child ? child->type : Type::none;
+  }
+  if (auto* call = parent->dynCast<Call>()) {
+    auto* callee = wasm.getFunctionOrNull(call->target);
+    if (!callee || call->operands.size() != callee->getNumParams()) {
+      return child->type;
+    }
+    for (Index i = 0; i < call->operands.size(); i++) {
+      if (call->operands[i] == child) {
+        return callee->getLocalType(i);
+      }
+    }
+    return child->type;
+  }
+  if (auto* cr = parent->dynCast<CallRef>()) {
+    if (!cr->target || !cr->target->type.isSignature() ||
+        cr->target->type.isNull()) {
+      return child->type;
+    }
+    if (cr->target == child) {
+      return Type(cr->target->type.getHeapType(), Nullable);
+    }
+    auto params = cr->target->type.getHeapType().getSignature().params;
+    if (cr->operands.size() != params.size()) {
+      return child->type;
+    }
+    for (Index i = 0; i < cr->operands.size(); i++) {
+      if (cr->operands[i] == child) {
+        return params[i];
+      }
+    }
+    return child->type;
+  }
+  if (auto* ci = parent->dynCast<CallIndirect>()) {
+    if (!ci->heapType.isSignature()) {
+      return child->type;
+    }
+    auto params = ci->heapType.getSignature().params;
+    if (ci->operands.size() != params.size()) {
+      return child->type;
+    }
+    for (Index i = 0; i < ci->operands.size(); i++) {
+      if (ci->operands[i] == child) {
+        return params[i];
+      }
+    }
+    return child->type;
+  }
+  if (auto* sn = parent->dynCast<StructNew>()) {
+    if (!sn->isWithDefault() && sn->type.isStruct()) {
+      const auto& fields = sn->type.getHeapType().getStruct().fields;
+      if (sn->operands.size() == fields.size()) {
+        for (Index i = 0; i < sn->operands.size(); i++) {
+          if (sn->operands[i] == child) {
+            return fields[i].type;
+          }
+        }
+      }
+    }
+    return child->type;
+  }
+  if (auto* sg = parent->dynCast<StructGet>()) {
+    if (sg->ref == child && sg->ref->type.isStruct() &&
+        !sg->ref->type.isNull()) {
+      return Type(sg->ref->type.getHeapType(), Nullable);
+    }
+    return child->type;
+  }
+  if (auto* ss = parent->dynCast<StructSet>()) {
+    if (!ss->ref || !ss->ref->type.isStruct() || ss->ref->type.isNull()) {
+      return child->type;
+    }
+    if (ss->ref == child) {
+      return Type(ss->ref->type.getHeapType(), Nullable);
+    }
+    if (ss->value == child) {
+      return ss->ref->type.getHeapType().getStruct().fields[ss->index].type;
+    }
+    return child->type;
+  }
+  if (auto* an = parent->dynCast<ArrayNew>()) {
+    if (an->init == child && an->type.isArray()) {
+      return an->type.getHeapType().getArray().element.type;
+    }
+    return child->type;
+  }
+  if (auto* anf = parent->dynCast<ArrayNewFixed>()) {
+    if (anf->type.isArray()) {
+      Type elemType = anf->type.getHeapType().getArray().element.type;
+      for (auto* v : anf->values) {
+        if (v == child) {
+          return elemType;
+        }
+      }
+    }
+    return child->type;
+  }
+  if (auto* ag = parent->dynCast<ArrayGet>()) {
+    if (ag->ref == child && ag->ref->type.isArray() &&
+        !ag->ref->type.isNull()) {
+      return Type(ag->ref->type.getHeapType(), Nullable);
+    }
+    return child->type;
+  }
+  if (auto* as = parent->dynCast<ArraySet>()) {
+    if (!as->ref || !as->ref->type.isArray() || as->ref->type.isNull()) {
+      return child->type;
+    }
+    if (as->ref == child) {
+      return Type(as->ref->type.getHeapType(), Nullable);
+    }
+    if (as->value == child) {
+      return as->ref->type.getHeapType().getArray().element.type;
+    }
+    return child->type;
+  }
+  if (auto* al = parent->dynCast<ArrayLen>()) {
+    if (al->ref == child) {
+      return Type(HeapType::array, Nullable);
+    }
+    return child->type;
+  }
+  if (auto* gs = parent->dynCast<GlobalSet>()) {
+    if (gs->value == child) {
+      if (auto* g = wasm.getGlobalOrNull(gs->name)) {
+        return g->type;
+      }
+    }
+    return child->type;
+  }
+  if (auto* ra = parent->dynCast<RefAs>()) {
+    if (ra->op == RefAsNonNull && ra->value == child) {
+      return Type(
+        child->type.getHeapType(), Nullable, child->type.getExactness());
+    }
+    return child->type;
+  }
+  if (auto* rin = parent->dynCast<RefIsNull>()) {
+    if (rin->value == child) {
+      return Type(child->type.getHeapType().getTop(), Nullable);
+    }
+    return child->type;
+  }
+  if (auto* req = parent->dynCast<RefEq>()) {
+    if (req->left == child || req->right == child) {
+      return Type(HeapType::eq, Nullable);
+    }
+    return child->type;
+  }
+  if (auto* rt = parent->dynCast<RefTest>()) {
+    if (rt->ref == child && rt->castType.isRef()) {
+      return Type(rt->castType.getHeapType().getTop(), Nullable);
+    }
+    return child->type;
+  }
+  if (auto* rc = parent->dynCast<RefCast>()) {
+    if (!rc->desc && rc->ref == child && rc->type.isRef() &&
+        rc->type.isNonNullable() && rc->type.isInexact()) {
+      return Type(rc->type.getHeapType().getTop(), Nullable);
+    }
+    return child->type;
+  }
+  return child->type;
+}
 
 // Counts total reads and writes per local across an entire function body.
 struct LocalUseCounter : public PostWalker<LocalUseCounter> {
@@ -459,8 +638,12 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
   Mode mode;
   // Whether constants are holes in this round.
   bool constHoles;
+  // Whether reference-typed local holes are canonicalized to their demanded
+  // types.
+  bool canonicalizeLocalHoles;
   std::vector<Index> totalReads;
   std::vector<Index> totalWrites;
+  std::vector<Expression*> parentStack;
   Index loopDepth = 0;
 
   // Infos of the already-visited children of the expressions we are in the
@@ -471,8 +654,10 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
           Function* func,
           FunctionInfo& info,
           Mode mode,
-          bool constHoles)
-    : wasm(wasm), func(func), info(info), mode(mode), constHoles(constHoles) {
+          bool constHoles,
+          bool canonicalizeLocalHoles)
+    : wasm(wasm), func(func), info(info), mode(mode), constHoles(constHoles),
+      canonicalizeLocalHoles(canonicalizeLocalHoles) {
     LocalUseCounter counter(func->getNumLocals());
     counter.walk(func->body);
     totalReads = std::move(counter.reads);
@@ -481,15 +666,24 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
 
   static void scan(Scanner* self, Expression** currp) {
     PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>>::scan(self, currp);
+    self->parentStack.push_back(*currp);
     if ((*currp)->is<Loop>()) {
       self->loopDepth++;
     }
   }
 
   void visitExpression(Expression* curr) {
+    assert(!parentStack.empty() && parentStack.back() == curr);
+    parentStack.pop_back();
     if (curr->is<Loop>()) {
       assert(loopDepth > 0);
       loopDepth--;
+    }
+    if (canonicalizeLocalHoles) {
+      if (auto* get = curr->dynCast<LocalGet>()) {
+        Expression* par = parentStack.empty() ? nullptr : parentStack.back();
+        info.demandedTypes[get] = getChildDemandedType(wasm, par, get);
+      }
     }
     NodeInfo node;
     node.hash = getShallowHash(curr);
@@ -984,8 +1178,13 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
   }
 
   size_t getShallowHash(Expression* curr) {
-    if (curr->is<LocalGet>() || curr->is<LocalSet>() ||
-        (constHoles && isConstHole(wasm, curr))) {
+    if (auto* get = curr->dynCast<LocalGet>()) {
+      auto digest = hash(curr->_id);
+      Type t = canonicalizeLocalHoles ? info.demandedTypes.at(get) : get->type;
+      rehash(digest, t.getID());
+      return digest;
+    }
+    if (curr->is<LocalSet>() || (constHoles && isConstHole(wasm, curr))) {
       // A hole (or a write to one). Only the kind and type matter.
       auto digest = hash(curr->_id);
       rehash(digest, curr->type.getID());
@@ -1096,10 +1295,15 @@ struct HoleFinder
   Module& wasm;
   const Site* site;
   bool constHoles;
+  const std::unordered_map<LocalGet*, Type>* demandedTypes;
   std::vector<Hole> holes;
 
-  HoleFinder(Module& wasm, const Site* site, bool constHoles)
-    : wasm(wasm), site(site), constHoles(constHoles) {}
+  HoleFinder(Module& wasm,
+             const Site* site,
+             bool constHoles,
+             const std::unordered_map<LocalGet*, Type>* demandedTypes = nullptr)
+    : wasm(wasm), site(site), constHoles(constHoles),
+      demandedTypes(demandedTypes) {}
 
   void visitExpression(Expression* curr) {
     if (auto* get = curr->dynCast<LocalGet>()) {
@@ -1107,12 +1311,19 @@ struct HoleFinder
           site->isOverwriteLocal(get->index)) {
         return;
       }
+      Type hType = get->type;
+      if (demandedTypes && !site->isWrittenLocal(get->index)) {
+        if (auto it = demandedTypes->find(get); it != demandedTypes->end()) {
+          hType = it->second;
+        }
+      }
       for (auto& hole : holes) {
         if (hole.isLocal && hole.localIndex == get->index) {
+          hole.type = Type::getGreatestLowerBound(hole.type, hType);
           return;
         }
       }
-      holes.push_back({curr, get->index, get->type, true});
+      holes.push_back({curr, get->index, hType, true});
     } else if (constHoles && isConstHole(wasm, curr)) {
       holes.push_back({curr, 0, curr->type, false});
     }
@@ -1127,18 +1338,26 @@ void appendPassthroughHoles(const Site* site, std::vector<Hole>& holes) {
 }
 
 std::vector<Hole>
-getHoles(Module& wasm, Expression* expr, const Site* site, bool constHoles) {
-  HoleFinder finder(wasm, site, constHoles);
+getHoles(Module& wasm,
+         Expression* expr,
+         const Site* site,
+         bool constHoles,
+         const std::unordered_map<LocalGet*, Type>* demandedTypes = nullptr) {
+  HoleFinder finder(wasm, site, constHoles, demandedTypes);
   finder.walk(expr);
   appendPassthroughHoles(site, finder.holes);
   return std::move(finder.holes);
 }
 
-std::vector<Hole> getHoles(Module& wasm, const Site* site, bool constHoles) {
+std::vector<Hole>
+getHoles(Module& wasm,
+         const Site* site,
+         bool constHoles,
+         const std::unordered_map<LocalGet*, Type>* demandedTypes = nullptr) {
   if (site->sliceLen == 0) {
-    return getHoles(wasm, site->expr, site, constHoles);
+    return getHoles(wasm, site->expr, site, constHoles, demandedTypes);
   }
-  HoleFinder finder(wasm, site, constHoles);
+  HoleFinder finder(wasm, site, constHoles, demandedTypes);
   for (Index i = 0; i < site->sliceLen; i++) {
     Expression* elem = site->getSliceExpr(i);
     finder.walk(elem);
@@ -1306,10 +1525,16 @@ struct OutlineExpressions : public Pass {
 
   // Whether constants are holes in the current round.
   bool constHoles = false;
+  // Whether reference-typed local holes are canonicalized to demanded types.
+  bool canonicalizeLocalHoles = false;
+  ModuleUtils::ParallelFunctionAnalysis<FunctionInfo>* currentAnalysis =
+    nullptr;
 
   void run(Module* module) override {
     wasm = module;
     scratchGlobals.clear();
+    canonicalizeLocalHoles =
+      getPassOptions().shrinkLevel > 0 && getPassOptions().trapsNeverHappen;
 
     auto mode = getMode();
 
@@ -1329,8 +1554,12 @@ struct OutlineExpressions : public Pass {
       }
     }
     foldCallRefDispatch(true);
-    for (Index round = 0; round < 2; round++) {
-      if (!sinkWrapperCalls()) {
+    for (Index round = 0; round < 3; round++) {
+      bool changed = sinkWrapperCalls();
+      if (getPassOptions().shrinkLevel > 0) {
+        changed |= sinkConstantArgs();
+      }
+      if (!changed) {
         break;
       }
     }
@@ -1368,9 +1597,11 @@ struct OutlineExpressions : public Pass {
         if (func->imported()) {
           return;
         }
-        Scanner(*wasm, func, info, mode, constHoles).walk(func->body);
+        Scanner(*wasm, func, info, mode, constHoles, canonicalizeLocalHoles)
+          .walk(func->body);
         noteParents(func->body, info);
       });
+    currentAnalysis = &analysis;
 
     // Group the sites by key.
     for (auto& func : wasm->functions) {
@@ -1619,11 +1850,32 @@ struct OutlineExpressions : public Pass {
         if (leftSite->isInternalLocal(leftIndex) !=
               rightSite->isInternalLocal(rightIndex) ||
             leftSite->isPassthroughLocal(leftIndex) !=
-              rightSite->isPassthroughLocal(rightIndex)) {
+              rightSite->isPassthroughLocal(rightIndex) ||
+            leftSite->isOverwriteLocal(leftIndex) !=
+              rightSite->isOverwriteLocal(rightIndex) ||
+            leftSite->isWrittenLocal(leftIndex) !=
+              rightSite->isWrittenLocal(rightIndex)) {
           mismatch = true;
+        }
+        if (leftSite->isInternalLocal(leftIndex) ||
+            leftSite->isOverwriteLocal(leftIndex) ||
+            leftSite->isPassthroughLocal(leftIndex) ||
+            leftSite->isWrittenLocal(leftIndex)) {
+          if (leftSite->func->getLocalType(leftIndex) !=
+              rightSite->func->getLocalType(rightIndex)) {
+            mismatch = true;
+          }
         }
       }
     };
+    const auto* leftDemanded =
+      canonicalizeLocalHoles
+        ? &currentAnalysis->map.at(leftSite->func).demandedTypes
+        : nullptr;
+    const auto* rightDemanded =
+      canonicalizeLocalHoles
+        ? &currentAnalysis->map.at(rightSite->func).demandedTypes
+        : nullptr;
     ExpressionAnalyzer::ExprComparer comparer = [&](Expression* left,
                                                     Expression* right) {
       if (constHoles) {
@@ -1642,7 +1894,11 @@ struct OutlineExpressions : public Pass {
         if (!rightGet) {
           return false;
         }
-        if (leftGet->type != rightGet->type) {
+        Type leftType =
+          leftDemanded ? leftDemanded->at(leftGet) : leftGet->type;
+        Type rightType =
+          rightDemanded ? rightDemanded->at(rightGet) : rightGet->type;
+        if (leftType != rightType) {
           mismatch = true;
           return true;
         }
@@ -1729,7 +1985,11 @@ struct OutlineExpressions : public Pass {
 
   void ensureHoles(Site* site) {
     if (!site->holesComputed) {
-      site->holes = getHoles(*wasm, site, constHoles);
+      const auto* demanded =
+        canonicalizeLocalHoles
+          ? &currentAnalysis->map.at(site->func).demandedTypes
+          : nullptr;
+      site->holes = getHoles(*wasm, site, constHoles, demanded);
       site->holesComputed = true;
     }
   }
@@ -2210,12 +2470,32 @@ struct OutlineExpressions : public Pass {
       return;
     }
     Index i = 0;
-    for (auto& hole : site.holes) {
+    for (Index hIdx = 0; hIdx < site.holes.size(); hIdx++) {
+      auto& hole = site.holes[hIdx];
       if (!hole.isLocal) {
         continue;
       }
-      if (hole.localIndex != i || hole.type != func->getLocalType(i)) {
+      if (hole.localIndex != i) {
         return;
+      }
+      Type paramType = func->getLocalType(i);
+      if (hole.type != paramType) {
+        if (!canonicalizeLocalHoles) {
+          return;
+        }
+        bool allSub = true;
+        for (auto* otherSite : key.sites) {
+          auto& otherHole = otherSite->holes[hIdx];
+          Type actualType =
+            otherSite->func->getLocalType(otherHole.localIndex);
+          if (!Type::isSubType(actualType, paramType)) {
+            allSub = false;
+            break;
+          }
+        }
+        if (!allSub) {
+          return;
+        }
       }
       i++;
     }
@@ -2243,13 +2523,18 @@ struct OutlineExpressions : public Pass {
     : public PostWalker<HoleReplacer, UnifiedExpressionVisitor<HoleReplacer>> {
     Module& wasm;
     std::unordered_map<Index, Index> paramOfLocal;
+    std::unordered_map<Index, Type> typeOfLocal;
     std::unordered_map<Expression*, Index> paramOfConst;
 
     HoleReplacer(Module& wasm) : wasm(wasm) {}
 
     void visitExpression(Expression* curr) {
       if (auto* get = curr->dynCast<LocalGet>()) {
-        get->index = paramOfLocal.at(get->index);
+        Index oldIdx = get->index;
+        get->index = paramOfLocal.at(oldIdx);
+        if (auto it = typeOfLocal.find(oldIdx); it != typeOfLocal.end()) {
+          get->type = it->second;
+        }
       } else if (auto* set = curr->dynCast<LocalSet>()) {
         set->index = paramOfLocal.at(set->index);
       } else if (auto iter = paramOfConst.find(curr);
@@ -2322,14 +2607,16 @@ struct OutlineExpressions : public Pass {
         continue;
       }
       auto& hole = holes[i];
+      Type paramType = site->holes[i].type;
       Index pIdx = params.size();
       holeParamIdx[i] = pIdx;
       if (hole.isLocal) {
         replacer.paramOfLocal[hole.localIndex] = pIdx;
+        replacer.typeOfLocal[hole.localIndex] = paramType;
       } else {
         replacer.paramOfConst[hole.expr] = pIdx;
       }
-      params.push_back(hole.type);
+      params.push_back(paramType);
     }
     assert(params.size() == key.numLocals + key.numVarying);
     std::vector<Type> vars;
@@ -2437,8 +2724,8 @@ struct OutlineExpressions : public Pass {
     }
   };
 
-  static bool isPureVtableBodyExpr(Expression* e) {
-    if (!e || e->type == Type::unreachable) {
+  bool isPureVtableBodyExpr(Expression* e, int depth = 0) {
+    if (!e || e->type == Type::unreachable || depth > 4) {
       return false;
     }
     if (e->is<LocalGet>() || e->is<Const>()) {
@@ -2446,29 +2733,38 @@ struct OutlineExpressions : public Pass {
     }
     if (auto* sg = e->dynCast<StructGet>()) {
       return sg->ref && sg->ref->type.isStruct() &&
-             isPureVtableBodyExpr(sg->ref);
+             isPureVtableBodyExpr(sg->ref, depth);
     }
     if (auto* rc = e->dynCast<RefCast>()) {
-      return !rc->desc && rc->ref && isPureVtableBodyExpr(rc->ref);
+      return !rc->desc && rc->ref && isPureVtableBodyExpr(rc->ref, depth);
     }
     if (auto* ra = e->dynCast<RefAs>()) {
       return ra->op == RefAsNonNull && ra->value &&
-             isPureVtableBodyExpr(ra->value);
+             isPureVtableBodyExpr(ra->value, depth);
     }
     if (auto* ag = e->dynCast<ArrayGet>()) {
       return ag->ref && ag->ref->type.isArray() && ag->index &&
-             isPureVtableBodyExpr(ag->ref) && isPureVtableBodyExpr(ag->index);
+             isPureVtableBodyExpr(ag->ref, depth) &&
+             isPureVtableBodyExpr(ag->index, depth);
+    }
+    if (auto* call = e->dynCast<Call>()) {
+      return !call->isReturn && call->operands.size() == 1 &&
+             isPureVtableHelper(call->target, depth + 1) &&
+             isPureVtableBodyExpr(call->operands[0], depth + 1);
     }
     return false;
   }
 
-  bool isPureVtableHelper(Name name) {
+  bool isPureVtableHelper(Name name, int depth = 0) {
+    if (depth > 4) {
+      return false;
+    }
     Function* f = wasm->getFunctionOrNull(name);
     if (!f || f->imported() || f->getNumParams() != 1 || !f->vars.empty() ||
         !f->getResults().isSingle() || !f->getResults().isRef()) {
       return false;
     }
-    return isPureVtableBodyExpr(f->body);
+    return isPureVtableBodyExpr(f->body, depth);
   }
 
   bool isPureVtableLookupOnLocal(Expression* e,
@@ -2766,13 +3062,23 @@ struct OutlineExpressions : public Pass {
           }
           Expression* wvPar = layout.parent[wv];
           auto* sg0 = wvPar ? wvPar->dynCast<StructGet>() : nullptr;
-          if (!sg0 || sg0->ref != wv) {
-            continue;
+          CallRef* cr0 = nullptr;
+          bool directTarget = false;
+          if (sg0 && sg0->ref == wv) {
+            Expression* sg0Par = layout.parent[sg0];
+            cr0 = sg0Par ? sg0Par->dynCast<CallRef>() : nullptr;
+            if (cr0 && cr0->target != sg0) {
+              cr0 = nullptr;
+            }
+          } else if (wvPar && wvPar->is<CallRef>()) {
+            cr0 = wvPar->cast<CallRef>();
+            if (cr0->target == wv) {
+              directTarget = true;
+            } else {
+              cr0 = nullptr;
+            }
           }
-          Expression* sg0Par = layout.parent[sg0];
-          auto* cr0 = sg0Par ? sg0Par->dynCast<CallRef>() : nullptr;
-          if (!cr0 || cr0->target != sg0 || cr0->isReturn ||
-              cr0->operands.empty()) {
+          if (!cr0 || cr0->isReturn || cr0->operands.empty()) {
             continue;
           }
           // Determine receiver local $x from cr0->operands[0].
@@ -2808,6 +3114,7 @@ struct OutlineExpressions : public Pass {
           }
 
           SmallVector<StructGet*, 4> readStructGets;
+          SmallVector<CallRef*, 4> readDirectCallRefs;
           Expression* lca = cr0;
           Index wvPre = layout.preOrder.at(wv);
           bool readsOk = true;
@@ -2817,15 +3124,28 @@ struct OutlineExpressions : public Pass {
               break;
             }
             Expression* gvPar = layout.parent[gv];
-            auto* sgi = gvPar ? gvPar->dynCast<StructGet>() : nullptr;
-            if (!sgi || sgi->ref != gv) {
-              readsOk = false;
-              break;
+            CallRef* cri = nullptr;
+            StructGet* sgi = nullptr;
+            if (!directTarget) {
+              sgi = gvPar ? gvPar->dynCast<StructGet>() : nullptr;
+              if (!sgi || sgi->ref != gv) {
+                readsOk = false;
+                break;
+              }
+              Expression* sgiPar = layout.parent[sgi];
+              cri = sgiPar ? sgiPar->dynCast<CallRef>() : nullptr;
+              if (!cri || cri->target != sgi) {
+                readsOk = false;
+                break;
+              }
+            } else {
+              cri = gvPar ? gvPar->dynCast<CallRef>() : nullptr;
+              if (!cri || cri->target != gv) {
+                readsOk = false;
+                break;
+              }
             }
-            Expression* sgiPar = layout.parent[sgi];
-            auto* cri = sgiPar ? sgiPar->dynCast<CallRef>() : nullptr;
-            if (!cri || cri->target != sgi || cri->isReturn ||
-                cri->operands.empty()) {
+            if (cri->isReturn || cri->operands.empty()) {
               readsOk = false;
               break;
             }
@@ -2845,7 +3165,11 @@ struct OutlineExpressions : public Pass {
             if (!readsOk) {
               break;
             }
-            readStructGets.push_back(sgi);
+            if (directTarget) {
+              readDirectCallRefs.push_back(cri);
+            } else {
+              readStructGets.push_back(sgi);
+            }
             lca = layout.getLCA(lca, cri);
           }
           if (!readsOk || !lca || !layout.isUnconditionalFrom(op0, lca)) {
@@ -2881,9 +3205,16 @@ struct OutlineExpressions : public Pass {
           }
 
           Expression* vExpr = wv->value;
-          sg0->ref = vExpr;
-          for (auto* sgi : readStructGets) {
-            sgi->ref = ExpressionManipulator::copy(vExpr, *wasm);
+          if (directTarget) {
+            cr0->target = vExpr;
+            for (auto* cri : readDirectCallRefs) {
+              cri->target = ExpressionManipulator::copy(vExpr, *wasm);
+            }
+          } else {
+            sg0->ref = vExpr;
+            for (auto* sgi : readStructGets) {
+              sgi->ref = ExpressionManipulator::copy(vExpr, *wasm);
+            }
           }
           funcChanged = true;
         }
@@ -3723,8 +4054,85 @@ struct OutlineExpressions : public Pass {
     return true;
   }
 
+  bool isNonMutatingWrapper(Function* wFunc, int depth = 0) {
+    if (!wFunc || wFunc->imported() || depth > 4) {
+      return false;
+    }
+    EffectAnalyzer wEff(getPassOptions(), *wasm, wFunc);
+    wEff.localsRead.clear();
+    wEff.localsWritten.clear();
+    if (!wEff.hasSideEffects() && !wEff.throws()) {
+      return true;
+    }
+    Expression* body = wFunc->body;
+    if (!body) {
+      return false;
+    }
+    // Pattern 1: Lazy cached constant-pool/factory wrapper starting with
+    // (block $l (drop (br_on_non_null $l (array.get/global.get ...))) ...).
+    if (auto* blk = body->dynCast<Block>()) {
+      if (!blk->list.empty()) {
+        if (auto* drop = blk->list[0]->dynCast<Drop>()) {
+          if (auto* brOn = drop->value->dynCast<BrOn>()) {
+            if (brOn->op == BrOnNonNull) {
+              return true;
+            }
+          }
+        }
+        // Pattern 2: Idempotent once-init getter:
+        // (block (if (i32.eqz (global.get $init)) ...) (global.get $val)).
+        if (blk->list.size() == 2 && blk->list[1]->is<GlobalGet>()) {
+          if (auto* iff = blk->list[0]->dynCast<If>()) {
+            if (!iff->ifFalse) {
+              if (auto* un = iff->condition->dynCast<Unary>()) {
+                if (un->op == EqZInt32 && un->value->is<GlobalGet>()) {
+                  return true;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    // Pattern 3: Pure allocation / read tree whose only mutations (if any) are
+    // initializing a freshly allocated struct/array in a local tee, and whose
+    // calls (if any) are to non-mutating wrappers.
+    if (!FindAll<Throw>(body).list.empty() ||
+        !FindAll<Rethrow>(body).list.empty() ||
+        !FindAll<GlobalSet>(body).list.empty() ||
+        !FindAll<Store>(body).list.empty() ||
+        !FindAll<CallRef>(body).list.empty() ||
+        !FindAll<CallIndirect>(body).list.empty()) {
+      return false;
+    }
+    for (auto* ss : FindAll<StructSet>(body).list) {
+      auto* tee = ss->ref->dynCast<LocalSet>();
+      if (!tee || !tee->isTee() || !tee->value->is<StructNew>()) {
+        return false;
+      }
+    }
+    for (auto* as : FindAll<ArraySet>(body).list) {
+      auto* tee = as->ref->dynCast<LocalSet>();
+      if (!tee || !tee->isTee() ||
+          (!tee->value->is<ArrayNew>() && !tee->value->is<ArrayNewFixed>())) {
+        return false;
+      }
+    }
+    for (auto* c : FindAll<Call>(body).list) {
+      if (c->isReturn || c->target == wFunc->name ||
+          !isNonMutatingWrapper(wasm->getFunctionOrNull(c->target),
+                                depth + 1)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   bool canMoveWrapperPast(Function* wFunc, Expression* laterOp) {
     EffectAnalyzer opEff(getPassOptions(), *wasm, laterOp);
+    // wFunc is a separate function and cannot access the caller's locals.
+    opEff.localsRead.clear();
+    opEff.localsWritten.clear();
     if (!opEff.hasAnything()) {
       return true;
     }
@@ -3732,14 +4140,13 @@ struct OutlineExpressions : public Pass {
       return false;
     }
     EffectAnalyzer wEff(getPassOptions(), *wasm, wFunc);
+    wEff.localsRead.clear();
+    wEff.localsWritten.clear();
     if (!wEff.invalidates(opEff)) {
       return true;
     }
-    // Many constant-pool / string-literal wrappers (like $0, $1, $3) lazily
-    // populate a private cache array/global on first miss, while laterOp is a
-    // pure call-free read (e.g. struct.get of a field).
-    if (!opEff.hasSideEffects() && !opEff.calls && !opEff.throws() &&
-        FindAll<StructSet>(wFunc->body).list.empty()) {
+    if (!opEff.throws() && !opEff.trap && !opEff.transfersControlFlow() &&
+        isNonMutatingWrapper(wFunc)) {
       bool globalsDisjoint = true;
       for (auto* gg : FindAll<GlobalGet>(laterOp).list) {
         if (wEff.globalsWritten.count(gg->name)) {
@@ -3747,9 +4154,14 @@ struct OutlineExpressions : public Pass {
           break;
         }
       }
-      if (globalsDisjoint &&
-          (FindAll<ArrayGet>(laterOp).list.empty() ||
-           FindAll<ArraySet>(wFunc->body).list.empty())) {
+      for (auto* gs : FindAll<GlobalSet>(laterOp).list) {
+        if (wEff.globalsWritten.count(gs->name) ||
+            wEff.mutableGlobalsRead.count(gs->name)) {
+          globalsDisjoint = false;
+          break;
+        }
+      }
+      if (globalsDisjoint) {
         return true;
       }
     }
@@ -3762,10 +4174,6 @@ struct OutlineExpressions : public Pass {
                              LocalGet*& outGet) {
     outGet = nullptr;
     if (!wFunc || wFunc->imported()) {
-      return false;
-    }
-    EffectAnalyzer wEff(getPassOptions(), *wasm, wFunc);
-    if (wEff.hasAnything()) {
       return false;
     }
     TreeLayout layout;
@@ -3782,6 +4190,24 @@ struct OutlineExpressions : public Pass {
     }
     if (!targetGet || !layout.isUnconditionalFrom(targetGet, callee->body)) {
       return false;
+    }
+    // Check that every expression evaluated before targetGet on the path from
+    // callee->body to targetGet can be moved past wFunc.
+    Expression* curr = targetGet;
+    while (curr && curr != callee->body) {
+      Expression* par = layout.parent.at(curr);
+      if (!par) {
+        return false;
+      }
+      for (auto* sib : ChildIterator(par)) {
+        if (sib == curr) {
+          break;
+        }
+        if (sib && !canMoveWrapperPast(wFunc, sib)) {
+          return false;
+        }
+      }
+      curr = par;
     }
     outGet = targetGet;
     return true;
@@ -3885,6 +4311,7 @@ struct OutlineExpressions : public Pass {
       for (Index k = 0; k < m; k++) {
         currentParams[k] = callee->getLocalType(k);
       }
+      std::vector<bool> removedParam(m, false);
       bool calleeModified = false;
 
       for (Index revK = 0; revK < m; revK++) {
@@ -3893,11 +4320,13 @@ struct OutlineExpressions : public Pass {
           continue;
         }
         auto* firstW = sites[0].call->operands[k]->dynCast<Call>();
-        if (!firstW || firstW->isReturn || firstW->operands.size() != 1 ||
+        if (!firstW || firstW->isReturn || firstW->operands.size() > 1 ||
             firstW->target == callee->name ||
-            firstW->operands[0]->type == Type::unreachable) {
+            (firstW->operands.size() == 1 &&
+             firstW->operands[0]->type == Type::unreachable)) {
           continue;
         }
+        Index wArity = firstW->operands.size();
         Name wName = firstW->target;
         Function* wFunc = wasm->getFunctionOrNull(wName);
         if (!wFunc || modifiedCallees.count(wFunc)) {
@@ -3905,7 +4334,9 @@ struct OutlineExpressions : public Pass {
         }
         Type wInputType = wFunc->getParams();
         Type wResultType = wFunc->getResults();
-        if (!wInputType.isSingle() || !wResultType.isSingle() ||
+        if ((wArity == 1 && !wInputType.isSingle()) ||
+            (wArity == 0 && wInputType != Type::none) ||
+            !wResultType.isSingle() ||
             !Type::isSubType(wResultType, currentParams[k])) {
           continue;
         }
@@ -3914,14 +4345,19 @@ struct OutlineExpressions : public Pass {
         for (const auto& s : sites) {
           auto* wCall = s.call->operands[k]->dynCast<Call>();
           if (!wCall || touchedCalls.count(wCall) || wCall->isReturn ||
-              wCall->target != wName || wCall->operands.size() != 1 ||
-              wCall->operands[0]->type == Type::unreachable ||
-              !Type::isSubType(wCall->operands[0]->type, wInputType)) {
+              wCall->target != wName || wCall->operands.size() != wArity) {
+            allMatch = false;
+            break;
+          }
+          if (wArity == 1 && (wCall->operands[0]->type == Type::unreachable ||
+                              !Type::isSubType(wCall->operands[0]->type,
+                                               wInputType))) {
             allMatch = false;
             break;
           }
           for (Index j = k + 1; j < m; j++) {
-            if (!canMoveWrapperPast(wFunc, s.call->operands[j])) {
+            if (!removedParam[j] &&
+                !canMoveWrapperPast(wFunc, s.call->operands[j])) {
               allMatch = false;
               break;
             }
@@ -3934,25 +4370,105 @@ struct OutlineExpressions : public Pass {
           continue;
         }
 
+        if (wArity == 0) {
+          // 0-arg wrapper call: either substitute (call $w) directly at all
+          // reads of param k (when pure or single-entry read) or compute once
+          // into a fresh local at callee entry, then remove param k.
+          LocalGet* singleGet = nullptr;
+          bool canSubDirectly =
+            (localWrites[k] == 0 &&
+             ((localReads[k] == 1 &&
+               isSingleEntryReadSafe(callee, k, wFunc, singleGet)) ||
+              isNonMutatingWrapper(wFunc)));
+          unsigned callWSize = getShallowBytes(firstW);
+          unsigned costBytes = 0;
+          bool useDirectSub = false;
+          if (canSubDirectly &&
+              localReads[k] * (callWSize - 2) <= callWSize + 4) {
+            useDirectSub = true;
+            costBytes = localReads[k] * (callWSize - 2);
+          } else if (currentParams[k].isDefaultable()) {
+            useDirectSub = false;
+            costBytes = callWSize + 4;
+          } else if (canSubDirectly) {
+            useDirectSub = true;
+            costBytes = localReads[k] * (callWSize - 2);
+          } else {
+            continue;
+          }
+          if (callWSize * N <= costBytes) {
+            continue;
+          }
+
+          if (useDirectSub) {
+            struct ParamGetReplacer : public PostWalker<ParamGetReplacer> {
+              Index targetIdx;
+              Name wName;
+              Type wResultType;
+              Builder& builder;
+              ParamGetReplacer(Index targetIdx,
+                               Name wName,
+                               Type wResultType,
+                               Builder& builder)
+                : targetIdx(targetIdx), wName(wName), wResultType(wResultType),
+                  builder(builder) {}
+              void visitLocalGet(LocalGet* curr) {
+                if (curr->index == targetIdx) {
+                  replaceCurrent(builder.makeCall(wName, {}, wResultType));
+                }
+              }
+            };
+            ParamGetReplacer(k, wName, wResultType, builder).walk(callee->body);
+          } else {
+            Index tmpLocal = Builder::addVar(callee, currentParams[k]);
+            for (auto* lg : FindAll<LocalGet>(callee->body).list) {
+              if (lg->index == k) {
+                lg->index = tmpLocal;
+              }
+            }
+            for (auto* ls : FindAll<LocalSet>(callee->body).list) {
+              if (ls->index == k) {
+                ls->index = tmpLocal;
+              }
+            }
+            Expression* setExpr = builder.makeLocalSet(
+              tmpLocal, builder.makeCall(wName, {}, wResultType));
+            callee->body = builder.makeSequence(setExpr, callee->body);
+          }
+
+          removedParam[k] = true;
+          for (const auto& s : sites) {
+            auto* wCall = s.call->operands[k]->cast<Call>();
+            touchedCalls.insert(wCall);
+            modifiedFuncs.insert(s.caller);
+          }
+          modifiedCallees.insert(callee);
+          modifiedCallees.insert(wFunc);
+          calleeModified = true;
+          anyChanged = true;
+          continue;
+        }
+
         Type oldParamType = currentParams[k];
         LocalGet* singleGet = nullptr;
         bool directSub = localWrites[k] == 0 && localReads[k] == 1 &&
                          isSingleEntryReadSafe(callee, k, wFunc, singleGet);
-        unsigned costBytes = 3;
+        unsigned callWOverhead = getShallowBytes(firstW);
+        unsigned costBytes = callWOverhead;
         if (!directSub) {
           if (wInputType == oldParamType) {
-            costBytes = 7;
+            costBytes = callWOverhead + 4;
           } else if (oldParamType.isDefaultable()) {
-            costBytes = 9;
+            costBytes = callWOverhead + 6;
           } else {
             continue;
           }
         }
-        if (3 * N <= costBytes) {
+        if (callWOverhead * N <= costBytes) {
           continue;
         }
 
-        // Apply in-place sinking on callee and all N call sites.
+        // Apply in-place 1-arg wrapper sinking on callee and all N call sites.
         currentParams[k] = wInputType;
         if (directSub) {
           struct SingleGetReplacer : public PostWalker<SingleGetReplacer> {
@@ -3996,7 +4512,6 @@ struct OutlineExpressions : public Pass {
 
         for (const auto& s : sites) {
           auto* wCall = s.call->operands[k]->cast<Call>();
-          touchedCalls.insert(s.call);
           touchedCalls.insert(wCall);
           s.call->operands[k] = wCall->operands[0];
           modifiedFuncs.insert(s.caller);
@@ -4008,13 +4523,64 @@ struct OutlineExpressions : public Pass {
       }
 
       if (calleeModified) {
-        callee->setParams(Type(currentParams));
+        bool anyRemoved = false;
+        for (Index k = 0; k < m; k++) {
+          if (removedParam[k]) {
+            anyRemoved = true;
+            break;
+          }
+        }
+        if (anyRemoved) {
+          Index totalLocals = callee->getNumLocals();
+          std::vector<Index> indexMap(totalLocals, 0);
+          std::vector<Type> keptParams;
+          Index nextIdx = 0;
+          for (Index k = 0; k < m; k++) {
+            if (!removedParam[k]) {
+              indexMap[k] = nextIdx++;
+              keptParams.push_back(currentParams[k]);
+            }
+          }
+          for (Index v = m; v < totalLocals; v++) {
+            indexMap[v] = nextIdx++;
+          }
+          for (auto* lg : FindAll<LocalGet>(callee->body).list) {
+            lg->index = indexMap[lg->index];
+            if (lg->index < keptParams.size()) {
+              lg->type = keptParams[lg->index];
+            }
+          }
+          for (auto* ls : FindAll<LocalSet>(callee->body).list) {
+            ls->index = indexMap[ls->index];
+          }
+          callee->setParams(Type(keptParams));
+          for (const auto& s : sites) {
+            ExpressionList newOps(wasm->allocator);
+            for (Index k = 0; k < m; k++) {
+              if (!removedParam[k]) {
+                newOps.push_back(s.call->operands[k]);
+              }
+            }
+            s.call->operands = std::move(newOps);
+          }
+        } else {
+          callee->setParams(Type(currentParams));
+          for (auto* lg : FindAll<LocalGet>(callee->body).list) {
+            if (lg->index < m) {
+              lg->type = currentParams[lg->index];
+            }
+          }
+        }
+        for (const auto& s : sites) {
+          touchedCalls.insert(s.call);
+        }
         modifiedFuncs.insert(callee);
       }
     }
 
     // Part B: Partial wrapper specialization when shrinkLevel > 0 and a subset
-    // M >= 6 of callers of callee pass (call $w X_k) at parameter k.
+    // M >= 5 of callers of callee pass (call $w X_k) or 0-arg (call $w) at
+    // parameter k.
     if (getPassOptions().shrinkLevel > 0) {
       struct PartialKey {
         Name calleeName;
@@ -4055,18 +4621,21 @@ struct OutlineExpressions : public Pass {
           for (Index k = 0; k < m; k++) {
             auto* wCall = c->operands[k]->dynCast<Call>();
             if (!wCall || wCall->isReturn || touchedCalls.count(wCall) ||
-                wCall->operands.size() != 1 ||
-                wCall->operands[0]->type == Type::unreachable) {
+                wCall->operands.size() > 1 ||
+                (wCall->operands.size() == 1 &&
+                 wCall->operands[0]->type == Type::unreachable)) {
               continue;
             }
+            Index wArity = wCall->operands.size();
             Function* wFunc = wasm->getFunctionOrNull(wCall->target);
             if (!wFunc || modifiedCallees.count(wFunc) ||
-                !wFunc->getParams().isSingle() ||
+                (wArity == 1 && !wFunc->getParams().isSingle()) ||
+                (wArity == 0 && wFunc->getParams() != Type::none) ||
                 !wFunc->getResults().isSingle() ||
                 !Type::isSubType(wFunc->getResults(),
                                  callee->getLocalType(k)) ||
-                !Type::isSubType(wCall->operands[0]->type,
-                                 wFunc->getParams())) {
+                (wArity == 1 && !Type::isSubType(wCall->operands[0]->type,
+                                                 wFunc->getParams()))) {
               continue;
             }
             bool laterSafe = true;
@@ -4102,6 +4671,7 @@ struct OutlineExpressions : public Pass {
         Function* callee = wasm->getFunction(pKey.calleeName);
         Function* wFunc = wasm->getFunction(pKey.wName);
         Index k = pKey.paramIdx;
+        Index wArity = wFunc->getParams() == Type::none ? 0 : 1;
         std::vector<CallSiteInfo> active;
         for (const auto& s : sites) {
           if (touchedCalls.count(s.call)) {
@@ -4109,34 +4679,49 @@ struct OutlineExpressions : public Pass {
           }
           auto* wCall = s.call->operands[k]->dynCast<Call>();
           if (!wCall || touchedCalls.count(wCall) ||
-              wCall->target != pKey.wName || wCall->operands.size() != 1 ||
-              !Type::isSubType(wCall->operands[0]->type, wFunc->getParams())) {
+              wCall->target != pKey.wName || wCall->operands.size() != wArity ||
+              (wArity == 1 &&
+               !Type::isSubType(wCall->operands[0]->type, wFunc->getParams()))) {
             continue;
           }
           active.push_back(s);
         }
-        if (active.size() < 6) {
+        if (active.size() < 5) {
           continue;
         }
         Index m = callee->getNumParams();
         unsigned savedBytes = 3 * unsigned(active.size());
-        unsigned helperCost = 15 + 2 * unsigned(m);
-        if (savedBytes <= helperCost + 6) {
+        unsigned helperCost = 10 + 2 * unsigned(m - (wArity == 0 ? 1 : 0));
+        if (savedBytes <= helperCost + 4) {
           continue;
         }
 
-        std::vector<Type> newParams(m);
+        std::vector<Type> newParams;
         for (Index j = 0; j < m; j++) {
-          newParams[j] =
-            (j == k) ? wFunc->getParams() : callee->getLocalType(j);
+          if (j == k) {
+            if (wArity == 1) {
+              newParams.push_back(wFunc->getParams());
+            }
+          } else {
+            newParams.push_back(callee->getLocalType(j));
+          }
         }
         std::vector<Expression*> forwardArgs(m);
+        Index nextParamIdx = 0;
         for (Index j = 0; j < m; j++) {
-          Expression* lg = builder.makeLocalGet(j, newParams[j]);
           if (j == k) {
-            forwardArgs[j] =
-              builder.makeCall(wFunc->name, {lg}, wFunc->getResults());
+            if (wArity == 1) {
+              Expression* lg =
+                builder.makeLocalGet(nextParamIdx++, wFunc->getParams());
+              forwardArgs[j] =
+                builder.makeCall(wFunc->name, {lg}, wFunc->getResults());
+            } else {
+              forwardArgs[j] =
+                builder.makeCall(wFunc->name, {}, wFunc->getResults());
+            }
           } else {
+            Expression* lg =
+              builder.makeLocalGet(nextParamIdx++, callee->getLocalType(j));
             forwardArgs[j] = lg;
           }
         }
@@ -4150,10 +4735,692 @@ struct OutlineExpressions : public Pass {
         for (const auto& s : active) {
           auto* wCall = s.call->operands[k]->cast<Call>();
           s.call->target = newName;
-          s.call->operands[k] = wCall->operands[0];
+          if (wArity == 1) {
+            s.call->operands[k] = wCall->operands[0];
+          } else {
+            ExpressionList newOps(wasm->allocator);
+            for (Index j = 0; j < m; j++) {
+              if (j != k) {
+                newOps.push_back(s.call->operands[j]);
+              }
+            }
+            s.call->operands = std::move(newOps);
+          }
           touchedCalls.insert(s.call);
           touchedCalls.insert(wCall);
           modifiedFuncs.insert(s.caller);
+        }
+        anyChanged = true;
+      }
+    }
+
+    for (Function* func : modifiedFuncs) {
+      ReFinalize().walkFunctionInModule(func, wasm);
+      if (func->effects) {
+        func->effects =
+          std::make_unique<EffectAnalyzer>(getPassOptions(), *wasm, func);
+      }
+    }
+    return anyChanged;
+  }
+
+  // Phase 2: Constant-Argument Sinking, Existing Constant-Specialized Helper
+  // Reuse, and Partial Constant-Argument Specialization.
+  //
+  // 1. Part A (100%-caller in-place constant parameter sinking):
+  //    For any non-escaped function $F (including 0/1-arg wrappers that DAE
+  //    skips in early stages) where 100% of N >= 2 callers pass the same
+  //    constant C (Const, GlobalGet of immutable global, RefFunc, RefNull) at
+  //    parameter k, substitute C for every local.get $k in $F and remove
+  //    parameter k when N * sizeof(C) > reads(k) * (sizeof(C) - 2).
+  // 2. Part B (Existing constant-specialized forwarding helper reuse):
+  //    Discover all existing functions $H whose body is a single (call $F ...)
+  //    forwarding its parameters in order and filling one or more parameters of
+  //    $F with constants. Rewrite any remaining direct call to $F with matching
+  //    constant arguments to call $H instead (widening $H's parameter types in
+  //    place when $H is non-escaped and a caller passes a subtype of $F's
+  //    parameter type).
+  // 3. Part C (Partial constant-argument specialization):
+  //    Group remaining call sites of each target $F by subsets of constant
+  //    arguments and greedily emit new forwarding helpers $H for any subset
+  //    that yields net binary size savings >= 6 bytes.
+  bool sinkConstantArgs() {
+    std::unordered_set<Name> immutableGlobals;
+    for (auto& g : wasm->globals) {
+      if (!g->mutable_) {
+        immutableGlobals.insert(g->name);
+      }
+    }
+
+    auto isSinkableConst = [&](Expression* expr) -> bool {
+      if (expr->is<Const>() || expr->is<RefNull>() || expr->is<RefFunc>()) {
+        return true;
+      }
+      if (auto* gg = expr->dynCast<GlobalGet>()) {
+        return immutableGlobals.count(gg->name) > 0;
+      }
+      return false;
+    };
+
+    std::unordered_set<Name> disallowedTargets;
+    for (auto& ex : wasm->exports) {
+      if (ex->kind == ExternalKind::Function) {
+        disallowedTargets.insert(*ex->getInternalName());
+      }
+    }
+    for (auto& seg : wasm->elementSegments) {
+      for (auto* expr : seg->data) {
+        for (auto* rf : FindAll<RefFunc>(expr).list) {
+          disallowedTargets.insert(rf->func);
+        }
+      }
+    }
+    for (auto& g : wasm->globals) {
+      if (!g->imported() && g->init) {
+        for (auto* rf : FindAll<RefFunc>(g->init).list) {
+          disallowedTargets.insert(rf->func);
+        }
+      }
+    }
+
+    struct CallSiteInfo {
+      Function* caller;
+      Call* call;
+    };
+    std::unordered_map<Name, std::vector<CallSiteInfo>> callsByTarget;
+    for (auto& f : wasm->functions) {
+      if (f->imported()) {
+        continue;
+      }
+      Function* caller = f.get();
+      for (auto* rf : FindAll<RefFunc>(caller->body).list) {
+        disallowedTargets.insert(rf->func);
+      }
+      for (auto* c : FindAll<Call>(caller->body).list) {
+        callsByTarget[c->target].push_back({caller, c});
+      }
+    }
+
+    Builder builder(*wasm);
+    std::unordered_set<Function*> modifiedFuncs;
+    bool anyChanged = false;
+
+    // Step 2A: In-place 100%-caller constant parameter sinking.
+    for (auto& f : wasm->functions) {
+      if (f->imported()) {
+        continue;
+      }
+      Function* callee = f.get();
+      if (disallowedTargets.count(callee->name) ||
+          callee->getNumParams() == 0) {
+        continue;
+      }
+      auto it = callsByTarget.find(callee->name);
+      if (it == callsByTarget.end() || it->second.size() < 2) {
+        continue;
+      }
+      auto& sites = it->second;
+      Index N = sites.size();
+      Index m = callee->getNumParams();
+      bool validSites = true;
+      for (const auto& s : sites) {
+        if (s.caller == callee || s.call->isReturn ||
+            s.call->operands.size() != m) {
+          validSites = false;
+          break;
+        }
+        for (auto* op : s.call->operands) {
+          if (op->type == Type::unreachable) {
+            validSites = false;
+            break;
+          }
+        }
+        if (!validSites) {
+          break;
+        }
+      }
+      if (!validSites) {
+        continue;
+      }
+
+      std::vector<Index> localReads(callee->getNumLocals(), 0);
+      std::vector<Index> localWrites(callee->getNumLocals(), 0);
+      for (auto* lg : FindAll<LocalGet>(callee->body).list) {
+        localReads[lg->index]++;
+      }
+      for (auto* ls : FindAll<LocalSet>(callee->body).list) {
+        localWrites[ls->index]++;
+      }
+
+      std::vector<bool> removedParam(m, false);
+      bool calleeModified = false;
+
+      for (Index revK = 0; revK < m; revK++) {
+        Index k = m - 1 - revK;
+        if (localReads[k] == 0 || localWrites[k] > 0) {
+          continue;
+        }
+        Expression* firstArg = sites[0].call->operands[k];
+        if (!isSinkableConst(firstArg) ||
+            !Type::isSubType(firstArg->type, callee->getLocalType(k))) {
+          continue;
+        }
+        bool allSame = true;
+        for (Index i = 1; i < N; i++) {
+          if (!ExpressionAnalyzer::equal(firstArg, sites[i].call->operands[k])) {
+            allSame = false;
+            break;
+          }
+        }
+        if (!allSame) {
+          continue;
+        }
+        // Check that later arguments at all call sites have no side effects so
+        // removing argument k does not alter trap/side-effect ordering.
+        bool laterSafe = true;
+        for (const auto& s : sites) {
+          for (Index j = k + 1; j < m; j++) {
+            if (removedParam[j]) {
+              continue;
+            }
+            EffectAnalyzer eff(getPassOptions(), *wasm, s.call->operands[j]);
+            if (eff.hasSideEffects() || eff.throws()) {
+              laterSafe = false;
+              break;
+            }
+          }
+          if (!laterSafe) {
+            break;
+          }
+        }
+        if (!laterSafe) {
+          continue;
+        }
+
+        unsigned constSize = getShallowBytes(firstArg);
+        int savedBytes = int(N) * int(constSize);
+        int addedBytes = int(localReads[k]) * (int(constSize) - 2);
+        if (savedBytes <= addedBytes) {
+          continue;
+        }
+
+        struct ConstParamReplacer : public PostWalker<ConstParamReplacer> {
+          Index targetIdx;
+          Expression* proto;
+          Module& wasm;
+          ConstParamReplacer(Index targetIdx, Expression* proto, Module& wasm)
+            : targetIdx(targetIdx), proto(proto), wasm(wasm) {}
+          void visitLocalGet(LocalGet* curr) {
+            if (curr->index == targetIdx) {
+              replaceCurrent(ExpressionManipulator::copy(proto, wasm));
+            }
+          }
+        };
+        ConstParamReplacer(k, firstArg, *wasm).walk(callee->body);
+        removedParam[k] = true;
+        calleeModified = true;
+        anyChanged = true;
+      }
+
+      if (calleeModified) {
+        Index totalLocals = callee->getNumLocals();
+        std::vector<Index> indexMap(totalLocals, 0);
+        std::vector<Type> keptParams;
+        Index nextIdx = 0;
+        for (Index k = 0; k < m; k++) {
+          if (!removedParam[k]) {
+            indexMap[k] = nextIdx++;
+            keptParams.push_back(callee->getLocalType(k));
+          }
+        }
+        for (Index v = m; v < totalLocals; v++) {
+          indexMap[v] = nextIdx++;
+        }
+        for (auto* lg : FindAll<LocalGet>(callee->body).list) {
+          lg->index = indexMap[lg->index];
+        }
+        for (auto* ls : FindAll<LocalSet>(callee->body).list) {
+          ls->index = indexMap[ls->index];
+        }
+        callee->setParams(Type(keptParams));
+        for (const auto& s : sites) {
+          ExpressionList newOps(wasm->allocator);
+          for (Index k = 0; k < m; k++) {
+            if (!removedParam[k]) {
+              newOps.push_back(s.call->operands[k]);
+            }
+          }
+          s.call->operands = std::move(newOps);
+          modifiedFuncs.insert(s.caller);
+        }
+        modifiedFuncs.insert(callee);
+      }
+    }
+
+    if (anyChanged) {
+      for (Function* func : modifiedFuncs) {
+        ReFinalize().walkFunctionInModule(func, wasm);
+        if (func->effects) {
+          func->effects =
+            std::make_unique<EffectAnalyzer>(getPassOptions(), *wasm, func);
+        }
+      }
+      modifiedFuncs.clear();
+      callsByTarget.clear();
+      for (auto& f : wasm->functions) {
+        if (!f->imported()) {
+          for (auto* c : FindAll<Call>(f->body).list) {
+            callsByTarget[c->target].push_back({f.get(), c});
+          }
+        }
+      }
+    }
+
+    // Step 2B: Reuse existing constant-specialized forwarding helpers $H.
+    // A function $H is a constant-specialized forwarding helper for $F if:
+    // - $H->getNumVars() == 0 and $H->getResults() == $F->getResults()
+    // - $H->body is a non-return (call $F arg_0 ... arg_{m-1})
+    // - Each arg_j is either (local.get $p) with strictly increasing $p
+    //   covering 0 .. H_params-1, or a sinkable constant expression.
+    struct ForwardingHelper {
+      Function* helper;
+      Function* target;
+      std::vector<std::pair<Index, Expression*>> constArgs;
+      std::vector<Index> keptParamPositions;
+      unsigned savedBytesPerCall = 0;
+    };
+    std::unordered_map<Name, std::vector<ForwardingHelper>> helpersByTarget;
+    std::unordered_set<Function*> allForwardingHelpers;
+
+    for (auto& f : wasm->functions) {
+      if (f->imported() || f->getNumVars() != 0) {
+        continue;
+      }
+      Function* h = f.get();
+      auto* innerCall = h->body->dynCast<Call>();
+      if (!innerCall || innerCall->isReturn || innerCall->target == h->name) {
+        continue;
+      }
+      Function* target = wasm->getFunctionOrNull(innerCall->target);
+      if (!target || target->imported() ||
+          h->getResults() != target->getResults() ||
+          innerCall->operands.size() != target->getNumParams()) {
+        continue;
+      }
+      Index m = innerCall->operands.size();
+      Index expectedLocal = 0;
+      std::vector<std::pair<Index, Expression*>> constArgs;
+      std::vector<Index> keptPos;
+      unsigned savedBytes = 0;
+      bool validForwarder = true;
+      for (Index j = 0; j < m; j++) {
+        Expression* op = innerCall->operands[j];
+        if (auto* lg = op->dynCast<LocalGet>()) {
+          if (lg->index != expectedLocal) {
+            validForwarder = false;
+            break;
+          }
+          expectedLocal++;
+          keptPos.push_back(j);
+        } else if (isSinkableConst(op)) {
+          constArgs.push_back({j, op});
+          savedBytes += getShallowBytes(op);
+        } else {
+          validForwarder = false;
+          break;
+        }
+      }
+      if (!validForwarder || expectedLocal != h->getNumParams() ||
+          constArgs.empty()) {
+        continue;
+      }
+      helpersByTarget[target->name].push_back(
+        {h, target, std::move(constArgs), std::move(keptPos), savedBytes});
+      allForwardingHelpers.insert(h);
+    }
+
+    std::unordered_set<Call*> rewrittenCalls;
+    for (auto& [targetName, helperList] : helpersByTarget) {
+      auto it = callsByTarget.find(targetName);
+      if (it == callsByTarget.end()) {
+        continue;
+      }
+      Function* targetFunc = wasm->getFunction(targetName);
+      // Prefer helpers that save the most bytes per call site.
+      std::sort(helperList.begin(),
+                helperList.end(),
+                [](const ForwardingHelper& a, const ForwardingHelper& b) {
+                  if (a.savedBytesPerCall != b.savedBytesPerCall) {
+                    return a.savedBytesPerCall > b.savedBytesPerCall;
+                  }
+                  return a.helper->name < b.helper->name;
+                });
+
+      for (const auto& s : it->second) {
+        if (s.call->isReturn || rewrittenCalls.count(s.call) ||
+            allForwardingHelpers.count(s.caller) ||
+            s.call->operands.size() != targetFunc->getNumParams()) {
+          continue;
+        }
+        bool hasUnreachable = false;
+        for (auto* op : s.call->operands) {
+          if (op->type == Type::unreachable) {
+            hasUnreachable = true;
+            break;
+          }
+        }
+        if (hasUnreachable) {
+          continue;
+        }
+
+        for (auto& fh : helperList) {
+          if (s.caller == fh.helper) {
+            continue;
+          }
+          bool constsMatch = true;
+          for (const auto& [pos, cExpr] : fh.constArgs) {
+            if (!ExpressionAnalyzer::equal(s.call->operands[pos], cExpr)) {
+              constsMatch = false;
+              break;
+            }
+          }
+          if (!constsMatch) {
+            continue;
+          }
+          // Check that non-constant operands following any removed constant
+          // position do not have side effects / traps if the helper were to
+          // evaluate anything out of order (constants are pure so dropping them
+          // at the call site preserves evaluation order of remaining operands).
+          bool typesMatch = true;
+          bool needsWiden = false;
+          for (Index p = 0; p < fh.keptParamPositions.size(); p++) {
+            Index origPos = fh.keptParamPositions[p];
+            Type argType = s.call->operands[origPos]->type;
+            Type hParamType = fh.helper->getLocalType(p);
+            if (!Type::isSubType(argType, hParamType)) {
+              if (!disallowedTargets.count(fh.helper->name) &&
+                  Type::isSubType(argType, fh.target->getLocalType(origPos))) {
+                needsWiden = true;
+              } else {
+                typesMatch = false;
+                break;
+              }
+            }
+          }
+          if (!typesMatch) {
+            continue;
+          }
+          if (needsWiden) {
+            std::vector<Type> widenedParams(fh.keptParamPositions.size());
+            auto* hCall = fh.helper->body->cast<Call>();
+            for (Index p = 0; p < fh.keptParamPositions.size(); p++) {
+              Index origPos = fh.keptParamPositions[p];
+              Type lub = Type::getLeastUpperBound(fh.helper->getLocalType(p),
+                                                  s.call->operands[origPos]->type);
+              widenedParams[p] = lub;
+              hCall->operands[origPos]->cast<LocalGet>()->type = lub;
+            }
+            fh.helper->setParams(Type(widenedParams));
+            modifiedFuncs.insert(fh.helper);
+          }
+
+          ExpressionList newOps(wasm->allocator);
+          for (Index origPos : fh.keptParamPositions) {
+            newOps.push_back(s.call->operands[origPos]);
+          }
+          s.call->target = fh.helper->name;
+          s.call->operands = std::move(newOps);
+          rewrittenCalls.insert(s.call);
+          modifiedFuncs.insert(s.caller);
+          anyChanged = true;
+          break;
+        }
+      }
+    }
+
+    // Step 2C: Partial constant-argument specialization for remaining calls.
+    // For each target function $F with m >= 1 parameters, find subsets of
+    // constant arguments shared by M >= 3 call sites and greedily emit new
+    // forwarding helpers when net binary savings >= 6 bytes.
+    struct ConstValKey {
+      enum Kind : uint8_t {
+        KConst,
+        KGlobal,
+        KRefFunc,
+        KRefNull,
+      } kind;
+      Literal lit;
+      Name name;
+      Type type;
+      bool operator<(const ConstValKey& o) const {
+        if (kind != o.kind) {
+          return kind < o.kind;
+        }
+        if (kind == KConst) {
+          if (lit.type != o.lit.type) {
+            return lit.type.getID() < o.lit.type.getID();
+          }
+          uint8_t bufA[16] = {0};
+          uint8_t bufB[16] = {0};
+          lit.getBits(bufA);
+          o.lit.getBits(bufB);
+          return std::memcmp(bufA, bufB, 16) < 0;
+        }
+        if (kind == KGlobal || kind == KRefFunc) {
+          return name < o.name;
+        }
+        return type.getID() < o.type.getID();
+      }
+      bool operator==(const ConstValKey& o) const {
+        return !(*this < o) && !(o < *this);
+      }
+    };
+
+    auto makeConstKey = [&](Expression* expr) -> ConstValKey {
+      if (auto* c = expr->dynCast<Const>()) {
+        return {ConstValKey::KConst, c->value, Name(), c->type};
+      }
+      if (auto* gg = expr->dynCast<GlobalGet>()) {
+        return {ConstValKey::KGlobal, Literal(), gg->name, gg->type};
+      }
+      if (auto* rf = expr->dynCast<RefFunc>()) {
+        return {ConstValKey::KRefFunc, Literal(), rf->func, rf->type};
+      }
+      auto* rn = expr->cast<RefNull>();
+      return {ConstValKey::KRefNull, Literal(), Name(), rn->type};
+    };
+
+    for (auto& f : wasm->functions) {
+      if (f->imported()) {
+        continue;
+      }
+      Function* target = f.get();
+      Index m = target->getNumParams();
+      if (m == 0 || m > 8) {
+        continue;
+      }
+      auto it = callsByTarget.find(target->name);
+      if (it == callsByTarget.end() || it->second.size() < 3) {
+        continue;
+      }
+
+      std::vector<Index> targetReads(target->getNumLocals(), 0);
+      for (auto* lg : FindAll<LocalGet>(target->body).list) {
+        targetReads[lg->index]++;
+      }
+
+      std::vector<CallSiteInfo> validCalls;
+      for (const auto& s : it->second) {
+        if (s.call->isReturn || rewrittenCalls.count(s.call) ||
+            s.call->operands.size() != m) {
+          continue;
+        }
+        bool ok = true;
+        for (Index j = 0; j < m; j++) {
+          if (s.call->operands[j]->type == Type::unreachable ||
+              !Type::isSubType(s.call->operands[j]->type,
+                               target->getLocalType(j))) {
+            ok = false;
+            break;
+          }
+        }
+        if (ok) {
+          validCalls.push_back(s);
+        }
+      }
+      if (validCalls.size() < 3) {
+        continue;
+      }
+
+      // Greedily specialize subsets for this target until no profitable subset
+      // remains.
+      std::vector<bool> callUsed(validCalls.size(), false);
+      while (true) {
+        using SubsetPattern = std::vector<std::pair<Index, ConstValKey>>;
+        struct PatternInfo {
+          std::vector<Index> callIndices;
+          std::vector<Expression*> protoConsts;
+          unsigned constBytesSum = 0;
+        };
+        std::map<SubsetPattern, PatternInfo> patternMap;
+
+        for (Index ci = 0; ci < validCalls.size(); ci++) {
+          if (callUsed[ci]) {
+            continue;
+          }
+          Call* c = validCalls[ci].call;
+          std::vector<Index> constPositions;
+          std::vector<ConstValKey> constKeys;
+          std::vector<Expression*> constExprs;
+          std::vector<unsigned> constSizes;
+          for (Index j = 0; j < m; j++) {
+            if (targetReads[j] > 0 && isSinkableConst(c->operands[j])) {
+              constPositions.push_back(j);
+              constKeys.push_back(makeConstKey(c->operands[j]));
+              constExprs.push_back(c->operands[j]);
+              constSizes.push_back(getShallowBytes(c->operands[j]));
+            }
+          }
+          Index k = constPositions.size();
+          if (k == 0) {
+            continue;
+          }
+          // Enumerate all non-empty subsets of up to 3 constant positions, plus
+          // the full constant set if k > 3.
+          auto addMask = [&](uint32_t mask) {
+            SubsetPattern pat;
+            std::vector<Expression*> protos;
+            unsigned bytesSum = 0;
+            for (Index bit = 0; bit < k; bit++) {
+              if (mask & (1u << bit)) {
+                pat.push_back({constPositions[bit], constKeys[bit]});
+                protos.push_back(constExprs[bit]);
+                bytesSum += constSizes[bit];
+              }
+            }
+            auto& info = patternMap[pat];
+            if (info.callIndices.empty()) {
+              info.protoConsts = std::move(protos);
+              info.constBytesSum = bytesSum;
+            }
+            info.callIndices.push_back(ci);
+          };
+
+          if (k <= 4) {
+            for (uint32_t mask = 1; mask < (1u << k); mask++) {
+              addMask(mask);
+            }
+          } else {
+            for (Index a = 0; a < k; a++) {
+              addMask(1u << a);
+              for (Index b = a + 1; b < k; b++) {
+                addMask((1u << a) | (1u << b));
+              }
+            }
+            addMask((1u << k) - 1);
+          }
+        }
+
+        int bestNetSavings = 5; // Require at least 6 bytes net savings
+        SubsetPattern bestPat;
+        for (const auto& [pat, info] : patternMap) {
+          Index M = info.callIndices.size();
+          if (M < 3) {
+            continue;
+          }
+          Index numRemoved = pat.size();
+          Index numKept = m - numRemoved;
+          int grossSaved = int(M) * int(info.constBytesSum);
+          int helperOverhead =
+            10 + int(info.constBytesSum) + 2 * int(numKept);
+          int netSavings = grossSaved - helperOverhead;
+          if (netSavings > bestNetSavings) {
+            bestNetSavings = netSavings;
+            bestPat = pat;
+          }
+        }
+
+        if (bestPat.empty()) {
+          break;
+        }
+
+        const auto& bestInfo = patternMap[bestPat];
+        std::vector<Expression*> constAtPos(m, nullptr);
+        for (Index idx = 0; idx < bestPat.size(); idx++) {
+          constAtPos[bestPat[idx].first] = bestInfo.protoConsts[idx];
+        }
+
+        std::vector<Type> newParams;
+        std::vector<Index> keptPositions;
+        for (Index j = 0; j < m; j++) {
+          if (!constAtPos[j]) {
+            keptPositions.push_back(j);
+            // Compute LUB of argument types across the selected call sites so
+            // the specialized helper has the tightest valid parameter type.
+            Type lub = validCalls[bestInfo.callIndices[0]].call->operands[j]->type;
+            for (Index idx = 1; idx < bestInfo.callIndices.size(); idx++) {
+              lub = Type::getLeastUpperBound(
+                lub,
+                validCalls[bestInfo.callIndices[idx]].call->operands[j]->type);
+            }
+            if (!Type::isSubType(lub, target->getLocalType(j))) {
+              lub = target->getLocalType(j);
+            }
+            newParams.push_back(lub);
+          }
+        }
+
+        std::vector<Expression*> forwardArgs(m, nullptr);
+        Index nextParamIdx = 0;
+        for (Index j = 0; j < m; j++) {
+          if (constAtPos[j]) {
+            forwardArgs[j] =
+              ExpressionManipulator::copy(constAtPos[j], *wasm);
+          } else {
+            Type pType = newParams[nextParamIdx];
+            forwardArgs[j] = builder.makeLocalGet(nextParamIdx, pType);
+            nextParamIdx++;
+          }
+        }
+
+        Expression* newBody = builder.makeCall(
+          target->name, forwardArgs, target->getResults(), false);
+        Name newName = Names::getValidFunctionName(*wasm, "outlined_c");
+        Function* newFunc = wasm->addFunction(Builder::makeFunction(
+          newName, Signature(Type(newParams), target->getResults()), {}, newBody));
+        ReFinalize().walkFunctionInModule(newFunc, wasm);
+
+        for (Index ci : bestInfo.callIndices) {
+          callUsed[ci] = true;
+          Call* c = validCalls[ci].call;
+          ExpressionList newOps(wasm->allocator);
+          for (Index origPos : keptPositions) {
+            newOps.push_back(c->operands[origPos]);
+          }
+          c->target = newName;
+          c->operands = std::move(newOps);
+          rewrittenCalls.insert(c);
+          modifiedFuncs.insert(validCalls[ci].caller);
         }
         anyChanged = true;
       }
