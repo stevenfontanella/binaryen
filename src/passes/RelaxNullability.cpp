@@ -1028,7 +1028,7 @@ struct FunctionRelaxer
   bool unaliasCastLocals(Function* func, const std::vector<LocalSet*>& sets) {
     Index numParams = func->getNumParams();
     Index numLocals = func->getNumLocals();
-    if (numParams == 0 || numLocals <= numParams) {
+    if (numLocals <= numParams) {
       return false;
     }
 
@@ -1089,7 +1089,8 @@ struct FunctionRelaxer
         continue;
       }
       Index b = srcGet->index;
-      if (b >= numParams || writeCount[b] != 0) {
+      if (b == a ||
+          (b < numParams ? writeCount[b] != 0 : writeCount[b] != 1)) {
         continue;
       }
       Type bType = func->getLocalType(b);
@@ -1112,7 +1113,8 @@ struct FunctionRelaxer
       func, *getModule(), LocalStructuralDominance::All);
     std::vector<CastAlias> domCandidates;
     for (auto& cand : candidates) {
-      if (!dom.nonDominatingIndices.count(cand.a)) {
+      if (!dom.nonDominatingIndices.count(cand.a) &&
+          (cand.b < numParams || !dom.nonDominatingIndices.count(cand.b))) {
         domCandidates.push_back(cand);
       }
     }
@@ -1146,7 +1148,13 @@ struct FunctionRelaxer
 
     Builder builder(*getModule());
     bool anyModified = false;
+    std::unordered_set<Index> modifiedAs;
+    std::unordered_set<Index> usedBs;
     for (auto& cand : domCandidates) {
+      if (modifiedAs.count(cand.a) || modifiedAs.count(cand.b) ||
+          usedBs.count(cand.a)) {
+        continue;
+      }
       auto setIt = collector.setPtrs.find(cand.set);
       if (setIt == collector.setPtrs.end()) {
         continue;
@@ -1179,8 +1187,12 @@ struct FunctionRelaxer
 
       size_t remTee = (cand.set->isTee() && !teeOk) ? 1 : 0;
       size_t totalRem = remTee + narrowGets.size();
+      bool canFoldRem =
+        totalRem <= 1 &&
+        (cand.valPtr == &cand.set->value ||
+         getPassOptions().trapsNeverHappen || narrowGets.empty());
 
-      if (!teeOk && wideGets.empty()) {
+      if (!teeOk && wideGets.empty() && !canFoldRem) {
         continue;
       }
 
@@ -1189,10 +1201,10 @@ struct FunctionRelaxer
         *getPtr = builder.makeLocalGet(cand.b, bType);
       }
       anyModified = true;
+      modifiedAs.insert(cand.a);
+      usedBs.insert(cand.b);
 
-      if (totalRem <= 1 &&
-          (cand.valPtr == &cand.set->value ||
-           getPassOptions().trapsNeverHappen || narrowGets.empty())) {
+      if (canFoldRem) {
         cand.cast->ref = builder.makeLocalGet(cand.b, bType);
         cand.cast->type =
           cand.cast->type.with(bType.isNonNullable() ? NonNullable : Nullable);
@@ -1429,7 +1441,7 @@ struct FunctionRelaxer
           }
         }
         refreshLocals();
-        if (unaliasCastLocals(func, sets)) {
+        for (int iter = 0; iter < 4 && unaliasCastLocals(func, sets); ++iter) {
           gets = FindAll<LocalGet>(func->body).list;
           sets = FindAll<LocalSet>(func->body).list;
           refreshLocals();
@@ -2686,33 +2698,149 @@ struct RelaxNullability : public Pass {
       sigFuncCount[func->getSig()]++;
     }
 
-    // Count how many 1-group signatures map to the same canonical root signature.
+    auto addCanonCandidates = [&](const Signature& origSig,
+                                  std::vector<Signature>& out) {
+      std::vector<Type> origParams(origSig.params.begin(),
+                                   origSig.params.end());
+      Type origRes = origSig.results;
+      std::vector<Type> resChoices = {origRes};
+      if (origRes.isRef() && !origRes.isExact()) {
+        Type nullRes = Type(origRes.getHeapType(), Nullable);
+        Type rootRes = Type(getRootAncestor(origRes.getHeapType()), Nullable);
+        Type topRes = Type(origRes.getHeapType().getTop(), Nullable);
+        if (nullRes != origRes) {
+          resChoices.push_back(nullRes);
+        }
+        if (rootRes != nullRes) {
+          resChoices.push_back(rootRes);
+        }
+        if (topRes != rootRes) {
+          resChoices.push_back(topRes);
+        }
+      }
+
+      std::vector<Type> rootParams = origParams;
+      std::vector<Type> topParams = origParams;
+      std::vector<Type> unsubTopParams = origParams;
+      for (size_t i = 0; i < origParams.size(); ++i) {
+        Type p = origParams[i];
+        if (p.isRef() && !p.isExact()) {
+          HeapType rHT = getRootAncestor(p.getHeapType());
+          HeapType tHT = p.getHeapType().getTop();
+          rootParams[i] = Type(rHT, Nullable);
+          topParams[i] = Type(tHT, Nullable);
+          unsubTopParams[i] =
+            (!rHT.isBasic() && subTypes.getImmediateSubTypes(rHT).empty())
+              ? Type(tHT, Nullable)
+              : Type(rHT, Nullable);
+        }
+      }
+
+      std::vector<Type> paramChoices;
+      auto addParamChoice = [&](Type pt) {
+        if (std::find(paramChoices.begin(), paramChoices.end(), pt) ==
+            paramChoices.end()) {
+          paramChoices.push_back(pt);
+        }
+      };
+      addParamChoice(Type(rootParams));
+      addParamChoice(origSig.params);
+      addParamChoice(Type(topParams));
+      addParamChoice(Type(unsubTopParams));
+      for (size_t i = 0; i < origParams.size(); ++i) {
+        Type p = origParams[i];
+        if (p.isRef() && !p.isExact()) {
+          Type tType(p.getHeapType().getTop(), Nullable);
+          if (tType != p) {
+            std::vector<Type> singleTop = origParams;
+            singleTop[i] = tType;
+            addParamChoice(Type(singleTop));
+          }
+          if (tType != rootParams[i]) {
+            std::vector<Type> rootSingleTop = rootParams;
+            rootSingleTop[i] = tType;
+            addParamChoice(Type(rootSingleTop));
+          }
+        }
+      }
+
+      for (Type pt : paramChoices) {
+        for (Type rt : resChoices) {
+          Signature cand(pt, rt);
+          if (std::find(out.begin(), out.end(), cand) == out.end()) {
+            out.push_back(cand);
+          }
+        }
+      }
+    };
+
+    // Count how many 1-group signatures map to the same canonical signature.
     std::unordered_map<Signature, size_t> canonSigCount;
     for (auto& [ht, flist] : htFuncs) {
       if (pinnedHTs.count(ht) || flist.empty()) {
         continue;
       }
       Signature origSig = ht.getSignature();
-      if (sigFuncCount[origSig] != flist.size() || origSig.results.isTuple()) {
+      if (sigFuncCount[origSig] != flist.size() || origSig.results.isTuple() ||
+          (origSig.params.isTuple() && origSig.params.size() > 16)) {
         continue;
       }
-      std::vector<Type> rootParams(origSig.params.begin(),
+      std::vector<Type> origParams(origSig.params.begin(),
                                    origSig.params.end());
-      for (auto& p : rootParams) {
-        if (p.isRef() && !p.isExact()) {
-          p = Type(getRootAncestor(p.getHeapType()), Nullable);
+      int sigDefBytes = 3 + int(origParams.size()) * 2 +
+                        (origSig.results != Type::none ? 2 : 0);
+      std::vector<Signature> groupCands;
+      addCanonCandidates(origSig, groupCands);
+      for (const auto& cand : groupCands) {
+        std::vector<Type> candParams(cand.params.begin(), cand.params.end());
+        Type candRes = cand.results;
+        bool ok = true;
+        int addedBytes = 0;
+        for (auto* f : flist) {
+          auto& sum = summaries.map[f];
+          for (size_t i = 0; i < origParams.size(); ++i) {
+            if (candParams[i] == origParams[i]) {
+              continue;
+            }
+            if (sum.localWriteCounts[i] > 0 ||
+                !Type::isSubType(origParams[i], candParams[i])) {
+              ok = false;
+              break;
+            }
+            for (auto& site : sum.paramSites[i]) {
+              Type accType =
+                site.isSelfReturn
+                  ? candRes
+                  : Type(site.acceptedHT, site.acceptedNull);
+              if (!site.isFixedConsumer ||
+                  !Type::isSubType(candParams[i], accType)) {
+                addedBytes += 3;
+              }
+            }
+          }
+          if (!ok) {
+            break;
+          }
+          if (candRes != origSig.results) {
+            auto callIt = callsTo.find(f->name);
+            if (callIt == callsTo.end() || callIt->second.empty() ||
+                !Type::isSubType(origSig.results, candRes)) {
+              ok = false;
+              break;
+            }
+            int callCastBytes =
+              (candRes.getHeapType() != origSig.results.getHeapType()) ? 3 : 1;
+            for (auto& csite : callIt->second) {
+              Type accType(csite.acceptedHT, csite.acceptedNull);
+              if (!csite.isFixedConsumer ||
+                  !Type::isSubType(candRes, accType)) {
+                addedBytes += callCastBytes;
+              }
+            }
+          }
         }
-      }
-      canonSigCount[Signature(Type(rootParams), origSig.results)]++;
-      if (origSig.results.isRef() && !origSig.results.isExact()) {
-        Type nullRes = Type(origSig.results.getHeapType(), Nullable);
-        Type rootRes =
-          Type(getRootAncestor(origSig.results.getHeapType()), Nullable);
-        if (nullRes != origSig.results) {
-          canonSigCount[Signature(Type(rootParams), nullRes)]++;
-        }
-        if (rootRes != nullRes) {
-          canonSigCount[Signature(Type(rootParams), rootRes)]++;
+        if (ok && addedBytes < sigDefBytes) {
+          canonSigCount[cand]++;
         }
       }
     }
@@ -2748,32 +2876,13 @@ struct RelaxNullability : public Pass {
                         (origRes != Type::none ? 2 : 0);
 
       // Build candidate target signatures:
-      // 1. Canonical root-ancestor signature (with result keep / null / root).
+      // 1. Canonical root-ancestor / top signatures (with result keep / null /
+      //    root / top).
       // 2. Selective per-parameter LUB / root widening for parameters with
       //    caller RefCasts.
       // 3. Zero-cast basic-type (`any` / `eq` / `func`) generalized signature.
       std::vector<Signature> candidates;
-      {
-        std::vector<Type> rootParams = origParams;
-        for (auto& p : rootParams) {
-          if (p.isRef() && !p.isExact()) {
-            p = Type(getRootAncestor(p.getHeapType()), Nullable);
-          }
-        }
-        candidates.push_back(Signature(Type(rootParams), origRes));
-        if (origRes.isRef() && !origRes.isExact()) {
-          Type nullRes = Type(origRes.getHeapType(), Nullable);
-          Type rootRes = Type(getRootAncestor(origRes.getHeapType()), Nullable);
-          if (nullRes != origRes) {
-            candidates.push_back(Signature(Type(rootParams), nullRes));
-            candidates.push_back(Signature(origSig.params, nullRes));
-          }
-          if (rootRes != nullRes) {
-            candidates.push_back(Signature(Type(rootParams), rootRes));
-            candidates.push_back(Signature(origSig.params, rootRes));
-          }
-        }
-      }
+      addCanonCandidates(origSig, candidates);
       {
         std::vector<Type> selLubParams = origParams;
         std::vector<Type> selRootParams = origParams;
@@ -4429,6 +4538,13 @@ struct RelaxNullability : public Pass {
     if (!getPassOptions().trapsNeverHappen) {
       // Without this assumption removing casts changes behavior.
       return;
+    }
+
+    if (getPassOptions().shrinkLevel >= 2) {
+      PassRunner runner(getPassRunner());
+      runner.setIsNested(true);
+      runner.add("ssa-nomerge");
+      runner.run();
     }
 
     bool widenTypes =

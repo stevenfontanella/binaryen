@@ -1150,3 +1150,230 @@
     )
   )
 )
+
+(module
+  (rec
+    ;; CHECK:      (rec
+    ;; CHECK-NEXT:  (type $Base (sub (struct (field i32))))
+    ;; NO_TNH:      (rec
+    ;; NO_TNH-NEXT:  (type $Base (sub (struct (field i32))))
+    (type $Base (sub (struct (field i32))))
+    ;; CHECK:       (type $Sub (sub $Base (struct (field i32) (field i64))))
+    ;; NO_TNH:       (type $Sub (sub $Base (struct (field i32) (field i64))))
+    (type $Sub (sub $Base (struct (field i32) (field i64))))
+    ;; CHECK:       (type $UnsubA (struct (field i32) (field i32)))
+    ;; NO_TNH:       (type $UnsubA (struct (field i32) (field i32)))
+    (type $UnsubA (struct (field i32) (field i32)))
+    ;; CHECK:       (type $UnsubB (struct (field i32) (field i64)))
+    ;; NO_TNH:       (type $UnsubB (struct (field i32) (field i64)))
+    (type $UnsubB (struct (field i32) (field i64)))
+  )
+
+  ;; CHECK:      (type $4 (func (param anyref i32) (result i32)))
+
+  ;; CHECK:      (type $5 (func (param i32) (result i64)))
+
+  ;; CHECK:      (type $6 (func (param (ref null $UnsubA) (ref null $UnsubB)) (result i32)))
+
+  ;; CHECK:      (rec
+  ;; CHECK-NEXT:  (type $7 (func (param (ref null $UnsubB) i32) (result i32)))
+
+  ;; CHECK:       (type $8 (func (param (ref null $UnsubA) i32) (result i32)))
+
+  ;; CHECK:       (type $9 (func (param i32) (result (ref null $Base))))
+
+  ;; CHECK:      (export "unalias-body" (func $unalias-body-local-single-narrow))
+
+  ;; CHECK:      (export "existing-any" (func $existing-any))
+
+  ;; CHECK:      (export "call-unsub" (func $call-unsub))
+
+  ;; CHECK:      (func $make-base (type $9) (param $x i32) (result (ref null $Base))
+  ;; CHECK-NEXT:  (struct.new $Base
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; NO_TNH:      (type $4 (func (param i32) (result (ref $Base))))
+
+  ;; NO_TNH:      (type $5 (func (param i32) (result i64)))
+
+  ;; NO_TNH:      (type $6 (func (param anyref i32) (result i32)))
+
+  ;; NO_TNH:      (type $7 (func (param (ref null $UnsubA) i32) (result i32)))
+
+  ;; NO_TNH:      (type $8 (func (param (ref null $UnsubB) i32) (result i32)))
+
+  ;; NO_TNH:      (type $9 (func (param (ref null $UnsubA) (ref null $UnsubB)) (result i32)))
+
+  ;; NO_TNH:      (export "unalias-body" (func $unalias-body-local-single-narrow))
+
+  ;; NO_TNH:      (export "existing-any" (func $existing-any))
+
+  ;; NO_TNH:      (export "call-unsub" (func $call-unsub))
+
+  ;; NO_TNH:      (func $make-base (type $4) (param $x i32) (result (ref $Base))
+  ;; NO_TNH-NEXT:  (struct.new $Base
+  ;; NO_TNH-NEXT:   (local.get $x)
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT: )
+  (func $make-base (param $x i32) (result (ref $Base))
+    (struct.new $Base
+      (local.get $x)
+    )
+  )
+
+  ;; Single-assignment body local $b dominates cast temporary $a, which has a
+  ;; single narrow read; $a's cast folds directly into the struct.get.
+  ;; CHECK:      (func $unalias-body-local-single-narrow (type $5) (param $x i32) (result i64)
+  ;; CHECK-NEXT:  (local $b (ref null $Base))
+  ;; CHECK-NEXT:  (local $a (ref null $Sub))
+  ;; CHECK-NEXT:  (local.set $b
+  ;; CHECK-NEXT:   (call $make-base
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (nop)
+  ;; CHECK-NEXT:  (struct.get $Sub 1
+  ;; CHECK-NEXT:   (ref.cast (ref null $Sub)
+  ;; CHECK-NEXT:    (local.get $b)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; NO_TNH:      (func $unalias-body-local-single-narrow (type $5) (param $x i32) (result i64)
+  ;; NO_TNH-NEXT:  (local $b (ref null $Base))
+  ;; NO_TNH-NEXT:  (local $a (ref null $Sub))
+  ;; NO_TNH-NEXT:  (local.set $b
+  ;; NO_TNH-NEXT:   (call $make-base
+  ;; NO_TNH-NEXT:    (local.get $x)
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT:  (local.set $a
+  ;; NO_TNH-NEXT:   (ref.cast (ref null $Sub)
+  ;; NO_TNH-NEXT:    (local.get $b)
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT:  (struct.get $Sub 1
+  ;; NO_TNH-NEXT:   (local.get $a)
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT: )
+  (func $unalias-body-local-single-narrow (export "unalias-body") (param $x i32) (result i64)
+    (local $b (ref null $Base))
+    (local $a (ref null $Sub))
+    (local.set $b
+      (call $make-base
+        (local.get $x)
+      )
+    )
+    (local.set $a
+      (ref.cast (ref null $Sub)
+        (local.get $b)
+      )
+    )
+    (struct.get $Sub 1
+      (local.get $a)
+    )
+  )
+
+  ;; Two sole-use unpinned functions taking unsubtyped struct parameters can
+  ;; generalize their parameters to anyref and share a single signature.
+  ;; CHECK:      (func $existing-any (type $4) (param $p anyref) (param $y i32) (result i32)
+  ;; CHECK-NEXT:  (local.get $y)
+  ;; CHECK-NEXT: )
+  ;; NO_TNH:      (func $existing-any (type $6) (param $p anyref) (param $y i32) (result i32)
+  ;; NO_TNH-NEXT:  (local.get $y)
+  ;; NO_TNH-NEXT: )
+  (func $existing-any (export "existing-any") (param $p anyref) (param $y i32) (result i32)
+    (local.get $y)
+  )
+
+  ;; CHECK:      (func $unsub-a (type $4) (param $p anyref) (param $y i32) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (struct.get $UnsubA 0
+  ;; CHECK-NEXT:    (ref.cast (ref null $UnsubA)
+  ;; CHECK-NEXT:     (local.get $p)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.get $y)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; NO_TNH:      (func $unsub-a (type $7) (param $p (ref null $UnsubA)) (param $y i32) (result i32)
+  ;; NO_TNH-NEXT:  (i32.add
+  ;; NO_TNH-NEXT:   (struct.get $UnsubA 0
+  ;; NO_TNH-NEXT:    (local.get $p)
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:   (local.get $y)
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT: )
+  (func $unsub-a (param $p (ref null $UnsubA)) (param $y i32) (result i32)
+    (i32.add
+      (struct.get $UnsubA 0
+        (local.get $p)
+      )
+      (local.get $y)
+    )
+  )
+
+  ;; CHECK:      (func $unsub-b (type $4) (param $p anyref) (param $y i32) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (struct.get $UnsubB 0
+  ;; CHECK-NEXT:    (ref.cast (ref null $UnsubB)
+  ;; CHECK-NEXT:     (local.get $p)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.get $y)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; NO_TNH:      (func $unsub-b (type $8) (param $p (ref null $UnsubB)) (param $y i32) (result i32)
+  ;; NO_TNH-NEXT:  (i32.add
+  ;; NO_TNH-NEXT:   (struct.get $UnsubB 0
+  ;; NO_TNH-NEXT:    (local.get $p)
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:   (local.get $y)
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT: )
+  (func $unsub-b (param $p (ref null $UnsubB)) (param $y i32) (result i32)
+    (i32.add
+      (struct.get $UnsubB 0
+        (local.get $p)
+      )
+      (local.get $y)
+    )
+  )
+
+  ;; CHECK:      (func $call-unsub (type $6) (param $a (ref null $UnsubA)) (param $b (ref null $UnsubB)) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (call $unsub-a
+  ;; CHECK-NEXT:    (local.get $a)
+  ;; CHECK-NEXT:    (i32.const 1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (call $unsub-b
+  ;; CHECK-NEXT:    (local.get $b)
+  ;; CHECK-NEXT:    (i32.const 2)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; NO_TNH:      (func $call-unsub (type $9) (param $a (ref null $UnsubA)) (param $b (ref null $UnsubB)) (result i32)
+  ;; NO_TNH-NEXT:  (i32.add
+  ;; NO_TNH-NEXT:   (call $unsub-a
+  ;; NO_TNH-NEXT:    (local.get $a)
+  ;; NO_TNH-NEXT:    (i32.const 1)
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:   (call $unsub-b
+  ;; NO_TNH-NEXT:    (local.get $b)
+  ;; NO_TNH-NEXT:    (i32.const 2)
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT: )
+  (func $call-unsub (export "call-unsub") (param $a (ref null $UnsubA)) (param $b (ref null $UnsubB)) (result i32)
+    (i32.add
+      (call $unsub-a
+        (local.get $a)
+        (i32.const 1)
+      )
+      (call $unsub-b
+        (local.get $b)
+        (i32.const 2)
+      )
+    )
+  )
+)
