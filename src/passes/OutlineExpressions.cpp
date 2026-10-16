@@ -608,7 +608,7 @@ Type getChildDemandedType(Module& wasm, Expression* parent, Expression* child) {
   }
   if (auto* rc = parent->dynCast<RefCast>()) {
     if (!rc->desc && rc->ref == child && rc->type.isRef() &&
-        rc->type.isNonNullable() && rc->type.isInexact()) {
+        rc->type.isInexact()) {
       return Type(rc->type.getHeapType().getTop(), Nullable);
     }
     return child->type;
@@ -682,7 +682,11 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
     if (canonicalizeLocalHoles) {
       if (auto* get = curr->dynCast<LocalGet>()) {
         Expression* par = parentStack.empty() ? nullptr : parentStack.back();
-        info.demandedTypes[get] = getChildDemandedType(wasm, par, get);
+        Type demanded = getChildDemandedType(wasm, par, get);
+        if (!Type::isSubType(get->type, demanded)) {
+          demanded = get->type;
+        }
+        info.demandedTypes[get] = demanded;
       }
     }
     NodeInfo node;
@@ -4054,9 +4058,42 @@ struct OutlineExpressions : public Pass {
     return true;
   }
 
+  static Expression* unwrapRefAsNonNull(Expression* e) {
+    while (e) {
+      if (auto* ra = e->dynCast<RefAs>()) {
+        if (ra->op == RefAsNonNull) {
+          e = ra->value;
+          continue;
+        }
+      }
+      break;
+    }
+    return e;
+  }
+
+  void refreshFuncEffects(Function* func) {
+    if (!func || !func->effects) {
+      return;
+    }
+    bool wasIdempotent = func->effects->isIdempotent;
+    bool wasOnlyInit = func->effects->onlyTouchesInitGlobals;
+    auto newEff =
+      std::make_unique<EffectAnalyzer>(getPassOptions(), *wasm, func);
+    if (wasIdempotent && wasOnlyInit && !newEff->throws()) {
+      newEff->isIdempotent = true;
+      newEff->onlyTouchesInitGlobals = true;
+    }
+    func->effects = std::move(newEff);
+  }
+
   bool isNonMutatingWrapper(Function* wFunc, int depth = 0) {
     if (!wFunc || wFunc->imported() || depth > 4) {
       return false;
+    }
+    if (wFunc->getNumParams() <= 1 && wFunc->effects &&
+        wFunc->effects->isIdempotent &&
+        wFunc->effects->onlyTouchesInitGlobals && !wFunc->effects->throws()) {
+      return true;
     }
     EffectAnalyzer wEff(getPassOptions(), *wasm, wFunc);
     wEff.localsRead.clear();
@@ -4064,30 +4101,55 @@ struct OutlineExpressions : public Pass {
     if (!wEff.hasSideEffects() && !wEff.throws()) {
       return true;
     }
-    Expression* body = wFunc->body;
+    Expression* body = unwrapRefAsNonNull(wFunc->body);
     if (!body) {
       return false;
     }
     // Pattern 1: Lazy cached constant-pool/factory wrapper starting with
-    // (block $l (drop (br_on_non_null $l (array.get/global.get ...))) ...).
+    // (block $l (br_on_non_null $l (array.get/global.get ...)) ...)
+    // (optionally preceded by lazy-init If guards or wrapped in Drop).
     if (auto* blk = body->dynCast<Block>()) {
-      if (!blk->list.empty()) {
-        if (auto* drop = blk->list[0]->dynCast<Drop>()) {
-          if (auto* brOn = drop->value->dynCast<BrOn>()) {
-            if (brOn->op == BrOnNonNull) {
-              return true;
-            }
+      Index firstIdx = 0;
+      while (firstIdx < blk->list.size()) {
+        if (auto* iff = blk->list[firstIdx]->dynCast<If>()) {
+          if (!iff->ifFalse) {
+            firstIdx++;
+            continue;
           }
         }
-        // Pattern 2: Idempotent once-init getter:
-        // (block (if (i32.eqz (global.get $init)) ...) (global.get $val)).
-        if (blk->list.size() == 2 && blk->list[1]->is<GlobalGet>()) {
-          if (auto* iff = blk->list[0]->dynCast<If>()) {
-            if (!iff->ifFalse) {
-              if (auto* un = iff->condition->dynCast<Unary>()) {
-                if (un->op == EqZInt32 && un->value->is<GlobalGet>()) {
-                  return true;
-                }
+        break;
+      }
+      if (firstIdx < blk->list.size()) {
+        Expression* firstStmt = unwrapRefAsNonNull(blk->list[firstIdx]);
+        if (auto* innerBlk = firstStmt->dynCast<Block>()) {
+          if (!innerBlk->list.empty()) {
+            firstStmt = innerBlk->list[0];
+          }
+        }
+        if (auto* drop = firstStmt->dynCast<Drop>()) {
+          firstStmt = drop->value;
+        }
+        if (auto* brOn = firstStmt->dynCast<BrOn>()) {
+          if (brOn->op == BrOnNonNull) {
+            return true;
+          }
+        }
+      }
+      // Pattern 2: Idempotent once-init getter:
+      // (block (if (i32.eqz/ref.is_null (global.get $init)) ...)
+      //        (global.get $val)).
+      if (blk->list.size() == 2 &&
+          unwrapRefAsNonNull(blk->list[1])->is<GlobalGet>()) {
+        if (auto* iff = blk->list[0]->dynCast<If>()) {
+          if (!iff->ifFalse) {
+            if (auto* un = iff->condition->dynCast<Unary>()) {
+              if (un->op == EqZInt32 && un->value->is<GlobalGet>()) {
+                return true;
+              }
+            }
+            if (auto* rin = iff->condition->dynCast<RefIsNull>()) {
+              if (rin->value->is<GlobalGet>()) {
+                return true;
               }
             }
           }
@@ -4128,6 +4190,25 @@ struct OutlineExpressions : public Pass {
     return true;
   }
 
+  bool canExprThrow(Expression* expr, const EffectAnalyzer& eff) {
+    if (!eff.throws()) {
+      return false;
+    }
+    if (eff.suspends || !FindAll<Throw>(expr).list.empty() ||
+        !FindAll<Rethrow>(expr).list.empty() ||
+        !FindAll<CallRef>(expr).list.empty() ||
+        !FindAll<CallIndirect>(expr).list.empty()) {
+      return true;
+    }
+    for (auto* c : FindAll<Call>(expr).list) {
+      Function* f = wasm->getFunctionOrNull(c->target);
+      if (!f || !isNonMutatingWrapper(f)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   bool canMoveWrapperPast(Function* wFunc, Expression* laterOp) {
     EffectAnalyzer opEff(getPassOptions(), *wasm, laterOp);
     // wFunc is a separate function and cannot access the caller's locals.
@@ -4139,33 +4220,14 @@ struct OutlineExpressions : public Pass {
     if (!wFunc || wFunc->imported()) {
       return false;
     }
+    if (isNonMutatingWrapper(wFunc)) {
+      return !opEff.branchesOut && !opEff.hasExternalBreakTargets() &&
+             !canExprThrow(laterOp, opEff);
+    }
     EffectAnalyzer wEff(getPassOptions(), *wasm, wFunc);
     wEff.localsRead.clear();
     wEff.localsWritten.clear();
-    if (!wEff.invalidates(opEff)) {
-      return true;
-    }
-    if (!opEff.throws() && !opEff.trap && !opEff.transfersControlFlow() &&
-        isNonMutatingWrapper(wFunc)) {
-      bool globalsDisjoint = true;
-      for (auto* gg : FindAll<GlobalGet>(laterOp).list) {
-        if (wEff.globalsWritten.count(gg->name)) {
-          globalsDisjoint = false;
-          break;
-        }
-      }
-      for (auto* gs : FindAll<GlobalSet>(laterOp).list) {
-        if (wEff.globalsWritten.count(gs->name) ||
-            wEff.mutableGlobalsRead.count(gs->name)) {
-          globalsDisjoint = false;
-          break;
-        }
-      }
-      if (globalsDisjoint) {
-        return true;
-      }
-    }
-    return false;
+    return !wEff.invalidates(opEff);
   }
 
   bool isSingleEntryReadSafe(Function* callee,
@@ -4256,6 +4318,7 @@ struct OutlineExpressions : public Pass {
     Builder builder(*wasm);
     std::unordered_set<Function*> modifiedFuncs;
     std::unordered_set<Function*> modifiedCallees;
+    std::unordered_set<Function*> calleesWithStaleCallSites;
     std::unordered_set<Expression*> touchedCalls;
     bool anyChanged = false;
 
@@ -4267,7 +4330,9 @@ struct OutlineExpressions : public Pass {
       }
       Function* callee = f.get();
       if (disallowedTargets.count(callee->name) ||
-          modifiedCallees.count(callee) || callee->getNumParams() == 0) {
+          modifiedCallees.count(callee) ||
+          calleesWithStaleCallSites.count(callee) ||
+          callee->getNumParams() == 0) {
         continue;
       }
       auto it = callsByTarget.find(callee->name);
@@ -4443,7 +4508,7 @@ struct OutlineExpressions : public Pass {
             modifiedFuncs.insert(s.caller);
           }
           modifiedCallees.insert(callee);
-          modifiedCallees.insert(wFunc);
+          calleesWithStaleCallSites.insert(wFunc);
           calleeModified = true;
           anyChanged = true;
           continue;
@@ -4517,7 +4582,7 @@ struct OutlineExpressions : public Pass {
           modifiedFuncs.insert(s.caller);
         }
         modifiedCallees.insert(callee);
-        modifiedCallees.insert(wFunc);
+        calleesWithStaleCallSites.insert(wFunc);
         calleeModified = true;
         anyChanged = true;
       }
@@ -4578,6 +4643,253 @@ struct OutlineExpressions : public Pass {
       }
     }
 
+    // Step 1B: Reuse existing 0-var wrapper-forwarding helpers $H matching
+    // (call $callee (local.get 0) ... (call $w (local.get k)) ...).
+    {
+      struct WrappedArg {
+        Index targetPos;
+        Function* wFunc;
+        Index wArity;
+      };
+      struct ParamSource {
+        Index targetPos;
+        Function* wFunc; // non-null if 1-arg wrapped at targetPos
+      };
+      struct WrapperForwarder {
+        Function* helper;
+        Function* target;
+        std::vector<WrappedArg> wrappedArgs;
+        std::vector<ParamSource> paramSources;
+        unsigned savedBytesPerCall = 0;
+      };
+      std::unordered_map<Name, std::vector<WrapperForwarder>>
+        wrapperHelpersByTarget;
+      std::unordered_set<Function*> allWrapperHelpers;
+
+      for (auto& f : wasm->functions) {
+        if (f->imported() || f->getNumVars() != 0) {
+          continue;
+        }
+        Function* h = f.get();
+        if (modifiedCallees.count(h)) {
+          continue;
+        }
+        auto* innerCall = h->body->dynCast<Call>();
+        if (!innerCall || innerCall->isReturn || innerCall->target == h->name) {
+          continue;
+        }
+        Function* target = wasm->getFunctionOrNull(innerCall->target);
+        if (!target || target->imported() || modifiedCallees.count(target) ||
+            h->getResults() != target->getResults() ||
+            innerCall->operands.size() != target->getNumParams()) {
+          continue;
+        }
+        Index m = innerCall->operands.size();
+        Index expectedLocal = 0;
+        std::vector<WrappedArg> wrappedArgs;
+        std::vector<ParamSource> paramSources;
+        unsigned savedBytes = 0;
+        bool validForwarder = true;
+        for (Index j = 0; j < m; j++) {
+          Expression* op = innerCall->operands[j];
+          if (auto* lg = op->dynCast<LocalGet>()) {
+            if (lg->index != expectedLocal) {
+              validForwarder = false;
+              break;
+            }
+            expectedLocal++;
+            paramSources.push_back({j, nullptr});
+          } else if (auto* wCall = op->dynCast<Call>()) {
+            if (wCall->isReturn || wCall->operands.size() > 1 ||
+                wCall->target == h->name) {
+              validForwarder = false;
+              break;
+            }
+            Function* wFunc = wasm->getFunctionOrNull(wCall->target);
+            if (!wFunc || wFunc->imported() || modifiedCallees.count(wFunc) ||
+                !wFunc->getResults().isSingle() ||
+                !Type::isSubType(wFunc->getResults(),
+                                 target->getLocalType(j))) {
+              validForwarder = false;
+              break;
+            }
+            Index wArity = wCall->operands.size();
+            if (wArity == 1) {
+              auto* lg = wCall->operands[0]->dynCast<LocalGet>();
+              if (!lg || lg->index != expectedLocal ||
+                  !wFunc->getParams().isSingle() ||
+                  !Type::isSubType(h->getLocalType(expectedLocal),
+                                   wFunc->getParams())) {
+                validForwarder = false;
+                break;
+              }
+              expectedLocal++;
+              paramSources.push_back({j, wFunc});
+            } else {
+              if (wFunc->getParams() != Type::none) {
+                validForwarder = false;
+                break;
+              }
+            }
+            wrappedArgs.push_back({j, wFunc, wArity});
+            savedBytes += getShallowBytes(wCall);
+          } else {
+            validForwarder = false;
+            break;
+          }
+        }
+        if (!validForwarder || expectedLocal != h->getNumParams() ||
+            wrappedArgs.empty()) {
+          continue;
+        }
+        wrapperHelpersByTarget[target->name].push_back(
+          {h, target, std::move(wrappedArgs), std::move(paramSources), savedBytes});
+        allWrapperHelpers.insert(h);
+      }
+
+      for (auto& [targetName, helperList] : wrapperHelpersByTarget) {
+        auto it = callsByTarget.find(targetName);
+        if (it == callsByTarget.end()) {
+          continue;
+        }
+        Function* targetFunc = wasm->getFunction(targetName);
+        std::sort(helperList.begin(),
+                  helperList.end(),
+                  [](const WrapperForwarder& a, const WrapperForwarder& b) {
+                    if (a.savedBytesPerCall != b.savedBytesPerCall) {
+                      return a.savedBytesPerCall > b.savedBytesPerCall;
+                    }
+                    return a.helper->name < b.helper->name;
+                  });
+
+        for (const auto& s : it->second) {
+          if (s.call->isReturn || touchedCalls.count(s.call) ||
+              allWrapperHelpers.count(s.caller) ||
+              s.call->operands.size() != targetFunc->getNumParams()) {
+            continue;
+          }
+          bool hasUnreachable = false;
+          for (auto* op : s.call->operands) {
+            if (op->type == Type::unreachable) {
+              hasUnreachable = true;
+              break;
+            }
+          }
+          if (hasUnreachable) {
+            continue;
+          }
+
+          Index m = s.call->operands.size();
+          for (auto& wh : helperList) {
+            if (s.caller == wh.helper) {
+              continue;
+            }
+            bool wrappersMatch = true;
+            for (const auto& wa : wh.wrappedArgs) {
+              auto* wCall = s.call->operands[wa.targetPos]->dynCast<Call>();
+              if (!wCall || wCall->isReturn || touchedCalls.count(wCall) ||
+                  wCall->target != wa.wFunc->name ||
+                  wCall->operands.size() != wa.wArity) {
+                wrappersMatch = false;
+                break;
+              }
+              if (wa.wArity == 1 &&
+                  (wCall->operands[0]->type == Type::unreachable ||
+                   !Type::isSubType(wCall->operands[0]->type,
+                                    wa.wFunc->getParams()))) {
+                wrappersMatch = false;
+                break;
+              }
+              for (Index j = wa.targetPos + 1; j < m; j++) {
+                if (!canMoveWrapperPast(wa.wFunc, s.call->operands[j])) {
+                  wrappersMatch = false;
+                  break;
+                }
+              }
+              if (!wrappersMatch) {
+                break;
+              }
+            }
+            if (!wrappersMatch) {
+              continue;
+            }
+
+            bool typesMatch = true;
+            bool needsWiden = false;
+            for (Index p = 0; p < wh.paramSources.size(); p++) {
+              const auto& src = wh.paramSources[p];
+              Expression* newArg =
+                src.wFunc
+                  ? s.call->operands[src.targetPos]->cast<Call>()->operands[0]
+                  : s.call->operands[src.targetPos];
+              Type maxAllowed = src.wFunc
+                                  ? src.wFunc->getParams()
+                                  : wh.target->getLocalType(src.targetPos);
+              Type argType = newArg->type;
+              Type hParamType = wh.helper->getLocalType(p);
+              if (!Type::isSubType(argType, hParamType)) {
+                if (!disallowedTargets.count(wh.helper->name) &&
+                    Type::isSubType(argType, maxAllowed)) {
+                  needsWiden = true;
+                } else {
+                  typesMatch = false;
+                  break;
+                }
+              }
+            }
+            if (!typesMatch) {
+              continue;
+            }
+
+            if (needsWiden) {
+              std::vector<Type> widenedParams(wh.paramSources.size());
+              auto* hCall = wh.helper->body->cast<Call>();
+              for (Index p = 0; p < wh.paramSources.size(); p++) {
+                const auto& src = wh.paramSources[p];
+                Expression* newArg =
+                  src.wFunc
+                    ? s.call->operands[src.targetPos]->cast<Call>()->operands[0]
+                    : s.call->operands[src.targetPos];
+                Type lub = Type::getLeastUpperBound(wh.helper->getLocalType(p),
+                                                    newArg->type);
+                widenedParams[p] = lub;
+                if (src.wFunc) {
+                  hCall->operands[src.targetPos]
+                    ->cast<Call>()
+                    ->operands[0]
+                    ->cast<LocalGet>()
+                    ->type = lub;
+                } else {
+                  hCall->operands[src.targetPos]->cast<LocalGet>()->type = lub;
+                }
+              }
+              wh.helper->setParams(Type(widenedParams));
+              modifiedFuncs.insert(wh.helper);
+            }
+
+            ExpressionList newOps(wasm->allocator);
+            for (Index p = 0; p < wh.paramSources.size(); p++) {
+              const auto& src = wh.paramSources[p];
+              Expression* newArg =
+                src.wFunc
+                  ? s.call->operands[src.targetPos]->cast<Call>()->operands[0]
+                  : s.call->operands[src.targetPos];
+              newOps.push_back(newArg);
+            }
+            for (const auto& wa : wh.wrappedArgs) {
+              touchedCalls.insert(s.call->operands[wa.targetPos]);
+            }
+            s.call->target = wh.helper->name;
+            s.call->operands = std::move(newOps);
+            touchedCalls.insert(s.call);
+            modifiedFuncs.insert(s.caller);
+            anyChanged = true;
+            break;
+          }
+        }
+      }
+    }
+
     // Part B: Partial wrapper specialization when shrinkLevel > 0 and a subset
     // M >= 5 of callers of callee pass (call $w X_k) or 0-arg (call $w) at
     // parameter k.
@@ -4628,7 +4940,7 @@ struct OutlineExpressions : public Pass {
             }
             Index wArity = wCall->operands.size();
             Function* wFunc = wasm->getFunctionOrNull(wCall->target);
-            if (!wFunc || modifiedCallees.count(wFunc) ||
+            if (!wFunc || wFunc->imported() || modifiedCallees.count(wFunc) ||
                 (wArity == 1 && !wFunc->getParams().isSingle()) ||
                 (wArity == 0 && wFunc->getParams() != Type::none) ||
                 !wFunc->getResults().isSingle() ||
@@ -4756,10 +5068,7 @@ struct OutlineExpressions : public Pass {
 
     for (Function* func : modifiedFuncs) {
       ReFinalize().walkFunctionInModule(func, wasm);
-      if (func->effects) {
-        func->effects =
-          std::make_unique<EffectAnalyzer>(getPassOptions(), *wasm, func);
-      }
+      refreshFuncEffects(func);
     }
     return anyChanged;
   }
@@ -4792,7 +5101,7 @@ struct OutlineExpressions : public Pass {
       }
     }
 
-    auto isSinkableConst = [&](Expression* expr) -> bool {
+    auto isSinkableConstLeaf = [&](Expression* expr) -> bool {
       if (expr->is<Const>() || expr->is<RefNull>() || expr->is<RefFunc>()) {
         return true;
       }
@@ -4800,6 +5109,37 @@ struct OutlineExpressions : public Pass {
         return immutableGlobals.count(gg->name) > 0;
       }
       return false;
+    };
+
+    auto isSinkableConst = [&](Expression* expr) -> bool {
+      if (isSinkableConstLeaf(expr)) {
+        return true;
+      }
+      if (auto* c = expr->dynCast<Call>()) {
+        if (c->isReturn || c->operands.size() > 1) {
+          return false;
+        }
+        Function* wFunc = wasm->getFunctionOrNull(c->target);
+        if (!wFunc || !isNonMutatingWrapper(wFunc)) {
+          return false;
+        }
+        if (c->operands.empty()) {
+          return true;
+        }
+        return isSinkableConstLeaf(c->operands[0]);
+      }
+      return false;
+    };
+
+    auto getSinkableConstBytes = [&](Expression* expr) -> unsigned {
+      if (auto* c = expr->dynCast<Call>()) {
+        unsigned b = getShallowBytes(c);
+        for (auto* op : c->operands) {
+          b += getShallowBytes(op);
+        }
+        return b;
+      }
+      return getShallowBytes(expr);
     };
 
     std::unordered_set<Name> disallowedTargets;
@@ -4843,6 +5183,8 @@ struct OutlineExpressions : public Pass {
 
     Builder builder(*wasm);
     std::unordered_set<Function*> modifiedFuncs;
+    std::unordered_set<Function*> modifiedCallees;
+    std::unordered_set<Function*> calleesWithStaleCallSites;
     bool anyChanged = false;
 
     // Step 2A: In-place 100%-caller constant parameter sinking.
@@ -4852,6 +5194,8 @@ struct OutlineExpressions : public Pass {
       }
       Function* callee = f.get();
       if (disallowedTargets.count(callee->name) ||
+          modifiedCallees.count(callee) ||
+          calleesWithStaleCallSites.count(callee) ||
           callee->getNumParams() == 0) {
         continue;
       }
@@ -4905,6 +5249,16 @@ struct OutlineExpressions : public Pass {
             !Type::isSubType(firstArg->type, callee->getLocalType(k))) {
           continue;
         }
+        Function* wFunc = nullptr;
+        if (auto* wCall = firstArg->dynCast<Call>()) {
+          if (wCall->target == callee->name) {
+            continue;
+          }
+          wFunc = wasm->getFunctionOrNull(wCall->target);
+          if (!wFunc || modifiedCallees.count(wFunc)) {
+            continue;
+          }
+        }
         bool allSame = true;
         for (Index i = 1; i < N; i++) {
           if (!ExpressionAnalyzer::equal(firstArg, sites[i].call->operands[k])) {
@@ -4924,7 +5278,9 @@ struct OutlineExpressions : public Pass {
               continue;
             }
             EffectAnalyzer eff(getPassOptions(), *wasm, s.call->operands[j]);
-            if (eff.hasSideEffects() || eff.throws()) {
+            eff.localsRead.clear();
+            eff.localsWritten.clear();
+            if (eff.hasSideEffects() || canExprThrow(s.call->operands[j], eff)) {
               laterSafe = false;
               break;
             }
@@ -4937,7 +5293,7 @@ struct OutlineExpressions : public Pass {
           continue;
         }
 
-        unsigned constSize = getShallowBytes(firstArg);
+        unsigned constSize = getSinkableConstBytes(firstArg);
         int savedBytes = int(N) * int(constSize);
         int addedBytes = int(localReads[k]) * (int(constSize) - 2);
         if (savedBytes <= addedBytes) {
@@ -4959,6 +5315,10 @@ struct OutlineExpressions : public Pass {
         ConstParamReplacer(k, firstArg, *wasm).walk(callee->body);
         removedParam[k] = true;
         calleeModified = true;
+        modifiedCallees.insert(callee);
+        if (wFunc) {
+          calleesWithStaleCallSites.insert(wFunc);
+        }
         anyChanged = true;
       }
 
@@ -5000,10 +5360,7 @@ struct OutlineExpressions : public Pass {
     if (anyChanged) {
       for (Function* func : modifiedFuncs) {
         ReFinalize().walkFunctionInModule(func, wasm);
-        if (func->effects) {
-          func->effects =
-            std::make_unique<EffectAnalyzer>(getPassOptions(), *wasm, func);
-        }
+        refreshFuncEffects(func);
       }
       modifiedFuncs.clear();
       callsByTarget.clear();
@@ -5064,7 +5421,7 @@ struct OutlineExpressions : public Pass {
           keptPos.push_back(j);
         } else if (isSinkableConst(op)) {
           constArgs.push_back({j, op});
-          savedBytes += getShallowBytes(op);
+          savedBytes += getSinkableConstBytes(op);
         } else {
           validForwarder = false;
           break;
@@ -5188,11 +5545,16 @@ struct OutlineExpressions : public Pass {
         KGlobal,
         KRefFunc,
         KRefNull,
+        KCall0,
       } kind;
+      Name callTarget;
       Literal lit;
       Name name;
       Type type;
       bool operator<(const ConstValKey& o) const {
+        if (callTarget != o.callTarget) {
+          return callTarget < o.callTarget;
+        }
         if (kind != o.kind) {
           return kind < o.kind;
         }
@@ -5216,18 +5578,31 @@ struct OutlineExpressions : public Pass {
       }
     };
 
-    auto makeConstKey = [&](Expression* expr) -> ConstValKey {
+    auto makeLeafConstKey = [&](Expression* expr) -> ConstValKey {
       if (auto* c = expr->dynCast<Const>()) {
-        return {ConstValKey::KConst, c->value, Name(), c->type};
+        return {ConstValKey::KConst, Name(), c->value, Name(), c->type};
       }
       if (auto* gg = expr->dynCast<GlobalGet>()) {
-        return {ConstValKey::KGlobal, Literal(), gg->name, gg->type};
+        return {ConstValKey::KGlobal, Name(), Literal(), gg->name, gg->type};
       }
       if (auto* rf = expr->dynCast<RefFunc>()) {
-        return {ConstValKey::KRefFunc, Literal(), rf->func, rf->type};
+        return {ConstValKey::KRefFunc, Name(), Literal(), rf->func, rf->type};
       }
       auto* rn = expr->cast<RefNull>();
-      return {ConstValKey::KRefNull, Literal(), Name(), rn->type};
+      return {ConstValKey::KRefNull, Name(), Literal(), Name(), rn->type};
+    };
+
+    auto makeConstKey = [&](Expression* expr) -> ConstValKey {
+      if (auto* call = expr->dynCast<Call>()) {
+        if (call->operands.empty()) {
+          return {
+            ConstValKey::KCall0, call->target, Literal(), Name(), call->type};
+        }
+        ConstValKey k = makeLeafConstKey(call->operands[0]);
+        k.callTarget = call->target;
+        return k;
+      }
+      return makeLeafConstKey(expr);
     };
 
     for (auto& f : wasm->functions) {
@@ -5298,7 +5673,7 @@ struct OutlineExpressions : public Pass {
               constPositions.push_back(j);
               constKeys.push_back(makeConstKey(c->operands[j]));
               constExprs.push_back(c->operands[j]);
-              constSizes.push_back(getShallowBytes(c->operands[j]));
+              constSizes.push_back(getSinkableConstBytes(c->operands[j]));
             }
           }
           Index k = constPositions.size();
@@ -5428,10 +5803,7 @@ struct OutlineExpressions : public Pass {
 
     for (Function* func : modifiedFuncs) {
       ReFinalize().walkFunctionInModule(func, wasm);
-      if (func->effects) {
-        func->effects =
-          std::make_unique<EffectAnalyzer>(getPassOptions(), *wasm, func);
-      }
+      refreshFuncEffects(func);
     }
     return anyChanged;
   }

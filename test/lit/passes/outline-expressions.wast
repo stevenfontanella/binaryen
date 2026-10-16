@@ -3148,6 +3148,10 @@
     )
   )
 )
+
+;; Multi-callee lazy-cache wrapper sinking (without wFunc poisoning), existing
+;; wrapper-forwarding helper reuse, factory-constant (call $w C) sinking, and
+;; nullable ref.cast demanded-type hole canonicalization.
 ;; SHRINK:      (func $outlined_c (type $0) (param $0 i32) (result i32)
 ;; SHRINK-NEXT:  (call $callee_partial
 ;; SHRINK-NEXT:   (local.get $0)
@@ -3155,3 +3159,466 @@
 ;; SHRINK-NEXT:   (global.get $g)
 ;; SHRINK-NEXT:  )
 ;; SHRINK-NEXT: )
+(module
+  ;; CHECK:      (type $Base (sub (struct (field i32))))
+  ;; SHRINK:      (type $Base (sub (struct (field i32))))
+  (type $Base (sub (struct (field i32))))
+  ;; CHECK:      (type $Mid (sub $Base (struct (field i32) (field i32))))
+  ;; SHRINK:      (type $Mid (sub $Base (struct (field i32) (field i32))))
+  (type $Mid (sub $Base (struct (field i32) (field i32))))
+  ;; CHECK:      (type $Sub (sub $Mid (struct (field i32) (field i32) (field i32))))
+  ;; SHRINK:      (type $Sub (sub $Mid (struct (field i32) (field i32) (field i32))))
+  (type $Sub (sub $Mid (struct (field i32) (field i32) (field i32))))
+  ;; CHECK:      (type $Arr (array (mut (ref null $Base))))
+  ;; SHRINK:      (type $Arr (array (mut (ref null $Base))))
+  (type $Arr (array (mut (ref null $Base))))
+
+  ;; CHECK:      (type $4 (func (param i32) (result (ref $Base))))
+
+  ;; CHECK:      (type $5 (func (param i32) (result i32)))
+
+  ;; CHECK:      (type $6 (func (param i32 (ref null $Base)) (result i32)))
+
+  ;; CHECK:      (type $7 (func (param i32 i32) (result i32)))
+
+  ;; CHECK:      (type $8 (func (param i32 (ref null $Mid)) (result i32)))
+
+  ;; CHECK:      (type $9 (func (param i32 (ref null $Mid) (ref null $Base)) (result i32)))
+
+  ;; CHECK:      (global $cache (mut (ref null $Arr)) (ref.null none))
+  ;; SHRINK:      (type $4 (func (param i32) (result (ref $Base))))
+
+  ;; SHRINK:      (type $5 (func (param i32) (result i32)))
+
+  ;; SHRINK:      (type $6 (func (param i32 (ref null $Base)) (result i32)))
+
+  ;; SHRINK:      (type $7 (func (param (ref null $Base)) (result i32)))
+
+  ;; SHRINK:      (type $8 (func (param i32 i32) (result i32)))
+
+  ;; SHRINK:      (type $9 (func (param i32 (ref null $Mid)) (result i32)))
+
+  ;; SHRINK:      (type $10 (func (param i32 (ref null $Mid) (ref null $Base)) (result i32)))
+
+  ;; SHRINK:      (global $cache (mut (ref null $Arr)) (ref.null none))
+  (global $cache (mut (ref null $Arr)) (ref.null none))
+
+  ;; CHECK:      (func $make_item (type $4) (param $idx i32) (result (ref $Base))
+  ;; CHECK-NEXT:  (struct.new $Base
+  ;; CHECK-NEXT:   (local.get $idx)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $make_item (type $4) (param $idx i32) (result (ref $Base))
+  ;; SHRINK-NEXT:  (struct.new $Base
+  ;; SHRINK-NEXT:   (local.get $idx)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $make_item (param $idx i32) (result (ref $Base))
+    (struct.new $Base (local.get $idx))
+  )
+
+  ;; Lazy-cache factory with outer ref.as_non_null and direct br_on_non_null.
+  ;; CHECK:      (func $lazy_factory (type $4) (param $idx i32) (result (ref $Base))
+  ;; CHECK-NEXT:  (local $tmp (ref $Base))
+  ;; CHECK-NEXT:  (ref.as_non_null
+  ;; CHECK-NEXT:   (block $found (result (ref $Base))
+  ;; CHECK-NEXT:    (br_on_non_null $found
+  ;; CHECK-NEXT:     (array.get $Arr
+  ;; CHECK-NEXT:      (global.get $cache)
+  ;; CHECK-NEXT:      (local.get $idx)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (local.set $tmp
+  ;; CHECK-NEXT:     (call $make_item
+  ;; CHECK-NEXT:      (local.get $idx)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (array.set $Arr
+  ;; CHECK-NEXT:     (global.get $cache)
+  ;; CHECK-NEXT:     (local.get $idx)
+  ;; CHECK-NEXT:     (local.get $tmp)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (local.get $tmp)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $lazy_factory (type $4) (param $idx i32) (result (ref $Base))
+  ;; SHRINK-NEXT:  (local $tmp (ref $Base))
+  ;; SHRINK-NEXT:  (ref.as_non_null
+  ;; SHRINK-NEXT:   (block $found (result (ref $Base))
+  ;; SHRINK-NEXT:    (br_on_non_null $found
+  ;; SHRINK-NEXT:     (array.get $Arr
+  ;; SHRINK-NEXT:      (global.get $cache)
+  ;; SHRINK-NEXT:      (local.get $idx)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (local.set $tmp
+  ;; SHRINK-NEXT:     (call $make_item
+  ;; SHRINK-NEXT:      (local.get $idx)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (array.set $Arr
+  ;; SHRINK-NEXT:     (global.get $cache)
+  ;; SHRINK-NEXT:     (local.get $idx)
+  ;; SHRINK-NEXT:     (local.get $tmp)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (local.get $tmp)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $lazy_factory (param $idx i32) (result (ref $Base))
+    (local $tmp (ref $Base))
+    (ref.as_non_null
+      (block $found (result (ref $Base))
+        (br_on_non_null $found
+          (array.get $Arr (global.get $cache) (local.get $idx))
+        )
+        (local.set $tmp (call $make_item (local.get $idx)))
+        (array.set $Arr (global.get $cache) (local.get $idx) (local.get $tmp))
+        (local.get $tmp)
+      )
+    )
+  )
+
+  ;; Callee 1 & Callee 2: both take (call $lazy_factory X) at 100% of callers,
+  ;; testing that sinking $lazy_factory into $sink_callee1 does not poison
+  ;; $lazy_factory from also sinking into $sink_callee2.
+  ;; CHECK:      (func $sink_callee1 (type $5) (param $a i32) (result i32)
+  ;; CHECK-NEXT:  (struct.get $Base 0
+  ;; CHECK-NEXT:   (call $lazy_factory
+  ;; CHECK-NEXT:    (local.get $a)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $sink_callee1 (type $7) (param $a (ref null $Base)) (result i32)
+  ;; SHRINK-NEXT:  (struct.get $Base 0
+  ;; SHRINK-NEXT:   (local.get $a)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $sink_callee1 (param $a (ref null $Base)) (result i32)
+    (struct.get $Base 0 (local.get $a))
+  )
+
+  ;; CHECK:      (func $sink_callee2 (type $5) (param $a i32) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (struct.get $Base 0
+  ;; CHECK-NEXT:    (call $lazy_factory
+  ;; CHECK-NEXT:     (local.get $a)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.const 1)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $sink_callee2 (type $5) (param $a i32) (result i32)
+  ;; SHRINK-NEXT:  (i32.add
+  ;; SHRINK-NEXT:   (call $sink_callee1
+  ;; SHRINK-NEXT:    (call $lazy_factory
+  ;; SHRINK-NEXT:     (local.get $a)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (i32.const 1)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $sink_callee2 (param $a (ref null $Base)) (result i32)
+    (i32.add (struct.get $Base 0 (local.get $a)) (i32.const 1))
+  )
+
+  ;; Callee with an existing wrapper-forwarding helper $existing_wrap_helper.
+  ;; CHECK:      (func $partial_wrap_callee (type $6) (param $x i32) (param $a (ref null $Base)) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (struct.get $Base 0
+  ;; CHECK-NEXT:    (local.get $a)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $partial_wrap_callee (type $6) (param $x i32) (param $a (ref null $Base)) (result i32)
+  ;; SHRINK-NEXT:  (i32.add
+  ;; SHRINK-NEXT:   (local.get $x)
+  ;; SHRINK-NEXT:   (call $sink_callee1
+  ;; SHRINK-NEXT:    (local.get $a)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $partial_wrap_callee (param $x i32) (param $a (ref null $Base)) (result i32)
+    (i32.add (local.get $x) (struct.get $Base 0 (local.get $a)))
+  )
+
+  ;; CHECK:      (func $existing_wrap_helper (type $7) (param $x i32) (param $idx i32) (result i32)
+  ;; CHECK-NEXT:  (call $partial_wrap_callee
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (call $lazy_factory
+  ;; CHECK-NEXT:    (local.get $idx)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $existing_wrap_helper (type $8) (param $x i32) (param $idx i32) (result i32)
+  ;; SHRINK-NEXT:  (call $partial_wrap_callee
+  ;; SHRINK-NEXT:   (local.get $x)
+  ;; SHRINK-NEXT:   (call $lazy_factory
+  ;; SHRINK-NEXT:    (local.get $idx)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $existing_wrap_helper (param $x i32) (param $idx i32) (result i32)
+    (call $partial_wrap_callee (local.get $x) (call $lazy_factory (local.get $idx)))
+  )
+
+  ;; Callee where all callers pass the same factory-constant (call $lazy_factory (i32.const 7)).
+  ;; CHECK:      (func $factory_const_callee (type $7) (param $x i32) (param $c i32) (result i32)
+  ;; CHECK-NEXT:  (i32.sub
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (struct.get $Base 0
+  ;; CHECK-NEXT:    (call $lazy_factory
+  ;; CHECK-NEXT:     (local.get $c)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $factory_const_callee (type $5) (param $x i32) (result i32)
+  ;; SHRINK-NEXT:  (i32.sub
+  ;; SHRINK-NEXT:   (local.get $x)
+  ;; SHRINK-NEXT:   (call $sink_callee1
+  ;; SHRINK-NEXT:    (call $lazy_factory
+  ;; SHRINK-NEXT:     (i32.const 7)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $factory_const_callee (param $x i32) (param $c (ref null $Base)) (result i32)
+    (i32.sub (local.get $x) (struct.get $Base 0 (local.get $c)))
+  )
+
+  ;; CHECK:      (func $caller_a (type $6) (param $i i32) (param $p (ref null $Base)) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (call $sink_callee1
+  ;; CHECK-NEXT:     (local.get $i)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (call $sink_callee2
+  ;; CHECK-NEXT:     (local.get $i)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (call $existing_wrap_helper
+  ;; CHECK-NEXT:      (local.get $i)
+  ;; CHECK-NEXT:      (local.get $i)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (call $factory_const_callee
+  ;; CHECK-NEXT:      (local.get $i)
+  ;; CHECK-NEXT:      (i32.const 7)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (struct.get $Sub 2
+  ;; CHECK-NEXT:      (ref.cast (ref null $Sub)
+  ;; CHECK-NEXT:       (local.get $p)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.const 100000)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $caller_a (type $6) (param $i i32) (param $p (ref null $Base)) (result i32)
+  ;; SHRINK-NEXT:  (i32.add
+  ;; SHRINK-NEXT:   (i32.add
+  ;; SHRINK-NEXT:    (call $sink_callee1
+  ;; SHRINK-NEXT:     (call $lazy_factory
+  ;; SHRINK-NEXT:      (local.get $i)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (call $sink_callee2
+  ;; SHRINK-NEXT:     (local.get $i)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (i32.add
+  ;; SHRINK-NEXT:    (i32.add
+  ;; SHRINK-NEXT:     (call $existing_wrap_helper
+  ;; SHRINK-NEXT:      (local.get $i)
+  ;; SHRINK-NEXT:      (local.get $i)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:     (call $factory_const_callee
+  ;; SHRINK-NEXT:      (local.get $i)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (i32.add
+  ;; SHRINK-NEXT:     (struct.get $Sub 2
+  ;; SHRINK-NEXT:      (ref.cast (ref null $Sub)
+  ;; SHRINK-NEXT:       (local.get $p)
+  ;; SHRINK-NEXT:      )
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:     (i32.const 100000)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $caller_a (param $i i32) (param $p (ref null $Base)) (result i32)
+    (i32.add
+      (i32.add
+        (call $sink_callee1 (call $lazy_factory (local.get $i)))
+        (call $sink_callee2 (call $lazy_factory (local.get $i)))
+      )
+      (i32.add
+        (i32.add
+          (call $partial_wrap_callee (local.get $i) (call $lazy_factory (local.get $i)))
+          (call $factory_const_callee (local.get $i) (call $lazy_factory (i32.const 7)))
+        )
+        (i32.add
+          (struct.get $Sub 2
+            (ref.cast (ref null $Sub) (local.get $p))
+          )
+          (i32.const 100000)
+        )
+      )
+    )
+  )
+
+  ;; CHECK:      (func $caller_b (type $8) (param $j i32) (param $q (ref null $Mid)) (result i32)
+  ;; CHECK-NEXT:  (i32.sub
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (call $sink_callee1
+  ;; CHECK-NEXT:     (i32.eqz
+  ;; CHECK-NEXT:      (local.get $j)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (call $sink_callee2
+  ;; CHECK-NEXT:     (i32.eqz
+  ;; CHECK-NEXT:      (local.get $j)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (call $existing_wrap_helper
+  ;; CHECK-NEXT:      (i32.eqz
+  ;; CHECK-NEXT:       (local.get $j)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (local.get $j)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (call $factory_const_callee
+  ;; CHECK-NEXT:      (i32.eqz
+  ;; CHECK-NEXT:       (local.get $j)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (i32.const 7)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (struct.get $Sub 2
+  ;; CHECK-NEXT:      (ref.cast (ref null $Sub)
+  ;; CHECK-NEXT:       (local.get $q)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.const 100000)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $caller_b (type $9) (param $j i32) (param $q (ref null $Mid)) (result i32)
+  ;; SHRINK-NEXT:  (i32.sub
+  ;; SHRINK-NEXT:   (i32.add
+  ;; SHRINK-NEXT:    (call $sink_callee1
+  ;; SHRINK-NEXT:     (call $lazy_factory
+  ;; SHRINK-NEXT:      (i32.eqz
+  ;; SHRINK-NEXT:       (local.get $j)
+  ;; SHRINK-NEXT:      )
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (call $sink_callee2
+  ;; SHRINK-NEXT:     (i32.eqz
+  ;; SHRINK-NEXT:      (local.get $j)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (i32.add
+  ;; SHRINK-NEXT:    (i32.add
+  ;; SHRINK-NEXT:     (call $existing_wrap_helper
+  ;; SHRINK-NEXT:      (i32.eqz
+  ;; SHRINK-NEXT:       (local.get $j)
+  ;; SHRINK-NEXT:      )
+  ;; SHRINK-NEXT:      (local.get $j)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:     (call $factory_const_callee
+  ;; SHRINK-NEXT:      (i32.eqz
+  ;; SHRINK-NEXT:       (local.get $j)
+  ;; SHRINK-NEXT:      )
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (i32.add
+  ;; SHRINK-NEXT:     (struct.get $Sub 2
+  ;; SHRINK-NEXT:      (ref.cast (ref null $Sub)
+  ;; SHRINK-NEXT:       (local.get $q)
+  ;; SHRINK-NEXT:      )
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:     (i32.const 100000)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $caller_b (param $j i32) (param $q (ref null $Mid)) (result i32)
+    (i32.sub
+      (i32.add
+        (call $sink_callee1 (call $lazy_factory (i32.eqz (local.get $j))))
+        (call $sink_callee2 (call $lazy_factory (i32.eqz (local.get $j))))
+      )
+      (i32.add
+        (i32.add
+          (call $partial_wrap_callee (i32.eqz (local.get $j)) (call $lazy_factory (local.get $j)))
+          (call $factory_const_callee (i32.eqz (local.get $j)) (call $lazy_factory (i32.const 7)))
+        )
+        (i32.add
+          (struct.get $Sub 2
+            (ref.cast (ref null $Sub) (local.get $q))
+          )
+          (i32.const 100000)
+        )
+      )
+    )
+  )
+
+  ;; CHECK:      (func $caller_c (type $9) (param $k i32) (param $r (ref null $Mid)) (param $other (ref null $Base)) (result i32)
+  ;; CHECK-NEXT:  (i32.xor
+  ;; CHECK-NEXT:   (call $partial_wrap_callee
+  ;; CHECK-NEXT:    (local.get $k)
+  ;; CHECK-NEXT:    (local.get $other)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (struct.get $Sub 2
+  ;; CHECK-NEXT:     (ref.cast (ref null $Sub)
+  ;; CHECK-NEXT:      (local.get $r)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.const 100000)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $caller_c (type $10) (param $k i32) (param $r (ref null $Mid)) (param $other (ref null $Base)) (result i32)
+  ;; SHRINK-NEXT:  (i32.xor
+  ;; SHRINK-NEXT:   (call $partial_wrap_callee
+  ;; SHRINK-NEXT:    (local.get $k)
+  ;; SHRINK-NEXT:    (local.get $other)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (i32.add
+  ;; SHRINK-NEXT:    (struct.get $Sub 2
+  ;; SHRINK-NEXT:     (ref.cast (ref null $Sub)
+  ;; SHRINK-NEXT:      (local.get $r)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (i32.const 100000)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $caller_c (param $k i32) (param $r (ref null $Mid)) (param $other (ref null $Base)) (result i32)
+    (i32.xor
+      (call $partial_wrap_callee (local.get $k) (local.get $other))
+      (i32.add
+        (struct.get $Sub 2
+          (ref.cast (ref null $Sub) (local.get $r))
+        )
+        (i32.const 100000)
+      )
+    )
+  )
+)
+
