@@ -2,6 +2,7 @@
 ;; NOTE: This test was ported using port_passes_tests_to_lit.py and could be cleaned up.
 
 ;; RUN: foreach %s %t wasm-opt --local-cse -all -S -o - | filecheck %s
+;; RUN: foreach %s %t wasm-opt --generate-global-effects --local-cse --shrink-level=1 -all -S -o - | filecheck %s --check-prefix=SHRINK
 
 (module
   ;; CHECK:      (type $0 (func))
@@ -9,12 +10,19 @@
   ;; CHECK:      (type $1 (func (param i32) (result i32)))
 
   ;; CHECK:      (import "a" "b" (func $import (type $0)))
+  ;; SHRINK:      (type $0 (func))
+
+  ;; SHRINK:      (type $1 (func (param i32) (result i32)))
+
+  ;; SHRINK:      (import "a" "b" (func $import (type $0)))
   (import "a" "b" (func $import))
 
   ;; CHECK:      (global $mutable (mut i32) (i32.const 42))
+  ;; SHRINK:      (global $mutable (mut i32) (i32.const 42))
   (global $mutable (mut i32) (i32.const 42))
 
   ;; CHECK:      (global $immutable i32 (i32.const 1337))
+  ;; SHRINK:      (global $immutable i32 (i32.const 1337))
   (global $immutable i32 (i32.const 1337))
 
   ;; CHECK:      (@binaryen.idempotent)
@@ -22,6 +30,11 @@
   ;; CHECK-NEXT:  (call $import)
   ;; CHECK-NEXT:  (i32.const 42)
   ;; CHECK-NEXT: )
+  ;; SHRINK:      (@binaryen.idempotent)
+  ;; SHRINK-NEXT: (func $idempotent (type $1) (param $0 i32) (result i32)
+  ;; SHRINK-NEXT:  (call $import)
+  ;; SHRINK-NEXT:  (i32.const 42)
+  ;; SHRINK-NEXT: )
   (@binaryen.idempotent)
   (func $idempotent (param i32) (result i32)
     ;; This function has side effects, but is marked idempotent.
@@ -33,6 +46,10 @@
   ;; CHECK-NEXT:  (call $import)
   ;; CHECK-NEXT:  (i32.const 1337)
   ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $potent (type $1) (param $0 i32) (result i32)
+  ;; SHRINK-NEXT:  (call $import)
+  ;; SHRINK-NEXT:  (i32.const 1337)
+  ;; SHRINK-NEXT: )
   (func $potent (param i32) (result i32)
     ;; As above, but not marked as idempotent.
     (call $import)
@@ -52,6 +69,19 @@
   ;; CHECK-NEXT:   (local.get $0)
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $yes (type $0)
+  ;; SHRINK-NEXT:  (local $0 i32)
+  ;; SHRINK-NEXT:  (drop
+  ;; SHRINK-NEXT:   (local.tee $0
+  ;; SHRINK-NEXT:    (call $idempotent
+  ;; SHRINK-NEXT:     (i32.const 10)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (drop
+  ;; SHRINK-NEXT:   (local.get $0)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
   (func $yes
     ;; We can optimize here.
     (drop
@@ -78,6 +108,18 @@
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $no (type $0)
+  ;; SHRINK-NEXT:  (drop
+  ;; SHRINK-NEXT:   (call $potent
+  ;; SHRINK-NEXT:    (i32.const 10)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (drop
+  ;; SHRINK-NEXT:   (call $potent
+  ;; SHRINK-NEXT:    (i32.const 10)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
   (func $no
     ;; Without idempotency we cannot optimize.
     (drop
@@ -104,6 +146,18 @@
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $different-input (type $0)
+  ;; SHRINK-NEXT:  (drop
+  ;; SHRINK-NEXT:   (call $idempotent
+  ;; SHRINK-NEXT:    (i32.const 10)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (drop
+  ;; SHRINK-NEXT:   (call $idempotent
+  ;; SHRINK-NEXT:    (i32.const 20)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
   (func $different-input
     ;; We cannot optimize here.
     (drop
@@ -130,6 +184,19 @@
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $idem-effects (type $0)
+  ;; SHRINK-NEXT:  (local $0 i32)
+  ;; SHRINK-NEXT:  (drop
+  ;; SHRINK-NEXT:   (local.tee $0
+  ;; SHRINK-NEXT:    (call $idempotent
+  ;; SHRINK-NEXT:     (global.get $mutable)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (drop
+  ;; SHRINK-NEXT:   (local.get $0)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
   (func $idem-effects
     ;; An idempotent function still has effects on the first call. Those effects
     ;; can invalidate the global.get here.
@@ -158,6 +225,19 @@
   ;; CHECK-NEXT:   (local.get $0)
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $idem-effects-immutable (type $0)
+  ;; SHRINK-NEXT:  (local $0 i32)
+  ;; SHRINK-NEXT:  (drop
+  ;; SHRINK-NEXT:   (local.tee $0
+  ;; SHRINK-NEXT:    (call $idempotent
+  ;; SHRINK-NEXT:     (global.get $immutable)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (drop
+  ;; SHRINK-NEXT:   (local.get $0)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
   (func $idem-effects-immutable
     ;; But here we read an immutable value, so we can optimize.
     (drop
@@ -196,6 +276,31 @@
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $idem-effects-interact (type $0)
+  ;; SHRINK-NEXT:  (local $0 i32)
+  ;; SHRINK-NEXT:  (drop
+  ;; SHRINK-NEXT:   (i32.add
+  ;; SHRINK-NEXT:    (global.get $mutable)
+  ;; SHRINK-NEXT:    (global.get $mutable)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (drop
+  ;; SHRINK-NEXT:   (local.tee $0
+  ;; SHRINK-NEXT:    (call $idempotent
+  ;; SHRINK-NEXT:     (global.get $immutable)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (drop
+  ;; SHRINK-NEXT:   (i32.add
+  ;; SHRINK-NEXT:    (global.get $mutable)
+  ;; SHRINK-NEXT:    (global.get $mutable)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (drop
+  ;; SHRINK-NEXT:   (local.get $0)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
   (func $idem-effects-interact
     ;; An idempotent function still has effects on the first call. That
     ;; prevents optimizing the i32.add, as the first call might alter $mutable.
@@ -247,6 +352,31 @@
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $idem-effects-interact-2 (type $0)
+  ;; SHRINK-NEXT:  (local $0 i32)
+  ;; SHRINK-NEXT:  (drop
+  ;; SHRINK-NEXT:   (local.tee $0
+  ;; SHRINK-NEXT:    (call $idempotent
+  ;; SHRINK-NEXT:     (global.get $immutable)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (drop
+  ;; SHRINK-NEXT:   (i32.add
+  ;; SHRINK-NEXT:    (global.get $mutable)
+  ;; SHRINK-NEXT:    (global.get $mutable)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (drop
+  ;; SHRINK-NEXT:   (local.get $0)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (drop
+  ;; SHRINK-NEXT:   (i32.add
+  ;; SHRINK-NEXT:    (global.get $mutable)
+  ;; SHRINK-NEXT:    (global.get $mutable)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
   (func $idem-effects-interact-2
     ;; As above, but interleaved differently. The first i32.add is now between
     ;; the two idempotent calls. Here we could optimize, but do not atm, as the
@@ -273,6 +403,326 @@
       (i32.add
         (global.get $mutable)
         (global.get $mutable)
+      )
+    )
+  )
+)
+
+(module
+  ;; CHECK:      (type $S (struct (field i32) (field (mut i32))))
+  ;; SHRINK:      (type $S (struct (field i32) (field (mut i32))))
+  (type $S (struct (field i32) (field (mut i32))))
+
+  ;; CHECK:      (type $1 (func))
+
+  ;; CHECK:      (type $2 (func (result (ref null $S))))
+
+  ;; CHECK:      (type $3 (func (param (ref $S) i32) (result i32)))
+
+  ;; CHECK:      (type $4 (func (param (ref $S)) (result i32)))
+
+  ;; CHECK:      (global $lazy (mut (ref null $S)) (ref.null none))
+  ;; SHRINK:      (type $1 (func))
+
+  ;; SHRINK:      (type $2 (func (result (ref null $S))))
+
+  ;; SHRINK:      (type $3 (func (param (ref $S) i32) (result i32)))
+
+  ;; SHRINK:      (type $4 (func (param (ref $S)) (result i32)))
+
+  ;; SHRINK:      (global $lazy (mut (ref null $S)) (ref.null none))
+  (global $lazy (mut (ref null $S)) (ref.null none))
+  ;; CHECK:      (global $clinit_done (mut i32) (i32.const 0))
+  ;; SHRINK:      (global $clinit_done (mut i32) (i32.const 0))
+  (global $clinit_done (mut i32) (i32.const 0))
+
+  ;; CHECK:      (func $clinit (type $1)
+  ;; CHECK-NEXT:  (block $done
+  ;; CHECK-NEXT:   (if
+  ;; CHECK-NEXT:    (global.get $clinit_done)
+  ;; CHECK-NEXT:    (then
+  ;; CHECK-NEXT:     (return)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (global.set $clinit_done
+  ;; CHECK-NEXT:    (i32.const 1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $clinit (type $1)
+  ;; SHRINK-NEXT:  (block $done
+  ;; SHRINK-NEXT:   (if
+  ;; SHRINK-NEXT:    (global.get $clinit_done)
+  ;; SHRINK-NEXT:    (then
+  ;; SHRINK-NEXT:     (return)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (global.set $clinit_done
+  ;; SHRINK-NEXT:    (i32.const 1)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $clinit
+    (block $done
+      (if
+        (global.get $clinit_done)
+        (then
+          (return)
+        )
+      )
+      (global.set $clinit_done
+        (i32.const 1)
+      )
+    )
+  )
+
+  ;; CHECK:      (func $get_lazy (type $2) (result (ref null $S))
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (ref.is_null
+  ;; CHECK-NEXT:    (global.get $lazy)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (global.set $lazy
+  ;; CHECK-NEXT:     (struct.new $S
+  ;; CHECK-NEXT:      (i32.const 7)
+  ;; CHECK-NEXT:      (i32.const 8)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (global.get $lazy)
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $get_lazy (type $2) (result (ref null $S))
+  ;; SHRINK-NEXT:  (if
+  ;; SHRINK-NEXT:   (ref.is_null
+  ;; SHRINK-NEXT:    (global.get $lazy)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (then
+  ;; SHRINK-NEXT:    (global.set $lazy
+  ;; SHRINK-NEXT:     (struct.new $S
+  ;; SHRINK-NEXT:      (i32.const 7)
+  ;; SHRINK-NEXT:      (i32.const 8)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (global.get $lazy)
+  ;; SHRINK-NEXT: )
+  (func $get_lazy (result (ref null $S))
+    (if
+      (ref.is_null
+        (global.get $lazy)
+      )
+      (then
+        (global.set $lazy
+          (struct.new $S
+            (i32.const 7)
+            (i32.const 8)
+          )
+        )
+      )
+    )
+    (global.get $lazy)
+  )
+
+  ;; CHECK:      (func $dominator-and-lazy-cse (type $3) (param $p (ref $S)) (param $cond i32) (result i32)
+  ;; CHECK-NEXT:  (local $a i32)
+  ;; CHECK-NEXT:  (local $3 i32)
+  ;; CHECK-NEXT:  (local.set $a
+  ;; CHECK-NEXT:   (local.tee $3
+  ;; CHECK-NEXT:    (struct.get $S 0
+  ;; CHECK-NEXT:     (local.get $p)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (call $clinit)
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (struct.get $S 0
+  ;; CHECK-NEXT:    (call $get_lazy)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (local.get $cond)
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (drop
+  ;; CHECK-NEXT:     (local.get $3)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (else
+  ;; CHECK-NEXT:    (drop
+  ;; CHECK-NEXT:     (struct.get $S 0
+  ;; CHECK-NEXT:      (local.get $p)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (struct.get $S 0
+  ;; CHECK-NEXT:    (call $get_lazy)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (local.get $a)
+  ;; CHECK-NEXT:   (struct.get $S 0
+  ;; CHECK-NEXT:    (local.get $p)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $dominator-and-lazy-cse (type $3) (param $p (ref $S)) (param $cond i32) (result i32)
+  ;; SHRINK-NEXT:  (local $a i32)
+  ;; SHRINK-NEXT:  (local $3 i32)
+  ;; SHRINK-NEXT:  (local.set $a
+  ;; SHRINK-NEXT:   (struct.get $S 0
+  ;; SHRINK-NEXT:    (local.get $p)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (call $clinit)
+  ;; SHRINK-NEXT:  (drop
+  ;; SHRINK-NEXT:   (local.tee $3
+  ;; SHRINK-NEXT:    (struct.get $S 0
+  ;; SHRINK-NEXT:     (call $get_lazy)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (if
+  ;; SHRINK-NEXT:   (local.get $cond)
+  ;; SHRINK-NEXT:   (then
+  ;; SHRINK-NEXT:    (drop
+  ;; SHRINK-NEXT:     (local.get $a)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (else
+  ;; SHRINK-NEXT:    (drop
+  ;; SHRINK-NEXT:     (local.get $a)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (drop
+  ;; SHRINK-NEXT:   (local.get $3)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (i32.add
+  ;; SHRINK-NEXT:   (local.get $a)
+  ;; SHRINK-NEXT:   (local.get $a)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $dominator-and-lazy-cse (param $p (ref $S)) (param $cond i32) (result i32)
+    (local $a i32)
+    ;; Under -Os + --generate-global-effects, 2-node struct.get is CSE'd across
+    ;; the clinit call, into both if arms, and after the if; and duplicate
+    ;; lazy-init getter calls are CSE'd.
+    (local.set $a
+      (struct.get $S 0
+        (local.get $p)
+      )
+    )
+    (call $clinit)
+    (drop
+      (struct.get $S 0
+        (call $get_lazy)
+      )
+    )
+    (if
+      (local.get $cond)
+      (then
+        (drop
+          (struct.get $S 0
+            (local.get $p)
+          )
+        )
+      )
+      (else
+        (drop
+          (struct.get $S 0
+            (local.get $p)
+          )
+        )
+      )
+    )
+    (drop
+      (struct.get $S 0
+        (call $get_lazy)
+      )
+    )
+    (i32.add
+      (local.get $a)
+      (struct.get $S 0
+        (local.get $p)
+      )
+    )
+  )
+
+  ;; CHECK:      (func $forward-and-unalias (type $4) (param $p (ref $S)) (result i32)
+  ;; CHECK-NEXT:  (local $s (ref null $S))
+  ;; CHECK-NEXT:  (local $alias (ref $S))
+  ;; CHECK-NEXT:  (local $3 i32)
+  ;; CHECK-NEXT:  (local.set $s
+  ;; CHECK-NEXT:   (struct.new $S
+  ;; CHECK-NEXT:    (i32.const 99)
+  ;; CHECK-NEXT:    (i32.const 100)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $alias
+  ;; CHECK-NEXT:   (local.get $p)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (struct.get $S 0
+  ;; CHECK-NEXT:    (local.get $s)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (local.tee $3
+  ;; CHECK-NEXT:     (struct.get $S 0
+  ;; CHECK-NEXT:      (local.get $alias)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (local.get $3)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $forward-and-unalias (type $4) (param $p (ref $S)) (result i32)
+  ;; SHRINK-NEXT:  (local $s (ref null $S))
+  ;; SHRINK-NEXT:  (local $alias i32)
+  ;; SHRINK-NEXT:  (local.set $s
+  ;; SHRINK-NEXT:   (struct.new $S
+  ;; SHRINK-NEXT:    (i32.const 99)
+  ;; SHRINK-NEXT:    (i32.const 100)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (local.set $alias
+  ;; SHRINK-NEXT:   (struct.get $S 0
+  ;; SHRINK-NEXT:    (local.get $p)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (i32.add
+  ;; SHRINK-NEXT:   (i32.const 99)
+  ;; SHRINK-NEXT:   (i32.add
+  ;; SHRINK-NEXT:    (local.get $alias)
+  ;; SHRINK-NEXT:    (local.get $alias)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $forward-and-unalias (param $p (ref $S)) (result i32)
+    (local $s (ref null $S))
+    (local $alias (ref $S))
+    (local.set $s
+      (struct.new $S
+        (i32.const 99)
+        (i32.const 100)
+      )
+    )
+    (local.set $alias
+      (local.get $p)
+    )
+    (i32.add
+      (struct.get $S 0
+        (local.get $s)
+      )
+      (i32.add
+        (struct.get $S 0
+          (local.get $alias)
+        )
+        (struct.get $S 0
+          (local.get $alias)
+        )
       )
     )
   )

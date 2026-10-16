@@ -20,9 +20,11 @@
 //
 
 #include "ir/effects.h"
+#include "ir/intrinsics.h"
 #include "ir/module-utils.h"
 #include "ir/subtypes.h"
 #include "pass.h"
+#include "passes/string-utils.h"
 #include "support/graph_traversal.h"
 #include "support/strongly_connected_components.h"
 #include "support/utilities.h"
@@ -120,6 +122,49 @@ std::map<Function*, FuncInfo> analyzeFuncs(Module& module,
   ModuleUtils::ParallelFunctionAnalysis<FuncInfo> analysis(
     module, [&](Function* func, FuncInfo& funcInfo) {
       if (func->imported()) {
+        if (func->module == WasmStringsModule) {
+          auto setImplicitTrap = [&](EffectAnalyzer& eff) {
+            if (!passOptions.ignoreImplicitTraps) {
+              eff.implicitTrap = true;
+              eff.trap = true;
+            }
+          };
+          if (func->base == "equals" || func->base == "test") {
+            funcInfo.effects.emplace(passOptions, module);
+            funcInfo.effects->isIdempotent = true;
+            funcInfo.effects->onlyTouchesInitGlobals = true;
+            return;
+          }
+          if (func->base == "compare" || func->base == "length" ||
+              func->base == "charCodeAt" || func->base == "codePointAt" ||
+              func->base == "cast") {
+            funcInfo.effects.emplace(passOptions, module);
+            setImplicitTrap(*funcInfo.effects);
+            funcInfo.effects->isIdempotent = true;
+            funcInfo.effects->onlyTouchesInitGlobals = true;
+            return;
+          }
+          if (func->base == "fromCodePoint" || func->base == "fromCharCode" ||
+              func->base == "concat" || func->base == "substring") {
+            funcInfo.effects.emplace(passOptions, module);
+            setImplicitTrap(*funcInfo.effects);
+            funcInfo.effects->generative = true;
+            return;
+          }
+          if (func->base == "fromCharCodeArray") {
+            funcInfo.effects.emplace(passOptions, module);
+            setImplicitTrap(*funcInfo.effects);
+            funcInfo.effects->readsMutableArray = true;
+            funcInfo.effects->generative = true;
+            return;
+          }
+          if (func->base == "intoCharCodeArray") {
+            funcInfo.effects.emplace(passOptions, module);
+            setImplicitTrap(*funcInfo.effects);
+            funcInfo.effects->writesArray = true;
+            return;
+          }
+        }
         // Imports can do almost anything, so we need to assume the worst
         // anyhow, which is the same as not specifying any effects for them in
         // the map (which we do by not setting funcInfo.effects).
@@ -138,12 +183,14 @@ std::map<Function*, FuncInfo> analyzeFuncs(Module& module,
         // below.
         funcInfo.effects->calls = false;
 
-        // Clear throws and suspends as well, as we are "forgetting" calls right
-        // now, and want to forget their throwing and suspending effects as
-        // well. If we see something else that throws or suspends, below, then
-        // we'll note that there.
+        // Clear throws, suspends, and generative as well, as we are
+        // "forgetting" calls right now, and want to forget their throwing,
+        // suspending, and generative effects as well. If we see something else
+        // that throws, suspends, or allocates, below, then we'll note that
+        // there.
         funcInfo.effects->throws_ = false;
         funcInfo.effects->suspends = false;
+        funcInfo.effects->generative = false;
 
         struct CallScanner
           : public PostWalker<CallScanner,
@@ -181,15 +228,18 @@ std::map<Function*, FuncInfo> analyzeFuncs(Module& module,
               assert(options.worldMode == WorldMode::Open);
               funcInfo.effects = std::nullopt;
             } else {
-              // No call here, but update throwing and suspending if we see it.
-              // (Only do so, however, if we have effects; if we cleared it -
-              // see before - then we assume the worst anyhow, and have nothing
-              // to update.)
+              // No call here, but update throwing, suspending, and generative
+              // if we see it. (Only do so, however, if we have effects; if we
+              // cleared it - see before - then we assume the worst anyhow, and
+              // have nothing to update.)
               if (effects.throws_ && funcInfo.effects) {
                 funcInfo.effects->throws_ = true;
               }
               if (effects.suspends && funcInfo.effects) {
                 funcInfo.effects->suspends = true;
+              }
+              if (effects.generative && funcInfo.effects) {
+                funcInfo.effects->generative = true;
               }
             }
           }
@@ -376,6 +426,202 @@ void propagateEffects(
   };
   CallGraphSCCs sccs(funcNodes, funcInfos, callGraph, module);
 
+  std::unordered_map<Name, Index> mutableGlobalFuncCount;
+  bool hasUnknownFuncEffects = false;
+  for (const auto& [fn, info] : funcInfos) {
+    if (!fn->imported() && !info.effects) {
+      hasUnknownFuncEffects = true;
+    }
+    if (info.effects) {
+      for (Name g : info.effects->mutableGlobalsRead) {
+        mutableGlobalFuncCount[g]++;
+      }
+      for (Name g : info.effects->globalsWritten) {
+        if (!info.effects->mutableGlobalsRead.contains(g)) {
+          mutableGlobalFuncCount[g]++;
+        }
+      }
+    }
+  }
+  for (const auto& ex : module.exports) {
+    if (ex->kind == ExternalKind::Global) {
+      mutableGlobalFuncCount[*ex->getInternalName()] += 2;
+    }
+  }
+
+  auto unwrapRefAsNonNull = [](Expression* e) -> Expression* {
+    while (auto* ra = e->dynCast<RefAs>()) {
+      if (ra->op == RefAsNonNull) {
+        e = ra->value;
+      } else {
+        break;
+      }
+    }
+    return e;
+  };
+
+  auto isCachedFactoryFunc = [&](Function* f) -> bool {
+    if (!f->getResults().isRef() || !f->body) {
+      return false;
+    }
+    Expression* body = unwrapRefAsNonNull(f->body);
+    auto* b = body->dynCast<Block>();
+    if (!b || b->list.empty()) {
+      return false;
+    }
+    if (!b->name.is()) {
+      Expression* last = unwrapRefAsNonNull(b->list.back());
+      auto* inner = last->dynCast<Block>();
+      if (!inner) {
+        return false;
+      }
+      for (Index i = 0; i + 1 < b->list.size(); i++) {
+        if (!b->list[i]->is<If>()) {
+          return false;
+        }
+      }
+      b = inner;
+    }
+    if (!b->name.is() || b->list.size() < 2) {
+      return false;
+    }
+    auto* brOn = b->list[0]->dynCast<BrOn>();
+    if (!brOn || brOn->op != BrOnNonNull || brOn->name != b->name) {
+      return false;
+    }
+    auto* retGet = unwrapRefAsNonNull(b->list.back())->dynCast<LocalGet>();
+    if (!retGet) {
+      return false;
+    }
+    Expression* setStmt = b->list[b->list.size() - 2];
+    if (f->getNumParams() == 1 && f->getParams() == Type::i32) {
+      auto* ag = brOn->ref->dynCast<ArrayGet>();
+      auto* as = setStmt->dynCast<ArraySet>();
+      if (!ag || !as) {
+        return false;
+      }
+      auto* gg1 = ag->ref->dynCast<GlobalGet>();
+      auto* lg1 = ag->index->dynCast<LocalGet>();
+      auto* gg2 = as->ref->dynCast<GlobalGet>();
+      auto* lg2 = as->index->dynCast<LocalGet>();
+      auto* lt = as->value->dynCast<LocalSet>();
+      if (!gg1 || !lg1 || !gg2 || !lg2 || !lt || !lt->isTee()) {
+        return false;
+      }
+      auto* cg = module.getGlobalOrNull(gg1->name);
+      return cg && !cg->imported() && !cg->mutable_ &&
+             cg->init->is<ArrayNew>() && gg1->name == gg2->name &&
+             lg1->index == 0 && lg2->index == 0 && lt->index == retGet->index;
+    }
+    if (f->getNumParams() == 0) {
+      auto* gg1 = brOn->ref->dynCast<GlobalGet>();
+      auto* gs = setStmt->dynCast<GlobalSet>();
+      if (!gg1 || !gs || gg1->name != gs->name) {
+        return false;
+      }
+      auto* lt = gs->value->dynCast<LocalSet>();
+      auto* cg = module.getGlobalOrNull(gg1->name);
+      return lt && lt->isTee() && lt->index == retGet->index && cg &&
+             !cg->imported() && cg->mutable_ && cg->init->is<RefNull>() &&
+             mutableGlobalFuncCount[gg1->name] == 1;
+    }
+    if (f->getNumParams() == 2 && b->list.size() == 3) {
+      auto* ag = brOn->ref->dynCast<ArrayGet>();
+      auto* as = setStmt->dynCast<ArraySet>();
+      if (!ag || !as) {
+        return false;
+      }
+      auto* lgArr1 = ag->ref->dynCast<LocalGet>();
+      auto* lgIdx1 = ag->index->dynCast<LocalGet>();
+      auto* lgArr2 = as->ref->dynCast<LocalGet>();
+      auto* lgIdx2 = as->index->dynCast<LocalGet>();
+      auto* lt = as->value->dynCast<LocalSet>();
+      return lgArr1 && lgIdx1 && lgArr2 && lgIdx2 && lt && lt->isTee() &&
+             lgArr1->index == 0 && lgIdx1->index == 1 && lgArr2->index == 0 &&
+             lgIdx2->index == 1 && lt->index == retGet->index;
+    }
+    return false;
+  };
+
+  auto extractGuardGlobal = [](Expression* cond, Name& gOut) -> bool {
+    if (auto* rin = cond->dynCast<RefIsNull>()) {
+      if (auto* gg = rin->value->dynCast<GlobalGet>()) {
+        gOut = gg->name;
+        return true;
+      }
+    }
+    if (auto* u = cond->dynCast<Unary>()) {
+      if (u->op == EqZInt32) {
+        if (auto* gg = u->value->dynCast<GlobalGet>()) {
+          gOut = gg->name;
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+
+  auto isLazyInitOrOnceFunc = [&](Function* f,
+                                  const EffectAnalyzer& eff) -> bool {
+    if (f->getNumParams() != 0 || !f->body) {
+      return false;
+    }
+    if (f->getResults().isConcrete()) {
+      Expression* body = unwrapRefAsNonNull(f->body);
+      auto* b = body->dynCast<Block>();
+      if (!b || b->list.size() != 2) {
+        return false;
+      }
+      auto* iff = b->list[0]->dynCast<If>();
+      auto* retGG = unwrapRefAsNonNull(b->list[1])->dynCast<GlobalGet>();
+      Name guardG;
+      if (iff && !iff->ifFalse && retGG &&
+          extractGuardGlobal(iff->condition, guardG)) {
+        auto* g1 = module.getGlobalOrNull(guardG);
+        auto* g2 = module.getGlobalOrNull(retGG->name);
+        if (g1 && !g1->imported() && g1->mutable_ && g2 && !g2->imported() &&
+            g2->mutable_ && eff.globalsWritten.contains(guardG) &&
+            eff.globalsWritten.contains(retGG->name)) {
+          return true;
+        }
+      }
+      return false;
+    }
+    if (f->getResults() == Type::none) {
+      if (auto* iff = f->body->dynCast<If>()) {
+        Name guardG;
+        if (!iff->ifFalse && extractGuardGlobal(iff->condition, guardG)) {
+          auto* g = module.getGlobalOrNull(guardG);
+          if (g && !g->imported() && g->mutable_ &&
+              eff.globalsWritten.contains(guardG)) {
+            return true;
+          }
+        }
+      }
+      if (auto* b = f->body->dynCast<Block>()) {
+        if (b->list.size() >= 2) {
+          auto* iff = b->list[0]->dynCast<If>();
+          auto* gs = b->list[1]->dynCast<GlobalSet>();
+          if (iff && !iff->ifFalse && gs) {
+            auto* gg = iff->condition->dynCast<GlobalGet>();
+            auto* c = gs->value->dynCast<Const>();
+            bool exits = iff->ifTrue->is<Return>();
+            if (!exits) {
+              if (auto* br = iff->ifTrue->dynCast<Break>()) {
+                exits = !br->condition && br->name == b->name;
+              }
+            }
+            if (gg && exits && gg->name == gs->name && c &&
+                !c->value.isZero()) {
+              return true;
+            }
+          }
+        }
+      }
+    }
+    return false;
+  };
+
   std::vector<std::shared_ptr<EffectAnalyzer>> componentEffects;
   // Points to an index in componentEffects
   std::unordered_map<CallGraphNode, Index> nodeComponents;
@@ -435,6 +681,67 @@ void propagateEffects(
       for (Function* f : ccFuncs) {
         const auto& effects = funcInfos.at(f).effects;
         mergeMaybeEffects(ccEffects, effects);
+      }
+    }
+
+    if (passOptions.shrinkLevel > 0 && ccEffects && cc.size() == 1 &&
+        ccFuncs.size() == 1) {
+      Function* f = ccFuncs[0];
+      if (!f->imported() &&
+          !funcInfos.at(f).calledFunctions.contains(f->name)) {
+        if (Intrinsics::getAnnotations(f).idempotent) {
+          ccEffects->generative = false;
+          ccEffects->isIdempotent = true;
+        }
+        bool onlyArrayOrGlobalWrites =
+          !ccEffects->writesMemory && !ccEffects->writesSharedMemory &&
+          !ccEffects->writesTable && !ccEffects->writesStruct &&
+          !ccEffects->writesSharedStruct && !ccEffects->writesSharedArray &&
+          !ccEffects->throws() && !ccEffects->suspends && !ccEffects->calls &&
+          !ccEffects->mayNotReturn && !ccEffects->danglingPop &&
+          !ccEffects->hasSynchronization();
+        if (onlyArrayOrGlobalWrites) {
+          if (!ccEffects->hasNonTrapSideEffects() && !ccEffects->generative &&
+              !ccEffects->readsMutableGlobalState()) {
+            ccEffects->isIdempotent = true;
+            ccEffects->onlyTouchesInitGlobals = true;
+          } else if (isCachedFactoryFunc(f)) {
+            bool allPrivateGlobals = !hasUnknownFuncEffects;
+            auto isPrivateOrLazyGlobal = [&](Name g) {
+              if (mutableGlobalFuncCount[g] == 1) {
+                return true;
+              }
+              auto* glob = module.getGlobalOrNull(g);
+              return glob && !glob->imported() && glob->mutable_ &&
+                     glob->init && glob->init->is<RefNull>();
+            };
+            for (Name g : ccEffects->globalsWritten) {
+              if (!isPrivateOrLazyGlobal(g)) {
+                allPrivateGlobals = false;
+                break;
+              }
+            }
+            for (Name g : ccEffects->mutableGlobalsRead) {
+              if (!isPrivateOrLazyGlobal(g)) {
+                allPrivateGlobals = false;
+                break;
+              }
+            }
+            if (allPrivateGlobals && f->getNumParams() <= 2) {
+              ccEffects->writesArray = false;
+              ccEffects->readsMutableArray = false;
+              ccEffects->globalsWritten.clear();
+              ccEffects->mutableGlobalsRead.clear();
+            }
+            ccEffects->generative = false;
+            ccEffects->isIdempotent = true;
+            ccEffects->onlyTouchesInitGlobals = true;
+          } else if (isLazyInitOrOnceFunc(f, *ccEffects)) {
+            ccEffects->generative = false;
+            ccEffects->isIdempotent = true;
+            ccEffects->onlyTouchesInitGlobals = true;
+          }
+        }
       }
     }
 

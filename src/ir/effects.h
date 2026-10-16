@@ -44,6 +44,7 @@ public:
       readsSharedMutableArray(false), writesSharedArray(false), trap(false),
       implicitTrap(false), throws_(false), danglingPop(false),
       mayNotReturn(false), hasReturnCallThrow(false), suspends(false),
+      generative(false), isIdempotent(false), onlyTouchesInitGlobals(false),
       module(module), features(module.features) {}
 
   EffectAnalyzer(const PassOptions& passOptions,
@@ -138,6 +139,17 @@ public:
   bool hasReturnCallThrow : 1;
 
   bool suspends : 1;
+
+  // Whether this expression or function may allocate a fresh reference.
+  bool generative : 1;
+
+  // Whether calling this function twice with identical arguments returns the
+  // same value and the second call has no observable side effects.
+  bool isIdempotent : 1;
+
+  // Whether this function's writes only touch lazy-init / once-init globals or
+  // cache arrays.
+  bool onlyTouchesInitGlobals : 1;
 
   const Module& module;
   FeatureSet features;
@@ -490,6 +502,7 @@ public:
     mayNotReturn = mayNotReturn || other.mayNotReturn;
     hasReturnCallThrow = hasReturnCallThrow || other.hasReturnCallThrow;
     suspends = suspends || other.suspends;
+    generative = generative || other.generative;
     readOrder = std::max(readOrder, other.readOrder);
     writeOrder = std::max(writeOrder, other.writeOrder);
 
@@ -1065,7 +1078,10 @@ private:
       parent.breakTargets.insert(curr->name);
       trapOnNull(curr->desc);
     }
-    void visitStructNew(StructNew* curr) { trapOnNull(curr->desc); }
+    void visitStructNew(StructNew* curr) {
+      parent.generative = true;
+      trapOnNull(curr->desc);
+    }
     void visitStructGet(StructGet* curr) {
       if (trapOnNull(curr->ref)) {
         return;
@@ -1137,18 +1153,20 @@ private:
       // to anywhere else from being moved before the publish.
       parent.calls = true;
     }
-    void visitArrayNew(ArrayNew* curr) {}
+    void visitArrayNew(ArrayNew* curr) { parent.generative = true; }
     void visitArrayNewData(ArrayNewData* curr) {
+      parent.generative = true;
       // Traps on out of bounds access to segments or access to dropped
       // segments.
       parent.implicitTrap = true;
     }
     void visitArrayNewElem(ArrayNewElem* curr) {
+      parent.generative = true;
       // Traps on out of bounds access to segments or access to dropped
       // segments.
       parent.implicitTrap = true;
     }
-    void visitArrayNewFixed(ArrayNewFixed* curr) {}
+    void visitArrayNewFixed(ArrayNewFixed* curr) { parent.generative = true; }
     void visitArrayGet(ArrayGet* curr) {
       if (trapOnNull(curr->ref)) {
         return;
@@ -1238,6 +1256,7 @@ private:
       trapOnNull(curr->value);
     }
     void visitStringNew(StringNew* curr) {
+      parent.generative = true;
       switch (curr->op) {
         case StringNewLossyUTF8Array:
         case StringNewWTF16Array:
@@ -1292,7 +1311,10 @@ private:
       // OOB string access.
       parent.implicitTrap = true;
     }
-    void visitContNew(ContNew* curr) { trapOnNull(curr->func); }
+    void visitContNew(ContNew* curr) {
+      parent.generative = true;
+      trapOnNull(curr->func);
+    }
     void visitContBind(ContBind* curr) {
       if (trapOnNull(curr->cont)) {
         return;
@@ -1394,6 +1416,7 @@ private:
       }
 
       parent.calls = true;
+      parent.generative = true;
       // If EH is enabled and we don't have global effects information,
       // assume that the call target may throw.
       if (parent.features.hasExceptionHandling()) {
