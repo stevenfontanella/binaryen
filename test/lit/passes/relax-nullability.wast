@@ -709,12 +709,18 @@
   ;; Shares $shared-sig with $wide-func, but requires $Sub for field 2.
   ;; CHECK:      (type $4 (func (param (ref null $Base)) (result i32)))
 
-  ;; CHECK:      (rec
-  ;; CHECK-NEXT:  (type $5 (func (param (ref null $Base)) (result (ref null $Base))))
+  ;; CHECK:      (type $5 (func (param i32 (ref null $Base) (ref null $Base)) (result i32)))
 
-  ;; CHECK:       (type $6 (func (param (ref null $Sub)) (result i32)))
+  ;; CHECK:      (rec
+  ;; CHECK-NEXT:  (type $6 (func (param (ref null $Base)) (result (ref null $Base))))
+
+  ;; CHECK:       (type $7 (func (param (ref null $Sub)) (result i32)))
 
   ;; CHECK:      (export "run" (func $unalias-and-call))
+
+  ;; CHECK:      (export "sink-block" (func $sink-named-block-casts))
+
+  ;; CHECK:      (export "sink-local" (func $sink-multiset-local-casts))
 
   ;; CHECK:      (func $tight-func (type $4) (param $p (ref null $Base)) (result i32)
   ;; CHECK-NEXT:  (struct.get $Sub 2
@@ -723,11 +729,17 @@
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
-  ;; NO_TNH:      (type $4 (func (param (ref null $Base)) (result (ref $Sub))))
+  ;; NO_TNH:      (type $4 (func (param i32 (ref null $Base) (ref null $Base)) (result i32)))
 
-  ;; NO_TNH:      (type $5 (func (param (ref null $Base)) (result i32)))
+  ;; NO_TNH:      (type $5 (func (param (ref null $Base)) (result (ref $Sub))))
+
+  ;; NO_TNH:      (type $6 (func (param (ref null $Base)) (result i32)))
 
   ;; NO_TNH:      (export "run" (func $unalias-and-call))
+
+  ;; NO_TNH:      (export "sink-block" (func $sink-named-block-casts))
+
+  ;; NO_TNH:      (export "sink-local" (func $sink-multiset-local-casts))
 
   ;; NO_TNH:      (func $tight-func (type $shared-sig) (param $p (ref $Sub)) (result i32)
   ;; NO_TNH-NEXT:  (struct.get $Sub 2
@@ -761,10 +773,10 @@
   ;; Non-escaped callee whose caller only needs (ref null $Base): its return
   ;; type relaxes and widens from (ref $Sub) to (ref null $Base), stripping the
   ;; trailing ref.cast.
-  ;; CHECK:      (func $ret-callee (type $5) (param $x (ref null $Base)) (result (ref null $Base))
+  ;; CHECK:      (func $ret-callee (type $6) (param $x (ref null $Base)) (result (ref null $Base))
   ;; CHECK-NEXT:  (local.get $x)
   ;; CHECK-NEXT: )
-  ;; NO_TNH:      (func $ret-callee (type $4) (param $x (ref null $Base)) (result (ref $Sub))
+  ;; NO_TNH:      (func $ret-callee (type $5) (param $x (ref null $Base)) (result (ref $Sub))
   ;; NO_TNH-NEXT:  (ref.cast (ref $Sub)
   ;; NO_TNH-NEXT:   (local.get $x)
   ;; NO_TNH-NEXT:  )
@@ -804,7 +816,7 @@
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
-  ;; NO_TNH:      (func $unalias-and-call (type $5) (param $x (ref null $Base)) (result i32)
+  ;; NO_TNH:      (func $unalias-and-call (type $6) (param $x (ref null $Base)) (result i32)
   ;; NO_TNH-NEXT:  (local $s (ref $Sub))
   ;; NO_TNH-NEXT:  (local.set $s
   ;; NO_TNH-NEXT:   (ref.cast (ref $Sub)
@@ -862,6 +874,158 @@
           )
         )
       )
+    )
+  )
+
+  ;; Sink repeated ref.casts on branch exits and fallthrough out of a named
+  ;; block, and strip them when the caller only demands the supertype.
+  ;; CHECK:      (func $sink-named-block-casts (type $5) (param $c i32) (param $x (ref null $Base)) (param $y (ref null $Base)) (result i32)
+  ;; CHECK-NEXT:  (struct.get $Sub 2
+  ;; CHECK-NEXT:   (ref.cast (ref null $Sub)
+  ;; CHECK-NEXT:    (block $out (result (ref null $Base))
+  ;; CHECK-NEXT:     (if
+  ;; CHECK-NEXT:      (local.get $c)
+  ;; CHECK-NEXT:      (then
+  ;; CHECK-NEXT:       (br $out
+  ;; CHECK-NEXT:        (local.get $x)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (local.get $y)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; NO_TNH:      (func $sink-named-block-casts (type $4) (param $c i32) (param $x (ref null $Base)) (param $y (ref null $Base)) (result i32)
+  ;; NO_TNH-NEXT:  (struct.get $Sub 2
+  ;; NO_TNH-NEXT:   (block $out (result (ref null $Sub))
+  ;; NO_TNH-NEXT:    (if
+  ;; NO_TNH-NEXT:     (local.get $c)
+  ;; NO_TNH-NEXT:     (then
+  ;; NO_TNH-NEXT:      (br $out
+  ;; NO_TNH-NEXT:       (ref.cast (ref null $Sub)
+  ;; NO_TNH-NEXT:        (local.get $x)
+  ;; NO_TNH-NEXT:       )
+  ;; NO_TNH-NEXT:      )
+  ;; NO_TNH-NEXT:     )
+  ;; NO_TNH-NEXT:    )
+  ;; NO_TNH-NEXT:    (ref.cast (ref null $Sub)
+  ;; NO_TNH-NEXT:     (local.get $y)
+  ;; NO_TNH-NEXT:    )
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT: )
+  (func $sink-named-block-casts (export "sink-block") (param $c i32) (param $x (ref null $Base)) (param $y (ref null $Base)) (result i32)
+    (struct.get $Sub 2
+      (block $out (result (ref null $Sub))
+        (if
+          (local.get $c)
+          (then
+            (br $out
+              (ref.cast (ref null $Sub)
+                (local.get $x)
+              )
+            )
+          )
+        )
+        (ref.cast (ref null $Sub)
+          (local.get $y)
+        )
+      )
+    )
+  )
+
+  ;; Sink ref.casts across multiple local.tee writes to $s when $s is mostly
+  ;; consumed as $Base/anyref (ref.is_null) and only read narrowly once.
+  ;; CHECK:      (func $sink-multiset-local-casts (type $5) (param $c i32) (param $x (ref null $Base)) (param $y (ref null $Base)) (result i32)
+  ;; CHECK-NEXT:  (local $s (ref null $Base))
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (local.get $c)
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (drop
+  ;; CHECK-NEXT:     (ref.is_null
+  ;; CHECK-NEXT:      (local.tee $s
+  ;; CHECK-NEXT:       (local.get $x)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (else
+  ;; CHECK-NEXT:    (drop
+  ;; CHECK-NEXT:     (ref.is_null
+  ;; CHECK-NEXT:      (local.tee $s
+  ;; CHECK-NEXT:       (local.get $y)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (struct.get $Sub 2
+  ;; CHECK-NEXT:   (ref.cast (ref null $Sub)
+  ;; CHECK-NEXT:    (local.get $s)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; NO_TNH:      (func $sink-multiset-local-casts (type $4) (param $c i32) (param $x (ref null $Base)) (param $y (ref null $Base)) (result i32)
+  ;; NO_TNH-NEXT:  (local $s (ref null $Sub))
+  ;; NO_TNH-NEXT:  (if
+  ;; NO_TNH-NEXT:   (local.get $c)
+  ;; NO_TNH-NEXT:   (then
+  ;; NO_TNH-NEXT:    (drop
+  ;; NO_TNH-NEXT:     (ref.is_null
+  ;; NO_TNH-NEXT:      (local.tee $s
+  ;; NO_TNH-NEXT:       (ref.cast (ref null $Sub)
+  ;; NO_TNH-NEXT:        (local.get $x)
+  ;; NO_TNH-NEXT:       )
+  ;; NO_TNH-NEXT:      )
+  ;; NO_TNH-NEXT:     )
+  ;; NO_TNH-NEXT:    )
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:   (else
+  ;; NO_TNH-NEXT:    (drop
+  ;; NO_TNH-NEXT:     (ref.is_null
+  ;; NO_TNH-NEXT:      (local.tee $s
+  ;; NO_TNH-NEXT:       (ref.cast (ref null $Sub)
+  ;; NO_TNH-NEXT:        (local.get $y)
+  ;; NO_TNH-NEXT:       )
+  ;; NO_TNH-NEXT:      )
+  ;; NO_TNH-NEXT:     )
+  ;; NO_TNH-NEXT:    )
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT:  (struct.get $Sub 2
+  ;; NO_TNH-NEXT:   (local.get $s)
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT: )
+  (func $sink-multiset-local-casts (export "sink-local") (param $c i32) (param $x (ref null $Base)) (param $y (ref null $Base)) (result i32)
+    (local $s (ref null $Sub))
+    (if
+      (local.get $c)
+      (then
+        (drop
+          (ref.is_null
+            (local.tee $s
+              (ref.cast (ref null $Sub)
+                (local.get $x)
+              )
+            )
+          )
+        )
+      )
+      (else
+        (drop
+          (ref.is_null
+            (local.tee $s
+              (ref.cast (ref null $Sub)
+                (local.get $y)
+              )
+            )
+          )
+        )
+      )
+    )
+    (struct.get $Sub 2
+      (local.get $s)
     )
   )
 )

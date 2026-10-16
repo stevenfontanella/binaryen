@@ -1223,11 +1223,38 @@ struct OptimizeInstructions
           return replaceCurrent(ret);
         }
       }
+      if (curr->condition->type != Type::unreachable && curr->type.isRef() &&
+          !curr->type.getHeapType().isBasic() &&
+          (curr->ifTrue->type == Type::unreachable) !=
+            (curr->ifFalse->type == Type::unreachable)) {
+        Builder builder(*getModule());
+        if (curr->ifFalse->type == Type::unreachable) {
+          curr->condition =
+            optimizeBoolean(builder.makeUnary(EqZInt32, curr->condition));
+          std::swap(curr->ifTrue, curr->ifFalse);
+          BranchHints::flip(curr, getFunction());
+        }
+        Expression* val = curr->ifFalse;
+        curr->ifFalse = nullptr;
+        curr->type = Type::none;
+        return replaceCurrent(builder.makeSequence(curr, val));
+      }
       optimizeTernary(curr);
     }
   }
 
   void visitLocalSet(LocalSet* curr) {
+    Block* outerSeq = nullptr;
+    if (auto* seq = curr->value->dynCast<Block>()) {
+      if (!seq->name.is() && seq->list.size() == 2 &&
+          seq->list[0]->is<If>() && seq->list[0]->type == Type::none &&
+          seq->list[1]->type.isConcrete()) {
+        outerSeq = seq;
+        curr->value = seq->list[1];
+        curr->finalize();
+      }
+    }
+    Expression* result = curr;
     // Interactions between local.set/tee and ref.as_non_null can be optimized
     // in some cases, by removing or moving the ref.as_non_null operation.
     if (auto* as = curr->value->dynCast<RefAs>()) {
@@ -1244,18 +1271,27 @@ struct OptimizeInstructions
           curr->finalize();
           as->value = curr;
           as->finalize();
-          replaceCurrent(as);
-          return;
-        }
-
-        // Otherwise, if this is not a tee, then no value falls through. The
-        // ref.as_non_null acts as a null check here, basically. If we are
-        // ignoring such traps, we can remove it.
-        auto& passOptions = getPassOptions();
-        if (passOptions.ignoreImplicitTraps || passOptions.trapsNeverHappen) {
-          curr->value = as->value;
+          result = as;
+        } else {
+          // Otherwise, if this is not a tee, then no value falls through. The
+          // ref.as_non_null acts as a null check here, basically. If we are
+          // ignoring such traps, we can remove it.
+          auto& passOptions = getPassOptions();
+          if (passOptions.ignoreImplicitTraps || passOptions.trapsNeverHappen) {
+            curr->value = as->value;
+          }
         }
       }
+    }
+    if (result == curr) {
+      skipCast(curr->value, getFunction()->getLocalType(curr->index));
+    }
+    if (outerSeq) {
+      outerSeq->list[1] = result;
+      outerSeq->finalize();
+      replaceCurrent(outerSeq);
+    } else if (result != curr) {
+      replaceCurrent(result);
     }
   }
 
@@ -1984,13 +2020,28 @@ struct OptimizeInstructions
 
   void visitStructGet(StructGet* curr) {
     skipNonNullCast(curr->ref, curr);
-    trapOnNull(curr, curr->ref);
+    if (trapOnNull(curr, curr->ref)) {
+      return;
+    }
     // Relax acquire loads of unshared fields to unordered because they cannot
     // synchronize with other threads.
     // TODO: Relax all other memory orderings as well.
     if (curr->order == MemoryOrder::AcqRel && curr->ref->type.isRef() &&
         !curr->ref->type.getHeapType().isShared()) {
       curr->order = MemoryOrder::Unordered;
+    }
+    if (auto* seq = curr->ref->dynCast<Block>()) {
+      if (!seq->name.is() && seq->list.size() == 2 &&
+          seq->list[0]->is<If>() && seq->list[0]->type == Type::none &&
+          seq->list[1]->type.isStruct() &&
+          seq->list[1]->type.getHeapType() == curr->ref->type.getHeapType()) {
+        curr->ref = seq->list[1];
+        skipNonNullCast(curr->ref, curr);
+        curr->finalize();
+        seq->list[1] = curr;
+        seq->finalize();
+        replaceCurrent(seq);
+      }
     }
   }
 
@@ -5978,6 +6029,73 @@ private:
     }
 
     if (!neverFold && curr->condition->type != Type::unreachable) {
+      auto isLazyCacheFactory = [&](Name target) -> bool {
+        auto* callee = getModule()->getFunctionOrNull(target);
+        if (!callee || callee->imported() || !callee->body ||
+            callee->getParams() != Type::i32 || !callee->getResults().isRef()) {
+          return false;
+        }
+        Expression* body = callee->body;
+        if (auto* as = body->dynCast<RefAs>()) {
+          if (as->op == RefAsNonNull) {
+            body = as->value;
+          }
+        }
+        auto* block = body->dynCast<Block>();
+        if (!block || !block->name.is() || block->list.size() < 2) {
+          return false;
+        }
+        auto* brOn = block->list[0]->dynCast<BrOn>();
+        if (!brOn || brOn->op != BrOnNonNull || brOn->name != block->name) {
+          return false;
+        }
+        auto* aget = brOn->ref->dynCast<ArrayGet>();
+        if (!aget || !aget->ref->is<GlobalGet>()) {
+          return false;
+        }
+        auto* idxGet = aget->index->dynCast<LocalGet>();
+        return idxGet && idxGet->index == 0;
+      };
+
+      auto getTailPtr = [&](Expression*& arm,
+                            SmallVector<Block*, 2>& blocks) -> Expression** {
+        Expression** p = &arm;
+        if constexpr (std::is_same<T, If>::value) {
+          if (!getPassOptions().trapsNeverHappen) {
+            return p;
+          }
+          while (auto* block = (*p)->dynCast<Block>()) {
+            if (block->name.is() || block->list.empty()) {
+              break;
+            }
+            bool hasUnreachablePrefix = false;
+            for (size_t i = 0; i + 1 < block->list.size(); ++i) {
+              if (block->list[i]->type == Type::unreachable) {
+                hasUnreachablePrefix = true;
+                break;
+              }
+            }
+            if (hasUnreachablePrefix) {
+              break;
+            }
+            blocks.push_back(block);
+            p = &block->list.back();
+          }
+        }
+        return p;
+      };
+
+      auto isTeeAndGet = [](Expression* a, Expression* b) -> bool {
+        if (auto* set = a->dynCast<LocalSet>()) {
+          if (set->isTee()) {
+            if (auto* get = b->dynCast<LocalGet>()) {
+              return set->index == get->index;
+            }
+          }
+        }
+        return false;
+      };
+
       // Identical code on both arms can be folded out, e.g.
       //
       //  (select
@@ -5996,101 +6114,302 @@ private:
       //
       // Continue doing this while we can, noting the chain of moved expressions
       // as we go, then do a single replaceCurrent() at the end.
-      SmallVector<Expression*, 1> chain;
+      SmallVector<std::pair<Expression*, Expression**>, 1> chain;
       while (1) {
-        // Ignore control flow structures (which are handled in MergeBlocks).
-        if (!Properties::isControlFlowStructure(curr->ifTrue) &&
-            ExpressionAnalyzer::shallowEqual(curr->ifTrue, curr->ifFalse)) {
-          // TODO: consider the case with more than one child.
-          ChildIterator ifTrueChildren(curr->ifTrue);
-          if (ifTrueChildren.children.size() == 1) {
-            // ifTrue and ifFalse's children will become the direct children of
-            // curr, and so they must be compatible to allow for a proper new
-            // type after the transformation.
-            //
-            // The children must have a shared supertype. For example, we cannot
-            // fold out the `drop` here because there would be no valid result
-            // type for the if afterward:
-            //
-            //  (if
-            //    (condition)
-            //    (drop (i32.const 1))
-            //    (drop (f64.const 2.0))
-            //  )
-            //
-            // However, having a shared supertype may not be enough. If $A and
-            // $B have a shared supertype, but that supertype does not have a
-            // field at index 1, then we cannot fold the duplicated struct.get
-            // here:
-            //
-            //  (if
-            //    (condition)
-            //    (struct.get $A 1 (..))
-            //    (struct.get $B 1 (..))
-            //  )
-            //
-            // (Note: In that example, the problem only happens because the type
-            // is not part of the struct.get - we infer it from the reference.
-            // That is why after hoisting the struct.get out, and computing a
-            // new type for the if that is now the child of the single
-            // struct.get, we get a struct.get of a supertype. So in principle
-            // we could fix this by modifying the IR as well, but the problem is
-            // more general, so avoid that.)
-            //
-            // For now, only support the case where the types of the children
-            // are the same.
-            //
-            // TODO: We could analyze whether the LUB of the children types
-            // would satisfy the constraints imposed by the shared parent
-            // instruction. This would require a version of ChildTyper that
-            // allows for generalizing type annotations.
-            ChildIterator ifFalseChildren(curr->ifFalse);
-            auto* ifTrueChild = *ifTrueChildren.begin();
-            auto* ifFalseChild = *ifFalseChildren.begin();
-            bool validTypes = ifTrueChild->type == ifFalseChild->type;
+        SmallVector<Block*, 2> trueBlocks, falseBlocks;
+        Expression** trueTailPtr = getTailPtr(curr->ifTrue, trueBlocks);
+        Expression** falseTailPtr = getTailPtr(curr->ifFalse, falseBlocks);
+        Expression* trueTail = *trueTailPtr;
+        Expression* falseTail = *falseTailPtr;
 
-            // If the expression we are about to move outside has side effects,
-            // then we cannot do so in general with a select: we'd be reducing
-            // the amount of the effects as well as moving them. For an if,
-            // the side effects execute once, so there is no problem.
-            // TODO: handle certain side effects when possible in select
-            bool validEffects = std::is_same<T, If>::value ||
-                                !ShallowEffectAnalyzer(
-                                   getPassOptions(), *getModule(), curr->ifTrue)
-                                   .hasSideEffects();
-
-            // In addition, check for specific limitations of select.
-            bool validChildren =
-              !std::is_same<T, Select>::value ||
-              Properties::canEmitSelectWithArms(ifTrueChild, ifFalseChild);
-
-            if (validTypes && validEffects && validChildren) {
-              // Replace ifTrue with its child.
-              curr->ifTrue = ifTrueChild;
-              // Replace ifFalse with its child, and reuse that node outside.
-              auto* reuse = curr->ifFalse;
-              curr->ifFalse = ifFalseChild;
-              // curr's type may have changed, if the instructions we moved out
-              // had different input types than output types.
-              curr->finalize();
-              // Point to curr from the code that is now outside of it.
-              *ChildIterator(reuse).begin() = curr;
-              if (!chain.empty()) {
-                // We've already moved things out, so chain them to there. That
-                // is, the end of the chain should now point to reuse (which
-                // in turn already points to curr).
-                *ChildIterator(chain.back()).begin() = reuse;
+        if (!Properties::isControlFlowStructure(trueTail) &&
+            !Properties::isControlFlowStructure(falseTail)) {
+          if (curr->type.isRef() && !curr->type.isExact()) {
+            auto* c1 = trueTail->dynCast<RefCast>();
+            auto* c2 = falseTail->dynCast<RefCast>();
+            if (getPassOptions().trapsNeverHappen && c1 && c2 && !c1->desc &&
+                !c2->desc && !c1->type.isExact() && !c2->type.isExact() &&
+                c1->type.getHeapType() == c2->type.getHeapType() &&
+                c1->type.getHeapType() == curr->type.getHeapType() &&
+                c1->type != c2->type) {
+              c1->type = curr->type;
+              c2->type = curr->type;
+            } else if ((c1 != nullptr) != (c2 != nullptr)) {
+              RefCast* cast = c1 ? c1 : c2;
+              Expression* otherTail = c1 ? falseTail : trueTail;
+              if (!cast->desc && !cast->type.isExact() &&
+                  (cast->type == curr->type ||
+                   (getPassOptions().trapsNeverHappen &&
+                    cast->type.getHeapType() == curr->type.getHeapType())) &&
+                  (std::is_same<T, If>::value ||
+                   getPassOptions().trapsNeverHappen) &&
+                  cast->ref->type.isRef() && !cast->ref->type.isNull() &&
+                  otherTail->type.isConcrete() &&
+                  Type::isSubType(otherTail->type, curr->type)) {
+                Expression* trueChild = c1 ? cast->ref : trueTail;
+                Expression* falseChild = c2 ? cast->ref : falseTail;
+                Type lub =
+                  Type::getLeastUpperBound(trueChild->type, falseChild->type);
+                bool validChildren =
+                  !std::is_same<T, Select>::value ||
+                  Properties::canEmitSelectWithArms(trueChild, falseChild);
+                if (validChildren && lub.isRef() && !lub.isExact() &&
+                    lub != curr->type &&
+                    HeapType::isSubType(curr->type.getHeapType(),
+                                        lub.getHeapType())) {
+                  Type origType = curr->type;
+                  *trueTailPtr = trueChild;
+                  *falseTailPtr = falseChild;
+                  for (int i = int(trueBlocks.size()) - 1; i >= 0; --i) {
+                    trueBlocks[i]->finalize();
+                  }
+                  for (int i = int(falseBlocks.size()) - 1; i >= 0; --i) {
+                    falseBlocks[i]->finalize();
+                  }
+                  curr->finalize();
+                  cast->type = origType;
+                  cast->ref = curr;
+                  cast->finalize();
+                  Expression** slot = &cast->ref;
+                  if (!chain.empty()) {
+                    *chain.back().second = cast;
+                  }
+                  chain.push_back({cast, slot});
+                  continue;
+                }
               }
-              chain.push_back(reuse);
-              continue;
+            }
+          }
+
+          if (ExpressionAnalyzer::shallowEqual(trueTail, falseTail)) {
+            ChildIterator ifTrueChildren(trueTail);
+            ChildIterator ifFalseChildren(falseTail);
+            Index numChildren = ifTrueChildren.children.size();
+            if (numChildren >= 1 &&
+                ifFalseChildren.children.size() == numChildren) {
+              Index diffCount = 0;
+              Index diffIdx = 0;
+              if (numChildren == 1) {
+                diffCount = 1;
+                diffIdx = 0;
+              } else {
+                for (Index j = 0; j < numChildren; ++j) {
+                  Expression* aChild = *ifTrueChildren.children[j];
+                  Expression* bChild = *ifFalseChildren.children[j];
+                  if (ExpressionAnalyzer::equal(aChild, bChild) ||
+                      (std::is_same<T, Select>::value &&
+                       isTeeAndGet(aChild, bChild))) {
+                    continue;
+                  }
+                  diffCount++;
+                  diffIdx = j;
+                }
+              }
+
+              if (diffCount == 1) {
+                auto* ifTrueChild = *ifTrueChildren.children[diffIdx];
+                auto* ifFalseChild = *ifFalseChildren.children[diffIdx];
+                auto* reuse = falseTail;
+
+                bool validInvariantArgs = true;
+                if (numChildren > 1) {
+                  EffectAnalyzer condAndPrefixEffects(
+                    getPassOptions(), *getModule(), curr->condition);
+                  for (auto* b : trueBlocks) {
+                    for (size_t i = 0; i + 1 < b->list.size(); ++i) {
+                      condAndPrefixEffects.walk(b->list[i]);
+                    }
+                  }
+                  for (auto* b : falseBlocks) {
+                    for (size_t i = 0; i + 1 < b->list.size(); ++i) {
+                      condAndPrefixEffects.walk(b->list[i]);
+                    }
+                  }
+                  for (Index j = 0; j < numChildren; ++j) {
+                    if (j == diffIdx) {
+                      continue;
+                    }
+                    Expression* aChild = *ifTrueChildren.children[j];
+                    Expression* bChild = *ifFalseChildren.children[j];
+                    if (std::is_same<T, Select>::value && j < diffIdx &&
+                        isTeeAndGet(aChild, bChild)) {
+                      Index v = aChild->cast<LocalSet>()->index;
+                      if (effects(ifTrueChild).localsWritten.count(v)) {
+                        validInvariantArgs = false;
+                        break;
+                      }
+                      continue;
+                    }
+                    if (!ExpressionAnalyzer::equal(aChild, bChild)) {
+                      validInvariantArgs = false;
+                      break;
+                    }
+                    EffectAnalyzer ej(getPassOptions(), *getModule(), aChild);
+                    if (ej.hasSideEffects()) {
+                      validInvariantArgs = false;
+                      break;
+                    }
+                    if (j < diffIdx) {
+                      if (ej.invalidates(condAndPrefixEffects)) {
+                        validInvariantArgs = false;
+                        break;
+                      }
+                      if (std::is_same<T, Select>::value &&
+                          (ej.invalidates(effects(ifTrueChild)) ||
+                           ej.invalidates(effects(ifFalseChild)))) {
+                        validInvariantArgs = false;
+                        break;
+                      }
+                    } else if (std::is_same<T, Select>::value) {
+                      if (ej.invalidates(effects(ifFalseChild)) ||
+                          ej.invalidates(condAndPrefixEffects)) {
+                        validInvariantArgs = false;
+                        break;
+                      }
+                    }
+                  }
+                }
+
+                bool validTypes = false;
+                if (validInvariantArgs && ifTrueChild->type.isConcrete() &&
+                    ifFalseChild->type.isConcrete()) {
+                  Type lub = Type::getLeastUpperBound(ifTrueChild->type,
+                                                      ifFalseChild->type);
+                  if (lub != Type::none && lub != Type::unreachable) {
+                    if (ifTrueChild->type == ifFalseChild->type) {
+                      validTypes = true;
+                      if (std::is_same<T, If>::value && reuse->is<Drop>() &&
+                          !lub.isBasic() &&
+                          !ExpressionAnalyzer::shallowEqual(ifTrueChild,
+                                                            ifFalseChild)) {
+                        validTypes = false;
+                      }
+                    } else if (auto* cast = reuse->dynCast<RefCast>()) {
+                      validTypes =
+                        diffIdx == 0 && !cast->desc &&
+                        (!cast->type.isExact() ||
+                         getModule()->features.hasCustomDescriptors()) &&
+                        lub.isRef();
+                    } else if (!getPassOptions().trapsNeverHappen) {
+                      validTypes = false;
+                    } else if (auto* as = reuse->dynCast<RefAs>()) {
+                      validTypes =
+                        (as->op == RefAsNonNull && lub.isRef() &&
+                         lub.with(NonNullable) == as->type) ||
+                        ((as->op == ExternConvertAny ||
+                          as->op == AnyConvertExtern) &&
+                         lub.isRef() &&
+                         lub.getNullability() == as->type.getNullability());
+                    } else if (reuse->is<RefIsNull>()) {
+                      validTypes = lub.isRef();
+                    } else if (auto* test = reuse->dynCast<RefTest>()) {
+                      validTypes =
+                        lub.isRef() &&
+                        (!test->castType.isExact() ||
+                         getModule()->features.hasCustomDescriptors());
+                    } else if (reuse->is<RefEq>()) {
+                      validTypes =
+                        lub.isRef() &&
+                        Type::isSubType(
+                          lub,
+                          Type(HeapTypes::eq.getBasic(
+                                 lub.getHeapType().getShared()),
+                               Nullable));
+                    } else if (reuse->is<Drop>()) {
+                      validTypes = !std::is_same<T, If>::value || lub.isBasic();
+                    } else if (auto* call = reuse->dynCast<Call>()) {
+                      auto params =
+                        getModule()->getFunction(call->target)->getParams();
+                      validTypes = diffIdx < params.size() &&
+                                   Type::isSubType(lub, params[diffIdx]);
+                    } else if (auto* set = reuse->dynCast<LocalSet>()) {
+                      validTypes = Type::isSubType(
+                        lub, getFunction()->getLocalType(set->index));
+                    } else if (auto* gset = reuse->dynCast<GlobalSet>()) {
+                      validTypes = Type::isSubType(
+                        lub, getModule()->getGlobal(gset->name)->type);
+                    } else if (auto* sget = reuse->dynCast<StructGet>()) {
+                      validTypes =
+                        lub.isStruct() &&
+                        lub.getHeapType() == sget->ref->type.getHeapType();
+                    } else if (auto* sset = reuse->dynCast<StructSet>()) {
+                      if (diffIdx == 0) {
+                        validTypes =
+                          lub.isStruct() &&
+                          lub.getHeapType() == sset->ref->type.getHeapType();
+                      } else if (diffIdx == 1 && sset->ref->type.isStruct()) {
+                        const auto& fields =
+                          sset->ref->type.getHeapType().getStruct().fields;
+                        validTypes =
+                          sset->index < fields.size() &&
+                          Type::isSubType(lub, fields[sset->index].type);
+                      }
+                    } else if (auto* snew = reuse->dynCast<StructNew>()) {
+                      if (!snew->isWithDefault() && snew->type.isStruct()) {
+                        const auto& fields =
+                          snew->type.getHeapType().getStruct().fields;
+                        validTypes = diffIdx < fields.size() &&
+                                     Type::isSubType(lub, fields[diffIdx].type);
+                      }
+                    }
+                  }
+                }
+
+                bool validEffects =
+                  std::is_same<T, If>::value ||
+                  !ShallowEffectAnalyzer(
+                     getPassOptions(), *getModule(), trueTail)
+                     .hasSideEffects() ||
+                  (getPassOptions().trapsNeverHappen && numChildren == 1 &&
+                   trueTail->is<Call>() &&
+                   isLazyCacheFactory(trueTail->cast<Call>()->target) &&
+                   !effects(ifTrueChild).hasSideEffects() &&
+                   !effects(ifFalseChild).hasSideEffects() &&
+                   !effects(curr->condition).hasSideEffects());
+
+                bool validChildren =
+                  !std::is_same<T, Select>::value ||
+                  Properties::canEmitSelectWithArms(ifTrueChild, ifFalseChild);
+
+                if (validTypes && validEffects && validChildren) {
+                  if (std::is_same<T, Select>::value && numChildren > 1) {
+                    for (Index j = 0; j < diffIdx; ++j) {
+                      Expression* aChild = *ifTrueChildren.children[j];
+                      Expression* bChild = *ifFalseChildren.children[j];
+                      if (isTeeAndGet(aChild, bChild)) {
+                        *ifFalseChildren.children[j] = aChild;
+                      }
+                    }
+                  }
+                  *trueTailPtr = ifTrueChild;
+                  *falseTailPtr = ifFalseChild;
+                  for (int i = int(trueBlocks.size()) - 1; i >= 0; --i) {
+                    trueBlocks[i]->finalize();
+                  }
+                  for (int i = int(falseBlocks.size()) - 1; i >= 0; --i) {
+                    falseBlocks[i]->finalize();
+                  }
+                  curr->finalize();
+                  Expression** slot = ifFalseChildren.children[diffIdx];
+                  *slot = curr;
+                  reuse->finalize();
+                  if (!chain.empty()) {
+                    *chain.back().second = reuse;
+                  }
+                  chain.push_back({reuse, slot});
+                  continue;
+                }
+              }
             }
           }
         }
         break;
       }
       if (!chain.empty()) {
-        // The beginning of the chain is the new top parent.
-        return replaceCurrent(chain[0]);
+        for (int i = int(chain.size()) - 1; i >= 0; --i) {
+          ReFinalizeNode().visit(chain[i].first);
+        }
+        return replaceCurrent(chain[0].first);
       }
     }
   }

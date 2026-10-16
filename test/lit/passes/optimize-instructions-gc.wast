@@ -3814,5 +3814,97 @@
     ;; Nothing reads the ref.eq on the stack.
     (unreachable)
   )
+
+  ;; Hoist ref.cast out of if/else when one arm has ref.cast $B and the other
+  ;; arm already has static subtype <= (ref null $B) (e.g. ref.null none).
+  ;; CHECK:      (func $hoist-asymmetric-if-cast (type $49) (param $cond i32) (param $a (ref null $A)) (result (ref null $B))
+  ;; CHECK-NEXT:  (ref.cast (ref null $B)
+  ;; CHECK-NEXT:   (if (result (ref null $A))
+  ;; CHECK-NEXT:    (local.get $cond)
+  ;; CHECK-NEXT:    (then
+  ;; CHECK-NEXT:     (local.get $a)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (else
+  ;; CHECK-NEXT:     (ref.null none)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $hoist-asymmetric-if-cast (param $cond i32) (param $a (ref null $A)) (result (ref null $B))
+    (if (result (ref null $B))
+      (local.get $cond)
+      (then
+        (ref.cast (ref null $B)
+          (local.get $a)
+        )
+      )
+      (else
+        (ref.null none)
+      )
+    )
+  )
+
+  ;; Un-nest an if with a concrete struct result type and one unreachable arm
+  ;; into a void if followed by the value arm.
+  ;; CHECK:      (func $unnest-concrete-if-unreachable-arm (type $50) (param $cond i32) (param $b (ref null $B)) (result (ref null $B))
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (i32.eqz
+  ;; CHECK-NEXT:    (local.get $cond)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (return
+  ;; CHECK-NEXT:     (ref.null none)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.get $b)
+  ;; CHECK-NEXT: )
+  (func $unnest-concrete-if-unreachable-arm (param $cond i32) (param $b (ref null $B)) (result (ref null $B))
+    (if (result (ref null $B))
+      (local.get $cond)
+      (then
+        (local.get $b)
+      )
+      (else
+        (return
+          (ref.null none)
+        )
+      )
+    )
+  )
+
+  ;; Hoist struct.set out of if/else when the target struct ref is identical and
+  ;; only the stored value differs.
+  ;; CHECK:      (func $hoist-struct-set-if (type $51) (param $cond i32) (param $s (ref null $struct)) (param $x i32) (param $y i32)
+  ;; CHECK-NEXT:  (struct.set $struct $i32
+  ;; CHECK-NEXT:   (local.get $s)
+  ;; CHECK-NEXT:   (if (result i32)
+  ;; CHECK-NEXT:    (local.get $cond)
+  ;; CHECK-NEXT:    (then
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (else
+  ;; CHECK-NEXT:     (local.get $y)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $hoist-struct-set-if (param $cond i32) (param $s (ref null $struct)) (param $x i32) (param $y i32)
+    (if
+      (local.get $cond)
+      (then
+        (struct.set $struct $i32
+          (local.get $s)
+          (local.get $x)
+        )
+      )
+      (else
+        (struct.set $struct $i32
+          (local.get $s)
+          (local.get $y)
+        )
+      )
+    )
+  )
 )
 

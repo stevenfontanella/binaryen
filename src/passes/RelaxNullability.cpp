@@ -715,6 +715,146 @@ struct FunctionRelaxer
         }
         return false;
       }
+      if (block->name.is() && !block->list.empty() && block->type.isRef() &&
+          !block->type.isExact()) {
+        struct BranchFinder : public PostWalker<BranchFinder> {
+          Name target;
+          bool canModify = true;
+          std::vector<Break*> breaks;
+          void visitBreak(Break* curr) {
+            if (curr->name == target) {
+              if (!curr->value) {
+                canModify = false;
+              } else if (curr->condition) {
+                if (!curr->value->type.isNull()) {
+                  canModify = false;
+                }
+              } else {
+                breaks.push_back(curr);
+              }
+            }
+          }
+          void visitSwitch(Switch* curr) {
+            if (curr->default_ == target) {
+              canModify = false;
+              return;
+            }
+            for (auto t : curr->targets) {
+              if (t == target) {
+                canModify = false;
+                return;
+              }
+            }
+          }
+          void visitBrOn(BrOn* curr) {
+            if (curr->name == target) {
+              canModify = false;
+            }
+          }
+        } finder;
+        finder.target = block->name;
+        finder.walk(*exprp);
+        if (finder.canModify) {
+          Nullability armNull =
+            demanded.isNullable() ? Nullable : block->type.getNullability();
+          Type armDemanded(demanded.getHeapType(), armNull);
+          bool anyChanged = false;
+          if (block->list.back()->type.isRef()) {
+            anyChanged |= stripTrailingCasts(
+              &block->list.back(), armDemanded, stripRefAs && armNull == Nullable);
+          }
+          for (auto* br : finder.breaks) {
+            if (br->value->type.isRef()) {
+              anyChanged |= stripTrailingCasts(
+                &br->value, armDemanded, stripRefAs && armNull == Nullable);
+            }
+          }
+          if (anyChanged) {
+            block->finalize();
+            if (demanded.isNonNullable() && block->type.isRef() &&
+                block->type.isNullable()) {
+              *exprp = Builder(*getModule()).makeRefAs(RefAsNonNull, *exprp);
+            }
+            return true;
+          }
+
+          // Also check if >= 2 exits have RefCast to block's HeapType that can
+          // be sunk to a single RefCast outside the block.
+          HeapType blockHT = block->type.getHeapType();
+          std::vector<Expression**> exits;
+          if (block->list.back()->type != Type::unreachable) {
+            exits.push_back(&block->list.back());
+          }
+          for (auto* br : finder.breaks) {
+            if (br->value->type != Type::unreachable) {
+              exits.push_back(&br->value);
+            }
+          }
+          if (exits.size() >= 2) {
+            size_t castExits = 0;
+            bool allCompatible = true;
+            Nullability outerNull =
+              demanded.isNonNullable() ? NonNullable : block->type.getNullability();
+            for (auto* exitp : exits) {
+              Expression** tailp = exitp;
+              while (auto* nb = (*tailp)->dynCast<Block>()) {
+                if (!nb->name.is() && !nb->list.empty()) {
+                  tailp = &nb->list.back();
+                } else {
+                  break;
+                }
+              }
+              if (auto* cast = (*tailp)->dynCast<RefCast>()) {
+                if (!cast->desc && !cast->type.isExact() &&
+                    cast->type.getHeapType() == blockHT &&
+                    cast->ref->type.isRef() &&
+                    cast->ref->type.getHeapType().getTop() ==
+                      blockHT.getTop() &&
+                    (getPassOptions().trapsNeverHappen ||
+                     cast->type.getNullability() == outerNull)) {
+                  castExits++;
+                  continue;
+                }
+              }
+              if (!Type::isSubType((*tailp)->type, Type(blockHT, Nullable))) {
+                allCompatible = false;
+                break;
+              }
+            }
+            if (allCompatible && castExits >= 2) {
+              for (auto* exitp : exits) {
+                std::vector<Block*> unwrapBlocks;
+                Expression** tailp = exitp;
+                while (auto* nb = (*tailp)->dynCast<Block>()) {
+                  if (!nb->name.is() && !nb->list.empty()) {
+                    unwrapBlocks.push_back(nb);
+                    tailp = &nb->list.back();
+                  } else {
+                    break;
+                  }
+                }
+                if (auto* cast = (*tailp)->dynCast<RefCast>()) {
+                  if (!cast->desc && !cast->type.isExact() &&
+                      cast->type.getHeapType() == blockHT &&
+                      cast->ref->type.isRef()) {
+                    *tailp = cast->ref;
+                    for (auto it = unwrapBlocks.rbegin();
+                         it != unwrapBlocks.rend();
+                         ++it) {
+                      (*it)->finalize();
+                    }
+                  }
+                }
+              }
+              block->finalize();
+              *exprp = Builder(*getModule())
+                         .makeRefCast(*exprp, Type(blockHT, outerNull));
+              return true;
+            }
+          }
+        }
+        return false;
+      }
     }
     if (auto* iff = (*exprp)->dynCast<If>()) {
       if (iff->ifFalse && iff->type.isRef()) {
@@ -810,6 +950,7 @@ struct FunctionRelaxer
       Index a;
       Index b;
       LocalSet* set;
+      Expression** valPtr;
       RefCast* cast;
     };
     std::vector<CastAlias> candidates;
@@ -822,7 +963,15 @@ struct FunctionRelaxer
         continue;
       }
       auto* set = singleSet[a];
-      Expression* val = set->value;
+      Expression** valPtr = &set->value;
+      while (auto* block = (*valPtr)->dynCast<Block>()) {
+        if (!block->name.is() && !block->list.empty()) {
+          valPtr = &block->list.back();
+        } else {
+          break;
+        }
+      }
+      Expression* val = *valPtr;
       while (auto* as = val->dynCast<RefAs>()) {
         if (as->op == RefAsNonNull) {
           val = as->value;
@@ -859,7 +1008,7 @@ struct FunctionRelaxer
       if (aHT == bHT || !HeapType::isSubType(aHT, bHT)) {
         continue;
       }
-      candidates.push_back({a, b, set, cast});
+      candidates.push_back({a, b, set, valPtr, cast});
     }
 
     if (candidates.empty()) {
@@ -948,27 +1097,201 @@ struct FunctionRelaxer
       }
       anyModified = true;
 
-      if (totalRem <= 1) {
+      if (totalRem <= 1 &&
+          (cand.valPtr == &cand.set->value ||
+           getPassOptions().trapsNeverHappen || narrowGets.empty())) {
         cand.cast->ref = builder.makeLocalGet(cand.b, bType);
         cand.cast->type =
           cand.cast->type.with(bType.isNonNullable() ? NonNullable : Nullable);
         if (remTee == 1) {
-          *setPtr = cand.cast;
+          *cand.valPtr = cand.cast;
+          *setPtr = cand.set->value;
         } else if (narrowGets.size() == 1) {
           *narrowGets[0] = cand.cast;
           if (cand.set->isTee()) {
-            *setPtr = builder.makeLocalGet(cand.b, bType);
+            *cand.valPtr = builder.makeLocalGet(cand.b, bType);
+            *setPtr = cand.set->value;
           } else {
-            *setPtr = builder.makeNop();
+            *cand.valPtr = builder.makeNop();
+            *setPtr = cand.set->value;
           }
         } else {
           if (cand.set->isTee()) {
-            *setPtr = builder.makeLocalGet(cand.b, bType);
+            *cand.valPtr = builder.makeLocalGet(cand.b, bType);
+            *setPtr = cand.set->value;
           } else {
-            *setPtr = builder.makeNop();
+            *cand.valPtr = builder.makeNop();
+            *setPtr = cand.set->value;
           }
         }
       }
+    }
+    return anyModified;
+  }
+
+  // Sink RefCasts across multiple LocalSet/LocalTee assignments to the same
+  // local `$a` when widening `$a` to the LUB of the uncast operands requires
+  // strictly fewer casts on narrow reads than the casts removed on writes.
+  bool sinkMultiSetCastLocals(Function* func,
+                              const std::vector<LocalSet*>& sets) {
+    Index numParams = func->getNumParams();
+    Index numLocals = func->getNumLocals();
+    if (numLocals <= numParams) {
+      return false;
+    }
+
+    std::vector<std::vector<LocalSet*>> localSets(numLocals);
+    for (auto* set : sets) {
+      if (set->index >= numParams) {
+        localSets[set->index].push_back(set);
+      }
+    }
+
+    struct CastWrite {
+      LocalSet* set;
+      Expression** valPtr;
+      RefCast* cast;
+    };
+    struct MultiCastCandidate {
+      Index a;
+      HeapType aHT;
+      HeapType lubHT;
+      std::vector<CastWrite> castWrites;
+    };
+    std::vector<MultiCastCandidate> candidates;
+
+    for (Index a = numParams; a < numLocals; ++a) {
+      if (localSets[a].size() < 2) {
+        continue;
+      }
+      Type aType = func->getLocalType(a);
+      if (!aType.isRef() || aType.isExact()) {
+        continue;
+      }
+      HeapType aHT = aType.getHeapType();
+      std::vector<CastWrite> castWrites;
+      bool allValid = true;
+      for (auto* set : localSets[a]) {
+        Expression** valPtr = &set->value;
+        while (auto* block = (*valPtr)->dynCast<Block>()) {
+          if (!block->name.is() && !block->list.empty()) {
+            valPtr = &block->list.back();
+          } else {
+            break;
+          }
+        }
+        Expression* val = *valPtr;
+        if (val->type.isNull()) {
+          continue;
+        }
+        auto* cast = val->dynCast<RefCast>();
+        if (cast && !cast->desc && !cast->type.isExact() &&
+            cast->type.getHeapType() == aHT && cast->ref->type.isRef() &&
+            !cast->ref->type.isNull() &&
+            cast->ref->type.getHeapType().getTop() == aHT.getTop()) {
+          castWrites.push_back({set, valPtr, cast});
+        } else {
+          allValid = false;
+          break;
+        }
+      }
+      if (!allValid || castWrites.size() < 2) {
+        continue;
+      }
+      HeapType lubHT = castWrites[0].cast->ref->type.getHeapType();
+      bool validLub = true;
+      for (size_t i = 1; i < castWrites.size(); ++i) {
+        auto nextLub = HeapType::getLeastUpperBound(
+          lubHT, castWrites[i].cast->ref->type.getHeapType());
+        if (!nextLub) {
+          validLub = false;
+          break;
+        }
+        lubHT = *nextLub;
+      }
+      if (!validLub || lubHT == aHT || !HeapType::isSubType(aHT, lubHT)) {
+        continue;
+      }
+      candidates.push_back({a, aHT, lubHT, std::move(castWrites)});
+    }
+
+    if (candidates.empty()) {
+      return false;
+    }
+
+    std::unordered_map<Expression*, std::optional<HeapType>> exprDemands;
+    DemandAnalyzer analyzer(*getModule(),
+                            func,
+                            nullptr,
+                            false,
+                            false,
+                            nullptr,
+                            nullptr,
+                            nullptr,
+                            &exprDemands);
+    analyzer.analyze();
+
+    struct PtrCollector : public PostWalker<PtrCollector> {
+      std::unordered_map<Index, std::vector<Expression**>> getPtrs;
+      std::unordered_map<LocalSet*, Expression**> setPtrs;
+      void visitLocalGet(LocalGet* curr) {
+        getPtrs[curr->index].push_back(getCurrentPointer());
+      }
+      void visitLocalSet(LocalSet* curr) {
+        setPtrs[curr] = getCurrentPointer();
+      }
+    } collector;
+    collector.walk(func->body);
+
+    Builder builder(*getModule());
+    bool anyModified = false;
+    for (auto& cand : candidates) {
+      std::vector<Expression**> narrowGets;
+      for (auto* getPtr : collector.getPtrs[cand.a]) {
+        auto* get = (*getPtr)->cast<LocalGet>();
+        auto demIt = exprDemands.find(get);
+        if (demIt == exprDemands.end() || !demIt->second ||
+            !HeapType::isSubType(cand.lubHT, *demIt->second)) {
+          narrowGets.push_back(getPtr);
+        }
+      }
+      std::vector<CastWrite> narrowTees;
+      bool missingSetPtr = false;
+      for (auto& cw : cand.castWrites) {
+        if (!collector.setPtrs.count(cw.set)) {
+          missingSetPtr = true;
+          break;
+        }
+        if (cw.set->isTee()) {
+          auto demIt = exprDemands.find(cw.set);
+          if (demIt == exprDemands.end() || !demIt->second ||
+              !HeapType::isSubType(cand.lubHT, *demIt->second)) {
+            narrowTees.push_back(cw);
+          }
+        }
+      }
+      if (missingSetPtr) {
+        continue;
+      }
+      if (narrowGets.size() + narrowTees.size() >= cand.castWrites.size()) {
+        continue;
+      }
+
+      Type wideType(cand.lubHT, Nullable);
+      func->vars[cand.a - numParams] = wideType;
+      for (auto& cw : cand.castWrites) {
+        *cw.valPtr = cw.cast->ref;
+      }
+      for (auto& cw : narrowTees) {
+        cw.set->type = wideType;
+        *collector.setPtrs[cw.set] = builder.makeRefCast(
+          cw.set, Type(cand.aHT, cw.cast->type.getNullability()));
+      }
+      for (auto* getPtr : narrowGets) {
+        (*getPtr)->type = wideType;
+        *getPtr = builder.makeRefCast(*getPtr, Type(cand.aHT, Nullable));
+      }
+      anyModified = true;
     }
     return anyModified;
   }
@@ -1014,6 +1337,11 @@ struct FunctionRelaxer
         }
         refreshLocals();
         if (unaliasCastLocals(func, sets)) {
+          gets = FindAll<LocalGet>(func->body).list;
+          sets = FindAll<LocalSet>(func->body).list;
+          refreshLocals();
+        }
+        if (sinkMultiSetCastLocals(func, sets)) {
           gets = FindAll<LocalGet>(func->body).list;
           sets = FindAll<LocalSet>(func->body).list;
           refreshLocals();
@@ -1253,6 +1581,7 @@ struct FuncConsumerSummary {
   std::vector<std::vector<ConsumerSite>> paramSites;
   std::vector<CallConsumerSite> callSites;
   std::vector<std::pair<Function*, Call*>> allCalls;
+  std::vector<Expression**> returnValueLocs;
 };
 
 void scanFunctionConsumers(Module& wasm,
@@ -1334,6 +1663,43 @@ void scanFunctionConsumers(Module& wasm,
         }
       }
       Expression* curr = *childp;
+      if (handled.count(curr)) {
+        return;
+      }
+      if (auto* iff = curr->dynCast<If>()) {
+        if (iff->ifFalse && iff->type.isRef()) {
+          handled.insert(iff);
+          Nullability armNull =
+            accNull == Nullable ? Nullable : iff->type.getNullability();
+          if (iff->ifTrue->type.isRef()) {
+            markAndRecord(&iff->ifTrue, isFixed, isSelfRet, accHT, armNull);
+          }
+          if (iff->ifFalse->type.isRef()) {
+            markAndRecord(&iff->ifFalse, isFixed, isSelfRet, accHT, armNull);
+          }
+          return;
+        }
+      }
+      if (auto* sel = curr->dynCast<Select>()) {
+        if (sel->type.isRef()) {
+          handled.insert(sel);
+          Nullability armNull =
+            accNull == Nullable ? Nullable : sel->type.getNullability();
+          if (sel->ifTrue->type.isRef()) {
+            markAndRecord(&sel->ifTrue, isFixed, isSelfRet, accHT, armNull);
+          }
+          if (sel->ifFalse->type.isRef()) {
+            markAndRecord(&sel->ifFalse, isFixed, isSelfRet, accHT, armNull);
+          }
+          return;
+        }
+      }
+      if (isSelfRet &&
+          std::find(out.returnValueLocs.begin(),
+                    out.returnValueLocs.end(),
+                    childp) == out.returnValueLocs.end()) {
+        out.returnValueLocs.push_back(childp);
+      }
       handled.insert(curr);
       if (auto* as = curr->dynCast<RefAs>()) {
         if (as->op == RefAsNonNull) {
@@ -1630,23 +1996,26 @@ struct RelaxNullability : public Pass {
       }
     }
 
+    bool mergeSignatures = hasArgument("relax-nullability-merge-signatures");
     Builder builder(*module);
     std::unordered_set<Function*> modifiedFuncs;
+    std::unordered_set<Function*> generalizedFuncs;
+    std::unordered_set<HeapType> usedTargetHTs;
+    std::unordered_map<Expression*, Type> strippedCastDemands;
     GlobalTypeRewriter::SignatureUpdates genUpdates;
 
-    for (auto& [ht, flist] : htFuncs) {
-      if (pinnedHTs.count(ht) || flist.empty()) {
-        continue;
+    auto tryGeneralizeGroup = [&](HeapType ht,
+                                  const std::vector<Function*>& flist,
+                                  bool canMutateHTInPlace) {
+      if (usedTargetHTs.count(ht)) {
+        canMutateHTInPlace = false;
       }
       Signature origSig = ht.getSignature();
-      if (sigFuncCount[origSig] != flist.size()) {
-        continue;
-      }
       if (origSig.params.isTuple() && origSig.params.size() > 16) {
-        continue;
+        return;
       }
       if (origSig.results.isTuple()) {
-        continue;
+        return;
       }
 
       std::vector<Type> origParams(origSig.params.begin(),
@@ -1659,7 +2028,9 @@ struct RelaxNullability : public Pass {
 
       // Build candidate target signatures:
       // 1. Canonical root-ancestor signature (with result keep / null / root).
-      // 2. Zero-cast basic-type (`any` / `eq` / `func`) generalized signature.
+      // 2. Selective per-parameter LUB / root widening for parameters with
+      //    caller RefCasts.
+      // 3. Zero-cast basic-type (`any` / `eq` / `func`) generalized signature.
       std::vector<Signature> candidates;
       {
         std::vector<Type> rootParams = origParams;
@@ -1674,9 +2045,78 @@ struct RelaxNullability : public Pass {
           Type rootRes = Type(getRootAncestor(origRes.getHeapType()), Nullable);
           if (nullRes != origRes) {
             candidates.push_back(Signature(Type(rootParams), nullRes));
+            candidates.push_back(Signature(origSig.params, nullRes));
           }
           if (rootRes != nullRes) {
             candidates.push_back(Signature(Type(rootParams), rootRes));
+            candidates.push_back(Signature(origSig.params, rootRes));
+          }
+        }
+      }
+      {
+        std::vector<Type> selLubParams = origParams;
+        std::vector<Type> selRootParams = origParams;
+        bool anySel = false;
+        for (size_t i = 0; i < origParams.size(); ++i) {
+          Type p = origParams[i];
+          if (!p.isRef() || p.isExact()) {
+            continue;
+          }
+          HeapType lubHT = p.getHeapType();
+          int castCallers = 0;
+          bool validLub = true;
+          for (auto* f : flist) {
+            auto callIt = allCallsTo.find(f->name);
+            if (callIt == allCallsTo.end()) {
+              continue;
+            }
+            for (auto& [caller, call] : callIt->second) {
+              if (i >= call->operands.size()) {
+                continue;
+              }
+              Expression* arg = call->operands[i];
+              if (auto* cast = arg->dynCast<RefCast>()) {
+                if (!cast->desc && cast->ref->type.isRef() &&
+                    !cast->ref->type.isNull() &&
+                    cast->ref->type.getHeapType().getTop() == lubHT.getTop()) {
+                  if (auto nextLub = HeapType::getLeastUpperBound(
+                        lubHT, cast->ref->type.getHeapType())) {
+                    lubHT = *nextLub;
+                    castCallers++;
+                    continue;
+                  }
+                }
+              }
+              if (arg->type.isRef() && !arg->type.isNull()) {
+                if (auto nextLub = HeapType::getLeastUpperBound(
+                      lubHT, arg->type.getHeapType())) {
+                  lubHT = *nextLub;
+                } else {
+                  validLub = false;
+                }
+              }
+            }
+          }
+          if (castCallers > 0 && validLub) {
+            selLubParams[i] = Type(lubHT, Nullable);
+            selRootParams[i] = Type(getRootAncestor(p.getHeapType()), Nullable);
+            anySel = true;
+            if (origParams.size() > 1) {
+              std::vector<Type> singleLub = origParams;
+              singleLub[i] = selLubParams[i];
+              candidates.push_back(Signature(Type(singleLub), origRes));
+              std::vector<Type> singleRoot = origParams;
+              singleRoot[i] = selRootParams[i];
+              if (singleRoot != singleLub) {
+                candidates.push_back(Signature(Type(singleRoot), origRes));
+              }
+            }
+          }
+        }
+        if (anySel) {
+          candidates.push_back(Signature(Type(selLubParams), origRes));
+          if (selRootParams != selLubParams) {
+            candidates.push_back(Signature(Type(selRootParams), origRes));
           }
         }
       }
@@ -1701,6 +2141,17 @@ struct RelaxNullability : public Pass {
               break;
             }
             for (auto& site : sum.paramSites[i]) {
+              auto sdIt = strippedCastDemands.find(site.get);
+              if (sdIt != strippedCastDemands.end()) {
+                if (!Type::isSubType(Type(topHT, Nullable), sdIt->second)) {
+                  canTop = false;
+                }
+                if (!canEq ||
+                    !Type::isSubType(Type(eqHT, Nullable), sdIt->second)) {
+                  canEq = false;
+                }
+                continue;
+              }
               if (!site.isFixedConsumer || site.isSelfReturn) {
                 canTop = false;
                 canEq = false;
@@ -1736,6 +2187,17 @@ struct RelaxNullability : public Pass {
               break;
             }
             for (auto& csite : it->second) {
+              auto sdIt = strippedCastDemands.find(csite.call);
+              if (sdIt != strippedCastDemands.end()) {
+                if (!Type::isSubType(Type(topHT, Nullable), sdIt->second)) {
+                  canTop = false;
+                }
+                if (!canEq ||
+                    !Type::isSubType(Type(eqHT, Nullable), sdIt->second)) {
+                  canEq = false;
+                }
+                continue;
+              }
               if (!csite.isFixedConsumer ||
                   csite.acceptedNull == NonNullable) {
                 canTop = false;
@@ -1776,7 +2238,7 @@ struct RelaxNullability : public Pass {
           continue;
         }
         bool alreadyExists = sigToHT.count(candSig) != 0;
-        if (!alreadyExists && canonSigCount[candSig] < 2) {
+        if (!canMutateHTInPlace && !alreadyExists) {
           continue;
         }
 
@@ -1788,6 +2250,8 @@ struct RelaxNullability : public Pass {
         int castsSavedBytes = 0;
         bool possible = true;
 
+        int totalNarrowGets = 0;
+        int totalNarrowCalls = 0;
         for (auto* f : flist) {
           auto& sum = summaries.map[f];
           for (size_t i = 0; i < origParams.size(); ++i) {
@@ -1801,6 +2265,14 @@ struct RelaxNullability : public Pass {
             }
             int narrowGets = 0;
             for (auto& site : sum.paramSites[i]) {
+              auto sdIt = strippedCastDemands.find(site.get);
+              if (sdIt != strippedCastDemands.end()) {
+                if (!Type::isSubType(candParams[i], sdIt->second)) {
+                  possible = false;
+                  break;
+                }
+                continue;
+              }
               Type accType =
                 site.isSelfReturn
                   ? candRes
@@ -1810,13 +2282,12 @@ struct RelaxNullability : public Pass {
                 narrowGets++;
               }
             }
-            if (narrowGets > 1) {
+            if (!possible || narrowGets > 8) {
               possible = false;
               break;
             }
-            if (narrowGets == 1) {
-              castsAddedBytes += 3;
-            }
+            totalNarrowGets = std::max(totalNarrowGets, narrowGets);
+            castsAddedBytes += narrowGets * 3;
             auto callIt = allCallsTo.find(f->name);
             if (callIt != allCallsTo.end()) {
               for (auto& [caller, call] : callIt->second) {
@@ -1847,6 +2318,14 @@ struct RelaxNullability : public Pass {
             int callCastBytes =
               (candRes.getHeapType() != origRes.getHeapType()) ? 3 : 1;
             for (auto& csite : callIt->second) {
+              auto sdIt = strippedCastDemands.find(csite.call);
+              if (sdIt != strippedCastDemands.end()) {
+                if (!Type::isSubType(candRes, sdIt->second)) {
+                  possible = false;
+                  break;
+                }
+                continue;
+              }
               Type accType(csite.acceptedHT, csite.acceptedNull);
               if (!csite.isFixedConsumer ||
                   !Type::isSubType(candRes, accType)) {
@@ -1854,28 +2333,29 @@ struct RelaxNullability : public Pass {
                 castsAddedBytes += callCastBytes;
               }
             }
-            if (narrowCalls > 1) {
+            if (!possible || narrowCalls > 8) {
               possible = false;
               break;
             }
-            Expression* tail = f->body;
-            while (auto* b = tail->dynCast<Block>()) {
-              if (!b->name.is() && !b->list.empty()) {
-                tail = b->list.back();
-              } else {
-                break;
+            totalNarrowCalls = std::max(totalNarrowCalls, narrowCalls);
+            for (auto* tailp : sum.returnValueLocs) {
+              Expression* tail = *tailp;
+              if (auto* as = tail->dynCast<RefAs>()) {
+                if (as->op == RefAsNonNull && candRes.isNullable()) {
+                  castsSavedBytes += 1;
+                  tail = as->value;
+                }
               }
-            }
-            if (auto* as = tail->dynCast<RefAs>()) {
-              if (as->op == RefAsNonNull && candRes.isNullable()) {
-                castsSavedBytes += 1;
-              }
-            } else if (auto* cast = tail->dynCast<RefCast>()) {
-              if (!cast->desc && cast->ref->type.isRef() &&
-                  !cast->ref->type.isNull() &&
-                  HeapType::isSubType(cast->ref->type.getHeapType(),
-                                      candRes.getHeapType())) {
-                castsSavedBytes += 3;
+              if (auto* cast = tail->dynCast<RefCast>()) {
+                if (!cast->desc && cast->ref->type.isRef() &&
+                    !cast->ref->type.isNull() &&
+                    HeapType::isSubType(cast->ref->type.getHeapType(),
+                                        candRes.getHeapType())) {
+                  castsSavedBytes +=
+                    (candRes.isNonNullable() && cast->ref->type.isNullable())
+                      ? 2
+                      : 3;
+                }
               }
             }
           }
@@ -1884,10 +2364,23 @@ struct RelaxNullability : public Pass {
         if (!possible) {
           continue;
         }
-        if (castsAddedBytes > castsSavedBytes + (alreadyExists ? 4 : 0)) {
-          continue;
+        if (castsSavedBytes <= castsAddedBytes) {
+          if (!canMutateHTInPlace ||
+              (!alreadyExists && canonSigCount[candSig] < 2)) {
+            continue;
+          }
+          if (!mergeSignatures &&
+              (totalNarrowGets > 1 || totalNarrowCalls > 1 ||
+               castsAddedBytes > castsSavedBytes + (alreadyExists ? 4 : 0))) {
+            continue;
+          }
         }
-        int typeSaving = alreadyExists ? sigDefBytes : (sigDefBytes / 2);
+        int typeSaving = 0;
+        if (canMutateHTInPlace) {
+          typeSaving = alreadyExists
+                         ? sigDefBytes
+                         : (canonSigCount[candSig] >= 2 ? (sigDefBytes / 2) : 0);
+        }
         int net = typeSaving + castsSavedBytes - castsAddedBytes;
         if (net > bestNet) {
           bestNet = net;
@@ -1896,16 +2389,19 @@ struct RelaxNullability : public Pass {
       }
 
       if (bestSig == origSig || bestNet <= 0) {
-        continue;
+        return;
       }
 
       HeapType targetHT = ht;
       auto sigIt = sigToHT.find(bestSig);
       if (sigIt != sigToHT.end()) {
         targetHT = sigIt->second;
+        usedTargetHTs.insert(targetHT);
       } else {
         targetHT = ht;
+        sigToHT.erase(origSig);
         sigToHT.emplace(bestSig, ht);
+        usedTargetHTs.insert(ht);
         genUpdates[ht] = bestSig;
       }
       existingSigs.insert(bestSig);
@@ -1916,6 +2412,7 @@ struct RelaxNullability : public Pass {
 
       for (auto* f : flist) {
         modifiedFuncs.insert(f);
+        generalizedFuncs.insert(f);
         auto& sum = summaries.map[f];
         for (size_t i = 0; i < origParams.size(); ++i) {
           if (targetParams[i] == origParams[i]) {
@@ -1923,6 +2420,9 @@ struct RelaxNullability : public Pass {
           }
           for (auto& site : sum.paramSites[i]) {
             site.get->type = targetParams[i];
+            if (strippedCastDemands.count(site.get)) {
+              continue;
+            }
             Type accType =
               site.isSelfReturn
                 ? targetRes
@@ -1950,6 +2450,20 @@ struct RelaxNullability : public Pass {
                       Type::isSubType(cast->ref->type, targetParams[i])) {
                     call->operands[i] = cast->ref;
                     modifiedFuncs.insert(caller);
+                    Expression* inner = cast->ref;
+                    Nullability reqNull = targetParams[i].getNullability();
+                    if (auto* as = inner->dynCast<RefAs>()) {
+                      if (as->op == RefAsNonNull) {
+                        inner = as->value;
+                        reqNull = NonNullable;
+                      }
+                    }
+                    Type reqType(targetParams[i].getHeapType(), reqNull);
+                    auto sdIt = strippedCastDemands.find(inner);
+                    if (sdIt == strippedCastDemands.end() ||
+                        Type::isSubType(reqType, sdIt->second)) {
+                      strippedCastDemands[inner] = reqType;
+                    }
                   }
                 }
               }
@@ -1958,27 +2472,21 @@ struct RelaxNullability : public Pass {
         }
 
         if (targetRes != origRes) {
-          Expression** tailp = &f->body;
-          while (auto* b = (*tailp)->dynCast<Block>()) {
-            if (!b->name.is() && !b->list.empty()) {
-              tailp = &b->list.back();
-            } else {
-              break;
+          for (auto* tailp : sum.returnValueLocs) {
+            if (auto* as = (*tailp)->dynCast<RefAs>()) {
+              if (as->op == RefAsNonNull && targetRes.isNullable()) {
+                *tailp = as->value;
+              }
             }
-          }
-          if (auto* as = (*tailp)->dynCast<RefAs>()) {
-            if (as->op == RefAsNonNull && targetRes.isNullable()) {
-              *tailp = as->value;
-            }
-          }
-          if (auto* cast = (*tailp)->dynCast<RefCast>()) {
-            if (!cast->desc && cast->ref->type.isRef() &&
-                !cast->ref->type.isNull() &&
-                HeapType::isSubType(cast->ref->type.getHeapType(),
-                                    targetRes.getHeapType())) {
-              *tailp = cast->ref;
-              if (targetRes.isNonNullable() && (*tailp)->type.isNullable()) {
-                *tailp = builder.makeRefAs(RefAsNonNull, *tailp);
+            if (auto* cast = (*tailp)->dynCast<RefCast>()) {
+              if (!cast->desc && cast->ref->type.isRef() &&
+                  !cast->ref->type.isNull() &&
+                  HeapType::isSubType(cast->ref->type.getHeapType(),
+                                      targetRes.getHeapType())) {
+                *tailp = cast->ref;
+                if (targetRes.isNonNullable() && (*tailp)->type.isNullable()) {
+                  *tailp = builder.makeRefAs(RefAsNonNull, *tailp);
+                }
               }
             }
           }
@@ -1989,6 +2497,9 @@ struct RelaxNullability : public Pass {
               modifiedFuncs.insert(csite.caller);
               if (csite.call->type != Type::unreachable) {
                 csite.call->type = targetRes;
+              }
+              if (strippedCastDemands.count(csite.call)) {
+                continue;
               }
               Type accType(csite.acceptedHT, csite.acceptedNull);
               if (csite.isFixedConsumer &&
@@ -2011,6 +2522,30 @@ struct RelaxNullability : public Pass {
         }
 
         f->type = f->type.with(targetHT);
+      }
+    };
+
+    // First pass: whole-HeapType groups where `ht` is unpinned and not shared
+    // with escaped functions.
+    for (auto& [ht, flist] : htFuncs) {
+      if (pinnedHTs.count(ht) || flist.empty()) {
+        continue;
+      }
+      Signature origSig = ht.getSignature();
+      if (sigFuncCount[origSig] != flist.size()) {
+        continue;
+      }
+      tryGeneralizeGroup(ht, flist, true);
+    }
+
+    // Second pass: per-function fallback for any remaining non-escaped function
+    // where switching to an already-existing signature saves casts in the code
+    // section.
+    for (auto& [ht, flist] : htFuncs) {
+      for (auto* f : flist) {
+        if (!generalizedFuncs.count(f)) {
+          tryGeneralizeGroup(ht, {f}, false);
+        }
       }
     }
 
