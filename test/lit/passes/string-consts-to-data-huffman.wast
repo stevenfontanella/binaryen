@@ -88,9 +88,9 @@
 
   ;; CHECK:      (global $string.consts$table (mut (ref null $1)) (ref.null none))
 
-  ;; CHECK:      (global $lz$bits (mut i32) (i32.const 1928))
+  ;; CHECK:      (global $lz$bits (mut i32) (i32.const 2064))
 
-  ;; CHECK:      (data $string.consts "\00\01\06\00\00\00\00\00\00\00\00\00\00\00\00\fe\n\r\14\1fD\fc\01\02\00\00\00\00\00\00\00\00\00\00\00\00\00\ff\0b(\00\00\00\05\15\02\00\00\00\00\00\00\00\00\00fhlyzabcdegijkmnopqrstuvwx\tA\00\00\00\00\08.\04\00\00\00\00\00\00\00\00\00XYZ^_lo!#$%&()*+-/0123456789:=@BCDEFGHIJKLMNOPQRSTUVW\n e\e9\01\02\00\00\00\00\00\00\00\00\00\00\00\00\00\f2e\c7\01\02\00\00\00\00\00\00\00\00\00\00\00\00\00f\01#\02\00\00\00\00\00\00\00\00\00\00\00\00\00\00\03\10\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\a8\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\01\03\ce\01\fe\19\e3\9f\0f\7f\8c\f1\af:\e7\00\e0\fcK\a0\1c\f8U\a1KS\d9\da5\d0\fa\0e\fb0\c41M4\e7\a5\acuk{?\c69\afu\ef\e7\bc\17>\c4Xl\e5h\d7x\d6w\01\84>\c28$QH9\89Y*r%M\e9\faP\a7\b6\e86\8ey\b3gq*\e0\97\82\cbW\dd\fa4\bb]\dd\ec\c7\d0\c76\d5\b9,y\a5-\ed\f1\08\'^\fe\86\c7\bd\16\1a\a4\b1\b2\c5a\f7y\d7?\c1\0eW4\e3\91t\a1\e5U,R\96\89$%\eaAE\cdS0\9ci3c\e9T\81?\17\a5\acU\ab{3\da\d9\ad~\0fg\bc\d3\9by\91Umz7\87=\dd\05\b7\7f\f0\r0\a2\84\c9\ceNq\ab\d7\fc\1e\8cpF+\de\c9\11n\feD\96DVD+F\b7\aa\d3\80z\03\cd\90E+\a5\04~\faE*c\15jl|\eb:\db\9bA\8fj\92\99\97\b7\de\ed\ec\fbX\e7\bc\c6\dd\9f\f6VXP\c6\94\a8XG&\b4\81\f3\c1\f3.:\c1\8e\82\e4,>\e9\ca\87le\e9S\1dZ\a7\cd\a8f\c9\b2Ei\02")
+  ;; CHECK:      (data $string.consts "\00\04\00\00\00\00\00\00\00\00\00\00\00\00\00\r\1f\fc\fe\00\03\02\00\00\00\00\00\00\00\00\00\00\00\00D\fc\fe\n\14\01\02\00\00\00\00\00\00\00\00\00\00\00\00\00\ff\0b(\00\00\00\05\15\02\00\00\00\00\00\00\00\00\00fhlyzabcdegijkmnopqrstuvwx\tA\00\00\00\00\08.\04\00\00\00\00\00\00\00\00\00XYZ^_lo!#$%&()*+-/0123456789:=@BCDEFGHIJKLMNOPQRSTUVW\n e\e9\01\02\00\00\00\00\00\00\00\00\00\00\00\00\00\f2e\c7\01\02\00\00\00\00\00\00\00\00\00\00\00\00\00f\01#\02\00\00\00\00\00\00\00\00\00\00\00\00\00\00\03\10\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\a8\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\01\00\e7\00\ff\8c\f1\cf\87?\c6\f8w\c9\f9\008\ff\96\91\80_\15\ba4\95\ad]\03\ad\ef\b0\0fC\1c\d3Ds^\caZ\b7\b6\f7c\9c\f3Z\f7~\ce{\e1C\8c\c5V\8ev\8dg}\17@\e8#\8cC\12\85\94\93\98\a5\"W\d2\94\ae\0fuj\8bn\e3\987{\16\a7\02~)\b8|\d5\adO\b3\db\d5\cd~\0c}lS\9d\cb\92W\da\d2\1e\8fp\e2\e5ox\dck\a1A\1a+[\1cv\9fw\fd\13\ecpE3\1eI\17Z^\c5\"e\99HR\a2\1eT\d4<\05\c3\9963\96N\15\f8sQ\caZ\b5\ba7\a3\9d\dd\ea\f7p\c6;\bd\99\17Y\d5\a6ws\d8\d3]p\fb\07\df\00#J\98\ec\ec\14\b7z\cd\ef\c1\08g\b4\e2\9d\1c\e1\e6OdIdE\b4bt\ab:\r\a87\d0\0cY\b4RJ\e0\'/R\19\abPc\e3[\d7\d9\de\0czT\93\cc\bc\bc\f5ng\df\c7:\e75\ee\fe\b4\b7\c2\822\a6D\c5:2\a1\r\9c\0f\9ew\d1\tv\14$g\f1IW>d+K\9f\ea\d0:mF5K\96-J\13\00")
 
   ;; CHECK:      (export "col" (func $read-column))
 
@@ -204,7 +204,8 @@
 ;; CHECK-NEXT:   )
 ;; CHECK-NEXT:  )
 ;; CHECK-NEXT: )
-;; CHECK-NEXT: (func $lz$symbol (type $12) (param $0 (ref $2)) (param $1 i32) (result i32)
+
+;; CHECK:      (func $lz$symbol (type $12) (param $0 (ref $2)) (param $1 i32) (result i32)
 ;; CHECK-NEXT:  (local $2 i32)
 ;; CHECK-NEXT:  (local $3 i32)
 ;; CHECK-NEXT:  (local $4 i32)
@@ -328,7 +329,8 @@
 ;; CHECK-NEXT:   (br $next)
 ;; CHECK-NEXT:  )
 ;; CHECK-NEXT: )
-;; CHECK-NEXT: (func $string.consts$decode (type $13)
+
+;; CHECK:      (func $string.consts$decode (type $13)
 ;; CHECK-NEXT:  (local $0 (ref $2))
 ;; CHECK-NEXT:  (local $1 (ref $0))
 ;; CHECK-NEXT:  (local $2 i32)
@@ -340,7 +342,7 @@
 ;; CHECK-NEXT:  (local.set $0
 ;; CHECK-NEXT:   (array.new_data $2 $string.consts
 ;; CHECK-NEXT:    (i32.const 0)
-;; CHECK-NEXT:    (i32.const 543)
+;; CHECK-NEXT:    (i32.const 560)
 ;; CHECK-NEXT:   )
 ;; CHECK-NEXT:  )
 ;; CHECK-NEXT:  (local.set $1
@@ -352,7 +354,14 @@
 ;; CHECK-NEXT:   (local.set $4
 ;; CHECK-NEXT:    (call $lz$symbol
 ;; CHECK-NEXT:     (local.get $0)
-;; CHECK-NEXT:     (i32.const 0)
+;; CHECK-NEXT:     (select
+;; CHECK-NEXT:      (i32.const 19)
+;; CHECK-NEXT:      (i32.const 0)
+;; CHECK-NEXT:      (i32.lt_u
+;; CHECK-NEXT:       (local.get $4)
+;; CHECK-NEXT:       (i32.const 2)
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:     )
 ;; CHECK-NEXT:    )
 ;; CHECK-NEXT:   )
 ;; CHECK-NEXT:   (local.set $5
@@ -372,7 +381,7 @@
 ;; CHECK-NEXT:       (i32.const 63)
 ;; CHECK-NEXT:       (call $lz$symbol
 ;; CHECK-NEXT:        (local.get $0)
-;; CHECK-NEXT:        (i32.const 22)
+;; CHECK-NEXT:        (i32.const 39)
 ;; CHECK-NEXT:       )
 ;; CHECK-NEXT:      )
 ;; CHECK-NEXT:     )
@@ -405,12 +414,12 @@
 ;; CHECK-NEXT:             (i32.or
 ;; CHECK-NEXT:              (call $lz$symbol
 ;; CHECK-NEXT:               (local.get $0)
-;; CHECK-NEXT:               (i32.const 156)
+;; CHECK-NEXT:               (i32.const 173)
 ;; CHECK-NEXT:              )
 ;; CHECK-NEXT:              (i32.shl
 ;; CHECK-NEXT:               (call $lz$symbol
 ;; CHECK-NEXT:                (local.get $0)
-;; CHECK-NEXT:                (i32.const 174)
+;; CHECK-NEXT:                (i32.const 191)
 ;; CHECK-NEXT:               )
 ;; CHECK-NEXT:               (i32.const 8)
 ;; CHECK-NEXT:              )
@@ -430,8 +439,8 @@
 ;; CHECK-NEXT:          (call $lz$symbol
 ;; CHECK-NEXT:           (local.get $0)
 ;; CHECK-NEXT:           (select
-;; CHECK-NEXT:            (i32.const 40)
-;; CHECK-NEXT:            (i32.const 83)
+;; CHECK-NEXT:            (i32.const 57)
+;; CHECK-NEXT:            (i32.const 100)
 ;; CHECK-NEXT:            (i32.lt_u
 ;; CHECK-NEXT:             (local.get $2)
 ;; CHECK-NEXT:             (i32.const 96)
@@ -469,12 +478,12 @@
 ;; CHECK-NEXT:        (i32.or
 ;; CHECK-NEXT:         (call $lz$symbol
 ;; CHECK-NEXT:          (local.get $0)
-;; CHECK-NEXT:          (i32.const 209)
+;; CHECK-NEXT:          (i32.const 226)
 ;; CHECK-NEXT:         )
 ;; CHECK-NEXT:         (i32.shl
 ;; CHECK-NEXT:          (call $lz$symbol
 ;; CHECK-NEXT:           (local.get $0)
-;; CHECK-NEXT:           (i32.const 225)
+;; CHECK-NEXT:           (i32.const 242)
 ;; CHECK-NEXT:          )
 ;; CHECK-NEXT:          (i32.const 8)
 ;; CHECK-NEXT:         )
@@ -485,7 +494,7 @@
 ;; CHECK-NEXT:       (local.set $6
 ;; CHECK-NEXT:        (call $lz$symbol
 ;; CHECK-NEXT:         (local.get $0)
-;; CHECK-NEXT:         (i32.const 192)
+;; CHECK-NEXT:         (i32.const 209)
 ;; CHECK-NEXT:        )
 ;; CHECK-NEXT:       )
 ;; CHECK-NEXT:      )

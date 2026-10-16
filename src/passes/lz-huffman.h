@@ -67,6 +67,7 @@ namespace wasm::LZHuffman {
 // The classes of bytes in the token stream, each with its own Huffman code.
 enum Table : uint8_t {
   TokenTable,
+  TokenTable2,
   ExtraTable,
   NarrowTable,
   NarrowTable2,
@@ -113,6 +114,9 @@ struct Encoder {
   // Whether to split narrow literals into two Huffman tables by previous unit
   // (< NarrowCtxThreshold vs >= NarrowCtxThreshold).
   bool splitNarrow = true;
+  // Whether to split tokens into two Huffman tables by previous token kind
+  // (< 2 after a literal run vs >= 2 after a match).
+  bool splitToken = true;
 
   // The largest length a token can hold: 63 + one extra byte.
   static constexpr Index MaxTokenLength = 63 + 255;
@@ -154,14 +158,15 @@ struct Encoder {
       }
     }
 
-    Index runTokenCost(Index kind, Index length) const {
+    Index runTokenCost(Index kind, Index length, bool afterLit = false) const {
       if (length == 0) {
         return 0;
       }
+      Table table = afterLit ? TokenTable2 : TokenTable;
       if (length < 63) {
-        return cost[TokenTable][kind | (length << 2)];
+        return cost[table][kind | (length << 2)];
       }
-      return cost[TokenTable][kind | (63 << 2)] + cost[ExtraTable][length - 63];
+      return cost[table][kind | (63 << 2)] + cost[ExtraTable][length - 63];
     }
 
     Index narrowCost(uint16_t unit, uint16_t prev, bool splitNarrow) const {
@@ -184,15 +189,16 @@ struct Encoder {
              cost[DistHiTable][distance >> 8];
     }
 
-    Index matchCost(Index length, Index distance) const {
+    Index matchCost(Index length, Index distance, bool afterLit = false) const {
       Index tokenLength = length - MinMatch;
+      Table table = afterLit ? TokenTable2 : TokenTable;
       Index bits = 0;
       if (tokenLength < 63) {
-        bits += cost[TokenTable]
+        bits += cost[table]
                     [(distance <= ShortDistance ? 2 : 3) | (tokenLength << 2)];
       } else {
         bits +=
-          cost[TokenTable][(distance <= ShortDistance ? 2 : 3) | (63 << 2)] +
+          cost[table][(distance <= ShortDistance ? 2 : 3) | (63 << 2)] +
           cost[ExtraTable][tokenLength - 63];
       }
       return bits + distCost(distance);
@@ -270,7 +276,8 @@ struct Encoder {
             break;
           }
           if (units[j2] == units[i] && units[j2 + 1] == units[i + 1]) {
-            Index cost = model->matchCost(2, distance);
+            Index cost = model->matchCost(2, distance, true) +
+                         model->matchCost(2, distance, false);
             if (cost < bestCost2) {
               bestCost2 = cost;
               bestDist2 = distance;
@@ -356,8 +363,10 @@ struct Encoder {
               for (Index c = 0; c < candidates.size; c++) {
                 auto& cand = candidates.data[c];
                 if (cand.length == length &&
-                    model->matchCost(length, distance) <
-                      model->matchCost(length, cand.distance)) {
+                    model->matchCost(length, distance, true) +
+                        model->matchCost(length, distance, false) <
+                      model->matchCost(length, cand.distance, true) +
+                        model->matchCost(length, cand.distance, false)) {
                   cand.distance = distance;
                   updated = true;
                   break;
@@ -399,8 +408,8 @@ struct Encoder {
       isWideAfterMatch(n, 0);
     for (Index i = n; i > 0;) {
       i--;
-      Match bestMatch;
-      Index bestCost = Index(-1);
+      Match bestMatchAfterMatch, bestMatchAfterLit;
+      Index bestCostAfterMatch = Index(-1), bestCostAfterLit = Index(-1);
       auto& candidates = matches[i];
       if (candidates.size > 0) {
         Index maxCandLen = candidates.data[candidates.size - 1].length;
@@ -409,12 +418,18 @@ struct Encoder {
           while (k < candidates.size && candidates.data[k].length < length) {
             k++;
           }
+          Index nextCost = costAfterMatch[i + length];
           for (Index m = k; m < candidates.size; m++) {
-            Index cost = model.matchCost(length, candidates.data[m].distance) +
-                         costAfterMatch[i + length];
-            if (cost < bestCost) {
-              bestCost = cost;
-              bestMatch = {length, candidates.data[m].distance};
+            Index dist = candidates.data[m].distance;
+            Index costM = model.matchCost(length, dist, false) + nextCost;
+            if (costM < bestCostAfterMatch) {
+              bestCostAfterMatch = costM;
+              bestMatchAfterMatch = {length, dist};
+            }
+            Index costL = model.matchCost(length, dist, true) + nextCost;
+            if (costL < bestCostAfterLit) {
+              bestCostAfterLit = costL;
+              bestMatchAfterLit = {length, dist};
             }
           }
         }
@@ -424,7 +439,8 @@ struct Encoder {
         hasWide && (units[i] >= NarrowCtxThreshold || i + 1 == n ||
                     choiceAfterWide[i + 1].length != 0 ||
                     isWideAfterWide[i + 1]);
-      Index cWideNew = Index(-1), cWideSame = Index(-1);
+      Index cWideNewAfterMatch = Index(-1), cWideNewAfterLit = Index(-1),
+            cWideSame = Index(-1);
       Index nextLenW = runLenWide[i + 1];
       if (canWide) {
         uint16_t prevW = approxPrevWide[i];
@@ -437,49 +453,56 @@ struct Encoder {
           }
         }
         Index wideUnit = model.wideCost(units[i], prevW) + restorePenalty;
-        cWideNew =
-          model.runTokenCost(1, 1) + wideUnit + costAfterWide[i + 1];
+        cWideNewAfterMatch =
+          model.runTokenCost(1, 1, false) + wideUnit + costAfterWide[i + 1];
+        cWideNewAfterLit =
+          model.runTokenCost(1, 1, true) + wideUnit + costAfterWide[i + 1];
         cWideSame =
           (nextLenW == MaxTokenLength - 1)
-            ? (wideUnit + costAfterWide[i + 1] + model.runTokenCost(1, 1))
+            ? (wideUnit + costAfterWide[i + 1] + model.runTokenCost(1, 1, true))
             : (wideUnit + costAfterWide[i + 1] +
-               model.runTokenCost(1, nextLenW + 2) -
-               model.runTokenCost(1, nextLenW + 1));
+               model.runTokenCost(1, nextLenW + 2, false) -
+               model.runTokenCost(1, nextLenW + 1, false));
       }
 
-      Index cNarSame = Index(-1), cNarNew = Index(-1);
+      Index cNarSame = Index(-1), cNarNewAfterMatch = Index(-1),
+            cNarNewAfterLit = Index(-1);
       Index nextLenN = runLenNarrow[i + 1];
       if (units[i] < 256) {
         uint16_t prevUnit = i == 0 ? 0 : units[i - 1];
         Index narUnit = model.narrowCost(units[i], prevUnit, splitNarrow);
-        cNarNew = model.runTokenCost(0, 1) + narUnit + costAfterNarrow[i + 1];
+        cNarNewAfterMatch =
+          model.runTokenCost(0, 1, false) + narUnit + costAfterNarrow[i + 1];
+        cNarNewAfterLit =
+          model.runTokenCost(0, 1, true) + narUnit + costAfterNarrow[i + 1];
         cNarSame =
           (nextLenN == MaxTokenLength - 1)
-            ? (narUnit + costAfterNarrow[i + 1] + model.runTokenCost(0, 1))
+            ? (narUnit + costAfterNarrow[i + 1] +
+               model.runTokenCost(0, 1, true))
             : (narUnit + costAfterNarrow[i + 1] +
-               model.runTokenCost(0, nextLenN + 2) -
-               model.runTokenCost(0, nextLenN + 1));
+               model.runTokenCost(0, nextLenN + 2, false) -
+               model.runTokenCost(0, nextLenN + 1, false));
       }
 
-      costAfterWide[i] = bestCost;
-      choiceAfterWide[i] = bestMatch;
+      costAfterWide[i] = bestCostAfterLit;
+      choiceAfterWide[i] = bestMatchAfterLit;
       if (canWide && cWideSame <= costAfterWide[i]) {
         costAfterWide[i] = cWideSame;
         choiceAfterWide[i] = Match();
         isWideAfterWide[i] = 1;
         runLenWide[i] = (nextLenW == MaxTokenLength - 1) ? 0 : (nextLenW + 1);
       }
-      if (units[i] < 256 && cNarNew <= costAfterWide[i]) {
-        costAfterWide[i] = cNarNew;
+      if (units[i] < 256 && cNarNewAfterLit <= costAfterWide[i]) {
+        costAfterWide[i] = cNarNewAfterLit;
         choiceAfterWide[i] = Match();
         isWideAfterWide[i] = 0;
         runLenWide[i] = 0;
       }
 
-      costAfterNarrow[i] = bestCost;
-      choiceAfterNarrow[i] = bestMatch;
-      if (canWide && cWideNew <= costAfterNarrow[i]) {
-        costAfterNarrow[i] = cWideNew;
+      costAfterNarrow[i] = bestCostAfterLit;
+      choiceAfterNarrow[i] = bestMatchAfterLit;
+      if (canWide && cWideNewAfterLit <= costAfterNarrow[i]) {
+        costAfterNarrow[i] = cWideNewAfterLit;
         choiceAfterNarrow[i] = Match();
         isWideAfterNarrow[i] = 1;
         runLenNarrow[i] = 0;
@@ -491,15 +514,19 @@ struct Encoder {
         runLenNarrow[i] = (nextLenN == MaxTokenLength - 1) ? 0 : (nextLenN + 1);
       }
 
-      costAfterMatch[i] = bestCost;
-      choiceAfterMatch[i] = bestMatch;
-      if (canWide && cWideNew <= costAfterMatch[i]) {
-        costAfterMatch[i] = cWideNew;
+      bool initAfterLit = (i == 0);
+      costAfterMatch[i] = initAfterLit ? bestCostAfterLit : bestCostAfterMatch;
+      choiceAfterMatch[i] =
+        initAfterLit ? bestMatchAfterLit : bestMatchAfterMatch;
+      Index cWideNewM = initAfterLit ? cWideNewAfterLit : cWideNewAfterMatch;
+      Index cNarNewM = initAfterLit ? cNarNewAfterLit : cNarNewAfterMatch;
+      if (canWide && cWideNewM <= costAfterMatch[i]) {
+        costAfterMatch[i] = cWideNewM;
         choiceAfterMatch[i] = Match();
         isWideAfterMatch[i] = 1;
       }
-      if (units[i] < 256 && cNarNew <= costAfterMatch[i]) {
-        costAfterMatch[i] = cNarNew;
+      if (units[i] < 256 && cNarNewM <= costAfterMatch[i]) {
+        costAfterMatch[i] = cNarNewM;
         choiceAfterMatch[i] = Match();
         isWideAfterMatch[i] = 0;
       }
@@ -507,14 +534,17 @@ struct Encoder {
 
     // Emit the tokens.
     std::vector<Symbol> out;
+    bool afterLit = true;
     auto emitToken = [&](Index kind, Index length) {
       assert(length <= MaxTokenLength);
+      Table table = (splitToken && afterLit) ? TokenTable2 : TokenTable;
       if (length < 63) {
-        out.emplace_back(TokenTable, uint8_t(kind | (length << 2)));
+        out.emplace_back(table, uint8_t(kind | (length << 2)));
       } else {
-        out.emplace_back(TokenTable, uint8_t(kind | (63 << 2)));
+        out.emplace_back(table, uint8_t(kind | (63 << 2)));
         out.emplace_back(ExtraTable, uint8_t(length - 63));
       }
+      afterLit = kind < 2;
     };
     uint16_t prevWide = 0;
     std::vector<std::pair<Index, bool>> pending;
@@ -603,7 +633,7 @@ struct Encoder {
 
   // The number of parses: the first with byte costs, the others with the bit
   // costs of the previous parse's Huffman code.
-  static constexpr Index MaxParses = 5;
+  static constexpr Index MaxParses = 7;
 
   Segment encode() {
     HashChains chains;
@@ -658,6 +688,15 @@ struct Encoder {
       std::array<std::array<Index, 256>, NumTables> counts{};
       for (auto& symbol : symbols) {
         counts[symbol.first][symbol.second]++;
+      }
+      if (segment.tableOffsets[TokenTable2] ==
+          segment.tableOffsets[TokenTable]) {
+        for (Index symbol = 0; symbol < 256; symbol++) {
+          Index merged =
+            counts[TokenTable][symbol] + counts[TokenTable2][symbol];
+          counts[TokenTable][symbol] = merged;
+          counts[TokenTable2][symbol] = merged;
+        }
       }
       if (segment.tableOffsets[NarrowTable2] ==
           segment.tableOffsets[NarrowTable]) {
@@ -808,32 +847,39 @@ struct Encoder {
       uint64_t codedBits = (MaxCodeLength + used) * 8 + huffBits;
       return huffman == 2 ? std::min(codedBits, rawBits) : codedBits;
     };
-    std::vector<uint64_t> mergedNarrow(256, 0);
-    bool anyNarrow1 = false, anyNarrow2 = false;
-    for (Index symbol = 0; symbol < 256; symbol++) {
-      mergedNarrow[symbol] =
-        counts[NarrowTable][symbol] + counts[NarrowTable2][symbol];
-      if (counts[NarrowTable][symbol]) {
-        anyNarrow1 = true;
+    auto maybeFoldPair = [&](Table primary,
+                             Table secondary,
+                             bool enableSplit,
+                             uint64_t penaltyBytes) {
+      std::vector<uint64_t> merged(256, 0);
+      bool any1 = false, any2 = false;
+      for (Index symbol = 0; symbol < 256; symbol++) {
+        merged[symbol] = counts[primary][symbol] + counts[secondary][symbol];
+        if (counts[primary][symbol]) {
+          any1 = true;
+        }
+        if (counts[secondary][symbol]) {
+          any2 = true;
+        }
       }
-      if (counts[NarrowTable2][symbol]) {
-        anyNarrow2 = true;
+      bool fold = !enableSplit || !any1 || !any2;
+      if (!fold && huffman == 2) {
+        uint64_t splitBits =
+          tableBitCost(counts[primary]) + tableBitCost(counts[secondary]);
+        uint64_t mergedBits = tableBitCost(merged);
+        uint64_t decoderPenaltyBits = penaltyBytes * 8;
+        if (splitBits + decoderPenaltyBits >= mergedBits) {
+          fold = true;
+        }
       }
-    }
-    bool foldNarrow2 = !splitNarrow || !anyNarrow1 || !anyNarrow2;
-    if (!foldNarrow2) {
-      uint64_t splitBits =
-        tableBitCost(counts[NarrowTable]) + tableBitCost(counts[NarrowTable2]);
-      uint64_t mergedBits = tableBitCost(mergedNarrow);
-      uint64_t decoderPenaltyBits = (huffman == 2) ? 10 * 8 : 0;
-      if (splitBits + decoderPenaltyBits >= mergedBits) {
-        foldNarrow2 = true;
+      if (fold) {
+        counts[primary] = std::move(merged);
+        counts[secondary].assign(256, 0);
       }
-    }
-    if (foldNarrow2) {
-      counts[NarrowTable] = std::move(mergedNarrow);
-      counts[NarrowTable2].assign(256, 0);
-    }
+      return fold;
+    };
+    bool foldToken2 = maybeFoldPair(TokenTable, TokenTable2, splitToken, 8);
+    bool foldNarrow2 = maybeFoldPair(NarrowTable, NarrowTable2, splitNarrow, 10);
     std::array<std::vector<uint8_t>, NumTables> lengths;
     std::array<std::array<uint32_t, 256>, NumTables> codes{};
     for (Index table = 0; table < NumTables; table++) {
@@ -880,6 +926,11 @@ struct Encoder {
         }
         code <<= 1;
       }
+    }
+    if (foldToken2) {
+      coded.tableOffsets[TokenTable2] = coded.tableOffsets[TokenTable];
+      lengths[TokenTable2] = lengths[TokenTable];
+      codes[TokenTable2] = codes[TokenTable];
     }
     if (foldNarrow2) {
       coded.tableOffsets[NarrowTable2] = coded.tableOffsets[NarrowTable];
@@ -1231,6 +1282,9 @@ makeDecoder(Module& module, const Segment& segment, const DecoderOptions& o) {
     return builder.makeLocalSet(index,
                                 add(get(index), builder.makeConst(value)));
   };
+  bool splitToken =
+    segment.huffman &&
+    segment.tableOffsets[TokenTable2] != segment.tableOffsets[TokenTable];
   bool splitNarrow =
     segment.huffman &&
     segment.tableOffsets[NarrowTable2] != segment.tableOffsets[NarrowTable];
@@ -1287,7 +1341,14 @@ makeDecoder(Module& module, const Segment& segment, const DecoderOptions& o) {
     builder.makeArrayNew(o.dstArrayType,
                          builder.makeConst(int32_t(o.numUnits))));
 
-  auto* readTok = builder.makeLocalSet(tok, readByte(TokenTable));
+  auto* readTok = builder.makeLocalSet(
+    tok,
+    splitToken
+      ? readByteExpr(builder.makeSelect(
+          builder.makeBinary(LtUInt32, get(tok), builder.makeConst(2)),
+          builder.makeConst(int32_t(segment.tableOffsets[TokenTable2])),
+          builder.makeConst(int32_t(segment.tableOffsets[TokenTable]))))
+      : readByte(TokenTable));
   auto* setLen = builder.makeLocalSet(
     len, builder.makeBinary(ShrUInt32, get(tok), builder.makeConst(2)));
   auto* extendLen =
