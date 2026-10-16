@@ -69,6 +69,7 @@
 #include <string>
 #include <tuple>
 
+#include "ir/effects.h"
 #include "ir/find_all.h"
 #include "ir/iteration.h"
 #include "ir/module-utils.h"
@@ -155,9 +156,16 @@ struct DeferGlobalAllocations : public Pass {
 
   using GroupKey = std::tuple<HeapType, Type, std::string>;
 
+  struct PaletteSlice {
+    Index offset;
+    Index length;
+  };
+
   Module* module;
   std::unordered_map<Name, Index> globalIndexes;
   std::unordered_map<Name, Index> functionIndexes;
+  std::unordered_map<Name, StructNew*> soleCandidateStructInits;
+  std::unordered_map<Name, std::vector<PaletteSlice>> paletteSlices;
   bool includeAllocationOperands = false;
   bool preserveThunkTypes = false;
   bool onceOnly = false;
@@ -175,6 +183,7 @@ struct DeferGlobalAllocations : public Pass {
       return;
     }
     segmentName = Names::getValidDataSegmentName(*module, "defer$data");
+    paletteSlices.clear();
     includeAllocationOperands =
       !getArgumentOrDefault("defer-global-allocations-allocation-operands", "")
          .empty();
@@ -200,6 +209,7 @@ struct DeferGlobalAllocations : public Pass {
     if (!preserveThunkTypes) {
       optimizeOnceGlobals(/*onlyArrays=*/true);
       segmentData.clear();
+      paletteSlices.clear();
     }
     runGroupDeferral(/*skipPreservedThunkGroups=*/false);
     if (!onceOnly) {
@@ -211,6 +221,9 @@ struct DeferGlobalAllocations : public Pass {
         segmentName, Name(), nullptr, segmentData.data(), segmentData.size()));
     }
     optimizeOnceGlobals(/*onlyArrays=*/false);
+    if (!preserveThunkTypes && !always) {
+      foldArrayGlobals();
+    }
   }
 
   void runGroupDeferral(bool skipPreservedThunkGroups = false) {
@@ -836,6 +849,23 @@ struct DeferGlobalAllocations : public Pass {
       }
     }
 
+    // Record sole-use flat StructNew candidates (used only in candidate/array
+    // initializers) so palette profitability accounts for post-deferral
+    // nullification.
+    soleCandidateStructInits.clear();
+    for (auto& [key, group] : groups) {
+      if (isPreservedThunkGroup(group) ||
+          group.leafFields.size() != group.type.getStruct().fields.size()) {
+        continue;
+      }
+      for (auto& cand : group.members) {
+        if (cand.uses == 0 && !otherNonCodeUses.count(cand.global->name) &&
+            initGlobalUses[cand.global->name] > 0) {
+          soleCandidateStructInits[cand.global->name] = cand.init;
+        }
+      }
+    }
+
     // Remove the candidates with non-code uses, and compute the bonuses.
     for (auto& [key, group] : groups) {
       auto& members = group.members;
@@ -1148,6 +1178,36 @@ private:
     Index chunkColumnOverhead = 0;
   };
 
+  Index getEffectivePaletteCount(const std::vector<Expression*>& distinct) {
+    Index D = distinct.size();
+    std::vector<StructNew*> soleTempls;
+    Index mergedCount = 0;
+    Index nonSoleCount = 0;
+    for (auto* expr : distinct) {
+      if (auto* gg = expr->dynCast<GlobalGet>()) {
+        auto it = soleCandidateStructInits.find(gg->name);
+        if (it != soleCandidateStructInits.end()) {
+          StructNew* sn = it->second;
+          bool found = false;
+          for (auto* prev : soleTempls) {
+            if (ExpressionAnalyzer::equal(prev, sn)) {
+              found = true;
+              break;
+            }
+          }
+          if (found) {
+            mergedCount++;
+          } else {
+            soleTempls.push_back(sn);
+          }
+          continue;
+        }
+      }
+      nonSoleCount++;
+    }
+    return nonSoleCount > 0 ? (D - mergedCount) : D;
+  }
+
   ColumnCosts computeColumnCosts(const Group& group,
                                  const std::vector<Candidate*>& members,
                                  const std::vector<Index>& varying,
@@ -1289,14 +1349,19 @@ private:
           }
         }
         Index D = distinct.size();
+        Index effD = ok ? getEffectivePaletteCount(distinct) : D;
         Index w1Extra = hasW1Col ? 8 : 25;
-        if (ok && 9 + 3 * D + N + w1Extra < 9 + 3 * N) {
+        if (ok && 9 + 3 * effD + N + w1Extra < 9 + 3 * N) {
           for (auto* m : members) {
             costs.memberTableBytes[m] += 1;
           }
           Index palBytes = 9;
           for (auto* expr : distinct) {
             palBytes += getOperandBytes(expr);
+          }
+          if (D > effD) {
+            Index savedPal = 3 * (D - effD);
+            palBytes = palBytes > savedPal ? palBytes - savedPal : 9;
           }
           paletteOverhead += palBytes + 6;
           dataWidthCols[1]++;
@@ -1515,7 +1580,7 @@ private:
         group.absorbedCount = 0;
       }
     }
-    if (chosen.empty()) {
+    if (chosen.empty() || (!always && !preservedThunk && chosen.size() < 2)) {
       return;
     }
     // Recompute the columns and exact savings over the chosen members only.
@@ -1559,12 +1624,22 @@ private:
         return c->uses == 1 && c->onceUses == 1;
       });
     // Fixed costs per chunk: the factory function (code, function section
-    // entry, type), the cache global and its type (unless cacheless), and per
-    // table column the global, its type, and the read in the factory.
+    // entry, type), the cache global and its type (unless cacheless), the
+    // fixed template instructions inside the factory, and per table column the
+    // global, its type, and the read in the factory.
+    Index varyingInitBytes = 0;
+    for (auto i : varying) {
+      varyingInitBytes += getOperandBytes(chosen[0]->leaves[i]);
+    }
+    Index fixedTemplateBytes =
+      chosen[0]->initBytes > 9 + varyingInitBytes
+        ? chosen[0]->initBytes - 9 - varyingInitBytes
+        : 0;
     Index numChunks = (chosen.size() + MaxChunkSize - 1) / MaxChunkSize;
-    Index baseFixed = allOnceSingleUse ? 25 : 70;
+    Index baseFixed = allOnceSingleUse ? 16 : 53;
     Index overhead =
-      numChunks * (baseFixed + finalCosts.chunkColumnOverhead);
+      numChunks *
+      (baseFixed + fixedTemplateBytes + finalCosts.chunkColumnOverhead);
     if (!always && saving <= int64_t(overhead)) {
       return;
     }
@@ -1913,8 +1988,9 @@ private:
           indices.push_back(uint8_t(idx));
         }
         Index D = distinct.size();
+        Index effD = ok ? getEffectivePaletteCount(distinct) : D;
         Index w1Extra = willHaveW1Col ? 8 : 25;
-        if (ok && 9 + 3 * D + N + w1Extra < 9 + 3 * N) {
+        if (ok && 9 + 3 * effD + N + w1Extra < 9 + 3 * N) {
           willHaveW1Col = true;
           std::vector<Expression*> palValues;
           palValues.reserve(D);
@@ -1998,9 +2074,13 @@ private:
       Index startOffset = segmentData.size();
       for (Index c = 0; c < groupCols.size(); c++) {
         auto* pdc = groupCols[c];
+        auto& col = columns.at(pdc->leafIndex);
+        if (col.paletteGlobal.is()) {
+          paletteSlices[col.paletteGlobal].push_back(
+            {Index(segmentData.size()), Index(pdc->bytes.size())});
+        }
         segmentData.insert(
           segmentData.end(), pdc->bytes.begin(), pdc->bytes.end());
-        auto& col = columns.at(pdc->leafIndex);
         col.global = tableName;
         col.globalType = tableGlobalType;
         col.elemOffset = c * N;
@@ -2550,6 +2630,8 @@ private:
       return true;
     };
 
+    std::unordered_map<Name, std::vector<std::pair<Function*, If*>>>
+      lazyGuardIfs;
     for (auto& func : module->functions) {
       if (func->imported()) {
         continue;
@@ -2558,12 +2640,19 @@ private:
         Name flag;
         if (!iff->ifFalse && isFlagEqzCond(iff->condition, flag)) {
           flagGuardIfs[flag].push_back({func.get(), iff});
+        } else if (!iff->ifFalse) {
+          if (auto* rin = iff->condition->dynCast<RefIsNull>()) {
+            if (auto* gg = rin->value->dynCast<GlobalGet>()) {
+              lazyGuardIfs[gg->name].push_back({func.get(), iff});
+            }
+          }
         }
       }
     }
 
     std::unordered_set<Name> onceHelperFuncs;
     std::unordered_map<Name, Function*> flagHelperFunc;
+    std::unordered_map<Name, Function*> lazyHelperFunc;
     for (auto& func : module->functions) {
       if (func->imported() || nonCallFuncUses.count(func->name)) {
         continue;
@@ -2573,27 +2662,56 @@ private:
         continue;
       }
       auto* firstSet = getFirstStmt(func->body)->dynCast<GlobalSet>();
-      if (!firstSet || !onceFlags.count(firstSet->name) ||
-          funcSets[firstSet->name].size() != 1) {
-        continue;
-      }
-      Name flag = firstSet->name;
-      auto& guards = flagGuardIfs[flag];
-      if (guards.size() != callers.size() ||
-          guards.size() != funcGets[flag].size()) {
-        continue;
-      }
-      bool allMatch = true;
-      for (auto& [_, iff] : guards) {
-        auto* call = getFirstStmt(iff->ifTrue)->dynCast<Call>();
-        if (!call || call != iff->ifTrue || call->target != func->name) {
-          allMatch = false;
-          break;
+      if (firstSet && onceFlags.count(firstSet->name) &&
+          funcSets[firstSet->name].size() == 1) {
+        Name flag = firstSet->name;
+        auto& guards = flagGuardIfs[flag];
+        if (guards.size() == callers.size() &&
+            guards.size() == funcGets[flag].size()) {
+          bool allMatch = true;
+          for (auto& [_, iff] : guards) {
+            auto* call = getFirstStmt(iff->ifTrue)->dynCast<Call>();
+            if (!call || call != iff->ifTrue || call->target != func->name) {
+              allMatch = false;
+              break;
+            }
+          }
+          if (allMatch) {
+            onceHelperFuncs.insert(func->name);
+            flagHelperFunc[flag] = func.get();
+            continue;
+          }
         }
       }
-      if (allMatch) {
-        onceHelperFuncs.insert(func->name);
-        flagHelperFunc[flag] = func.get();
+      // Also recognize helper functions whose every caller is guarded by
+      // (if (ref.is_null (global.get $lazy)) (then (call $func))) where $lazy
+      // is a 1-set nullable reference global set inside $func.
+      for (auto* gs : FindAll<GlobalSet>(func->body).list) {
+        Name lazy = gs->name;
+        auto* lg = module->getGlobalOrNull(lazy);
+        if (!lg || lg->imported() || !lg->mutable_ || !lg->type.isRef() ||
+            !lg->type.isNullable() || !lg->init->is<RefNull>() ||
+            nonCodeGlobalUses.count(lazy) || initGlobalUses[lazy] != 0 ||
+            funcSets[lazy].size() != 1 || gs->value->is<RefNull>()) {
+          continue;
+        }
+        auto& guards = lazyGuardIfs[lazy];
+        if (guards.size() != callers.size()) {
+          continue;
+        }
+        bool allMatch = true;
+        for (auto& [_, iff] : guards) {
+          auto* call = getFirstStmt(iff->ifTrue)->dynCast<Call>();
+          if (!call || call != iff->ifTrue || call->target != func->name) {
+            allMatch = false;
+            break;
+          }
+        }
+        if (allMatch) {
+          onceHelperFuncs.insert(func->name);
+          lazyHelperFunc[lazy] = func.get();
+          break;
+        }
       }
     }
 
@@ -2617,6 +2735,13 @@ private:
       if (auto* rin = iff->condition->dynCast<RefIsNull>()) {
         if (auto* gg = rin->value->dynCast<GlobalGet>()) {
           Name lazy = gg->name;
+          if (auto* call = getFirstStmt(iff->ifTrue)->dynCast<Call>()) {
+            auto it = lazyHelperFunc.find(lazy);
+            if (it != lazyHelperFunc.end() &&
+                it->second->name == call->target) {
+              return true;
+            }
+          }
           auto* lg = module->getGlobalOrNull(lazy);
           if (lg && !lg->imported() && lg->mutable_ && lg->type.isRef() &&
               lg->type.isNullable() && lg->init->is<RefNull>() &&
@@ -3162,6 +3287,50 @@ private:
       module->removeGlobal(gname);
     }
 
+    // Compact any palette array.new_fixed global whose elements now contain
+    // duplicate entries (such as multiple ref.null slots after nullification)
+    // when all of its uses are accounted for by paletteSlices, and remap the
+    // corresponding u8 index slices in segmentData.
+    for (auto& g : module->globals) {
+      if (g->imported() || !g->init || nonCodeUses.count(g->name) ||
+          initGlobalUses[g->name] > 0) {
+        continue;
+      }
+      auto palIt = paletteSlices.find(g->name);
+      if (palIt == paletteSlices.end() ||
+          codeGlobalGets[g->name] != palIt->second.size()) {
+        continue;
+      }
+      auto* anf = g->init->dynCast<ArrayNewFixed>();
+      if (!anf || anf->values.size() < 2) {
+        continue;
+      }
+      std::vector<Expression*> compacted;
+      std::vector<uint8_t> remap(anf->values.size());
+      for (Index oldIdx = 0; oldIdx < anf->values.size(); oldIdx++) {
+        Expression* val = anf->values[oldIdx];
+        Index newIdx = 0;
+        while (newIdx < compacted.size() &&
+               !sameRefLeaf(compacted[newIdx], val)) {
+          newIdx++;
+        }
+        if (newIdx == compacted.size()) {
+          compacted.push_back(val);
+        }
+        remap[oldIdx] = uint8_t(newIdx);
+      }
+      if (compacted.size() < anf->values.size()) {
+        anf->values.set(compacted);
+        for (auto& slice : palIt->second) {
+          for (Index j = 0; j < slice.length; j++) {
+            uint8_t oldIdx = uint8_t(segmentData[slice.offset + j]);
+            assert(oldIdx < remap.size());
+            segmentData[slice.offset + j] = char(remap[oldIdx]);
+          }
+        }
+      }
+    }
+
     // Convert any array.new_fixed global initializer whose elements are all
     // ref.null into array.new_default.
     for (auto& g : module->globals) {
@@ -3341,6 +3510,8 @@ private:
       return true;
     };
 
+    std::unordered_map<Name, std::vector<std::pair<Function*, If*>>>
+      lazyGuardIfs;
     for (auto& func : module->functions) {
       if (func->imported()) {
         continue;
@@ -3349,15 +3520,23 @@ private:
         Name flag;
         if (!iff->ifFalse && isFlagEqzCond(iff->condition, flag)) {
           flagGuardIfs[flag].push_back({func.get(), iff});
+        } else if (!iff->ifFalse) {
+          if (auto* rin = iff->condition->dynCast<RefIsNull>()) {
+            if (auto* gg = rin->value->dynCast<GlobalGet>()) {
+              lazyGuardIfs[gg->name].push_back({func.get(), iff});
+            }
+          }
         }
       }
     }
 
     // Identify direct once-helper functions: functions starting with
     // (global.set $flag (i32.const 1)) whose every call is in
-    // (if (i32.eqz (global.get $flag)) (then (call $fn))).
+    // (if (i32.eqz (global.get $flag)) (then (call $fn))), or functions whose
+    // every call is in (if (ref.is_null (global.get $lazy)) (then (call $fn))).
     std::unordered_set<Name> onceHelperFuncs;
     std::unordered_map<Name, Function*> flagHelperFunc;
+    std::unordered_map<Name, Function*> lazyHelperFunc;
     for (auto& func : module->functions) {
       if (func->imported() || nonCallFuncUses.count(func->name)) {
         continue;
@@ -3367,27 +3546,53 @@ private:
         continue;
       }
       auto* firstSet = getFirstStmt(func->body)->dynCast<GlobalSet>();
-      if (!firstSet || !onceFlags.count(firstSet->name) ||
-          funcSets[firstSet->name].size() != 1) {
-        continue;
-      }
-      Name flag = firstSet->name;
-      auto& guards = flagGuardIfs[flag];
-      if (guards.size() != callers.size() ||
-          guards.size() != funcGets[flag].size()) {
-        continue;
-      }
-      bool allMatch = true;
-      for (auto& [_, iff] : guards) {
-        auto* call = getFirstStmt(iff->ifTrue)->dynCast<Call>();
-        if (!call || call != iff->ifTrue || call->target != func->name) {
-          allMatch = false;
-          break;
+      if (firstSet && onceFlags.count(firstSet->name) &&
+          funcSets[firstSet->name].size() == 1) {
+        Name flag = firstSet->name;
+        auto& guards = flagGuardIfs[flag];
+        if (guards.size() == callers.size() &&
+            guards.size() == funcGets[flag].size()) {
+          bool allMatch = true;
+          for (auto& [_, iff] : guards) {
+            auto* call = getFirstStmt(iff->ifTrue)->dynCast<Call>();
+            if (!call || call != iff->ifTrue || call->target != func->name) {
+              allMatch = false;
+              break;
+            }
+          }
+          if (allMatch) {
+            onceHelperFuncs.insert(func->name);
+            flagHelperFunc[flag] = func.get();
+            continue;
+          }
         }
       }
-      if (allMatch) {
-        onceHelperFuncs.insert(func->name);
-        flagHelperFunc[flag] = func.get();
+      for (auto* gs : FindAll<GlobalSet>(func->body).list) {
+        Name lazy = gs->name;
+        auto* lg = module->getGlobalOrNull(lazy);
+        if (!lg || lg->imported() || !lg->mutable_ || !lg->type.isRef() ||
+            !lg->type.isNullable() || !lg->init->is<RefNull>() ||
+            nonCodeGlobalUses.count(lazy) || initGlobalUses[lazy] != 0 ||
+            funcSets[lazy].size() != 1 || gs->value->is<RefNull>()) {
+          continue;
+        }
+        auto& guards = lazyGuardIfs[lazy];
+        if (guards.size() != callers.size()) {
+          continue;
+        }
+        bool allMatch = true;
+        for (auto& [_, iff] : guards) {
+          auto* call = getFirstStmt(iff->ifTrue)->dynCast<Call>();
+          if (!call || call != iff->ifTrue || call->target != func->name) {
+            allMatch = false;
+            break;
+          }
+        }
+        if (allMatch) {
+          onceHelperFuncs.insert(func->name);
+          lazyHelperFunc[lazy] = func.get();
+          break;
+        }
       }
     }
 
@@ -3411,6 +3616,13 @@ private:
       if (auto* rin = iff->condition->dynCast<RefIsNull>()) {
         if (auto* gg = rin->value->dynCast<GlobalGet>()) {
           Name lazy = gg->name;
+          if (auto* call = getFirstStmt(iff->ifTrue)->dynCast<Call>()) {
+            auto it = lazyHelperFunc.find(lazy);
+            if (it != lazyHelperFunc.end() &&
+                it->second->name == call->target) {
+              return true;
+            }
+          }
           auto* lg = module->getGlobalOrNull(lazy);
           if (lg && !lg->imported() && lg->mutable_ && lg->type.isRef() &&
               lg->type.isNullable() && lg->init->is<RefNull>() &&
@@ -3730,65 +3942,218 @@ private:
     // -------------------------------------------------------------------------
     // Pattern 3: Eliminate redundant i32 once-flag globals
     // -------------------------------------------------------------------------
-    {
-      auto isGuaranteedNonNull = [&](Expression* val,
-                                     const ExpressionList& stmts) -> bool {
+    if (!preserveThunkTypes) {
+      std::function<bool(Expression*,
+                         Function*,
+                         const Block*,
+                         Index,
+                         Index,
+                         std::unordered_set<Name>&,
+                         Index)>
+        isProvenNonNull = [&](Expression* val,
+                              Function* fn,
+                              const Block* topB,
+                              Index flagIdx,
+                              Index tgIdx,
+                              std::unordered_set<Name>& visitedFuncs,
+                              Index depth) -> bool {
+        if (!val || depth > 8) {
+          return false;
+        }
         if (val->type.isRef() && val->type.isNonNullable()) {
           return true;
         }
+        if (val->is<StructNew>() || val->is<ArrayNew>() ||
+            val->is<ArrayNewFixed>() || val->is<ArrayNewData>() ||
+            val->is<ArrayNewElem>() || val->is<RefFunc>() ||
+            val->is<RefI31>() || val->is<StringConst>()) {
+          return true;
+        }
+        if (auto* ra = val->dynCast<RefAs>()) {
+          return ra->op == RefAsNonNull;
+        }
+        if (auto* rc = val->dynCast<RefCast>()) {
+          return (rc->type.isRef() && rc->type.isNonNullable()) ||
+                 isProvenNonNull(
+                   rc->ref, fn, topB, flagIdx, tgIdx, visitedFuncs, depth + 1);
+        }
+        if (auto* ls = val->dynCast<LocalSet>()) {
+          return ls->isTee() &&
+                 isProvenNonNull(
+                   ls->value, fn, topB, flagIdx, tgIdx, visitedFuncs, depth + 1);
+        }
         if (auto* lg = val->dynCast<LocalGet>()) {
-          bool foundNonNullSet = false;
-          for (Index i = 1; i + 1 < stmts.size(); i++) {
-            for (auto* ls : FindAll<LocalSet>(stmts[i]).list) {
-              if (ls->index == lg->index) {
-                if (ls->value->type.isRef() &&
-                    ls->value->type.isNonNullable()) {
-                  foundNonNullSet = true;
-                } else {
+          if (lg->index < fn->getNumParams()) {
+            return false;
+          }
+          bool foundSet = false;
+          for (auto* ls : FindAll<LocalSet>(fn->body).list) {
+            if (ls->index == lg->index) {
+              foundSet = true;
+              std::unordered_set<Name> subV = visitedFuncs;
+              if (!isProvenNonNull(
+                    ls->value, fn, topB, flagIdx, tgIdx, subV, depth + 1)) {
+                return false;
+              }
+            }
+          }
+          return foundSet;
+        }
+        if (auto* gg = val->dynCast<GlobalGet>()) {
+          Global* g = module->getGlobalOrNull(gg->name);
+          if (!g || g->imported()) {
+            return false;
+          }
+          if (g->type.isRef() && g->type.isNonNullable()) {
+            return true;
+          }
+          if (!g->mutable_) {
+            std::unordered_set<Name> subV = visitedFuncs;
+            return isProvenNonNull(
+              g->init, fn, nullptr, 0, 0, subV, depth + 1);
+          }
+          if (topB && !nonCodeGlobalUses.count(g->name) &&
+              initGlobalUses[g->name] == 0 && funcSets[g->name].size() == 1) {
+            auto [setterFn, setPtr] = funcSets[g->name][0];
+            auto* gs = (*setPtr)->cast<GlobalSet>();
+            bool calledBefore = false;
+            for (Index i = flagIdx + 1; i < tgIdx; i++) {
+              if (auto* c = topB->list[i]->dynCast<Call>()) {
+                if (c->target == setterFn->name) {
+                  calledBefore = true;
+                  break;
+                }
+              }
+            }
+            if (calledBefore) {
+              std::unordered_set<Name> subV = visitedFuncs;
+              return isProvenNonNull(
+                gs->value, setterFn, nullptr, 0, 0, subV, depth + 1);
+            }
+          }
+          return false;
+        }
+        if (auto* b = val->dynCast<Block>()) {
+          if (b->list.empty()) {
+            return false;
+          }
+          std::unordered_set<Name> subV = visitedFuncs;
+          if (!isProvenNonNull(
+                b->list.back(), fn, topB, flagIdx, tgIdx, subV, depth + 1)) {
+            return false;
+          }
+          if (b->name.is()) {
+            for (auto* br : FindAll<Break>(b).list) {
+              if (br->name == b->name) {
+                std::unordered_set<Name> brV = visitedFuncs;
+                if (!br->value ||
+                    !isProvenNonNull(
+                      br->value, fn, topB, flagIdx, tgIdx, brV, depth + 1)) {
                   return false;
                 }
               }
             }
+            for (auto* bron : FindAll<BrOn>(b).list) {
+              if (bron->name == b->name &&
+                  (bron->op == BrOnNull || bron->op == BrOnCastFail)) {
+                return false;
+              }
+            }
           }
-          return foundNonNullSet;
+          return true;
+        }
+        if (auto* iff = val->dynCast<If>()) {
+          if (!iff->ifFalse) {
+            return false;
+          }
+          std::unordered_set<Name> subV1 = visitedFuncs;
+          std::unordered_set<Name> subV2 = visitedFuncs;
+          return isProvenNonNull(
+                   iff->ifTrue, fn, topB, flagIdx, tgIdx, subV1, depth + 1) &&
+                 isProvenNonNull(
+                   iff->ifFalse, fn, topB, flagIdx, tgIdx, subV2, depth + 1);
+        }
+        if (auto* sel = val->dynCast<Select>()) {
+          std::unordered_set<Name> subV1 = visitedFuncs;
+          std::unordered_set<Name> subV2 = visitedFuncs;
+          return isProvenNonNull(
+                   sel->ifTrue, fn, topB, flagIdx, tgIdx, subV1, depth + 1) &&
+                 isProvenNonNull(
+                   sel->ifFalse, fn, topB, flagIdx, tgIdx, subV2, depth + 1);
+        }
+        if (auto* c = val->dynCast<Call>()) {
+          if (c->isReturn) {
+            return false;
+          }
+          Function* callee = module->getFunctionOrNull(c->target);
+          if (!callee || callee->imported() || !callee->getResults().isRef()) {
+            return false;
+          }
+          if (callee->getResults().isNonNullable()) {
+            return true;
+          }
+          if (!visitedFuncs.insert(callee->name).second) {
+            return false;
+          }
+          for (auto* ret : FindAll<Return>(callee->body).list) {
+            std::unordered_set<Name> subV = visitedFuncs;
+            if (!ret->value ||
+                !isProvenNonNull(
+                  ret->value, callee, nullptr, 0, 0, subV, depth + 1)) {
+              return false;
+            }
+          }
+          if (callee->body->type != Type::unreachable) {
+            std::unordered_set<Name> subV = visitedFuncs;
+            if (!isProvenNonNull(
+                  callee->body, callee, nullptr, 0, 0, subV, depth + 1)) {
+              return false;
+            }
+          }
+          return true;
         }
         return false;
       };
 
-      auto canExitOrModifyGlobals = [&](const ExpressionList& stmts,
-                                        Name topBlockName) -> bool {
-        for (Index i = 1; i + 1 < stmts.size(); i++) {
-          Expression* s = stmts[i];
-          if (!FindAll<GlobalSet>(s).list.empty() ||
-              !FindAll<Return>(s).list.empty() ||
-              !FindAll<Throw>(s).list.empty() ||
-              !FindAll<Rethrow>(s).list.empty() ||
-              !FindAll<Unreachable>(s).list.empty()) {
+      auto canStmtExitEarly = [&](Expression* s) -> bool {
+        if (!FindAll<Return>(s).list.empty() ||
+            !FindAll<Throw>(s).list.empty() ||
+            !FindAll<Rethrow>(s).list.empty() ||
+            !FindAll<Unreachable>(s).list.empty()) {
+          return true;
+        }
+        std::unordered_set<Name> internalLabels;
+        for (auto* b : FindAll<Block>(s).list) {
+          if (b->name.is()) {
+            internalLabels.insert(b->name);
+          }
+        }
+        for (auto* l : FindAll<Loop>(s).list) {
+          if (l->name.is()) {
+            internalLabels.insert(l->name);
+          }
+        }
+        for (auto* br : FindAll<Break>(s).list) {
+          if (!internalLabels.count(br->name)) {
             return true;
           }
-          if (topBlockName.is()) {
-            for (auto* br : FindAll<Break>(s).list) {
-              if (br->name == topBlockName) {
-                return true;
-              }
-            }
-            for (auto* sw : FindAll<Switch>(s).list) {
-              if (sw->default_ == topBlockName ||
-                  std::find(sw->targets.begin(),
-                            sw->targets.end(),
-                            topBlockName) != sw->targets.end()) {
-                return true;
-              }
-            }
-            for (auto* bron : FindAll<BrOn>(s).list) {
-              if (bron->name == topBlockName) {
-                return true;
-              }
+        }
+        for (auto* sw : FindAll<Switch>(s).list) {
+          if (!internalLabels.count(sw->default_)) {
+            return true;
+          }
+          for (Name t : sw->targets) {
+            if (!internalLabels.count(t)) {
+              return true;
             }
           }
         }
-        auto* lastSet = stmts.back()->cast<GlobalSet>();
-        return !FindAll<GlobalSet>(lastSet->value).list.empty();
+        for (auto* bron : FindAll<BrOn>(s).list) {
+          if (!internalLabels.count(bron->name)) {
+            return true;
+          }
+        }
+        return false;
       };
 
       auto funcTouchesGlobal = [&](Function* f, Name g) -> bool {
@@ -3810,6 +4175,8 @@ private:
       };
 
       auto canReachTargetOrFlag = [&](const ExpressionList& stmts,
+                                      Index flagIdx,
+                                      Index tgIdx,
                                       Name flag,
                                       Name tg,
                                       Function* selfFn) -> bool {
@@ -3821,6 +4188,11 @@ private:
               return true;
             }
           }
+          for (auto* gs : FindAll<GlobalSet>(e).list) {
+            if (gs->name == flag || gs->name == tg) {
+              return true;
+            }
+          }
           for (auto* c : FindAll<Call>(e).list) {
             if (visited.insert(c->target).second) {
               queue.push_back(c->target);
@@ -3828,12 +4200,12 @@ private:
           }
           return false;
         };
-        for (Index i = 1; i + 1 < stmts.size(); i++) {
+        for (Index i = flagIdx + 1; i < tgIdx; i++) {
           if (scanExpr(stmts[i])) {
             return true;
           }
         }
-        if (scanExpr(stmts.back()->cast<GlobalSet>()->value)) {
+        if (scanExpr(stmts[tgIdx]->cast<GlobalSet>()->value)) {
           return true;
         }
         while (!queue.empty()) {
@@ -3858,12 +4230,12 @@ private:
         return false;
       };
 
-      auto validateOnceBlock = [&](Block* topB,
-                                   Name flag,
-                                   Function* selfFn,
-                                   Global*& tgGlobOut,
-                                   Index& flagIdxOut) -> bool {
-        if (!topB || topB->list.size() < 2) {
+      auto cleanOnceBlock = [&](Block* topB,
+                                Name flag,
+                                Function* selfFn,
+                                If* selfGuardIf,
+                                Index& flagIdxOut) -> bool {
+        if (!topB || topB->list.empty()) {
           return false;
         }
         Index flagIdx = 0;
@@ -3871,37 +4243,123 @@ private:
                isTrivialLocalInit(topB->list[flagIdx])) {
           flagIdx++;
         }
-        if (flagIdx + 1 >= topB->list.size()) {
+        if (flagIdx >= topB->list.size()) {
           return false;
         }
         auto* firstSet = topB->list[flagIdx]->dynCast<GlobalSet>();
-        auto* lastSet = topB->list.back()->dynCast<GlobalSet>();
-        if (!firstSet || firstSet->name != flag || !lastSet) {
+        if (!firstSet || firstSet->name != flag) {
           return false;
         }
-        Name tg = lastSet->name;
-        if (tg == flag || nonCodeGlobalUses.count(tg) ||
-            initGlobalUses[tg] > 0 || funcSets[tg].size() != 1) {
-          return false;
+        for (Index i = 0; i < topB->list.size(); i++) {
+          if (i == flagIdx) {
+            continue;
+          }
+          for (auto* gg : FindAll<GlobalGet>(topB->list[i]).list) {
+            if (gg->name == flag) {
+              return false;
+            }
+          }
+          for (auto* gs : FindAll<GlobalSet>(topB->list[i]).list) {
+            if (gs->name == flag) {
+              return false;
+            }
+          }
         }
-        Global* tgGlob = module->getGlobalOrNull(tg);
-        if (!tgGlob || tgGlob->imported() || !tgGlob->mutable_ ||
-            !tgGlob->type.isRef() || !tgGlob->type.isNullable() ||
-            !tgGlob->init->is<RefNull>()) {
-          return false;
+        // Strip redundant default-value stores and direct self-calls before
+        // any call has executed.
+        bool seenAnyCall = false;
+        std::unordered_set<Name> seenSets;
+        for (Index i = flagIdx + 1; i < topB->list.size();) {
+          Expression* s = topB->list[i];
+          if (selfGuardIf && selfFn->body == selfGuardIf) {
+            if (auto* c = s->dynCast<Call>()) {
+              if (c->target == selfFn->name && c->operands.empty()) {
+                topB->list.erase(topB->list.begin() + i);
+                modifiedFuncs.insert(selfFn);
+                continue;
+              }
+            }
+          }
+          if (!seenAnyCall) {
+            if (auto* gs = s->dynCast<GlobalSet>()) {
+              Name gname = gs->name;
+              Global* g = module->getGlobalOrNull(gname);
+              if (g && !g->imported() && g->mutable_ && g->init &&
+                  !seenSets.count(gname)) {
+                bool sameAsInit =
+                  (gs->value->is<RefNull>() && g->init->is<RefNull>()) ||
+                  (gs->value->is<Const>() && g->init->is<Const>() &&
+                   gs->value->cast<Const>()->value ==
+                     g->init->cast<Const>()->value);
+                if (sameAsInit) {
+                  auto& setsVec = funcSets[gname];
+                  setsVec.erase(
+                    std::remove_if(setsVec.begin(),
+                                   setsVec.end(),
+                                   [&](const std::pair<Function*, Expression**>&
+                                         entry) { return *entry.second == s; }),
+                    setsVec.end());
+                  topB->list.erase(topB->list.begin() + i);
+                  modifiedFuncs.insert(selfFn);
+                  continue;
+                }
+              }
+            }
+          }
+          if (!FindAll<Call>(s).list.empty() ||
+              !FindAll<CallRef>(s).list.empty() ||
+              !FindAll<CallIndirect>(s).list.empty()) {
+            seenAnyCall = true;
+          }
+          for (auto* gs : FindAll<GlobalSet>(s).list) {
+            seenSets.insert(gs->name);
+          }
+          i++;
         }
-        if (!isGuaranteedNonNull(lastSet->value, topB->list)) {
-          return false;
-        }
-        if (canExitOrModifyGlobals(topB->list, topB->name)) {
-          return false;
-        }
-        if (canReachTargetOrFlag(topB->list, flag, tg, selfFn)) {
-          return false;
-        }
-        tgGlobOut = tgGlob;
         flagIdxOut = flagIdx;
         return true;
+      };
+
+      auto validateOnceBlock = [&](Block* topB,
+                                   Index flagIdx,
+                                   Name flag,
+                                   Function* selfFn,
+                                   Global*& tgGlobOut) -> bool {
+        for (Index tgIdx = flagIdx + 1; tgIdx < topB->list.size(); tgIdx++) {
+          Expression* stmt = topB->list[tgIdx];
+          auto* tgSet = stmt->dynCast<GlobalSet>();
+          if (tgSet) {
+            Name tg = tgSet->name;
+            if (tg != flag && !nonCodeGlobalUses.count(tg) &&
+                initGlobalUses[tg] == 0 && funcSets[tg].size() == 1) {
+              Global* tgGlob = module->getGlobalOrNull(tg);
+              if (tgGlob && !tgGlob->imported() && tgGlob->mutable_ &&
+                  tgGlob->type.isRef() && tgGlob->type.isNullable() &&
+                  tgGlob->init->is<RefNull>()) {
+                if (!canStmtExitEarly(tgSet->value) &&
+                    !canReachTargetOrFlag(
+                      topB->list, flagIdx, tgIdx, flag, tg, selfFn)) {
+                  std::unordered_set<Name> visitedFuncs;
+                  visitedFuncs.insert(selfFn->name);
+                  if (isProvenNonNull(tgSet->value,
+                                      selfFn,
+                                      topB,
+                                      flagIdx,
+                                      tgIdx,
+                                      visitedFuncs,
+                                      0)) {
+                    tgGlobOut = tgGlob;
+                    return true;
+                  }
+                }
+              }
+            }
+          }
+          if (canStmtExitEarly(stmt)) {
+            return false;
+          }
+        }
+        return false;
       };
 
       std::vector<Name> flagsToRemove;
@@ -3919,18 +4377,30 @@ private:
         if (auto it = flagHelperFunc.find(flag); it != flagHelperFunc.end()) {
           Function* helperFn = it->second;
           Block* topB = getEditableBlock(helperFn->body);
-          Global* tgGlob = nullptr;
           Index flagIdx = 0;
-          if (validateOnceBlock(topB, flag, helperFn, tgGlob, flagIdx)) {
-            for (auto& [callerFn, iff] : guards) {
-              iff->condition = builder.makeRefIsNull(
-                builder.makeGlobalGet(tgGlob->name, tgGlob->type));
-              modifiedFuncs.insert(callerFn);
+          if (cleanOnceBlock(topB, flag, helperFn, nullptr, flagIdx)) {
+            if (flagIdx + 1 == topB->list.size()) {
+              for (auto& [callerFn, iff] : guards) {
+                Builder(*module).replaceWithIdenticalType(iff);
+                modifiedFuncs.insert(callerFn);
+              }
+              topB->list.erase(topB->list.begin() + flagIdx);
+              modifiedFuncs.insert(helperFn);
+              flagsToRemove.push_back(flag);
+              continue;
             }
-            topB->list.erase(topB->list.begin() + flagIdx);
-            modifiedFuncs.insert(helperFn);
-            flagsToRemove.push_back(flag);
-            continue;
+            Global* tgGlob = nullptr;
+            if (validateOnceBlock(topB, flagIdx, flag, helperFn, tgGlob)) {
+              for (auto& [callerFn, iff] : guards) {
+                iff->condition = builder.makeRefIsNull(
+                  builder.makeGlobalGet(tgGlob->name, tgGlob->type));
+                modifiedFuncs.insert(callerFn);
+              }
+              topB->list.erase(topB->list.begin() + flagIdx);
+              modifiedFuncs.insert(helperFn);
+              flagsToRemove.push_back(flag);
+              continue;
+            }
           }
         }
         // Case 2: inline onceIf form (1 get in the same function)
@@ -3938,15 +4408,23 @@ private:
           auto [fn, iff] = guards[0];
           if (funcSets[flag][0].first == fn) {
             Block* topB = getEditableBlock(iff->ifTrue);
-            Global* tgGlob = nullptr;
             Index flagIdx = 0;
-            if (validateOnceBlock(topB, flag, fn, tgGlob, flagIdx)) {
-              iff->condition = builder.makeRefIsNull(
-                builder.makeGlobalGet(tgGlob->name, tgGlob->type));
-              topB->list.erase(topB->list.begin() + flagIdx);
-              modifiedFuncs.insert(fn);
-              flagsToRemove.push_back(flag);
-              continue;
+            if (cleanOnceBlock(topB, flag, fn, iff, flagIdx)) {
+              if (flagIdx + 1 == topB->list.size()) {
+                Builder(*module).replaceWithIdenticalType(iff);
+                modifiedFuncs.insert(fn);
+                flagsToRemove.push_back(flag);
+                continue;
+              }
+              Global* tgGlob = nullptr;
+              if (validateOnceBlock(topB, flagIdx, flag, fn, tgGlob)) {
+                iff->condition = builder.makeRefIsNull(
+                  builder.makeGlobalGet(tgGlob->name, tgGlob->type));
+                topB->list.erase(topB->list.begin() + flagIdx);
+                modifiedFuncs.insert(fn);
+                flagsToRemove.push_back(flag);
+                continue;
+              }
             }
           }
         }
@@ -3958,6 +4436,403 @@ private:
 
     for (auto* fn : modifiedFuncs) {
       ReFinalize().walkFunctionInModule(fn, module);
+    }
+  }
+
+  void foldArrayGlobals() {
+    std::unordered_set<Name> nonCodeUses;
+    std::unordered_map<Name, Index> initGlobalUses;
+    {
+      struct Scanner : public PostWalker<Scanner> {
+        std::unordered_set<Name>* nonCode = nullptr;
+        std::unordered_map<Name, Index>* initCounts = nullptr;
+        void visitGlobalGet(GlobalGet* curr) {
+          if (initCounts) {
+            (*initCounts)[curr->name]++;
+          }
+          if (nonCode) {
+            nonCode->insert(curr->name);
+          }
+        }
+      } scanner;
+      scanner.initCounts = &initGlobalUses;
+      for (auto& g : module->globals) {
+        if (!g->imported()) {
+          scanner.walk(g->init);
+        }
+      }
+      scanner.initCounts = nullptr;
+      scanner.nonCode = &nonCodeUses;
+      for (auto& seg : module->elementSegments) {
+        if (seg->offset) {
+          scanner.walk(seg->offset);
+        }
+        for (auto* item : seg->data) {
+          scanner.walk(item);
+        }
+      }
+      for (auto& seg : module->dataSegments) {
+        if (seg->offset) {
+          scanner.walk(seg->offset);
+        }
+      }
+      for (auto& ex : module->exports) {
+        if (ex->kind == ExternalKind::Global) {
+          nonCodeUses.insert(*ex->getInternalName());
+        }
+      }
+    }
+
+    struct CodeScanInfo {
+      std::unordered_map<Name, Index> gets;
+      std::unordered_map<Name, std::vector<Expression**>> arrayGets;
+    };
+    ModuleUtils::ParallelFunctionAnalysis<CodeScanInfo> codeScan(
+      *module, [&](Function* func, CodeScanInfo& info) {
+        if (func->imported()) {
+          return;
+        }
+        struct Walker : public PostWalker<Walker> {
+          CodeScanInfo& info;
+          Walker(CodeScanInfo& info) : info(info) {}
+          void visitGlobalGet(GlobalGet* curr) { info.gets[curr->name]++; }
+          void visitArrayGet(ArrayGet* curr) {
+            if (curr->order != MemoryOrder::Unordered) {
+              return;
+            }
+            if (auto* gg = curr->ref->dynCast<GlobalGet>()) {
+              info.arrayGets[gg->name].push_back(getCurrentPointer());
+            }
+          }
+        };
+        Walker(info).walk(func->body);
+      });
+
+    std::unordered_map<Name, Index> codeGlobalGets;
+    std::unordered_map<Name, std::vector<std::pair<Function*, Expression**>>>
+      arrayGetSites;
+    for (auto& func : module->functions) {
+      if (func->imported()) {
+        continue;
+      }
+      auto& info = codeScan.map[func.get()];
+      for (auto& [name, count] : info.gets) {
+        codeGlobalGets[name] += count;
+      }
+      for (auto& [name, sites] : info.arrayGets) {
+        for (auto** site : sites) {
+          arrayGetSites[name].push_back({func.get(), site});
+        }
+      }
+    }
+
+    computeIndexes();
+    Builder builder(*module);
+    std::unordered_set<Function*> refinalizeFuncs;
+    std::vector<Name> globalsToRemove;
+
+    auto isFoldableElem = [&](Expression* e) -> bool {
+      if (e->is<Const>() || e->is<RefNull>() || e->is<RefFunc>()) {
+        return true;
+      }
+      if (auto* gg = e->dynCast<GlobalGet>()) {
+        auto* g = module->getGlobalOrNull(gg->name);
+        return g && !g->mutable_;
+      }
+      if (auto* i31 = e->dynCast<RefI31>()) {
+        return i31->value->is<Const>();
+      }
+      return false;
+    };
+
+    for (auto& g : module->globals) {
+      if (g->imported() || g->mutable_ || nonCodeUses.count(g->name) ||
+          initGlobalUses[g->name] > 0) {
+        continue;
+      }
+      if (!onceOnly && paletteSlices.count(g->name)) {
+        continue;
+      }
+      auto* anf = g->init->dynCast<ArrayNewFixed>();
+      if (!anf || anf->values.empty() || !g->type.isRef() ||
+          g->type.isNullable()) {
+        continue;
+      }
+      HeapType arrHt = g->type.getHeapType();
+      if (!arrHt.isArray() || arrHt.isShared()) {
+        continue;
+      }
+      Field elemField = arrHt.getArray().element;
+      Index totalGets = codeGlobalGets[g->name];
+      auto& sites = arrayGetSites[g->name];
+      if (totalGets == 0 || totalGets != sites.size()) {
+        continue;
+      }
+      bool allElemsValid = true;
+      for (auto* v : anf->values) {
+        if (!isFoldableElem(v)) {
+          allElemsValid = false;
+          break;
+        }
+      }
+      if (!allElemsValid) {
+        continue;
+      }
+      bool consistentSigned = true;
+      bool isSigned =
+        sites[0].second ? (*sites[0].second)->cast<ArrayGet>()->signed_ : false;
+      Type resType = (*sites[0].second)->type;
+      for (auto& [_, site] : sites) {
+        auto* ag = (*site)->cast<ArrayGet>();
+        if (ag->signed_ != isSigned || ag->type != resType ||
+            ag->index->type != Type::i32) {
+          consistentSigned = false;
+          break;
+        }
+      }
+      if (!consistentSigned) {
+        continue;
+      }
+
+      Index N = anf->values.size();
+      std::vector<Expression*> normVals;
+      normVals.reserve(N);
+      for (auto* v : anf->values) {
+        if (elemField.isPacked() && v->is<Const>()) {
+          int32_t raw = v->cast<Const>()->value.geti32();
+          int32_t norm = 0;
+          if (elemField.packedType == Field::i8) {
+            norm = isSigned ? int32_t(int8_t(uint8_t(raw)))
+                            : int32_t(uint8_t(raw));
+          } else {
+            norm = isSigned ? int32_t(int16_t(uint16_t(raw)))
+                            : int32_t(uint16_t(raw));
+          }
+          normVals.push_back(builder.makeConst(norm));
+        } else {
+          normVals.push_back(v);
+        }
+      }
+
+      std::vector<Expression*> distinct;
+      std::vector<std::vector<Index>> distinctIndices;
+      for (Index k = 0; k < N; k++) {
+        Expression* v = normVals[k];
+        Index dIdx = 0;
+        while (dIdx < distinct.size() &&
+               !sameRefLeaf(distinct[dIdx], v)) {
+          dIdx++;
+        }
+        if (dIdx == distinct.size()) {
+          distinct.push_back(v);
+          distinctIndices.push_back({k});
+        } else {
+          distinctIndices[dIdx].push_back(k);
+        }
+      }
+
+      Index D = distinct.size();
+      Index globalCost = 9;
+      for (auto* v : anf->values) {
+        globalCost += getOperandBytes(v);
+      }
+      Index arrayGetOpCost =
+        3 + 1 + getLEBSize(U32LEB(globalIndexes[g->name]));
+      Index costBefore = globalCost + sites.size() * arrayGetOpCost;
+      Index selectOpBytes = resType.isRef() ? 4 : 1;
+
+      if (D == 1) {
+        Expression* val0 = distinct[0];
+        Index valBytes = getOperandBytes(val0);
+        Index costAfter = 0;
+        for (auto& [_, site] : sites) {
+          auto* ag = (*site)->cast<ArrayGet>();
+          bool needDrop =
+            EffectAnalyzer(getPassOptions(), *module, ag->index)
+              .hasUnremovableSideEffects();
+          costAfter += valBytes + (needDrop ? 1 : 0);
+        }
+        if (costAfter < costBefore) {
+          for (auto& [fn, site] : sites) {
+            auto* ag = (*site)->cast<ArrayGet>();
+            Expression* repl = ExpressionManipulator::copy(val0, *module);
+            if (EffectAnalyzer(getPassOptions(), *module, ag->index)
+                  .hasUnremovableSideEffects()) {
+              *site = builder.makeSequence(builder.makeDrop(ag->index), repl);
+            } else {
+              *site = repl;
+            }
+            refinalizeFuncs.insert(fn);
+          }
+          globalsToRemove.push_back(g->name);
+        }
+        continue;
+      }
+
+      if (N > 32) {
+        continue;
+      }
+
+      if (D == 2) {
+        // Choose v1 as the minority value (or index 1 when N == 2).
+        Index minIdx = 1;
+        if (N > 2 && distinctIndices[0].size() < distinctIndices[1].size()) {
+          minIdx = 0;
+        }
+        Expression* v1 = distinct[minIdx];
+        Expression* v0 = distinct[1 - minIdx];
+        auto& k1 = distinctIndices[minIdx];
+        Index vBytes = getOperandBytes(v1) + getOperandBytes(v0) + selectOpBytes;
+        Index condExtra = 0;
+        enum Mode { DirectIdx, EqConst, RangeLtU, RangeGeU, Bitmask } mode;
+        Index paramVal = 0;
+        if (N == 2 && k1.size() == 1 && k1[0] == 1) {
+          mode = DirectIdx;
+          condExtra = 0;
+        } else if (k1.size() == 1) {
+          mode = EqConst;
+          paramVal = k1[0];
+          condExtra = (paramVal == 0) ? 1 : (2 + getSLEBSize(paramVal));
+        } else if (k1.back() - k1.front() + 1 == k1.size() &&
+                   (k1.front() == 0 || k1.back() == N - 1)) {
+          if (k1.front() == 0) {
+            mode = RangeLtU;
+            paramVal = k1.back() + 1;
+          } else {
+            mode = RangeGeU;
+            paramVal = k1.front();
+          }
+          condExtra = 2 + getSLEBSize(paramVal);
+        } else {
+          mode = Bitmask;
+          uint32_t mask = 0;
+          for (Index idx : k1) {
+            mask |= (1u << idx);
+          }
+          paramVal = Index(mask);
+          condExtra = 5 + getSLEBSize(paramVal);
+        }
+        Index costAfter = sites.size() * (vBytes + condExtra);
+        if (costAfter < costBefore) {
+          for (auto& [fn, site] : sites) {
+            auto* ag = (*site)->cast<ArrayGet>();
+            Expression* cond = nullptr;
+            if (mode == DirectIdx) {
+              cond = ag->index;
+            } else if (mode == EqConst) {
+              if (paramVal == 0) {
+                cond = builder.makeUnary(EqZInt32, ag->index);
+              } else {
+                cond = builder.makeBinary(
+                  EqInt32, ag->index, builder.makeConst(int32_t(paramVal)));
+              }
+            } else if (mode == RangeLtU) {
+              cond = builder.makeBinary(
+                LtUInt32, ag->index, builder.makeConst(int32_t(paramVal)));
+            } else if (mode == RangeGeU) {
+              cond = builder.makeBinary(
+                GeUInt32, ag->index, builder.makeConst(int32_t(paramVal)));
+            } else {
+              cond = builder.makeBinary(
+                AndInt32,
+                builder.makeBinary(ShrUInt32,
+                                   builder.makeConst(int32_t(paramVal)),
+                                   ag->index),
+                builder.makeConst(int32_t(1)));
+            }
+            *site = builder.makeSelect(
+              cond,
+              ExpressionManipulator::copy(v1, *module),
+              ExpressionManipulator::copy(v0, *module));
+            refinalizeFuncs.insert(fn);
+          }
+          globalsToRemove.push_back(g->name);
+        }
+        continue;
+      }
+
+      if (D >= 3 && D <= 5 && N > D) {
+        // Check if D - 1 values are singletons and 1 value is the majority.
+        Index majIdx = Index(-1);
+        bool allOtherSingletons = true;
+        for (Index d = 0; d < D; d++) {
+          if (distinctIndices[d].size() > 1) {
+            if (majIdx == Index(-1)) {
+              majIdx = d;
+            } else {
+              allOtherSingletons = false;
+              break;
+            }
+          }
+        }
+        if (!allOtherSingletons || majIdx == Index(-1)) {
+          continue;
+        }
+        Expression* vMaj = distinct[majIdx];
+        std::vector<std::pair<Index, Expression*>> singletons;
+        Index singletonsCost = getOperandBytes(vMaj);
+        for (Index d = 0; d < D; d++) {
+          if (d == majIdx) {
+            continue;
+          }
+          Index k = distinctIndices[d][0];
+          Expression* v = distinct[d];
+          singletons.push_back({k, v});
+          Index eqCost = (k == 0) ? 1 : (2 + getSLEBSize(k));
+          singletonsCost += getOperandBytes(v) + eqCost + selectOpBytes;
+        }
+        Index M = singletons.size();
+        Index costAfter = 0;
+        for (auto& [_, site] : sites) {
+          auto* ag = (*site)->cast<ArrayGet>();
+          Index idxExtra =
+            ag->index->is<LocalGet>() ? (2 * (M - 1)) : (4 + 2 * (M - 1));
+          costAfter += singletonsCost + idxExtra;
+        }
+        if (costAfter < costBefore) {
+          for (auto& [fn, site] : sites) {
+            auto* ag = (*site)->cast<ArrayGet>();
+            Index scratchLoc = Index(-1);
+            if (!ag->index->is<LocalGet>()) {
+              scratchLoc = Builder::addVar(fn, Type::i32);
+            }
+            Expression* acc = ExpressionManipulator::copy(vMaj, *module);
+            for (Index m = 0; m < M; m++) {
+              auto [k, v] = singletons[m];
+              Expression* idxExpr = nullptr;
+              if (ag->index->is<LocalGet>()) {
+                idxExpr =
+                  (m == 0) ? ag->index
+                           : ExpressionManipulator::copy(ag->index, *module);
+              } else {
+                idxExpr =
+                  (m == 0)
+                    ? static_cast<Expression*>(
+                        builder.makeLocalTee(scratchLoc, ag->index, Type::i32))
+                    : static_cast<Expression*>(
+                        builder.makeLocalGet(scratchLoc, Type::i32));
+              }
+              Expression* cond =
+                (k == 0) ? static_cast<Expression*>(
+                             builder.makeUnary(EqZInt32, idxExpr))
+                         : static_cast<Expression*>(builder.makeBinary(
+                             EqInt32, idxExpr, builder.makeConst(int32_t(k))));
+              acc = builder.makeSelect(
+                cond, ExpressionManipulator::copy(v, *module), acc);
+            }
+            *site = acc;
+            refinalizeFuncs.insert(fn);
+          }
+          globalsToRemove.push_back(g->name);
+        }
+      }
+    }
+
+    for (auto* fn : refinalizeFuncs) {
+      ReFinalize().walkFunctionInModule(fn, module);
+    }
+    for (Name gname : globalsToRemove) {
+      module->removeGlobal(gname);
     }
   }
 };

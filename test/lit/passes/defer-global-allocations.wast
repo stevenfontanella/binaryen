@@ -1400,6 +1400,8 @@
     (array.get $vt_arr (global.get $pal3) (local.get $i))
   )
 )
+
+;; Multi-global once-flag elimination and array constant/select folding.
 ;; CHECK:      (func $defer$enum (type $6) (param $0 i32) (result (ref $enum))
 ;; CHECK-NEXT:  (local $1 (ref $enum))
 ;; CHECK-NEXT:  (if
@@ -1487,3 +1489,132 @@
 ;; CHECK-NEXT:   (local.get $2)
 ;; CHECK-NEXT:  )
 ;; CHECK-NEXT: )
+(module
+  ;; CHECK:      (type $box (struct (field i32)))
+  (type $box (struct (field i32)))
+  (type $i32_arr (array i32))
+
+  (global $flag1 (mut i32) (i32.const 0))
+  ;; CHECK:      (type $1 (func (param i32) (result (ref null $box))))
+
+  ;; CHECK:      (type $2 (func (result (ref null $box))))
+
+  ;; CHECK:      (type $3 (func (param i32) (result i32)))
+
+  ;; CHECK:      (global $scalar1 (mut i32) (i32.const 0))
+  (global $scalar1 (mut i32) (i32.const 0))
+  ;; CHECK:      (global $ref1 (mut (ref null $box)) (ref.null none))
+  (global $ref1 (mut (ref null $box)) (ref.null none))
+
+  (global $flag_empty (mut i32) (i32.const 0))
+  ;; CHECK:      (global $zero_scalar (mut i32) (i32.const 0))
+  (global $zero_scalar (mut i32) (i32.const 0))
+
+  (global $arr_d1 (ref $i32_arr) (array.new_fixed $i32_arr 4
+    (i32.const 42)
+    (i32.const 42)
+    (i32.const 42)
+    (i32.const 42)
+  ))
+
+  (global $arr_d2_single (ref $i32_arr) (array.new_fixed $i32_arr 4
+    (i32.const 10)
+    (i32.const 10)
+    (i32.const 99)
+    (i32.const 10)
+  ))
+
+  (global $arr_d2_mask (ref $i32_arr) (array.new_fixed $i32_arr 5
+    (i32.const 7)
+    (i32.const 8)
+    (i32.const 7)
+    (i32.const 8)
+    (i32.const 7)
+  ))
+
+  ;; CHECK:      (export "init_once" (func $init_once))
+
+  ;; CHECK:      (export "fold_arrays" (func $fold_arrays))
+
+  ;; CHECK:      (func $make_box (type $1) (param $x i32) (result (ref null $box))
+  ;; CHECK-NEXT:  (struct.new $box
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $make_box (param $x i32) (result (ref null $box))
+    (struct.new $box (local.get $x))
+  )
+
+  ;; CHECK:      (func $init_once (type $2) (result (ref null $box))
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (ref.is_null
+  ;; CHECK-NEXT:    (global.get $ref1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (global.set $scalar1
+  ;; CHECK-NEXT:     (i32.const 123)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (global.set $ref1
+  ;; CHECK-NEXT:     (call $make_box
+  ;; CHECK-NEXT:      (global.get $scalar1)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (nop)
+  ;; CHECK-NEXT:  (global.get $ref1)
+  ;; CHECK-NEXT: )
+  (func $init_once (export "init_once") (result (ref null $box))
+    (if (i32.eqz (global.get $flag1))
+      (then
+        (global.set $flag1 (i32.const 1))
+        (global.set $scalar1 (i32.const 123))
+        (global.set $ref1 (call $make_box (global.get $scalar1)))
+      )
+    )
+    (if (i32.eqz (global.get $flag_empty))
+      (then
+        (global.set $flag_empty (i32.const 1))
+        (global.set $zero_scalar (i32.const 0))
+      )
+    )
+    (global.get $ref1)
+  )
+
+  ;; CHECK:      (func $fold_arrays (type $3) (param $i i32) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (i32.const 42)
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (select
+  ;; CHECK-NEXT:     (i32.const 99)
+  ;; CHECK-NEXT:     (i32.const 10)
+  ;; CHECK-NEXT:     (i32.eq
+  ;; CHECK-NEXT:      (local.get $i)
+  ;; CHECK-NEXT:      (i32.const 2)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (select
+  ;; CHECK-NEXT:     (i32.const 8)
+  ;; CHECK-NEXT:     (i32.const 7)
+  ;; CHECK-NEXT:     (i32.and
+  ;; CHECK-NEXT:      (i32.shr_u
+  ;; CHECK-NEXT:       (i32.const 10)
+  ;; CHECK-NEXT:       (local.get $i)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (i32.const 1)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $fold_arrays (export "fold_arrays") (param $i i32) (result i32)
+    (i32.add
+      (array.get $i32_arr (global.get $arr_d1) (local.get $i))
+      (i32.add
+        (array.get $i32_arr (global.get $arr_d2_single) (local.get $i))
+        (array.get $i32_arr (global.get $arr_d2_mask) (local.get $i))
+      )
+    )
+  )
+)
+
