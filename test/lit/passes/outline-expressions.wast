@@ -3622,3 +3622,479 @@
   )
 )
 
+;; sinkWrapperCalls v2:
+;; 1. Exclusive-inner outer-call absorption ($exclusive_inner into imported $imp_outer).
+;; 2. Multi-arity inner call sinking ($multi_wrap into 100%-caller $multi_sink_callee)
+;;    and canMoveWrapperPast unblocking past throwing later operands.
+;; 3. Partial wrapper specialization for imported outer and multi-arity inner at last arg.
+(module
+  ;; CHECK:      (type $0 (func (param i32 i32) (result i32)))
+
+  ;; CHECK:      (type $1 (func (param i32) (result i32)))
+
+  ;; CHECK:      (type $2 (func (param i32 i32 i32) (result i32)))
+
+  ;; CHECK:      (import "env" "imp_outer" (func $imp_outer (type $0) (param i32 i32) (result i32)))
+  ;; SHRINK:      (type $0 (func (param i32 i32) (result i32)))
+
+  ;; SHRINK:      (type $1 (func (param i32 i32 i32) (result i32)))
+
+  ;; SHRINK:      (type $2 (func (param i32) (result i32)))
+
+  ;; SHRINK:      (import "env" "imp_outer" (func $imp_outer (type $0) (param i32 i32) (result i32)))
+  (import "env" "imp_outer" (func $imp_outer (param i32 i32) (result i32)))
+  ;; CHECK:      (import "env" "imp_throw" (func $imp_throw (type $1) (param i32) (result i32)))
+  ;; SHRINK:      (import "env" "imp_throw" (func $imp_throw (type $2) (param i32) (result i32)))
+  (import "env" "imp_throw" (func $imp_throw (param i32) (result i32)))
+
+  ;; CHECK:      (func $exclusive_inner (type $0) (param $0 i32) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (call $imp_outer
+  ;; CHECK-NEXT:   (local.get $0)
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (i32.const 99)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $exclusive_inner (type $0) (param $0 i32) (param $x i32) (result i32)
+  ;; SHRINK-NEXT:  (call $imp_outer
+  ;; SHRINK-NEXT:   (local.get $0)
+  ;; SHRINK-NEXT:   (i32.add
+  ;; SHRINK-NEXT:    (local.get $x)
+  ;; SHRINK-NEXT:    (i32.const 99)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $exclusive_inner (param $x i32) (result i32)
+    (i32.add (local.get $x) (i32.const 99))
+  )
+
+  ;; CHECK:      (func $multi_wrap (type $0) (param $a i32) (param $b i32) (result i32)
+  ;; CHECK-NEXT:  (i32.xor
+  ;; CHECK-NEXT:   (local.get $a)
+  ;; CHECK-NEXT:   (local.get $b)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $multi_wrap (type $0) (param $a i32) (param $b i32) (result i32)
+  ;; SHRINK-NEXT:  (i32.xor
+  ;; SHRINK-NEXT:   (local.get $a)
+  ;; SHRINK-NEXT:   (local.get $b)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $multi_wrap (param $a i32) (param $b i32) (result i32)
+    (i32.xor (local.get $a) (local.get $b))
+  )
+
+  ;; CHECK:      (func $multi_sink_callee (type $2) (param $p i32) (param $1 i32) (param $q i32) (result i32)
+  ;; CHECK-NEXT:  (i32.sub
+  ;; CHECK-NEXT:   (call $multi_wrap
+  ;; CHECK-NEXT:    (local.get $p)
+  ;; CHECK-NEXT:    (local.get $1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.get $q)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $multi_sink_callee (type $1) (param $p i32) (param $1 i32) (param $q i32) (result i32)
+  ;; SHRINK-NEXT:  (i32.sub
+  ;; SHRINK-NEXT:   (call $multi_wrap
+  ;; SHRINK-NEXT:    (local.get $p)
+  ;; SHRINK-NEXT:    (local.get $1)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (local.get $q)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $multi_sink_callee (param $p i32) (param $q i32) (result i32)
+    (i32.sub (local.get $p) (local.get $q))
+  )
+
+  ;; CHECK:      (func $caller_v2_1 (type $0) (param $a i32) (param $b i32) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (call $exclusive_inner
+  ;; CHECK-NEXT:    (i32.clz
+  ;; CHECK-NEXT:     (local.get $a)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.ctz
+  ;; CHECK-NEXT:     (local.get $b)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (call $multi_sink_callee
+  ;; CHECK-NEXT:     (local.get $a)
+  ;; CHECK-NEXT:     (i32.eqz
+  ;; CHECK-NEXT:      (local.get $b)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (call $imp_throw
+  ;; CHECK-NEXT:      (local.get $b)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (call $imp_outer
+  ;; CHECK-NEXT:      (i32.eqz
+  ;; CHECK-NEXT:       (local.get $a)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (call $multi_wrap
+  ;; CHECK-NEXT:       (i32.clz
+  ;; CHECK-NEXT:        (local.get $a)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:       (local.get $b)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.add
+  ;; CHECK-NEXT:      (call $imp_outer
+  ;; CHECK-NEXT:       (i32.ctz
+  ;; CHECK-NEXT:        (local.get $b)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:       (call $multi_wrap
+  ;; CHECK-NEXT:        (i32.popcnt
+  ;; CHECK-NEXT:         (local.get $b)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:        (local.get $a)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (i32.add
+  ;; CHECK-NEXT:       (call $imp_outer
+  ;; CHECK-NEXT:        (i32.const 1)
+  ;; CHECK-NEXT:        (call $multi_wrap
+  ;; CHECK-NEXT:         (i32.eqz
+  ;; CHECK-NEXT:          (local.get $a)
+  ;; CHECK-NEXT:         )
+  ;; CHECK-NEXT:         (i32.const 2)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:       (call $imp_outer
+  ;; CHECK-NEXT:        (i32.const 11)
+  ;; CHECK-NEXT:        (call $multi_wrap
+  ;; CHECK-NEXT:         (i32.clz
+  ;; CHECK-NEXT:          (local.get $b)
+  ;; CHECK-NEXT:         )
+  ;; CHECK-NEXT:         (i32.const 12)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $caller_v2_1 (type $0) (param $a i32) (param $b i32) (result i32)
+  ;; SHRINK-NEXT:  (i32.add
+  ;; SHRINK-NEXT:   (call $exclusive_inner
+  ;; SHRINK-NEXT:    (i32.clz
+  ;; SHRINK-NEXT:     (local.get $a)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (i32.ctz
+  ;; SHRINK-NEXT:     (local.get $b)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (i32.add
+  ;; SHRINK-NEXT:    (call $multi_sink_callee
+  ;; SHRINK-NEXT:     (local.get $a)
+  ;; SHRINK-NEXT:     (i32.eqz
+  ;; SHRINK-NEXT:      (local.get $b)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:     (call $imp_throw
+  ;; SHRINK-NEXT:      (local.get $b)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (i32.add
+  ;; SHRINK-NEXT:     (call $outlined_w
+  ;; SHRINK-NEXT:      (i32.eqz
+  ;; SHRINK-NEXT:       (local.get $a)
+  ;; SHRINK-NEXT:      )
+  ;; SHRINK-NEXT:      (i32.clz
+  ;; SHRINK-NEXT:       (local.get $a)
+  ;; SHRINK-NEXT:      )
+  ;; SHRINK-NEXT:      (local.get $b)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:     (i32.add
+  ;; SHRINK-NEXT:      (call $outlined_w
+  ;; SHRINK-NEXT:       (i32.ctz
+  ;; SHRINK-NEXT:        (local.get $b)
+  ;; SHRINK-NEXT:       )
+  ;; SHRINK-NEXT:       (i32.popcnt
+  ;; SHRINK-NEXT:        (local.get $b)
+  ;; SHRINK-NEXT:       )
+  ;; SHRINK-NEXT:       (local.get $a)
+  ;; SHRINK-NEXT:      )
+  ;; SHRINK-NEXT:      (i32.add
+  ;; SHRINK-NEXT:       (call $outlined_w
+  ;; SHRINK-NEXT:        (i32.const 1)
+  ;; SHRINK-NEXT:        (i32.eqz
+  ;; SHRINK-NEXT:         (local.get $a)
+  ;; SHRINK-NEXT:        )
+  ;; SHRINK-NEXT:        (i32.const 2)
+  ;; SHRINK-NEXT:       )
+  ;; SHRINK-NEXT:       (call $outlined_w
+  ;; SHRINK-NEXT:        (i32.const 11)
+  ;; SHRINK-NEXT:        (i32.clz
+  ;; SHRINK-NEXT:         (local.get $b)
+  ;; SHRINK-NEXT:        )
+  ;; SHRINK-NEXT:        (i32.const 12)
+  ;; SHRINK-NEXT:       )
+  ;; SHRINK-NEXT:      )
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $caller_v2_1 (param $a i32) (param $b i32) (result i32)
+    (i32.add
+      ;; Exclusive inner at last arg of imported $imp_outer (site 1/3).
+      (call $imp_outer
+        (i32.clz (local.get $a))
+        (call $exclusive_inner (i32.ctz (local.get $b)))
+      )
+      (i32.add
+        ;; 2-arg $multi_wrap sunk into $multi_sink_callee past throwing $imp_throw (site 1/2).
+        (call $multi_sink_callee
+          (call $multi_wrap (local.get $a) (i32.eqz (local.get $b)))
+          (call $imp_throw (local.get $b))
+        )
+        ;; Partial specialization of ($imp_outer, k=1, $multi_wrap) (sites 1..4 of 10).
+        (i32.add
+          (call $imp_outer (i32.eqz (local.get $a)) (call $multi_wrap (i32.clz (local.get $a)) (local.get $b)))
+          (i32.add
+            (call $imp_outer (i32.ctz (local.get $b)) (call $multi_wrap (i32.popcnt (local.get $b)) (local.get $a)))
+            (i32.add
+              (call $imp_outer (i32.const 1) (call $multi_wrap (i32.eqz (local.get $a)) (i32.const 2)))
+              (call $imp_outer (i32.const 11) (call $multi_wrap (i32.clz (local.get $b)) (i32.const 12)))
+            )
+          )
+        )
+      )
+    )
+  )
+
+  ;; CHECK:      (func $caller_v2_2 (type $0) (param $c i32) (param $d i32) (result i32)
+  ;; CHECK-NEXT:  (i32.sub
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (call $exclusive_inner
+  ;; CHECK-NEXT:     (i32.popcnt
+  ;; CHECK-NEXT:      (local.get $c)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.eqz
+  ;; CHECK-NEXT:      (local.get $d)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (call $exclusive_inner
+  ;; CHECK-NEXT:     (local.get $d)
+  ;; CHECK-NEXT:     (local.get $c)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (call $multi_sink_callee
+  ;; CHECK-NEXT:     (i32.clz
+  ;; CHECK-NEXT:      (local.get $c)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (local.get $d)
+  ;; CHECK-NEXT:     (call $imp_throw
+  ;; CHECK-NEXT:      (local.get $c)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (call $imp_outer
+  ;; CHECK-NEXT:      (i32.clz
+  ;; CHECK-NEXT:       (local.get $c)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (call $multi_wrap
+  ;; CHECK-NEXT:       (i32.ctz
+  ;; CHECK-NEXT:        (local.get $c)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:       (local.get $d)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.add
+  ;; CHECK-NEXT:      (call $imp_outer
+  ;; CHECK-NEXT:       (i32.popcnt
+  ;; CHECK-NEXT:        (local.get $d)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:       (call $multi_wrap
+  ;; CHECK-NEXT:        (i32.eqz
+  ;; CHECK-NEXT:         (local.get $d)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:        (local.get $c)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (i32.add
+  ;; CHECK-NEXT:       (call $imp_outer
+  ;; CHECK-NEXT:        (i32.const 3)
+  ;; CHECK-NEXT:        (call $multi_wrap
+  ;; CHECK-NEXT:         (i32.clz
+  ;; CHECK-NEXT:          (local.get $c)
+  ;; CHECK-NEXT:         )
+  ;; CHECK-NEXT:         (i32.const 4)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:       (i32.add
+  ;; CHECK-NEXT:        (call $imp_outer
+  ;; CHECK-NEXT:         (i32.const 5)
+  ;; CHECK-NEXT:         (call $multi_wrap
+  ;; CHECK-NEXT:          (i32.ctz
+  ;; CHECK-NEXT:           (local.get $d)
+  ;; CHECK-NEXT:          )
+  ;; CHECK-NEXT:          (i32.const 6)
+  ;; CHECK-NEXT:         )
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:        (i32.add
+  ;; CHECK-NEXT:         (call $imp_outer
+  ;; CHECK-NEXT:          (i32.const 7)
+  ;; CHECK-NEXT:          (call $multi_wrap
+  ;; CHECK-NEXT:           (i32.const 8)
+  ;; CHECK-NEXT:           (i32.popcnt
+  ;; CHECK-NEXT:            (local.get $c)
+  ;; CHECK-NEXT:           )
+  ;; CHECK-NEXT:          )
+  ;; CHECK-NEXT:         )
+  ;; CHECK-NEXT:         (call $imp_outer
+  ;; CHECK-NEXT:          (i32.const 9)
+  ;; CHECK-NEXT:          (call $multi_wrap
+  ;; CHECK-NEXT:           (i32.const 10)
+  ;; CHECK-NEXT:           (i32.eqz
+  ;; CHECK-NEXT:            (local.get $d)
+  ;; CHECK-NEXT:           )
+  ;; CHECK-NEXT:          )
+  ;; CHECK-NEXT:         )
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $caller_v2_2 (type $0) (param $c i32) (param $d i32) (result i32)
+  ;; SHRINK-NEXT:  (i32.sub
+  ;; SHRINK-NEXT:   (i32.add
+  ;; SHRINK-NEXT:    (call $exclusive_inner
+  ;; SHRINK-NEXT:     (i32.popcnt
+  ;; SHRINK-NEXT:      (local.get $c)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:     (i32.eqz
+  ;; SHRINK-NEXT:      (local.get $d)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (call $exclusive_inner
+  ;; SHRINK-NEXT:     (local.get $d)
+  ;; SHRINK-NEXT:     (local.get $c)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (i32.add
+  ;; SHRINK-NEXT:    (call $multi_sink_callee
+  ;; SHRINK-NEXT:     (i32.clz
+  ;; SHRINK-NEXT:      (local.get $c)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:     (local.get $d)
+  ;; SHRINK-NEXT:     (call $imp_throw
+  ;; SHRINK-NEXT:      (local.get $c)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (i32.add
+  ;; SHRINK-NEXT:     (call $outlined_w
+  ;; SHRINK-NEXT:      (i32.clz
+  ;; SHRINK-NEXT:       (local.get $c)
+  ;; SHRINK-NEXT:      )
+  ;; SHRINK-NEXT:      (i32.ctz
+  ;; SHRINK-NEXT:       (local.get $c)
+  ;; SHRINK-NEXT:      )
+  ;; SHRINK-NEXT:      (local.get $d)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:     (i32.add
+  ;; SHRINK-NEXT:      (call $outlined_w
+  ;; SHRINK-NEXT:       (i32.popcnt
+  ;; SHRINK-NEXT:        (local.get $d)
+  ;; SHRINK-NEXT:       )
+  ;; SHRINK-NEXT:       (i32.eqz
+  ;; SHRINK-NEXT:        (local.get $d)
+  ;; SHRINK-NEXT:       )
+  ;; SHRINK-NEXT:       (local.get $c)
+  ;; SHRINK-NEXT:      )
+  ;; SHRINK-NEXT:      (i32.add
+  ;; SHRINK-NEXT:       (call $outlined_w
+  ;; SHRINK-NEXT:        (i32.const 3)
+  ;; SHRINK-NEXT:        (i32.clz
+  ;; SHRINK-NEXT:         (local.get $c)
+  ;; SHRINK-NEXT:        )
+  ;; SHRINK-NEXT:        (i32.const 4)
+  ;; SHRINK-NEXT:       )
+  ;; SHRINK-NEXT:       (i32.add
+  ;; SHRINK-NEXT:        (call $outlined_w
+  ;; SHRINK-NEXT:         (i32.const 5)
+  ;; SHRINK-NEXT:         (i32.ctz
+  ;; SHRINK-NEXT:          (local.get $d)
+  ;; SHRINK-NEXT:         )
+  ;; SHRINK-NEXT:         (i32.const 6)
+  ;; SHRINK-NEXT:        )
+  ;; SHRINK-NEXT:        (i32.add
+  ;; SHRINK-NEXT:         (call $outlined_w
+  ;; SHRINK-NEXT:          (i32.const 7)
+  ;; SHRINK-NEXT:          (i32.const 8)
+  ;; SHRINK-NEXT:          (i32.popcnt
+  ;; SHRINK-NEXT:           (local.get $c)
+  ;; SHRINK-NEXT:          )
+  ;; SHRINK-NEXT:         )
+  ;; SHRINK-NEXT:         (call $outlined_w
+  ;; SHRINK-NEXT:          (i32.const 9)
+  ;; SHRINK-NEXT:          (i32.const 10)
+  ;; SHRINK-NEXT:          (i32.eqz
+  ;; SHRINK-NEXT:           (local.get $d)
+  ;; SHRINK-NEXT:          )
+  ;; SHRINK-NEXT:         )
+  ;; SHRINK-NEXT:        )
+  ;; SHRINK-NEXT:       )
+  ;; SHRINK-NEXT:      )
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $caller_v2_2 (param $c i32) (param $d i32) (result i32)
+    (i32.sub
+      ;; Exclusive inner at last arg of imported $imp_outer (sites 2..3/3).
+      (i32.add
+        (call $imp_outer
+          (i32.popcnt (local.get $c))
+          (call $exclusive_inner (i32.eqz (local.get $d)))
+        )
+        (call $imp_outer
+          (local.get $d)
+          (call $exclusive_inner (local.get $c))
+        )
+      )
+      (i32.add
+        ;; 2-arg $multi_wrap sunk into $multi_sink_callee past throwing $imp_throw (site 2/2).
+        (call $multi_sink_callee
+          (call $multi_wrap (i32.clz (local.get $c)) (local.get $d))
+          (call $imp_throw (local.get $c))
+        )
+        ;; Partial specialization of ($imp_outer, k=1, $multi_wrap) (sites 5..10 of 10).
+        (i32.add
+          (call $imp_outer (i32.clz (local.get $c)) (call $multi_wrap (i32.ctz (local.get $c)) (local.get $d)))
+          (i32.add
+            (call $imp_outer (i32.popcnt (local.get $d)) (call $multi_wrap (i32.eqz (local.get $d)) (local.get $c)))
+            (i32.add
+              (call $imp_outer (i32.const 3) (call $multi_wrap (i32.clz (local.get $c)) (i32.const 4)))
+              (i32.add
+                (call $imp_outer (i32.const 5) (call $multi_wrap (i32.ctz (local.get $d)) (i32.const 6)))
+                (i32.add
+                  (call $imp_outer (i32.const 7) (call $multi_wrap (i32.const 8) (i32.popcnt (local.get $c))))
+                  (call $imp_outer (i32.const 9) (call $multi_wrap (i32.const 10) (i32.eqz (local.get $d))))
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+
+;; SHRINK:      (func $outlined_w (type $1) (param $0 i32) (param $1 i32) (param $2 i32) (result i32)
+;; SHRINK-NEXT:  (call $imp_outer
+;; SHRINK-NEXT:   (local.get $0)
+;; SHRINK-NEXT:   (call $multi_wrap
+;; SHRINK-NEXT:    (local.get $1)
+;; SHRINK-NEXT:    (local.get $2)
+;; SHRINK-NEXT:   )
+;; SHRINK-NEXT:  )
+;; SHRINK-NEXT: )
