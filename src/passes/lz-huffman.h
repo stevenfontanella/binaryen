@@ -83,6 +83,7 @@ using Symbol = std::pair<Table, uint8_t>;
 static constexpr Index MaxCodeLength = 15;
 static constexpr Index MinMatch = 2;
 static constexpr Index RawByteOffset = Index(-8);
+static constexpr Index WideDeltaBias = 128;
 
 struct Segment {
   std::vector<char> data;
@@ -129,18 +130,39 @@ struct Encoder {
     Index size = 0;
   };
 
+  static std::pair<uint8_t, uint8_t> encodeWide(uint16_t unit, uint16_t prev) {
+    uint16_t d = uint16_t(unit - prev + WideDeltaBias);
+    return {uint8_t(d & 0xFF), uint8_t(d >> 8)};
+  }
+
   // The cost of each symbol in the parse, in bits. The first parse uses 8 bits
   // per byte; later parses use the code lengths of the previous Huffman code.
   struct CostModel {
     std::array<std::array<Index, 256>, NumTables> cost;
-    // The cost of the token that starts a narrow or wide run of literals.
-    Index narrowRun = 8;
-    Index wideRun = 8;
 
     CostModel() {
       for (auto& table : cost) {
         table.fill(8);
       }
+    }
+
+    Index runTokenCost(Index kind, Index length) const {
+      if (length == 0) {
+        return 0;
+      }
+      if (length < 63) {
+        return cost[TokenTable][kind | (length << 2)];
+      }
+      return cost[TokenTable][kind | (63 << 2)] + cost[ExtraTable][length - 63];
+    }
+
+    Index narrowCost(uint16_t unit) const {
+      return cost[NarrowTable][unit & 0xFF];
+    }
+
+    Index wideCost(uint16_t unit, uint16_t prev) const {
+      auto [lo, hi] = encodeWide(unit, prev);
+      return cost[WideLoTable][lo] + cost[WideHiTable][hi];
     }
 
     Index distCost(Index distance) const {
@@ -351,14 +373,19 @@ struct Encoder {
   // the given cost model. Three states: after a narrow literal, after a wide
   // literal, and after a match (where a literal needs a new run token).
   std::vector<Symbol> parse(const std::vector<Candidates>& matches,
+                            std::vector<uint16_t>& approxPrevWide,
+                            std::vector<uint16_t>& approxNextWide,
                             const CostModel& model) {
     Index n = units.size();
     std::vector<Index> costAfterNarrow(n + 1, 0), costAfterWide(n + 1, 0),
       costAfterMatch(n + 1, 0);
+    std::vector<Index> runLenNarrow(n + 1, 0), runLenWide(n + 1, 0);
     // The chosen match at each position for each state; length 0 is a
     // literal.
     std::vector<Match> choiceAfterNarrow(n), choiceAfterWide(n),
       choiceAfterMatch(n);
+    std::vector<uint8_t> isWideAfterNarrow(n, 0), isWideAfterWide(n, 0),
+      isWideAfterMatch(n, 0);
     for (Index i = n; i > 0;) {
       i--;
       Match bestMatch;
@@ -381,42 +408,80 @@ struct Encoder {
           }
         }
       }
-      bool isWide = units[i] >= 256;
-      Index wideUnitCost = model.cost[WideLoTable][units[i] & 0xFF] +
-                           model.cost[WideHiTable][units[i] >> 8];
-      Index narrowUnitCost = isWide ? 0 : model.cost[NarrowTable][units[i]];
-      Index inNarrow =
-        isWide ? (wideUnitCost + model.wideRun + costAfterWide[i + 1])
-               : (narrowUnitCost + costAfterNarrow[i + 1]);
-      Index inWide =
-        isWide ? (wideUnitCost + costAfterWide[i + 1])
-               : (narrowUnitCost + model.narrowRun + costAfterNarrow[i + 1]);
-      if (!isWide && i + 1 < n && units[i + 1] >= 256) {
-        inWide = std::min(inWide, wideUnitCost + costAfterWide[i + 1]);
+
+      uint16_t prevW = approxPrevWide[i];
+      Index restorePenalty = 0;
+      if (units[i] < 256 && approxNextWide[i] >= 256) {
+        Index costViaCur = model.wideCost(approxNextWide[i], units[i]);
+        Index costViaPrev = model.wideCost(approxNextWide[i], prevW);
+        if (costViaCur > costViaPrev) {
+          restorePenalty = costViaCur - costViaPrev;
+        }
       }
-      Index fromMatch =
-        isWide ? (wideUnitCost + model.wideRun + costAfterWide[i + 1])
-               : (narrowUnitCost + model.narrowRun + costAfterNarrow[i + 1]);
-      if (inNarrow <= bestCost) {
-        costAfterNarrow[i] = inNarrow;
-        choiceAfterNarrow[i] = Match();
-      } else {
-        costAfterNarrow[i] = bestCost;
-        choiceAfterNarrow[i] = bestMatch;
+      Index wideUnit = model.wideCost(units[i], prevW) + restorePenalty;
+      Index nextLenW = runLenWide[i + 1];
+      Index cWideNew = model.runTokenCost(1, 1) + wideUnit + costAfterWide[i + 1];
+      Index cWideSame =
+        (nextLenW == MaxTokenLength - 1)
+          ? (wideUnit + costAfterWide[i + 1] + model.runTokenCost(1, 1))
+          : (wideUnit + costAfterWide[i + 1] +
+             model.runTokenCost(1, nextLenW + 2) -
+             model.runTokenCost(1, nextLenW + 1));
+
+      Index cNarSame = Index(-1), cNarNew = Index(-1);
+      Index nextLenN = runLenNarrow[i + 1];
+      if (units[i] < 256) {
+        Index narUnit = model.narrowCost(units[i]);
+        cNarNew = model.runTokenCost(0, 1) + narUnit + costAfterNarrow[i + 1];
+        cNarSame =
+          (nextLenN == MaxTokenLength - 1)
+            ? (narUnit + costAfterNarrow[i + 1] + model.runTokenCost(0, 1))
+            : (narUnit + costAfterNarrow[i + 1] +
+               model.runTokenCost(0, nextLenN + 2) -
+               model.runTokenCost(0, nextLenN + 1));
       }
-      if (inWide <= bestCost) {
-        costAfterWide[i] = inWide;
+
+      costAfterWide[i] = bestCost;
+      choiceAfterWide[i] = bestMatch;
+      if (cWideSame <= costAfterWide[i]) {
+        costAfterWide[i] = cWideSame;
         choiceAfterWide[i] = Match();
-      } else {
-        costAfterWide[i] = bestCost;
-        choiceAfterWide[i] = bestMatch;
+        isWideAfterWide[i] = 1;
+        runLenWide[i] = (nextLenW == MaxTokenLength - 1) ? 0 : (nextLenW + 1);
       }
-      if (fromMatch <= bestCost) {
-        costAfterMatch[i] = fromMatch;
+      if (units[i] < 256 && cNarNew <= costAfterWide[i]) {
+        costAfterWide[i] = cNarNew;
+        choiceAfterWide[i] = Match();
+        isWideAfterWide[i] = 0;
+        runLenWide[i] = 0;
+      }
+
+      costAfterNarrow[i] = bestCost;
+      choiceAfterNarrow[i] = bestMatch;
+      if (cWideNew <= costAfterNarrow[i]) {
+        costAfterNarrow[i] = cWideNew;
+        choiceAfterNarrow[i] = Match();
+        isWideAfterNarrow[i] = 1;
+        runLenNarrow[i] = 0;
+      }
+      if (units[i] < 256 && cNarSame <= costAfterNarrow[i]) {
+        costAfterNarrow[i] = cNarSame;
+        choiceAfterNarrow[i] = Match();
+        isWideAfterNarrow[i] = 0;
+        runLenNarrow[i] = (nextLenN == MaxTokenLength - 1) ? 0 : (nextLenN + 1);
+      }
+
+      costAfterMatch[i] = bestCost;
+      choiceAfterMatch[i] = bestMatch;
+      if (cWideNew <= costAfterMatch[i]) {
+        costAfterMatch[i] = cWideNew;
         choiceAfterMatch[i] = Match();
-      } else {
-        costAfterMatch[i] = bestCost;
-        choiceAfterMatch[i] = bestMatch;
+        isWideAfterMatch[i] = 1;
+      }
+      if (units[i] < 256 && cNarNew <= costAfterMatch[i]) {
+        costAfterMatch[i] = cNarNew;
+        choiceAfterMatch[i] = Match();
+        isWideAfterMatch[i] = 0;
       }
     }
 
@@ -431,35 +496,28 @@ struct Encoder {
         out.emplace_back(ExtraTable, uint8_t(length - 63));
       }
     };
-    std::vector<uint16_t> pending;
+    uint16_t prevWide = 0;
+    std::vector<std::pair<uint16_t, bool>> pending;
     auto flushLiterals = [&]() {
-      // Split the pending literals into narrow and wide runs. A single narrow
-      // unit between wide units is emitted as wide, since a run token costs
-      // as much as the byte it would save.
       Index count = pending.size();
-      std::vector<bool> wide(count);
-      for (Index i = 0; i < count; i++) {
-        wide[i] = pending[i] >= 256;
-      }
-      for (Index i = 0; i < count; i++) {
-        if (!wide[i] && (i == 0 || wide[i - 1]) &&
-            (i + 1 == count || wide[i + 1]) && count > 1) {
-          wide[i] = true;
-        }
-      }
       Index i = 0;
       while (i < count) {
+        bool wide = pending[i].second;
         Index j = i;
-        while (j < count && wide[j] == wide[i] && j - i < MaxTokenLength) {
+        while (j < count && pending[j].second == wide &&
+               j - i < MaxTokenLength) {
           j++;
         }
-        emitToken(wide[i] ? 1 : 0, j - i);
+        emitToken(wide ? 1 : 0, j - i);
         for (Index k = i; k < j; k++) {
-          if (wide[i]) {
-            out.emplace_back(WideLoTable, uint8_t(pending[k] & 0xFF));
-            out.emplace_back(WideHiTable, uint8_t(pending[k] >> 8));
+          uint16_t u = pending[k].first;
+          if (wide) {
+            auto [lo, hi] = encodeWide(u, prevWide);
+            prevWide = u;
+            out.emplace_back(WideLoTable, lo);
+            out.emplace_back(WideHiTable, hi);
           } else {
-            out.emplace_back(NarrowTable, uint8_t(pending[k]));
+            out.emplace_back(NarrowTable, uint8_t(u));
           }
         }
         i = j;
@@ -467,13 +525,20 @@ struct Encoder {
       pending.clear();
     };
     int state = 0; // 0: match, 1: narrow, 2: wide
+    std::vector<bool> emittedWide(n, false);
     for (Index i = 0; i < n;) {
       auto& choice = (state == 0)   ? choiceAfterMatch[i]
                      : (state == 1) ? choiceAfterNarrow[i]
                                     : choiceAfterWide[i];
+      bool wide = (state == 0)   ? isWideAfterMatch[i]
+                  : (state == 1) ? isWideAfterNarrow[i]
+                                 : isWideAfterWide[i];
       if (choice.length == 0) {
-        pending.push_back(units[i]);
-        state = (units[i] >= 256) ? 2 : 1;
+        pending.push_back({units[i], wide});
+        if (wide) {
+          emittedWide[i] = true;
+        }
+        state = wide ? 2 : 1;
         i++;
         continue;
       }
@@ -490,6 +555,22 @@ struct Encoder {
       i += choice.length;
     }
     flushLiterals();
+
+    uint16_t runningWide = 0;
+    for (Index i = 0; i < n; i++) {
+      approxPrevWide[i] = runningWide;
+      if (emittedWide[i] && units[i] >= 256) {
+        runningWide = units[i];
+      }
+    }
+    runningWide = 0;
+    for (Index i = n; i > 0;) {
+      i--;
+      approxNextWide[i] = runningWide;
+      if (emittedWide[i] && units[i] >= 256) {
+        runningWide = units[i];
+      }
+    }
     return out;
   }
 
@@ -506,13 +587,30 @@ struct Encoder {
     } else {
       matches.assign(units.size(), Candidates{});
     }
+    std::vector<uint16_t> approxPrevWide(units.size(), 0);
+    std::vector<uint16_t> approxNextWide(units.size(), 0);
+    uint16_t runningWide = 0;
+    for (size_t i = 0; i < units.size(); i++) {
+      approxPrevWide[i] = runningWide;
+      if (units[i] >= 256) {
+        runningWide = units[i];
+      }
+    }
+    runningWide = 0;
+    for (size_t i = units.size(); i > 0;) {
+      i--;
+      approxNextWide[i] = runningWide;
+      if (units[i] >= 256) {
+        runningWide = units[i];
+      }
+    }
     CostModel model;
     Segment best;
     for (Index pass = 0; pass < MaxParses; pass++) {
       if (pass > 0 && compress) {
         findMatches(chains, matches, &model);
       }
-      auto symbols = parse(matches, model);
+      auto symbols = parse(matches, approxPrevWide, approxNextWide, model);
       auto segment = packSymbols(symbols);
       bool better = pass == 0 || segment.data.size() < best.data.size();
       if (!segment.huffman || !compress) {
@@ -541,26 +639,6 @@ struct Encoder {
           Index length = lengths.empty() ? 0 : lengths[symbol];
           model.cost[table][symbol] = length ? length : unused;
         }
-      }
-      // A literal run costs the average literal run token of its width.
-      Index narrowBits = 0, narrowRuns = 0;
-      Index wideBits = 0, wideRuns = 0;
-      for (auto& symbol : symbols) {
-        if (symbol.first == TokenTable && (symbol.second & 3) < 2) {
-          if ((symbol.second & 3) == 0) {
-            narrowBits += model.cost[TokenTable][symbol.second];
-            narrowRuns++;
-          } else {
-            wideBits += model.cost[TokenTable][symbol.second];
-            wideRuns++;
-          }
-        }
-      }
-      if (narrowRuns) {
-        model.narrowRun = (narrowBits + narrowRuns / 2) / narrowRuns;
-      }
-      if (wideRuns) {
-        model.wideRun = (wideBits + wideRuns / 2) / wideRuns;
       }
     }
     return best;
@@ -1025,11 +1103,22 @@ struct DecoderOptions {
 inline void
 makeDecoder(Module& module, const Segment& segment, const DecoderOptions& o) {
   Builder builder(module);
-  Index src = 0, dst = 1, p = 2, q = 3, tok = 4, len = 5, d = 6, oldBits = 7;
+  Index src = 0, dst = 1, p = 2, q = 3, tok = 4, len = 5, d = 6;
   Type i8Ref(o.i8ArrayType, NonNullable);
   Type dstRef(o.dstArrayType, NonNullable);
   bool bytes = o.dstArrayType.getArray().element.packedType == Field::i8;
   auto i32 = Type::i32;
+  std::vector<Type> vars{i8Ref, dstRef, i32, i32, i32, i32, i32};
+  Index wide = 0;
+  if (!bytes) {
+    wide = vars.size();
+    vars.push_back(i32);
+  }
+  Index oldBits = 0;
+  if (segment.huffman && o.setBits) {
+    oldBits = vars.size();
+    vars.push_back(i32);
+  }
   auto get = [&](Index index) { return builder.makeLocalGet(index, i32); };
   auto add = [&](Expression* a, Expression* b) {
     return builder.makeBinary(AddInt32, a, b);
@@ -1100,8 +1189,14 @@ makeDecoder(Module& module, const Segment& segment, const DecoderOptions& o) {
   Name litLabel("lit");
   Expression* setLiteral = setDst(readByte(NarrowTable));
   if (!bytes) {
-    setLiteral = builder.makeIf(
-      get(tok), setDst(readPair(WideLoTable, WideHiTable)), setLiteral);
+    Expression* wideVal = builder.makeLocalTee(
+      wide,
+      add(get(wide),
+          builder.makeBinary(SubInt32,
+                             readPair(WideLoTable, WideHiTable),
+                             builder.makeConst(int32_t(WideDeltaBias)))),
+      i32);
+    setLiteral = builder.makeIf(get(tok), setDst(wideVal), setLiteral);
   }
   auto* literal = builder.makeLoop(
     litLabel,
@@ -1153,10 +1248,6 @@ makeDecoder(Module& module, const Segment& segment, const DecoderOptions& o) {
     builder.makeGlobalSet(o.dataGlobal, builder.makeLocalGet(dst, dstRef)));
   if (segment.huffman && o.setBits) {
     body.push_back(builder.makeGlobalSet(o.symbols.bitsGlobal, get(oldBits)));
-  }
-  std::vector<Type> vars{i8Ref, dstRef, i32, i32, i32, i32, i32};
-  if (segment.huffman && o.setBits) {
-    vars.push_back(i32);
   }
   module.addFunction(builder.makeFunction(o.decodeFunc,
                                           Signature(Type::none, Type::none),

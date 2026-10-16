@@ -111,7 +111,7 @@
   ;; CHECK-NEXT:  (i32.const 2)
   ;; CHECK-NEXT: ))
 
-  ;; CHECK:      (data $string.consts ",foo\00h\e9llo!\00\t\e5e,g\18\00\00foo \n\0e\02\05\02\r\n\01\n\108\00only-in-code\00")
+  ;; CHECK:      (data $string.consts ",foo\00h\e9llo!\00\tef\c7\01\18\00\00foo \n\0e\02\05\02\r\n\01\n\108\00only-in-code\00")
 
   ;; CHECK:      (export "exported" (global $exported))
   (export "exported" (global $exported))
@@ -327,6 +327,7 @@
 ;; CHECK-NEXT:  (local $4 i32)
 ;; CHECK-NEXT:  (local $5 i32)
 ;; CHECK-NEXT:  (local $6 i32)
+;; CHECK-NEXT:  (local $7 i32)
 ;; CHECK-NEXT:  (local.set $0
 ;; CHECK-NEXT:   (array.new_data $1 $string.consts
 ;; CHECK-NEXT:    (i32.const 0)
@@ -403,33 +404,41 @@
 ;; CHECK-NEXT:        (array.set $0
 ;; CHECK-NEXT:         (local.get $1)
 ;; CHECK-NEXT:         (local.get $3)
-;; CHECK-NEXT:         (i32.or
-;; CHECK-NEXT:          (array.get_u $1
-;; CHECK-NEXT:           (local.get $0)
+;; CHECK-NEXT:         (local.tee $7
+;; CHECK-NEXT:          (i32.add
+;; CHECK-NEXT:           (local.get $7)
 ;; CHECK-NEXT:           (i32.sub
-;; CHECK-NEXT:            (local.tee $2
-;; CHECK-NEXT:             (i32.add
-;; CHECK-NEXT:              (local.get $2)
-;; CHECK-NEXT:              (i32.const 1)
-;; CHECK-NEXT:             )
-;; CHECK-NEXT:            )
-;; CHECK-NEXT:            (i32.const 1)
-;; CHECK-NEXT:           )
-;; CHECK-NEXT:          )
-;; CHECK-NEXT:          (i32.shl
-;; CHECK-NEXT:           (array.get_u $1
-;; CHECK-NEXT:            (local.get $0)
-;; CHECK-NEXT:            (i32.sub
-;; CHECK-NEXT:             (local.tee $2
-;; CHECK-NEXT:              (i32.add
-;; CHECK-NEXT:               (local.get $2)
+;; CHECK-NEXT:            (i32.or
+;; CHECK-NEXT:             (array.get_u $1
+;; CHECK-NEXT:              (local.get $0)
+;; CHECK-NEXT:              (i32.sub
+;; CHECK-NEXT:               (local.tee $2
+;; CHECK-NEXT:                (i32.add
+;; CHECK-NEXT:                 (local.get $2)
+;; CHECK-NEXT:                 (i32.const 1)
+;; CHECK-NEXT:                )
+;; CHECK-NEXT:               )
 ;; CHECK-NEXT:               (i32.const 1)
 ;; CHECK-NEXT:              )
 ;; CHECK-NEXT:             )
-;; CHECK-NEXT:             (i32.const 1)
+;; CHECK-NEXT:             (i32.shl
+;; CHECK-NEXT:              (array.get_u $1
+;; CHECK-NEXT:               (local.get $0)
+;; CHECK-NEXT:               (i32.sub
+;; CHECK-NEXT:                (local.tee $2
+;; CHECK-NEXT:                 (i32.add
+;; CHECK-NEXT:                  (local.get $2)
+;; CHECK-NEXT:                  (i32.const 1)
+;; CHECK-NEXT:                 )
+;; CHECK-NEXT:                )
+;; CHECK-NEXT:                (i32.const 1)
+;; CHECK-NEXT:               )
+;; CHECK-NEXT:              )
+;; CHECK-NEXT:              (i32.const 8)
+;; CHECK-NEXT:             )
 ;; CHECK-NEXT:            )
+;; CHECK-NEXT:            (i32.const 128)
 ;; CHECK-NEXT:           )
-;; CHECK-NEXT:           (i32.const 8)
 ;; CHECK-NEXT:          )
 ;; CHECK-NEXT:         )
 ;; CHECK-NEXT:        )
