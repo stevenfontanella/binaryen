@@ -707,6 +707,53 @@ static bool SubtreeTargetsName(Expression* root, Name target) {
   return finder.found;
 }
 
+static bool exprDoesNotReturn(Expression* e, Module& wasm) {
+  if (!e) {
+    return false;
+  }
+  if (e->type == Type::unreachable) {
+    return true;
+  }
+  if (auto* b = e->dynCast<Block>()) {
+    for (auto* elem : b->list) {
+      if (SubtreeTargetsName(elem, b->name)) {
+        return false;
+      }
+      if (exprDoesNotReturn(elem, wasm)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (auto* iff = e->dynCast<If>()) {
+    if (exprDoesNotReturn(iff->condition, wasm)) {
+      return true;
+    }
+    return iff->ifFalse && exprDoesNotReturn(iff->ifTrue, wasm) &&
+           exprDoesNotReturn(iff->ifFalse, wasm);
+  }
+  if (auto* d = e->dynCast<Drop>()) {
+    return exprDoesNotReturn(d->value, wasm);
+  }
+  if (auto* ls = e->dynCast<LocalSet>()) {
+    return exprDoesNotReturn(ls->value, wasm);
+  }
+  if (auto* call = e->dynCast<Call>()) {
+    if (auto* target = wasm.getFunctionOrNull(call->target)) {
+      if (target->effects && target->effects->mustNotReturn) {
+        return true;
+      }
+    }
+    for (auto* op : call->operands) {
+      if (exprDoesNotReturn(op, wasm)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  return false;
+}
+
 static bool forwardStructNewFields(Function* func,
                                    Module& wasm,
                                    PassOptions& options) {
@@ -717,7 +764,7 @@ static bool forwardStructNewFields(Function* func,
   Index numLocals = func->getNumLocals();
   Index numParams = func->getNumParams();
   std::vector<Index> setCounts(numLocals, 0);
-  std::unordered_set<HeapType> writtenStructTypes;
+  SmallVector<std::pair<HeapType, Index>, 8> writtenStructFields;
   bool hasUnknownStructWrite = false;
   bool hasCandidateStructNew = false;
 
@@ -738,7 +785,7 @@ static bool forwardStructNewFields(Function* func,
     PassOptions& options;
     Index numParams;
     std::vector<Index>& setCounts;
-    std::unordered_set<HeapType>& writtenStructTypes;
+    SmallVector<std::pair<HeapType, Index>, 8>& writtenStructFields;
     bool& hasUnknownStructWrite;
     bool& hasCandidateStructNew;
 
@@ -746,11 +793,11 @@ static bool forwardStructNewFields(Function* func,
                PassOptions& options,
                Index numParams,
                std::vector<Index>& setCounts,
-               std::unordered_set<HeapType>& writtenStructTypes,
+               SmallVector<std::pair<HeapType, Index>, 8>& writtenStructFields,
                bool& hasUnknownStructWrite,
                bool& hasCandidateStructNew)
       : wasm(wasm), options(options), numParams(numParams),
-        setCounts(setCounts), writtenStructTypes(writtenStructTypes),
+        setCounts(setCounts), writtenStructFields(writtenStructFields),
         hasUnknownStructWrite(hasUnknownStructWrite),
         hasCandidateStructNew(hasCandidateStructNew) {}
 
@@ -780,18 +827,19 @@ static bool forwardStructNewFields(Function* func,
         }
         return;
       }
-      if (auto* ss = curr->dynCast<StructSet>()) {
-        if (ss->ref->type.isRef()) {
-          writtenStructTypes.insert(ss->ref->type.getHeapType());
-        } else {
-          hasUnknownStructWrite = true;
-        }
-        return;
-      }
-      if (! hasUnknownStructWrite) {
+      if (!hasUnknownStructWrite) {
         ShallowEffectAnalyzer eff(options, wasm, curr);
-        if (eff.writesStruct || eff.writesSharedStruct || eff.calls) {
+        if (eff.writesSharedStruct || eff.calls ||
+            eff.hasUnknownMutableStructWrite) {
           hasUnknownStructWrite = true;
+        } else if (eff.writesStruct) {
+          for (const auto& key : eff.mutableStructFieldsWritten) {
+            if (std::find(writtenStructFields.begin(),
+                          writtenStructFields.end(),
+                          key) == writtenStructFields.end()) {
+              writtenStructFields.push_back(key);
+            }
+          }
         }
       }
     }
@@ -799,7 +847,7 @@ static bool forwardStructNewFields(Function* func,
                options,
                numParams,
                setCounts,
-               writtenStructTypes,
+               writtenStructFields,
                hasUnknownStructWrite,
                hasCandidateStructNew);
   preScanner.walk(func->body);
@@ -808,15 +856,17 @@ static bool forwardStructNewFields(Function* func,
     return false;
   }
 
-  auto isFieldUnmodified = [&](HeapType ht, const Field& field) -> bool {
+  auto isFieldUnmodified =
+    [&](HeapType ht, Index fieldIdx, const Field& field) -> bool {
     if (field.mutable_ == Immutable) {
       return true;
     }
     if (hasUnknownStructWrite) {
       return false;
     }
-    for (HeapType wht : writtenStructTypes) {
-      if (HeapType::isSubType(wht, ht) || HeapType::isSubType(ht, wht)) {
+    for (const auto& [wht, wIdx] : writtenStructFields) {
+      if (wIdx == fieldIdx &&
+          (HeapType::isSubType(wht, ht) || HeapType::isSubType(ht, wht))) {
         return false;
       }
     }
@@ -863,13 +913,29 @@ static bool forwardStructNewFields(Function* func,
       auto savedSN = activeStructNews;
       auto savedSS = activeSingleSets;
       walkDom(&iff->ifTrue);
+      auto afterTrueSN = std::move(activeStructNews);
+      auto afterTrueSS = std::move(activeSingleSets);
+      auto afterFalseSN = savedSN;
+      auto afterFalseSS = savedSS;
       if (iff->ifFalse) {
         activeStructNews = savedSN;
         activeSingleSets = savedSS;
         walkDom(&iff->ifFalse);
+        afterFalseSN = std::move(activeStructNews);
+        afterFalseSS = std::move(activeSingleSets);
       }
-      activeStructNews = std::move(savedSN);
-      activeSingleSets = std::move(savedSS);
+      bool thenNR = exprDoesNotReturn(iff->ifTrue, wasm);
+      bool elseNR = iff->ifFalse && exprDoesNotReturn(iff->ifFalse, wasm);
+      if (thenNR && !elseNR) {
+        activeStructNews = std::move(afterFalseSN);
+        activeSingleSets = std::move(afterFalseSS);
+      } else if (elseNR && !thenNR) {
+        activeStructNews = std::move(afterTrueSN);
+        activeSingleSets = std::move(afterTrueSS);
+      } else {
+        activeStructNews = std::move(savedSN);
+        activeSingleSets = std::move(savedSS);
+      }
       return;
     }
     if (auto* loop = curr->dynCast<Loop>()) {
@@ -960,7 +1026,7 @@ static bool forwardStructNewFields(Function* func,
         return;
       }
       const Field& field = ht.getStruct().fields[sg->index];
-      if (!isFieldUnmodified(ht, field)) {
+      if (!isFieldUnmodified(ht, sg->index, field)) {
         return;
       }
       Expression* op = sn->operands[sg->index];
@@ -1068,7 +1134,7 @@ static bool unaliasSingleFieldProjectionLocals(Function* func,
     std::vector<std::vector<Expression**>> gets(numLocals);
     std::vector<Index> dominatedGets(numLocals, 0);
     std::unordered_map<Expression*, Expression**> parentStructGets;
-    std::unordered_set<HeapType> writtenStructTypes;
+    SmallVector<std::pair<HeapType, Index>, 8> writtenStructFields;
     bool hasUnknownStructWrite = false;
     std::unordered_set<Index> activeSingleSets;
 
@@ -1103,11 +1169,22 @@ static bool unaliasSingleFieldProjectionLocals(Function* func,
         scanDom(&iff->condition);
         auto savedSS = activeSingleSets;
         scanDom(&iff->ifTrue);
+        auto afterTrueSS = std::move(activeSingleSets);
+        auto afterFalseSS = savedSS;
         if (iff->ifFalse) {
           activeSingleSets = savedSS;
           scanDom(&iff->ifFalse);
+          afterFalseSS = std::move(activeSingleSets);
         }
-        activeSingleSets = std::move(savedSS);
+        bool thenNR = exprDoesNotReturn(iff->ifTrue, wasm);
+        bool elseNR = iff->ifFalse && exprDoesNotReturn(iff->ifFalse, wasm);
+        if (thenNR && !elseNR) {
+          activeSingleSets = std::move(afterFalseSS);
+        } else if (elseNR && !thenNR) {
+          activeSingleSets = std::move(afterTrueSS);
+        } else {
+          activeSingleSets = std::move(savedSS);
+        }
         return;
       }
       if (auto* loop = curr->dynCast<Loop>()) {
@@ -1173,33 +1250,36 @@ static bool unaliasSingleFieldProjectionLocals(Function* func,
         }
         return;
       }
-      if (auto* ss = curr->dynCast<StructSet>()) {
-        if (ss->ref->type.isRef()) {
-          writtenStructTypes.insert(ss->ref->type.getHeapType());
-        } else {
-          hasUnknownStructWrite = true;
-        }
-        return;
-      }
       if (!hasUnknownStructWrite) {
         ShallowEffectAnalyzer eff(options, wasm, curr);
-        if (eff.writesStruct || eff.writesSharedStruct || eff.calls) {
+        if (eff.writesSharedStruct || eff.calls ||
+            eff.hasUnknownMutableStructWrite) {
           hasUnknownStructWrite = true;
+        } else if (eff.writesStruct) {
+          for (const auto& key : eff.mutableStructFieldsWritten) {
+            if (std::find(writtenStructFields.begin(),
+                          writtenStructFields.end(),
+                          key) == writtenStructFields.end()) {
+              writtenStructFields.push_back(key);
+            }
+          }
         }
       }
     };
 
     scanDom(&func->body);
 
-    auto isFieldUnmodified = [&](HeapType ht, const Field& field) -> bool {
+    auto isFieldUnmodified =
+      [&](HeapType ht, Index fieldIdx, const Field& field) -> bool {
       if (field.mutable_ == Immutable) {
         return true;
       }
       if (hasUnknownStructWrite) {
         return false;
       }
-      for (HeapType wht : writtenStructTypes) {
-        if (HeapType::isSubType(wht, ht) || HeapType::isSubType(ht, wht)) {
+      for (const auto& [wht, wIdx] : writtenStructFields) {
+        if (wIdx == fieldIdx &&
+            (HeapType::isSubType(wht, ht) || HeapType::isSubType(ht, wht))) {
           return false;
         }
       }
@@ -1264,7 +1344,7 @@ static bool unaliasSingleFieldProjectionLocals(Function* func,
         continue;
       }
       const Field& field = ht.getStruct().fields[protoSG->index];
-      if (!isFieldUnmodified(ht, field)) {
+      if (!isFieldUnmodified(ht, protoSG->index, field)) {
         continue;
       }
       Type newType = protoSG->type;
@@ -1317,6 +1397,12 @@ struct ScopedDominatorCSE {
     size_t hash;
     Index estBytes;
     Index existingLocal = Index(-1);
+    bool existingLocalNeedsNonNull = false;
+    Literal knownConst;
+    int8_t knownNullness = 0;
+    bool knownNonZero = false;
+    bool isFactOnly = false;
+    BinaryOp altBinaryOp = InvalidBinary;
     Index reuses = 0;
     SmallVector<Index, 4> localsRead;
     SmallVector<Name, 2> mutableGlobalsRead;
@@ -1351,6 +1437,8 @@ struct ScopedDominatorCSE {
   ActiveMap lastCondFalseMap;
   bool hasLastBrExitMap = false;
   ActiveMap lastBrExitMap;
+  ActiveMap lastBrTakenMap;
+  std::unordered_map<Expression*, NodeInfo> exprInfoMap;
   std::unordered_set<Type> activeVarTypes;
 
   static bool isConstZeroI32(Expression* e) {
@@ -1386,50 +1474,210 @@ struct ScopedDominatorCSE {
   }
 
   bool doesNotReturn(Expression* e) const {
-    if (!e) {
-      return false;
-    }
-    if (e->type == Type::unreachable) {
-      return true;
-    }
-    if (auto* b = e->dynCast<Block>()) {
-      for (auto* elem : b->list) {
-        if (SubtreeTargetsName(elem, b->name)) {
-          return false;
-        }
-        if (doesNotReturn(elem)) {
-          return true;
-        }
-      }
-      return false;
-    }
-    if (auto* iff = e->dynCast<If>()) {
-      if (doesNotReturn(iff->condition)) {
+    return exprDoesNotReturn(e, wasm);
+  }
+
+  bool isBooleanValueExpr(Expression* e) const {
+    while (e) {
+      if (e->is<RefIsNull>() || e->is<RefEq>() || e->is<RefTest>() ||
+          e->is<StringTest>()) {
         return true;
       }
-      return iff->ifFalse && doesNotReturn(iff->ifTrue) &&
-             doesNotReturn(iff->ifFalse);
-    }
-    if (auto* d = e->dynCast<Drop>()) {
-      return doesNotReturn(d->value);
-    }
-    if (auto* ls = e->dynCast<LocalSet>()) {
-      return doesNotReturn(ls->value);
-    }
-    if (auto* call = e->dynCast<Call>()) {
-      if (auto* target = wasm.getFunctionOrNull(call->target)) {
-        if (target->effects && target->effects->mustNotReturn) {
-          return true;
-        }
+      if (auto* seq = e->dynCast<StringEq>()) {
+        return seq->op == StringEqEqual;
       }
-      for (auto* op : call->operands) {
-        if (doesNotReturn(op)) {
-          return true;
-        }
+      if (auto* u = e->dynCast<Unary>()) {
+        return u->op == EqZInt32 || u->op == EqZInt64;
       }
-      return false;
+      if (auto* bin = e->dynCast<Binary>()) {
+        return bin->isRelational();
+      }
+      if (auto* c = e->dynCast<Const>()) {
+        return c->type == Type::i32 &&
+               (c->value.geti32() == 0 || c->value.geti32() == 1);
+      }
+      if (auto* iff = e->dynCast<If>()) {
+        if (!iff->ifFalse) {
+          return false;
+        }
+        bool tOk = doesNotReturn(iff->ifTrue) || isBooleanValueExpr(iff->ifTrue);
+        bool fOk =
+          doesNotReturn(iff->ifFalse) || isBooleanValueExpr(iff->ifFalse);
+        return tOk && fOk;
+      }
+      if (auto* sel = e->dynCast<Select>()) {
+        return isBooleanValueExpr(sel->ifTrue) &&
+               isBooleanValueExpr(sel->ifFalse);
+      }
+      if (auto* b = e->dynCast<Block>()) {
+        if (!b->list.empty() && !SubtreeTargetsName(b, b->name)) {
+          e = b->list.back();
+          continue;
+        }
+        return false;
+      }
+      if (auto* ls = e->dynCast<LocalSet>()) {
+        if (ls->isTee()) {
+          e = ls->value;
+          continue;
+        }
+        return false;
+      }
+      break;
     }
     return false;
+  }
+
+  static BinaryOp getComplementaryIntRelOp(BinaryOp op) {
+    switch (op) {
+      case EqInt32:
+        return NeInt32;
+      case NeInt32:
+        return EqInt32;
+      case LtSInt32:
+        return GeSInt32;
+      case GeSInt32:
+        return LtSInt32;
+      case LtUInt32:
+        return GeUInt32;
+      case GeUInt32:
+        return LtUInt32;
+      case GtSInt32:
+        return LeSInt32;
+      case LeSInt32:
+        return GtSInt32;
+      case GtUInt32:
+        return LeUInt32;
+      case LeUInt32:
+        return GtUInt32;
+      case EqInt64:
+        return NeInt64;
+      case NeInt64:
+        return EqInt64;
+      case LtSInt64:
+        return GeSInt64;
+      case GeSInt64:
+        return LtSInt64;
+      case LtUInt64:
+        return GeUInt64;
+      case GeUInt64:
+        return LtUInt64;
+      case GtSInt64:
+        return LeSInt64;
+      case LeSInt64:
+        return GtSInt64;
+      case GtUInt64:
+        return LeUInt64;
+      case LeUInt64:
+        return GtUInt64;
+      default:
+        return InvalidBinary;
+    }
+  }
+
+  static bool evalIntRelOp(BinaryOp op, Literal l, Literal r, Literal& out) {
+    if (l.type != r.type) {
+      return false;
+    }
+    if (l.type == Type::i32) {
+      int32_t a = l.geti32();
+      int32_t b = r.geti32();
+      uint32_t ua = uint32_t(a);
+      uint32_t ub = uint32_t(b);
+      int32_t res = 0;
+      switch (op) {
+        case EqInt32:
+          res = (a == b);
+          break;
+        case NeInt32:
+          res = (a != b);
+          break;
+        case LtSInt32:
+          res = (a < b);
+          break;
+        case LeSInt32:
+          res = (a <= b);
+          break;
+        case GtSInt32:
+          res = (a > b);
+          break;
+        case GeSInt32:
+          res = (a >= b);
+          break;
+        case LtUInt32:
+          res = (ua < ub);
+          break;
+        case LeUInt32:
+          res = (ua <= ub);
+          break;
+        case GtUInt32:
+          res = (ua > ub);
+          break;
+        case GeUInt32:
+          res = (ua >= ub);
+          break;
+        default:
+          return false;
+      }
+      out = Literal(res);
+      return true;
+    }
+    if (l.type == Type::i64) {
+      int64_t a = l.geti64();
+      int64_t b = r.geti64();
+      uint64_t ua = uint64_t(a);
+      uint64_t ub = uint64_t(b);
+      int32_t res = 0;
+      switch (op) {
+        case EqInt64:
+          res = (a == b);
+          break;
+        case NeInt64:
+          res = (a != b);
+          break;
+        case LtSInt64:
+          res = (a < b);
+          break;
+        case LeSInt64:
+          res = (a <= b);
+          break;
+        case GtSInt64:
+          res = (a > b);
+          break;
+        case GeSInt64:
+          res = (a >= b);
+          break;
+        case LtUInt64:
+          res = (ua < ub);
+          break;
+        case LeUInt64:
+          res = (ua <= ub);
+          break;
+        case GtUInt64:
+          res = (ua > ub);
+          break;
+        case GeUInt64:
+          res = (ua >= ub);
+          break;
+        default:
+          return false;
+      }
+      out = Literal(res);
+      return true;
+    }
+    return false;
+  }
+
+  static Index getConstEstBytes(Literal val) {
+    if (val.type == Type::i32) {
+      int32_t v = val.geti32();
+      return (-64 <= v && v <= 63) ? 2 : ((-8192 <= v && v <= 8191) ? 3 : 5);
+    }
+    if (val.type == Type::i64) {
+      int64_t v = val.geti64();
+      return (-64 <= v && v <= 63) ? 2 : ((-8192 <= v && v <= 8191) ? 3 : 6);
+    }
+    return val.type == Type::f64 ? 9 : 5;
   }
 
   bool collectPureCallStructFieldsRead(
@@ -1616,38 +1864,13 @@ struct ScopedDominatorCSE {
     if (rec.readsMutableStruct &&
         (eff.writesStruct || eff.writesSharedStruct || eff.calls)) {
       if (rec.readsUnknownMutableStruct || eff.writesSharedStruct ||
-          eff.calls || !killerExpr) {
-        return true;
-      }
-      if (!FindAll<CallRef>(killerExpr).list.empty() ||
-          !FindAll<CallIndirect>(killerExpr).list.empty()) {
+          eff.calls || eff.hasUnknownMutableStructWrite) {
         return true;
       }
       bool aliasFound = false;
-      for (auto* call : FindAll<Call>(killerExpr).list) {
-        auto* target = wasm.getFunctionOrNull(call->target);
-        if (!target || !target->effects) {
-          aliasFound = true;
-          break;
-        }
-        const auto& tEff = *target->effects;
-        if ((tEff.writesStruct || tEff.writesSharedStruct || tEff.calls) &&
-            !(tEff.isIdempotent && tEff.onlyTouchesInitGlobals)) {
-          aliasFound = true;
-          break;
-        }
-      }
-      if (aliasFound) {
-        return true;
-      }
-      for (auto* ss : FindAll<StructSet>(killerExpr).list) {
-        if (!ss->ref->type.isRef()) {
-          aliasFound = true;
-          break;
-        }
-        HeapType wHT = ss->ref->type.getHeapType();
-        for (auto& [rHT, rIdx] : rec.mutableStructFieldsRead) {
-          if (ss->index == rIdx &&
+      for (const auto& [wHT, wIdx] : eff.mutableStructFieldsWritten) {
+        for (const auto& [rHT, rIdx] : rec.mutableStructFieldsRead) {
+          if (wIdx == rIdx &&
               (HeapType::isSubType(wHT, rHT) ||
                HeapType::isSubType(rHT, wHT))) {
             aliasFound = true;
@@ -1686,8 +1909,8 @@ struct ScopedDominatorCSE {
     return false;
   }
 
-  void invalidateByLocalWrite(Index localIdx) {
-    for (auto it = activeMap.begin(); it != activeMap.end();) {
+  void invalidateMapByLocalWrite(ActiveMap& map, Index localIdx) {
+    for (auto it = map.begin(); it != map.end();) {
       auto& vec = it->second;
       vec.erase(
         std::remove_if(vec.begin(),
@@ -1700,11 +1923,15 @@ struct ScopedDominatorCSE {
                        }),
         vec.end());
       if (vec.empty()) {
-        it = activeMap.erase(it);
+        it = map.erase(it);
       } else {
         ++it;
       }
     }
+  }
+
+  void invalidateByLocalWrite(Index localIdx) {
+    invalidateMapByLocalWrite(activeMap, localIdx);
   }
 
   void invalidateByEffects(const EffectAnalyzer& eff,
@@ -1761,6 +1988,274 @@ struct ScopedDominatorCSE {
     return true;
   }
 
+  static bool factMatches(const OrigRecord& rec, Expression* curr) {
+    if (rec.altBinaryOp != InvalidBinary) {
+      auto* bin = curr->dynCast<Binary>();
+      auto* origBin = rec.orig->dynCast<Binary>();
+      if (!bin || !origBin || bin->op != rec.altBinaryOp ||
+          bin->type != origBin->type) {
+        return false;
+      }
+      return normEqual(origBin->left, bin->left) &&
+             normEqual(origBin->right, bin->right);
+    }
+    return normEqual(rec.orig, curr);
+  }
+
+  void addFactRecord(ActiveMap& map,
+                     Expression* expr,
+                     size_t hash,
+                     Index estBytes,
+                     Literal knownConst,
+                     int8_t knownNullness = 0,
+                     bool knownNonZero = false,
+                     BinaryOp altBinaryOp = InvalidBinary) {
+    if (!expr || !expr->type.isConcrete()) {
+      return;
+    }
+    Index newIdx = origRecords.size();
+    OrigRecord rec;
+    rec.orig = expr;
+    rec.hash = hash;
+    rec.estBytes = estBytes;
+    rec.knownConst = knownConst;
+    rec.knownNullness = knownNullness;
+    rec.knownNonZero = knownNonZero;
+    rec.isFactOnly = true;
+    rec.altBinaryOp = altBinaryOp;
+    Index lIdx;
+    if (getNormLocalIndex(expr, lIdx)) {
+      rec.localsRead.push_back(lIdx);
+    } else {
+      populateNormReadEffects(expr, rec);
+    }
+    origRecords.push_back(std::move(rec));
+    map[hash].push_back(newIdx);
+  }
+
+  void addFactForExpr(ActiveMap& map,
+                      Expression* expr,
+                      Literal knownConst,
+                      int8_t knownNullness = 0,
+                      bool knownNonZero = false) {
+    while (expr) {
+      if (auto* b = expr->dynCast<Block>()) {
+        if (!b->list.empty() && !SubtreeTargetsName(b, b->name)) {
+          expr = b->list.back();
+          continue;
+        }
+      }
+      break;
+    }
+    if (!expr) {
+      return;
+    }
+    auto it = exprInfoMap.find(expr);
+    if (it != exprInfoMap.end() && it->second.possible) {
+      addFactRecord(map,
+                    expr,
+                    it->second.hash,
+                    it->second.estBytes,
+                    knownConst,
+                    knownNullness,
+                    knownNonZero);
+    }
+    if (auto* ls = expr->dynCast<LocalSet>()) {
+      if (ls->isTee() &&
+          !EffectAnalyzer(options, wasm, ls->value)
+             .localsWritten.contains(ls->index)) {
+        addFactForExpr(
+          map, ls->value, knownConst, knownNullness, knownNonZero);
+      }
+    } else if (knownNullness != 0) {
+      if (auto* rc = expr->dynCast<RefCast>()) {
+        addFactForExpr(map, rc->ref, Literal(), knownNullness, false);
+      } else if (auto* ra = expr->dynCast<RefAs>()) {
+        if (ra->op == RefAsNonNull) {
+          addFactForExpr(map, ra->value, Literal(), knownNullness, false);
+        }
+      }
+    }
+  }
+
+  void recordConditionFacts(Expression* cond,
+                            ActiveMap& trueMap,
+                            ActiveMap& falseMap) {
+    while (cond) {
+      if (auto* b = cond->dynCast<Block>()) {
+        if (!b->list.empty() && !SubtreeTargetsName(b, b->name)) {
+          cond = b->list.back();
+          continue;
+        }
+      }
+      break;
+    }
+    if (!cond) {
+      return;
+    }
+    LocalSet* teeExpr = nullptr;
+    if (auto* ls = cond->dynCast<LocalSet>()) {
+      if (ls->isTee()) {
+        teeExpr = ls;
+        cond = ls->value;
+      }
+    }
+    if (auto* u = cond->dynCast<Unary>()) {
+      if (u->op == EqZInt32) {
+        if (teeExpr) {
+          size_t teeHash = wasm::hash(teeExpr->index);
+          addFactRecord(
+            trueMap, teeExpr, teeHash, 2, Literal(int32_t(1)), 0, true);
+          if (!EffectAnalyzer(options, wasm, cond)
+                 .localsWritten.contains(teeExpr->index)) {
+            addFactRecord(falseMap, teeExpr, teeHash, 2, Literal(int32_t(0)));
+          }
+        }
+        recordConditionFacts(u->value, falseMap, trueMap);
+        return;
+      }
+    }
+
+    auto infoIt = exprInfoMap.find(cond);
+    NodeInfo condInfo =
+      (infoIt != exprInfoMap.end()) ? infoIt->second : NodeInfo{};
+
+    if (condInfo.possible && cond->type == Type::i32) {
+      bool isBool = isBooleanValueExpr(cond);
+      if (isBool) {
+        addFactRecord(trueMap,
+                      cond,
+                      condInfo.hash,
+                      condInfo.estBytes,
+                      Literal(int32_t(1)),
+                      0,
+                      true);
+      } else {
+        addFactRecord(
+          trueMap, cond, condInfo.hash, condInfo.estBytes, Literal(), 0, true);
+      }
+      addFactRecord(falseMap,
+                    cond,
+                    condInfo.hash,
+                    condInfo.estBytes,
+                    Literal(int32_t(0)));
+      if (teeExpr) {
+        size_t teeHash = wasm::hash(teeExpr->index);
+        if (isBool) {
+          addFactRecord(
+            trueMap, teeExpr, teeHash, 2, Literal(int32_t(1)), 0, true);
+        } else {
+          addFactRecord(trueMap, teeExpr, teeHash, 2, Literal(), 0, true);
+        }
+        if (!EffectAnalyzer(options, wasm, cond)
+               .localsWritten.contains(teeExpr->index)) {
+          addFactRecord(falseMap, teeExpr, teeHash, 2, Literal(int32_t(0)));
+        }
+      }
+    }
+
+    if (auto* rn = cond->dynCast<RefIsNull>()) {
+      addFactForExpr(trueMap, rn->value, Literal(), 1);
+      addFactForExpr(falseMap, rn->value, Literal(), -1);
+    } else if (auto* rt = cond->dynCast<RefTest>()) {
+      if (rt->castType.isNonNullable()) {
+        addFactForExpr(trueMap, rt->ref, Literal(), -1);
+      } else {
+        addFactForExpr(falseMap, rt->ref, Literal(), -1);
+      }
+    } else if (auto* req = cond->dynCast<RefEq>()) {
+      Expression* other = nullptr;
+      if (req->left->is<RefNull>()) {
+        other = req->right;
+      } else if (req->right->is<RefNull>()) {
+        other = req->left;
+      }
+      if (other) {
+        addFactForExpr(trueMap, other, Literal(), 1);
+        addFactForExpr(falseMap, other, Literal(), -1);
+      }
+    } else if (auto* bin = cond->dynCast<Binary>()) {
+      if (bin->op == AndInt32) {
+        ActiveMap ignoredFalseMap;
+        EffectAnalyzer rightEff(options, wasm, bin->right);
+        rightEff.trap = false;
+        if (!rightEff.hasNonTrapSideEffects()) {
+          recordConditionFacts(bin->left, trueMap, ignoredFalseMap);
+        }
+        recordConditionFacts(bin->right, trueMap, ignoredFalseMap);
+      } else if (bin->op == OrInt32) {
+        ActiveMap ignoredTrueMap;
+        EffectAnalyzer rightEff(options, wasm, bin->right);
+        rightEff.trap = false;
+        if (!rightEff.hasNonTrapSideEffects()) {
+          recordConditionFacts(bin->left, ignoredTrueMap, falseMap);
+        }
+        recordConditionFacts(bin->right, ignoredTrueMap, falseMap);
+      } else if (condInfo.possible && bin->isRelational()) {
+        BinaryOp compOp = getComplementaryIntRelOp(bin->op);
+        if (compOp != InvalidBinary) {
+          auto lIt = exprInfoMap.find(bin->left);
+          auto rIt = exprInfoMap.find(bin->right);
+          if (lIt != exprInfoMap.end() && rIt != exprInfoMap.end() &&
+              lIt->second.possible && rIt->second.possible) {
+            BinaryOp origOp = bin->op;
+            bin->op = compOp;
+            size_t compHash = ExpressionAnalyzer::shallowHash(bin);
+            bin->op = origOp;
+            hash_combine(compHash, lIt->second.hash);
+            hash_combine(compHash, rIt->second.hash);
+            addFactRecord(trueMap,
+                          bin,
+                          compHash,
+                          condInfo.estBytes,
+                          Literal(int32_t(0)),
+                          0,
+                          false,
+                          compOp);
+            addFactRecord(falseMap,
+                          bin,
+                          compHash,
+                          condInfo.estBytes,
+                          Literal(int32_t(1)),
+                          0,
+                          true,
+                          compOp);
+          }
+        }
+        if (bin->op == EqInt32 || bin->op == NeInt32 || bin->op == EqInt64 ||
+            bin->op == NeInt64) {
+          Const* c = bin->right->dynCast<Const>();
+          Expression* other = bin->left;
+          if (!c) {
+            c = bin->left->dynCast<Const>();
+            other = bin->right;
+          }
+          if (c && !Properties::isConstantExpression(other)) {
+            bool isEq = (bin->op == EqInt32 || bin->op == EqInt64);
+            ActiveMap& eqMap = isEq ? trueMap : falseMap;
+            ActiveMap& neMap = isEq ? falseMap : trueMap;
+            bool isZeroConst =
+              (c->type == Type::i32 && c->value.geti32() == 0) ||
+              (c->type == Type::i64 && c->value.geti64() == 0);
+            addFactForExpr(eqMap, other, c->value, 0, !isZeroConst);
+            if (isZeroConst) {
+              addFactForExpr(neMap, other, Literal(), 0, true);
+            }
+          }
+        }
+      }
+    } else if (auto* u = cond->dynCast<Unary>()) {
+      if (u->op == EqZInt64) {
+        addFactForExpr(trueMap, u->value, Literal(int64_t(0)));
+        addFactForExpr(falseMap, u->value, Literal(), 0, true);
+      }
+    }
+  }
+
+  void recordNonNullFact(Expression* ref) {
+    addFactForExpr(activeMap, ref, Literal(), -1);
+  }
+
   NodeInfo walkExpr(Expression* curr) {
     lastCondExpr = nullptr;
     if (!curr) {
@@ -1777,15 +2272,20 @@ struct ScopedDominatorCSE {
         }
       }
       ActiveMap savedExitMap;
+      ActiveMap savedTakenExitMap;
       bool capturedAfterDirectBr = false;
       for (Index i = 0; i < block->list.size(); i++) {
         if (i == firstBranchIdx) {
           bool isDirectCondBr = false;
-          if (auto* br = block->list[i]->dynCast<Break>()) {
+          Expression* brStmt = block->list[i];
+          if (auto* d = brStmt->dynCast<Drop>()) {
+            brStmt = d->value;
+          }
+          if (auto* br = brStmt->dynCast<Break>()) {
             isDirectCondBr = br->name == block->name && br->condition &&
                              !SubtreeTargetsName(br->value, block->name) &&
                              !SubtreeTargetsName(br->condition, block->name);
-          } else if (auto* bron = block->list[i]->dynCast<BrOn>()) {
+          } else if (auto* bron = brStmt->dynCast<BrOn>()) {
             isDirectCondBr = bron->name == block->name &&
                              !SubtreeTargetsName(bron->ref, block->name) &&
                              !SubtreeTargetsName(bron->desc, block->name);
@@ -1799,8 +2299,13 @@ struct ScopedDominatorCSE {
         hasLastBrExitMap = false;
         walkExpr(block->list[i]);
         if (i == firstBranchIdx && capturedAfterDirectBr) {
-          savedExitMap =
-            hasLastBrExitMap ? std::move(lastBrExitMap) : activeMap;
+          if (hasLastBrExitMap) {
+            savedExitMap = std::move(lastBrExitMap);
+            savedTakenExitMap = std::move(lastBrTakenMap);
+          } else {
+            savedExitMap = activeMap;
+            savedTakenExitMap = activeMap;
+          }
           hasLastBrExitMap = false;
         }
       }
@@ -1808,14 +2313,32 @@ struct ScopedDominatorCSE {
         activeMap.clear();
         lastCondExpr = nullptr;
       } else if (firstBranchIdx < block->list.size()) {
-        activeMap = std::move(savedExitMap);
-        for (Index i = firstBranchIdx; i < block->list.size(); i++) {
-          if (i == firstBranchIdx && capturedAfterDirectBr) {
-            continue;
+        bool onlyExitsViaFirstDirectBr =
+          capturedAfterDirectBr && firstBranchIdx + 1 < block->list.size();
+        bool tailDoesNotReturn = false;
+        if (onlyExitsViaFirstDirectBr) {
+          for (Index i = firstBranchIdx + 1; i < block->list.size(); i++) {
+            if (SubtreeTargetsName(block->list[i], block->name)) {
+              onlyExitsViaFirstDirectBr = false;
+              break;
+            }
+            if (doesNotReturn(block->list[i])) {
+              tailDoesNotReturn = true;
+            }
           }
-          EffectAnalyzer eff(options, wasm, block->list[i]);
-          eff.trap = false;
-          invalidateByEffects(eff, block->list[i]);
+        }
+        if (onlyExitsViaFirstDirectBr && tailDoesNotReturn) {
+          activeMap = std::move(savedTakenExitMap);
+        } else {
+          activeMap = std::move(savedExitMap);
+          for (Index i = firstBranchIdx; i < block->list.size(); i++) {
+            if (i == firstBranchIdx && capturedAfterDirectBr) {
+              continue;
+            }
+            EffectAnalyzer eff(options, wasm, block->list[i]);
+            eff.trap = false;
+            invalidateByEffects(eff, block->list[i]);
+          }
         }
         lastCondExpr = nullptr;
       } else if (!block->list.empty() && lastCondExpr == block->list.back()) {
@@ -1835,6 +2358,7 @@ struct ScopedDominatorCSE {
                                  ? std::move(lastCondFalseMap)
                                  : afterCond;
       lastCondExpr = nullptr;
+      recordConditionFacts(iff->condition, condTrueMap, condFalseMap);
 
       Index origStart = origRecords.size();
       activeMap = std::move(condTrueMap);
@@ -1843,6 +2367,9 @@ struct ScopedDominatorCSE {
         (lastCondExpr == iff->ifTrue) ? std::move(lastCondTrueMap) : activeMap;
       ActiveMap thenFalseMap =
         (lastCondExpr == iff->ifTrue) ? std::move(lastCondFalseMap) : activeMap;
+      if (iff->type == Type::i32 && iff->ifFalse) {
+        recordConditionFacts(iff->ifTrue, thenTrueMap, thenFalseMap);
+      }
       ActiveMap afterTrue = std::move(activeMap);
       lastCondExpr = nullptr;
 
@@ -1858,6 +2385,9 @@ struct ScopedDominatorCSE {
         elseFalseMap = (lastCondExpr == iff->ifFalse)
                          ? std::move(lastCondFalseMap)
                          : activeMap;
+        if (iff->type == Type::i32) {
+          recordConditionFacts(iff->ifFalse, elseTrueMap, elseFalseMap);
+        }
         afterFalse = std::move(activeMap);
         lastCondExpr = nullptr;
       } else {
@@ -1971,12 +2501,19 @@ struct ScopedDominatorCSE {
       }
       if (br->condition) {
         walkExpr(br->condition);
-        if (lastCondExpr == br->condition) {
-          hasLastBrExitMap = true;
-          lastBrExitMap = activeMap;
-          activeMap = std::move(lastCondFalseMap);
-          lastCondExpr = nullptr;
-        }
+        ActiveMap afterCond = activeMap;
+        ActiveMap condTrueMap = (lastCondExpr == br->condition)
+                                  ? std::move(lastCondTrueMap)
+                                  : afterCond;
+        ActiveMap condFalseMap = (lastCondExpr == br->condition)
+                                   ? std::move(lastCondFalseMap)
+                                   : afterCond;
+        lastCondExpr = nullptr;
+        recordConditionFacts(br->condition, condTrueMap, condFalseMap);
+        hasLastBrExitMap = true;
+        lastBrExitMap = std::move(afterCond);
+        lastBrTakenMap = std::move(condTrueMap);
+        activeMap = std::move(condFalseMap);
       }
       if (!br->condition) {
         activeMap.clear();
@@ -1990,6 +2527,31 @@ struct ScopedDominatorCSE {
         walkExpr(bron->desc);
       }
       lastCondExpr = nullptr;
+      ActiveMap afterRef = activeMap;
+      ActiveMap takenMap = afterRef;
+      ActiveMap fallthroughMap = std::move(activeMap);
+      if (bron->op == BrOnNull || bron->op == BrOnNonNull) {
+        int8_t takenNullness = (bron->op == BrOnNull) ? 1 : -1;
+        int8_t fallNullness = (bron->op == BrOnNull) ? -1 : 1;
+        addFactForExpr(takenMap, bron->ref, Literal(), takenNullness);
+        addFactForExpr(fallthroughMap, bron->ref, Literal(), fallNullness);
+      } else if (bron->op == BrOnCast) {
+        if (bron->castType.isNonNullable()) {
+          addFactForExpr(takenMap, bron->ref, Literal(), -1);
+        } else {
+          addFactForExpr(fallthroughMap, bron->ref, Literal(), -1);
+        }
+      } else if (bron->op == BrOnCastFail) {
+        if (bron->castType.isNonNullable()) {
+          addFactForExpr(fallthroughMap, bron->ref, Literal(), -1);
+        } else {
+          addFactForExpr(takenMap, bron->ref, Literal(), -1);
+        }
+      }
+      hasLastBrExitMap = true;
+      lastBrExitMap = std::move(afterRef);
+      lastBrTakenMap = std::move(takenMap);
+      activeMap = std::move(fallthroughMap);
       return {};
     }
     if (auto* sw = curr->dynCast<Switch>()) {
@@ -2025,30 +2587,69 @@ struct ScopedDominatorCSE {
       if (func->isVar(lg->index)) {
         activeVarTypes.insert(getBinaryVarType(func->getLocalType(lg->index)));
       }
-      return {wasm::hash(lg->index), 2, true, false};
+      NodeInfo info{wasm::hash(lg->index), 2, true, false};
+      exprInfoMap[curr] = info;
+      auto bucketIt = activeMap.find(info.hash);
+      if (bucketIt != activeMap.end()) {
+        for (Index origIdx : bucketIt->second) {
+          const auto& rec = origRecords[origIdx];
+          if (rec.isFactOnly && rec.knownConst.type != Type::none &&
+              getConstEstBytes(rec.knownConst) <= 2 &&
+              factMatches(rec, curr)) {
+            repeatToOrigIdx[curr] = origIdx;
+            origRecords[origIdx].reuses++;
+            break;
+          }
+        }
+      }
+      return info;
     }
     if (auto* ls = curr->dynCast<LocalSet>()) {
       if (func->isVar(ls->index)) {
         activeVarTypes.insert(getBinaryVarType(func->getLocalType(ls->index)));
       }
       NodeInfo valInfo = walkExpr(ls->value);
-      lastCondExpr = nullptr;
+      bool valWasLastCond = (lastCondExpr == ls->value);
       invalidateByLocalWrite(ls->index);
+      if (valWasLastCond) {
+        invalidateMapByLocalWrite(lastCondTrueMap, ls->index);
+        invalidateMapByLocalWrite(lastCondFalseMap, ls->index);
+        if (ls->isTee()) {
+          lastCondExpr = ls;
+        } else {
+          lastCondExpr = nullptr;
+        }
+      } else {
+        lastCondExpr = nullptr;
+      }
       if (valInfo.possible && !origRecords.empty() &&
           origRecords.back().orig == ls->value &&
-          origRecords.back().reuses == 0 &&
-          func->getLocalType(ls->index) == ls->value->type) {
-        Index valOrigIdx = origRecords.size() - 1;
-        auto& rec = origRecords[valOrigIdx];
-        if (std::find(rec.localsRead.begin(),
-                      rec.localsRead.end(),
-                      ls->index) == rec.localsRead.end()) {
-          rec.existingLocal = ls->index;
-          rec.localsRead.push_back(ls->index);
+          !origRecords.back().isFactOnly &&
+          origRecords.back().reuses == 0) {
+        Type localType = func->getLocalType(ls->index);
+        Type valType = ls->value->type;
+        bool exactMatch = (localType == valType);
+        bool nullableMatch =
+          !exactMatch && localType.isRef() && valType.isRef() &&
+          localType.getHeapType() == valType.getHeapType() &&
+          localType.isNullable() && valType.isNonNullable() &&
+          localType.getExactness() == valType.getExactness();
+        if (exactMatch || nullableMatch) {
+          Index valOrigIdx = origRecords.size() - 1;
+          auto& rec = origRecords[valOrigIdx];
+          if (std::find(rec.localsRead.begin(),
+                        rec.localsRead.end(),
+                        ls->index) == rec.localsRead.end()) {
+            rec.existingLocal = ls->index;
+            rec.existingLocalNeedsNonNull = nullableMatch;
+            rec.localsRead.push_back(ls->index);
+          }
         }
       }
       if (ls->isTee()) {
-        return {wasm::hash(ls->index), 2, true, true};
+        NodeInfo info{wasm::hash(ls->index), 2, true, true};
+        exprInfoMap[curr] = info;
+        return info;
       }
       return {};
     }
@@ -2100,6 +2701,26 @@ struct ScopedDominatorCSE {
       return {};
     }
 
+    if (auto* ra = curr->dynCast<RefAs>()) {
+      if (ra->op == RefAsNonNull) {
+        recordNonNullFact(ra->value);
+      }
+    } else if (auto* sg = curr->dynCast<StructGet>()) {
+      recordNonNullFact(sg->ref);
+    } else if (auto* ss = curr->dynCast<StructSet>()) {
+      recordNonNullFact(ss->ref);
+    } else if (auto* ag = curr->dynCast<ArrayGet>()) {
+      recordNonNullFact(ag->ref);
+    } else if (auto* as = curr->dynCast<ArraySet>()) {
+      recordNonNullFact(as->ref);
+    } else if (auto* al = curr->dynCast<ArrayLen>()) {
+      recordNonNullFact(al->ref);
+    } else if (auto* rc = curr->dynCast<RefCast>()) {
+      if (rc->type.isNonNullable()) {
+        recordNonNullFact(rc->ref);
+      }
+    }
+
     bool shallowPossible =
       idempotentCall || pureReadOnlyCall ||
       (!shallow.hasNonTrapSideEffects() &&
@@ -2110,15 +2731,177 @@ struct ScopedDominatorCSE {
     }
 
     NodeInfo info{hash, estBytes, possible, hasTee};
+    exprInfoMap[curr] = info;
     if (!possible || !curr->type.isConcrete() ||
-        Properties::isConstantExpression(curr) || estBytes < 4) {
+        Properties::isConstantExpression(curr)) {
       return info;
+    }
+
+    if (!hasTee) {
+      auto foldWithConstFact = [&](Literal val) -> bool {
+        if (getConstEstBytes(val) > estBytes) {
+          return false;
+        }
+        Index fIdx = origRecords.size();
+        OrigRecord fRec;
+        fRec.orig = curr;
+        fRec.hash = hash;
+        fRec.estBytes = estBytes;
+        fRec.knownConst = val;
+        fRec.isFactOnly = true;
+        fRec.reuses = 1;
+        origRecords.push_back(std::move(fRec));
+        repeatToOrigIdx[curr] = fIdx;
+        for (auto* child : ChildIterator(curr)) {
+          auto cIt = repeatToOrigIdx.find(child);
+          if (cIt != repeatToOrigIdx.end()) {
+            Index cOrigIdx = cIt->second;
+            unmatchedChildren[curr].push_back({child, cOrigIdx});
+            assert(origRecords[cOrigIdx].reuses > 0);
+            origRecords[cOrigIdx].reuses--;
+            repeatToOrigIdx.erase(cIt);
+          }
+        }
+        return true;
+      };
+
+      if (auto* rn = curr->dynCast<RefIsNull>()) {
+        auto vIt = exprInfoMap.find(rn->value);
+        if (vIt != exprInfoMap.end() && vIt->second.possible) {
+          auto bIt = activeMap.find(vIt->second.hash);
+          if (bIt != activeMap.end()) {
+            for (Index origIdx : bIt->second) {
+              const auto& rec = origRecords[origIdx];
+              if (rec.knownNullness != 0 && factMatches(rec, rn->value)) {
+                int32_t res = (rec.knownNullness > 0) ? 1 : 0;
+                if (foldWithConstFact(Literal(res))) {
+                  return info;
+                }
+                break;
+              }
+            }
+          }
+        }
+      } else if (auto* rt = curr->dynCast<RefTest>()) {
+        auto vIt = exprInfoMap.find(rt->ref);
+        if (vIt != exprInfoMap.end() && vIt->second.possible) {
+          auto bIt = activeMap.find(vIt->second.hash);
+          if (bIt != activeMap.end()) {
+            for (Index origIdx : bIt->second) {
+              const auto& rec = origRecords[origIdx];
+              if (rec.knownNullness > 0 && factMatches(rec, rt->ref)) {
+                int32_t res = rt->castType.isNullable() ? 1 : 0;
+                if (foldWithConstFact(Literal(res))) {
+                  return info;
+                }
+                break;
+              }
+            }
+          }
+        }
+      } else if (auto* u = curr->dynCast<Unary>()) {
+        if (u->op == EqZInt32 || u->op == EqZInt64) {
+          auto vIt = exprInfoMap.find(u->value);
+          if (vIt != exprInfoMap.end() && vIt->second.possible) {
+            auto bIt = activeMap.find(vIt->second.hash);
+            if (bIt != activeMap.end()) {
+              for (Index origIdx : bIt->second) {
+                const auto& rec = origRecords[origIdx];
+                if ((rec.knownNonZero || rec.knownConst.type != Type::none) &&
+                    factMatches(rec, u->value)) {
+                  bool isZero = false;
+                  bool known = false;
+                  if (rec.knownNonZero) {
+                    isZero = false;
+                    known = true;
+                  } else if (rec.knownConst.type == Type::i32) {
+                    isZero = (rec.knownConst.geti32() == 0);
+                    known = true;
+                  } else if (rec.knownConst.type == Type::i64) {
+                    isZero = (rec.knownConst.geti64() == 0);
+                    known = true;
+                  }
+                  if (known &&
+                      foldWithConstFact(Literal(int32_t(isZero ? 1 : 0)))) {
+                    return info;
+                  }
+                  break;
+                }
+              }
+            }
+          }
+        }
+      } else if (auto* bin = curr->dynCast<Binary>()) {
+        if (bin->isRelational()) {
+          Const* cRight = bin->right->dynCast<Const>();
+          Const* cLeft = bin->left->dynCast<Const>();
+          if (cRight || cLeft) {
+            Expression* other = cRight ? bin->left : bin->right;
+            auto oIt = exprInfoMap.find(other);
+            if (oIt != exprInfoMap.end() && oIt->second.possible) {
+              auto bIt = activeMap.find(oIt->second.hash);
+              if (bIt != activeMap.end()) {
+                for (Index origIdx : bIt->second) {
+                  const auto& rec = origRecords[origIdx];
+                  if (rec.knownConst.type != Type::none &&
+                      factMatches(rec, other)) {
+                    Literal lVal = cLeft ? cLeft->value : rec.knownConst;
+                    Literal rVal = cRight ? cRight->value : rec.knownConst;
+                    Literal folded;
+                    if (evalIntRelOp(bin->op, lVal, rVal, folded) &&
+                        foldWithConstFact(folded)) {
+                      return info;
+                    }
+                    break;
+                  }
+                  if (rec.knownNonZero &&
+                      (bin->op == EqInt32 || bin->op == NeInt32 ||
+                       bin->op == EqInt64 || bin->op == NeInt64)) {
+                    Literal cVal = cRight ? cRight->value : cLeft->value;
+                    bool isZeroC =
+                      (cVal.type == Type::i32 && cVal.geti32() == 0) ||
+                      (cVal.type == Type::i64 && cVal.geti64() == 0);
+                    if (isZeroC && factMatches(rec, other)) {
+                      int32_t res =
+                        (bin->op == NeInt32 || bin->op == NeInt64) ? 1 : 0;
+                      if (foldWithConstFact(Literal(res))) {
+                        return info;
+                      }
+                      break;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     }
 
     auto& bucket = activeMap[hash];
     if (!hasTee) {
-      for (Index origIdx : bucket) {
-        if (normEqual(origRecords[origIdx].orig, curr)) {
+      for (int pass = 0; pass < 2; pass++) {
+        bool wantFact = (pass == 0);
+        for (Index origIdx : bucket) {
+          const auto& rec = origRecords[origIdx];
+          if (rec.isFactOnly != wantFact || !factMatches(rec, curr)) {
+            continue;
+          }
+          if (rec.isFactOnly) {
+            if (rec.knownConst.type != Type::none) {
+              if (getConstEstBytes(rec.knownConst) > estBytes) {
+                continue;
+              }
+            } else if (rec.knownNullness > 0 && curr->type.isNullable()) {
+              if (2 > estBytes) {
+                continue;
+              }
+            } else {
+              continue;
+            }
+          } else if (estBytes < 4) {
+            continue;
+          }
           repeatToOrigIdx[curr] = origIdx;
           origRecords[origIdx].reuses++;
           if (origRecords[origIdx].exitedArmScope) {
@@ -2139,8 +2922,13 @@ struct ScopedDominatorCSE {
       }
     }
 
+    if (estBytes < 4) {
+      return info;
+    }
+
     for (Index origIdx : bucket) {
-      if (normEqual(origRecords[origIdx].orig, curr)) {
+      if (!origRecords[origIdx].isFactOnly &&
+          normEqual(origRecords[origIdx].orig, curr)) {
         return info;
       }
     }
@@ -2150,6 +2938,9 @@ struct ScopedDominatorCSE {
     rec.orig = curr;
     rec.hash = hash;
     rec.estBytes = estBytes;
+    if (curr->type.isRef() && curr->type.isNonNullable()) {
+      rec.knownNullness = -1;
+    }
     populateNormReadEffects(curr, rec);
     origRecords.push_back(std::move(rec));
     exprToOrigIdx[curr] = newOrigIdx;
@@ -2192,11 +2983,24 @@ struct ScopedDominatorCSE {
 
     auto passesByteCostGate = [&](const OrigRecord& rec,
                                   Index effBytes) -> bool {
-      if (rec.reuses == 0 || effBytes <= 2) {
+      if (rec.reuses == 0) {
+        return false;
+      }
+      if (rec.isFactOnly) {
+        if (rec.knownConst.type != Type::none) {
+          return effBytes >= getConstEstBytes(rec.knownConst);
+        }
+        if (rec.knownNullness > 0 && rec.orig->type.isNullable()) {
+          return effBytes >= 2;
+        }
+        return false;
+      }
+      if (effBytes <= 2) {
         return false;
       }
       if (rec.existingLocal != Index(-1)) {
-        return effBytes >= 4;
+        Index repBytes = rec.existingLocalNeedsNonNull ? 3 : 2;
+        return effBytes > repBytes && effBytes >= 4;
       }
       Index nonNullPenalty =
         (rec.crossedScope && rec.orig->type.isNonNullable()) ? 1 : 0;
@@ -2214,12 +3018,16 @@ struct ScopedDominatorCSE {
       if (rec.reuses == 0) {
         continue;
       }
+      if (rec.isFactOnly) {
+        continue;
+      }
       Index effBytes = rec.estBytes;
       for (auto* child : ChildIterator(rec.orig)) {
         auto cIt = exprToOrigIdx.find(child);
         if (cIt != exprToOrigIdx.end()) {
           const auto& cRec = origRecords[cIt->second];
-          if (passesByteCostGate(cRec, cRec.estBytes) &&
+          if (!cRec.isFactOnly &&
+              passesByteCostGate(cRec, cRec.estBytes) &&
               cRec.estBytes > 2 && effBytes > cRec.estBytes - 2) {
             effBytes -= (cRec.estBytes - 2);
           }
@@ -2245,11 +3053,17 @@ struct ScopedDominatorCSE {
 
     std::unordered_map<Expression*, Index> origLocalMap;
     std::unordered_map<Expression*, Index> needsTeeWrap;
+    bool hasAnyTransform = false;
     for (Index idx = 0; idx < origRecords.size(); idx++) {
       const auto& rec = origRecords[idx];
       if (rec.reuses == 0) {
         continue;
       }
+      if (rec.isFactOnly) {
+        hasAnyTransform = true;
+        continue;
+      }
+      hasAnyTransform = true;
       if (rec.existingLocal != Index(-1)) {
         origLocalMap[rec.orig] = rec.existingLocal;
       } else {
@@ -2259,7 +3073,7 @@ struct ScopedDominatorCSE {
       }
     }
 
-    if (origLocalMap.empty()) {
+    if (!hasAnyTransform) {
       return;
     }
 
@@ -2283,10 +3097,35 @@ struct ScopedDominatorCSE {
       void visitExpression(Expression* curr) {
         if (auto rIt = repeatToOrigIdx.find(curr);
             rIt != repeatToOrigIdx.end()) {
-          Expression* orig = origRecords[rIt->second].orig;
+          const auto& rec = origRecords[rIt->second];
+          if (rec.isFactOnly) {
+            if (rec.knownConst.type != Type::none) {
+              replaceCurrent(Builder(wasm).makeConst(rec.knownConst));
+              return;
+            }
+            if (rec.knownNullness > 0 && curr->type.isNullable()) {
+              replaceCurrent(Builder(wasm).makeRefNull(
+                curr->type.getHeapType().getBottom()));
+              return;
+            }
+          }
+          Expression* orig = rec.orig;
           auto lIt = origLocalMap.find(orig);
           if (lIt != origLocalMap.end()) {
-            replaceCurrent(Builder(wasm).makeLocalGet(lIt->second, curr->type));
+            Expression* rep = nullptr;
+            if (rec.existingLocal != Index(-1) &&
+                rec.existingLocalNeedsNonNull &&
+                curr->type.isNonNullable()) {
+              Type localType = Type(curr->type.getHeapType(),
+                                    Nullable,
+                                    curr->type.getExactness());
+              rep = Builder(wasm).makeRefAs(
+                RefAsNonNull,
+                Builder(wasm).makeLocalGet(lIt->second, localType));
+            } else {
+              rep = Builder(wasm).makeLocalGet(lIt->second, curr->type);
+            }
+            replaceCurrent(rep);
             return;
           }
         }
@@ -2668,11 +3507,15 @@ static bool unCseSingleWriteTees(Function* func,
         for (Index i = 0; i < block->list.size(); i++) {
           if (i == firstBranchIdx) {
             bool isDirectCondBr = false;
-            if (auto* br = block->list[i]->dynCast<Break>()) {
+            Expression* brStmt = block->list[i];
+            if (auto* d = brStmt->dynCast<Drop>()) {
+              brStmt = d->value;
+            }
+            if (auto* br = brStmt->dynCast<Break>()) {
               isDirectCondBr = br->name == block->name && br->condition &&
                                !SubtreeTargetsName(br->value, block->name) &&
                                !SubtreeTargetsName(br->condition, block->name);
-            } else if (auto* bron = block->list[i]->dynCast<BrOn>()) {
+            } else if (auto* bron = brStmt->dynCast<BrOn>()) {
               isDirectCondBr = bron->name == block->name &&
                                !SubtreeTargetsName(bron->ref, block->name) &&
                                !SubtreeTargetsName(bron->desc, block->name);
@@ -2695,14 +3538,30 @@ static bool unCseSingleWriteTees(Function* func,
           activeTees.clear();
           lastCondExpr = nullptr;
         } else if (firstBranchIdx < block->list.size()) {
-          activeTees = std::move(savedExitMap);
-          for (Index i = firstBranchIdx; i < block->list.size(); i++) {
-            if (i == firstBranchIdx && capturedAfterDirectBr) {
-              continue;
+          bool onlyExitsViaFirstDirectBr =
+            capturedAfterDirectBr && firstBranchIdx + 1 < block->list.size();
+          bool tailDoesNotReturn = false;
+          if (onlyExitsViaFirstDirectBr) {
+            for (Index i = firstBranchIdx + 1; i < block->list.size(); i++) {
+              if (SubtreeTargetsName(block->list[i], block->name)) {
+                onlyExitsViaFirstDirectBr = false;
+                break;
+              }
+              if (helper.doesNotReturn(block->list[i])) {
+                tailDoesNotReturn = true;
+              }
             }
-            EffectAnalyzer eff(options, wasm, block->list[i]);
-            eff.trap = false;
-            invalidateActiveByEffects(eff, block->list[i]);
+          }
+          activeTees = std::move(savedExitMap);
+          if (!(onlyExitsViaFirstDirectBr && tailDoesNotReturn)) {
+            for (Index i = firstBranchIdx; i < block->list.size(); i++) {
+              if (i == firstBranchIdx && capturedAfterDirectBr) {
+                continue;
+              }
+              EffectAnalyzer eff(options, wasm, block->list[i]);
+              eff.trap = false;
+              invalidateActiveByEffects(eff, block->list[i]);
+            }
           }
           lastCondExpr = nullptr;
         } else if (!block->list.empty() && lastCondExpr == block->list.back()) {

@@ -45,7 +45,8 @@ public:
       implicitTrap(false), throws_(false), danglingPop(false),
       mayNotReturn(false), hasReturnCallThrow(false), suspends(false),
       generative(false), isIdempotent(false), onlyTouchesInitGlobals(false),
-      mustNotReturn(false), hasUnknownMutableStructRead(false), module(module),
+      mustNotReturn(false), hasUnknownMutableStructRead(false),
+      hasUnknownMutableStructWrite(false), module(module),
       features(module.features) {}
 
   EffectAnalyzer(const PassOptions& passOptions,
@@ -159,7 +160,98 @@ public:
   // statically enumerated in mutableStructFieldsRead.
   bool hasUnknownMutableStructRead : 1;
 
+  // Whether this function writes a mutable struct field that could not be
+  // statically enumerated in mutableStructFieldsWritten.
+  bool hasUnknownMutableStructWrite : 1;
+
   SmallVector<std::pair<HeapType, Index>, 2> mutableStructFieldsRead;
+  SmallVector<std::pair<HeapType, Index>, 2> mutableStructFieldsWritten;
+
+  static constexpr size_t MaxTrackedStructFields = 8;
+
+  void recordMutableStructFieldRead(HeapType type, Index index) {
+    if (hasUnknownMutableStructRead) {
+      return;
+    }
+    std::pair<HeapType, Index> key{type, index};
+    if (std::find(mutableStructFieldsRead.begin(),
+                  mutableStructFieldsRead.end(),
+                  key) != mutableStructFieldsRead.end()) {
+      return;
+    }
+    if (mutableStructFieldsRead.size() >= MaxTrackedStructFields) {
+      hasUnknownMutableStructRead = true;
+      mutableStructFieldsRead.clear();
+      return;
+    }
+    mutableStructFieldsRead.push_back(key);
+  }
+
+  void recordMutableStructFieldWritten(HeapType type, Index index) {
+    if (hasUnknownMutableStructWrite) {
+      return;
+    }
+    std::pair<HeapType, Index> key{type, index};
+    if (std::find(mutableStructFieldsWritten.begin(),
+                  mutableStructFieldsWritten.end(),
+                  key) != mutableStructFieldsWritten.end()) {
+      return;
+    }
+    if (mutableStructFieldsWritten.size() >= MaxTrackedStructFields) {
+      hasUnknownMutableStructWrite = true;
+      mutableStructFieldsWritten.clear();
+      return;
+    }
+    mutableStructFieldsWritten.push_back(key);
+  }
+
+  static bool structFieldsAlias(
+    const SmallVector<std::pair<HeapType, Index>, 2>& a,
+    bool aUnknown,
+    const SmallVector<std::pair<HeapType, Index>, 2>& b,
+    bool bUnknown) {
+    if (aUnknown || bUnknown) {
+      return true;
+    }
+    for (const auto& [htA, idxA] : a) {
+      for (const auto& [htB, idxB] : b) {
+        if (idxA == idxB &&
+            (HeapType::isSubType(htA, htB) || HeapType::isSubType(htB, htA))) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  bool structEffectsConflict(const EffectAnalyzer& other) const {
+    if ((calls && other.accessesMutableStruct()) ||
+        (other.calls && accessesMutableStruct())) {
+      return true;
+    }
+    if (writesStruct && other.writesStruct &&
+        structFieldsAlias(mutableStructFieldsWritten,
+                          hasUnknownMutableStructWrite,
+                          other.mutableStructFieldsWritten,
+                          other.hasUnknownMutableStructWrite)) {
+      return true;
+    }
+    if (writesStruct && other.readsMutableStruct &&
+        structFieldsAlias(mutableStructFieldsWritten,
+                          hasUnknownMutableStructWrite,
+                          other.mutableStructFieldsRead,
+                          other.hasUnknownMutableStructRead)) {
+      return true;
+    }
+    if (readsMutableStruct && other.writesStruct &&
+        structFieldsAlias(mutableStructFieldsRead,
+                          hasUnknownMutableStructRead,
+                          other.mutableStructFieldsWritten,
+                          other.hasUnknownMutableStructWrite)) {
+      return true;
+    }
+    return false;
+  }
 
   const Module& module;
   FeatureSet features;
@@ -373,8 +465,7 @@ public:
         ((other.writesSharedMemory || other.calls) && accessesSharedMemory()) ||
         ((writesTable || calls) && other.accessesTable()) ||
         ((other.writesTable || other.calls) && accessesTable()) ||
-        ((writesStruct || calls) && other.accessesMutableStruct()) ||
-        ((other.writesStruct || other.calls) && accessesMutableStruct()) ||
+        structEffectsConflict(other) ||
         ((writesSharedStruct || calls) &&
          other.accessesSharedMutableStruct()) ||
         ((other.writesSharedStruct || other.calls) &&
@@ -496,6 +587,26 @@ public:
     writesTable = writesTable || other.writesTable;
     readsMutableStruct = readsMutableStruct || other.readsMutableStruct;
     writesStruct = writesStruct || other.writesStruct;
+    if (other.readsMutableStruct) {
+      if (other.hasUnknownMutableStructRead) {
+        hasUnknownMutableStructRead = true;
+        mutableStructFieldsRead.clear();
+      } else if (!hasUnknownMutableStructRead) {
+        for (const auto& [ht, idx] : other.mutableStructFieldsRead) {
+          recordMutableStructFieldRead(ht, idx);
+        }
+      }
+    }
+    if (other.writesStruct) {
+      if (other.hasUnknownMutableStructWrite) {
+        hasUnknownMutableStructWrite = true;
+        mutableStructFieldsWritten.clear();
+      } else if (!hasUnknownMutableStructWrite) {
+        for (const auto& [ht, idx] : other.mutableStructFieldsWritten) {
+          recordMutableStructFieldWritten(ht, idx);
+        }
+      }
+    }
     readsSharedMutableStruct =
       readsSharedMutableStruct || other.readsSharedMutableStruct;
     writesSharedStruct = writesSharedStruct || other.writesSharedStruct;
@@ -675,6 +786,7 @@ private:
           parent.readOrder = std::max(parent.readOrder, order);
         } else {
           parent.readsMutableStruct = true;
+          parent.recordMutableStructFieldRead(type, index);
         }
       }
     }
@@ -686,6 +798,7 @@ private:
         parent.writeOrder = std::max(parent.writeOrder, order);
       } else {
         parent.writesStruct = true;
+        parent.recordMutableStructFieldWritten(type, index);
       }
     }
 

@@ -809,9 +809,7 @@
   ;; SHRINK-NEXT:   (struct.get $S 0
   ;; SHRINK-NEXT:    (call $get_lazy)
   ;; SHRINK-NEXT:   )
-  ;; SHRINK-NEXT:   (ref.is_null
-  ;; SHRINK-NEXT:    (call $get_lazy)
-  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (i32.const 0)
   ;; SHRINK-NEXT:  )
   ;; SHRINK-NEXT: )
   (func $uncse-overcsed-ref-tee (result i32)
@@ -834,7 +832,6 @@
   ;; SHRINK:      (type $A (struct (field (mut (ref null $A))) (field (mut i32))))
   (type $A (struct (field (mut (ref null $A))) (field (mut i32))))
 
-  ;; CHECK-NEXT-NOT: local
   ;; CHECK:      (type $1 (func (param (ref $A)) (result i32)))
 
   ;; CHECK:      (func $uncse-tee-across-disjoint-field (type $1) (param $a (ref $A)) (result i32)
@@ -891,25 +888,20 @@
   )
 
   ;; CHECK:      (func $cse-across-disjoint-field (type $1) (param $a (ref $A)) (result i32)
+  ;; CHECK-NEXT:  (local $1 i32)
   ;; CHECK-NEXT:  (struct.set $A 1
   ;; CHECK-NEXT:   (local.get $a)
-  ;; CHECK-NEXT:   (ref.is_null
-  ;; CHECK-NEXT:    (struct.get $A 0
-  ;; CHECK-NEXT:     (local.get $a)
+  ;; CHECK-NEXT:   (local.tee $1
+  ;; CHECK-NEXT:    (ref.is_null
+  ;; CHECK-NEXT:     (struct.get $A 0
+  ;; CHECK-NEXT:      (local.get $a)
+  ;; CHECK-NEXT:     )
   ;; CHECK-NEXT:    )
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT:  (i32.add
-  ;; CHECK-NEXT:   (ref.is_null
-  ;; CHECK-NEXT:    (struct.get $A 0
-  ;; CHECK-NEXT:     (local.get $a)
-  ;; CHECK-NEXT:    )
-  ;; CHECK-NEXT:   )
-  ;; CHECK-NEXT:   (ref.is_null
-  ;; CHECK-NEXT:    (struct.get $A 0
-  ;; CHECK-NEXT:     (local.get $a)
-  ;; CHECK-NEXT:    )
-  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.get $1)
+  ;; CHECK-NEXT:   (local.get $1)
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
   ;; SHRINK:      (func $cse-across-disjoint-field (type $1) (param $a (ref $A)) (result i32)
@@ -1332,6 +1324,110 @@
       (i32.add
         (call $pure_get_f0 (local.get $s))
         (call $pure_get_f0 (local.get $s))
+      )
+    )
+  )
+
+  ;; CHECK:      (func $condition-facts-and-nullness (type $3) (param $s (ref null $S)) (result i32)
+  ;; CHECK-NEXT:  (local $1 i32)
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (ref.is_null
+  ;; CHECK-NEXT:    (local.get $s)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (return
+  ;; CHECK-NEXT:     (i32.const 0)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (i32.ne
+  ;; CHECK-NEXT:    (struct.get $S 0
+  ;; CHECK-NEXT:     (local.get $s)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.const 7)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (call $throw_helper
+  ;; CHECK-NEXT:     (i32.const 2)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (ref.is_null
+  ;; CHECK-NEXT:    (local.get $s)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (i32.eq
+  ;; CHECK-NEXT:     (local.tee $1
+  ;; CHECK-NEXT:      (struct.get $S 0
+  ;; CHECK-NEXT:       (local.get $s)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.const 7)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (local.get $1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $condition-facts-and-nullness (type $3) (param $s (ref null $S)) (result i32)
+  ;; SHRINK-NEXT:  (if
+  ;; SHRINK-NEXT:   (ref.is_null
+  ;; SHRINK-NEXT:    (local.get $s)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (then
+  ;; SHRINK-NEXT:    (return
+  ;; SHRINK-NEXT:     (i32.const 0)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (if
+  ;; SHRINK-NEXT:   (i32.ne
+  ;; SHRINK-NEXT:    (struct.get $S 0
+  ;; SHRINK-NEXT:     (local.get $s)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (i32.const 7)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (then
+  ;; SHRINK-NEXT:    (call $throw_helper
+  ;; SHRINK-NEXT:     (i32.const 2)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (i32.add
+  ;; SHRINK-NEXT:   (i32.const 0)
+  ;; SHRINK-NEXT:   (i32.add
+  ;; SHRINK-NEXT:    (i32.const 1)
+  ;; SHRINK-NEXT:    (i32.const 7)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $condition-facts-and-nullness (param $s (ref null $S)) (result i32)
+    ;; Guard if (ref.is_null $s) return 0 -> after guard, (ref.is_null $s) is 0.
+    (if
+      (ref.is_null (local.get $s))
+      (then
+        (return (i32.const 0))
+      )
+    )
+    ;; Guard if ($s.f0 != 7) throw -> after guard, ($s.f0 == 7) is 1 and $s.f0 is 7.
+    (if
+      (i32.ne
+        (struct.get $S 0 (local.get $s))
+        (i32.const 7)
+      )
+      (then
+        (call $throw_helper (i32.const 2))
+      )
+    )
+    (i32.add
+      (ref.is_null (local.get $s))
+      (i32.add
+        (i32.eq
+          (struct.get $S 0 (local.get $s))
+          (i32.const 7)
+        )
+        (struct.get $S 0 (local.get $s))
       )
     )
   )
