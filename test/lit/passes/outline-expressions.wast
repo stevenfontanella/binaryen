@@ -3186,19 +3186,17 @@
   ;; CHECK:      (type $9 (func (param i32 (ref null $Mid) (ref null $Base)) (result i32)))
 
   ;; CHECK:      (global $cache (mut (ref null $Arr)) (ref.null none))
-  ;; SHRINK:      (type $4 (func (param i32) (result (ref $Base))))
+  ;; SHRINK:      (type $4 (func (param i32) (result i32)))
 
-  ;; SHRINK:      (type $5 (func (param i32) (result i32)))
+  ;; SHRINK:      (type $5 (func (param i32) (result (ref $Base))))
 
   ;; SHRINK:      (type $6 (func (param i32 (ref null $Base)) (result i32)))
 
-  ;; SHRINK:      (type $7 (func (param (ref null $Base)) (result i32)))
+  ;; SHRINK:      (type $7 (func (param i32 i32) (result i32)))
 
-  ;; SHRINK:      (type $8 (func (param i32 i32) (result i32)))
+  ;; SHRINK:      (type $8 (func (param i32 (ref null $Mid)) (result i32)))
 
-  ;; SHRINK:      (type $9 (func (param i32 (ref null $Mid)) (result i32)))
-
-  ;; SHRINK:      (type $10 (func (param i32 (ref null $Mid) (ref null $Base)) (result i32)))
+  ;; SHRINK:      (type $9 (func (param i32 (ref null $Mid) (ref null $Base)) (result i32)))
 
   ;; SHRINK:      (global $cache (mut (ref null $Arr)) (ref.null none))
   (global $cache (mut (ref null $Arr)) (ref.null none))
@@ -3208,7 +3206,7 @@
   ;; CHECK-NEXT:   (local.get $idx)
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
-  ;; SHRINK:      (func $make_item (type $4) (param $idx i32) (result (ref $Base))
+  ;; SHRINK:      (func $make_item (type $5) (param $idx i32) (result (ref $Base))
   ;; SHRINK-NEXT:  (struct.new $Base
   ;; SHRINK-NEXT:   (local.get $idx)
   ;; SHRINK-NEXT:  )
@@ -3242,7 +3240,7 @@
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
-  ;; SHRINK:      (func $lazy_factory (type $4) (param $idx i32) (result (ref $Base))
+  ;; SHRINK:      (func $lazy_factory (type $5) (param $idx i32) (result (ref $Base))
   ;; SHRINK-NEXT:  (local $tmp (ref $Base))
   ;; SHRINK-NEXT:  (ref.as_non_null
   ;; SHRINK-NEXT:   (block $found (result (ref $Base))
@@ -3290,9 +3288,11 @@
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
-  ;; SHRINK:      (func $sink_callee1 (type $7) (param $a (ref null $Base)) (result i32)
+  ;; SHRINK:      (func $sink_callee1 (type $4) (param $a i32) (result i32)
   ;; SHRINK-NEXT:  (struct.get $Base 0
-  ;; SHRINK-NEXT:   (local.get $a)
+  ;; SHRINK-NEXT:   (call $lazy_factory
+  ;; SHRINK-NEXT:    (local.get $a)
+  ;; SHRINK-NEXT:   )
   ;; SHRINK-NEXT:  )
   ;; SHRINK-NEXT: )
   (func $sink_callee1 (param $a (ref null $Base)) (result i32)
@@ -3309,12 +3309,10 @@
   ;; CHECK-NEXT:   (i32.const 1)
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
-  ;; SHRINK:      (func $sink_callee2 (type $5) (param $a i32) (result i32)
+  ;; SHRINK:      (func $sink_callee2 (type $4) (param $a i32) (result i32)
   ;; SHRINK-NEXT:  (i32.add
   ;; SHRINK-NEXT:   (call $sink_callee1
-  ;; SHRINK-NEXT:    (call $lazy_factory
-  ;; SHRINK-NEXT:     (local.get $a)
-  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (local.get $a)
   ;; SHRINK-NEXT:   )
   ;; SHRINK-NEXT:   (i32.const 1)
   ;; SHRINK-NEXT:  )
@@ -3335,7 +3333,7 @@
   ;; SHRINK:      (func $partial_wrap_callee (type $6) (param $x i32) (param $a (ref null $Base)) (result i32)
   ;; SHRINK-NEXT:  (i32.add
   ;; SHRINK-NEXT:   (local.get $x)
-  ;; SHRINK-NEXT:   (call $sink_callee1
+  ;; SHRINK-NEXT:   (struct.get $Base 0
   ;; SHRINK-NEXT:    (local.get $a)
   ;; SHRINK-NEXT:   )
   ;; SHRINK-NEXT:  )
@@ -3352,7 +3350,7 @@
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
-  ;; SHRINK:      (func $existing_wrap_helper (type $8) (param $x i32) (param $idx i32) (result i32)
+  ;; SHRINK:      (func $existing_wrap_helper (type $7) (param $x i32) (param $idx i32) (result i32)
   ;; SHRINK-NEXT:  (call $partial_wrap_callee
   ;; SHRINK-NEXT:   (local.get $x)
   ;; SHRINK-NEXT:   (call $lazy_factory
@@ -3375,13 +3373,11 @@
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
-  ;; SHRINK:      (func $factory_const_callee (type $5) (param $x i32) (result i32)
+  ;; SHRINK:      (func $factory_const_callee (type $4) (param $x i32) (result i32)
   ;; SHRINK-NEXT:  (i32.sub
   ;; SHRINK-NEXT:   (local.get $x)
   ;; SHRINK-NEXT:   (call $sink_callee1
-  ;; SHRINK-NEXT:    (call $lazy_factory
-  ;; SHRINK-NEXT:     (i32.const 7)
-  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (i32.const 7)
   ;; SHRINK-NEXT:   )
   ;; SHRINK-NEXT:  )
   ;; SHRINK-NEXT: )
@@ -3425,9 +3421,7 @@
   ;; SHRINK-NEXT:  (i32.add
   ;; SHRINK-NEXT:   (i32.add
   ;; SHRINK-NEXT:    (call $sink_callee1
-  ;; SHRINK-NEXT:     (call $lazy_factory
-  ;; SHRINK-NEXT:      (local.get $i)
-  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:     (local.get $i)
   ;; SHRINK-NEXT:    )
   ;; SHRINK-NEXT:    (call $sink_callee2
   ;; SHRINK-NEXT:     (local.get $i)
@@ -3515,14 +3509,12 @@
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
-  ;; SHRINK:      (func $caller_b (type $9) (param $j i32) (param $q (ref null $Mid)) (result i32)
+  ;; SHRINK:      (func $caller_b (type $8) (param $j i32) (param $q (ref null $Mid)) (result i32)
   ;; SHRINK-NEXT:  (i32.sub
   ;; SHRINK-NEXT:   (i32.add
   ;; SHRINK-NEXT:    (call $sink_callee1
-  ;; SHRINK-NEXT:     (call $lazy_factory
-  ;; SHRINK-NEXT:      (i32.eqz
-  ;; SHRINK-NEXT:       (local.get $j)
-  ;; SHRINK-NEXT:      )
+  ;; SHRINK-NEXT:     (i32.eqz
+  ;; SHRINK-NEXT:      (local.get $j)
   ;; SHRINK-NEXT:     )
   ;; SHRINK-NEXT:    )
   ;; SHRINK-NEXT:    (call $sink_callee2
@@ -3593,7 +3585,7 @@
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
-  ;; SHRINK:      (func $caller_c (type $10) (param $k i32) (param $r (ref null $Mid)) (param $other (ref null $Base)) (result i32)
+  ;; SHRINK:      (func $caller_c (type $9) (param $k i32) (param $r (ref null $Mid)) (param $other (ref null $Base)) (result i32)
   ;; SHRINK-NEXT:  (i32.xor
   ;; SHRINK-NEXT:   (call $partial_wrap_callee
   ;; SHRINK-NEXT:    (local.get $k)
@@ -4743,8 +4735,6 @@
 
   ;; SHRINK:      (type $3 (func (param (ref null $Rec) (ref null $Rec) i32) (result i32)))
 
-  ;; SHRINK:      (type $4 (func (param i32 (ref null $Rec)) (result i32)))
-
   ;; SHRINK:      (export "caller_v4" (func $caller_v4))
 
   ;; SHRINK:      (func $sink_param_unary (type $1) (param $x (ref null $Rec)) (param $y i32) (result i32)
@@ -4923,43 +4913,55 @@
   ;; SHRINK-NEXT:     )
   ;; SHRINK-NEXT:    )
   ;; SHRINK-NEXT:    (i32.add
-  ;; SHRINK-NEXT:     (call $outlined_pu
+  ;; SHRINK-NEXT:     (call $pu_target
   ;; SHRINK-NEXT:      (i32.eqz
   ;; SHRINK-NEXT:       (local.get $a)
   ;; SHRINK-NEXT:      )
-  ;; SHRINK-NEXT:      (local.get $r1)
+  ;; SHRINK-NEXT:      (struct.get $Rec 1
+  ;; SHRINK-NEXT:       (local.get $r1)
+  ;; SHRINK-NEXT:      )
   ;; SHRINK-NEXT:     )
   ;; SHRINK-NEXT:     (i32.add
-  ;; SHRINK-NEXT:      (call $outlined_pu
+  ;; SHRINK-NEXT:      (call $pu_target
   ;; SHRINK-NEXT:       (i32.clz
   ;; SHRINK-NEXT:        (local.get $a)
   ;; SHRINK-NEXT:       )
-  ;; SHRINK-NEXT:       (local.get $r2)
+  ;; SHRINK-NEXT:       (struct.get $Rec 1
+  ;; SHRINK-NEXT:        (local.get $r2)
+  ;; SHRINK-NEXT:       )
   ;; SHRINK-NEXT:      )
   ;; SHRINK-NEXT:      (i32.add
-  ;; SHRINK-NEXT:       (call $outlined_pu
+  ;; SHRINK-NEXT:       (call $pu_target
   ;; SHRINK-NEXT:        (i32.ctz
   ;; SHRINK-NEXT:         (local.get $a)
   ;; SHRINK-NEXT:        )
-  ;; SHRINK-NEXT:        (local.get $r1)
+  ;; SHRINK-NEXT:        (struct.get $Rec 1
+  ;; SHRINK-NEXT:         (local.get $r1)
+  ;; SHRINK-NEXT:        )
   ;; SHRINK-NEXT:       )
   ;; SHRINK-NEXT:       (i32.add
-  ;; SHRINK-NEXT:        (call $outlined_pu
+  ;; SHRINK-NEXT:        (call $pu_target
   ;; SHRINK-NEXT:         (i32.popcnt
   ;; SHRINK-NEXT:          (local.get $a)
   ;; SHRINK-NEXT:         )
-  ;; SHRINK-NEXT:         (local.get $r2)
+  ;; SHRINK-NEXT:         (struct.get $Rec 1
+  ;; SHRINK-NEXT:          (local.get $r2)
+  ;; SHRINK-NEXT:         )
   ;; SHRINK-NEXT:        )
   ;; SHRINK-NEXT:        (i32.add
-  ;; SHRINK-NEXT:         (call $outlined_pu
+  ;; SHRINK-NEXT:         (call $pu_target
   ;; SHRINK-NEXT:          (local.get $a)
-  ;; SHRINK-NEXT:          (local.get $r1)
+  ;; SHRINK-NEXT:          (struct.get $Rec 1
+  ;; SHRINK-NEXT:           (local.get $r1)
+  ;; SHRINK-NEXT:          )
   ;; SHRINK-NEXT:         )
-  ;; SHRINK-NEXT:         (call $outlined_pu
+  ;; SHRINK-NEXT:         (call $pu_target
   ;; SHRINK-NEXT:          (i32.eqz
   ;; SHRINK-NEXT:           (local.get $a)
   ;; SHRINK-NEXT:          )
-  ;; SHRINK-NEXT:          (local.get $r2)
+  ;; SHRINK-NEXT:          (struct.get $Rec 1
+  ;; SHRINK-NEXT:           (local.get $r2)
+  ;; SHRINK-NEXT:          )
   ;; SHRINK-NEXT:         )
   ;; SHRINK-NEXT:        )
   ;; SHRINK-NEXT:       )
@@ -5010,14 +5012,6 @@
 ;; - Step 1B existing 0-var helper reuse with parameter reuse + unary op.
 ;; - Simultaneous 2-argument wrapper/unary specialization ($outlined_w2).
 ;; - Chained 2-unary outer-op specialization ($outlined_u).
-;; SHRINK:      (func $outlined_pu (type $4) (param $0 i32) (param $1 (ref null $Rec)) (result i32)
-;; SHRINK-NEXT:  (call $pu_target
-;; SHRINK-NEXT:   (local.get $0)
-;; SHRINK-NEXT:   (struct.get $Rec 1
-;; SHRINK-NEXT:    (local.get $1)
-;; SHRINK-NEXT:   )
-;; SHRINK-NEXT:  )
-;; SHRINK-NEXT: )
 (module
   ;; CHECK:      (type $Base (sub (struct (field i32))))
   ;; SHRINK:      (type $Base (sub (struct (field i32))))
@@ -5376,30 +5370,30 @@
   ;; SHRINK-NEXT:       (local.get $a)
   ;; SHRINK-NEXT:      )
   ;; SHRINK-NEXT:      (i32.add
-  ;; SHRINK-NEXT:       (call $outlined_u_9
+  ;; SHRINK-NEXT:       (call $outlined_u
   ;; SHRINK-NEXT:        (i32.clz
   ;; SHRINK-NEXT:         (local.get $a)
   ;; SHRINK-NEXT:        )
   ;; SHRINK-NEXT:       )
   ;; SHRINK-NEXT:       (i32.add
-  ;; SHRINK-NEXT:        (call $outlined_u_9
+  ;; SHRINK-NEXT:        (call $outlined_u
   ;; SHRINK-NEXT:         (i32.ctz
   ;; SHRINK-NEXT:          (local.get $a)
   ;; SHRINK-NEXT:         )
   ;; SHRINK-NEXT:        )
   ;; SHRINK-NEXT:        (i32.add
-  ;; SHRINK-NEXT:         (call $outlined_u_9
+  ;; SHRINK-NEXT:         (call $outlined_u
   ;; SHRINK-NEXT:          (i32.popcnt
   ;; SHRINK-NEXT:           (local.get $a)
   ;; SHRINK-NEXT:          )
   ;; SHRINK-NEXT:         )
   ;; SHRINK-NEXT:         (i32.add
-  ;; SHRINK-NEXT:          (call $outlined_u_9
+  ;; SHRINK-NEXT:          (call $outlined_u
   ;; SHRINK-NEXT:           (i32.clz
   ;; SHRINK-NEXT:            (local.get $b)
   ;; SHRINK-NEXT:           )
   ;; SHRINK-NEXT:          )
-  ;; SHRINK-NEXT:          (call $outlined_u_9
+  ;; SHRINK-NEXT:          (call $outlined_u
   ;; SHRINK-NEXT:           (i32.ctz
   ;; SHRINK-NEXT:            (local.get $b)
   ;; SHRINK-NEXT:           )
@@ -5445,20 +5439,32 @@
   ;; SHRINK-NEXT:        )
   ;; SHRINK-NEXT:       )
   ;; SHRINK-NEXT:       (i32.add
-  ;; SHRINK-NEXT:        (call $outlined_u
-  ;; SHRINK-NEXT:         (i32.clz
-  ;; SHRINK-NEXT:          (local.get $a)
+  ;; SHRINK-NEXT:        (struct.get $Sub 1
+  ;; SHRINK-NEXT:         (ref.cast (ref null $Sub)
+  ;; SHRINK-NEXT:          (call $chain_maker
+  ;; SHRINK-NEXT:           (i32.clz
+  ;; SHRINK-NEXT:            (local.get $a)
+  ;; SHRINK-NEXT:           )
+  ;; SHRINK-NEXT:          )
   ;; SHRINK-NEXT:         )
   ;; SHRINK-NEXT:        )
   ;; SHRINK-NEXT:        (i32.add
-  ;; SHRINK-NEXT:         (call $outlined_u
-  ;; SHRINK-NEXT:          (i32.ctz
-  ;; SHRINK-NEXT:           (local.get $a)
+  ;; SHRINK-NEXT:         (struct.get $Sub 1
+  ;; SHRINK-NEXT:          (ref.cast (ref null $Sub)
+  ;; SHRINK-NEXT:           (call $chain_maker
+  ;; SHRINK-NEXT:            (i32.ctz
+  ;; SHRINK-NEXT:             (local.get $a)
+  ;; SHRINK-NEXT:            )
+  ;; SHRINK-NEXT:           )
   ;; SHRINK-NEXT:          )
   ;; SHRINK-NEXT:         )
-  ;; SHRINK-NEXT:         (call $outlined_u
-  ;; SHRINK-NEXT:          (i32.popcnt
-  ;; SHRINK-NEXT:           (local.get $b)
+  ;; SHRINK-NEXT:         (struct.get $Sub 1
+  ;; SHRINK-NEXT:          (ref.cast (ref null $Sub)
+  ;; SHRINK-NEXT:           (call $chain_maker
+  ;; SHRINK-NEXT:            (i32.popcnt
+  ;; SHRINK-NEXT:             (local.get $b)
+  ;; SHRINK-NEXT:            )
+  ;; SHRINK-NEXT:           )
   ;; SHRINK-NEXT:          )
   ;; SHRINK-NEXT:         )
   ;; SHRINK-NEXT:        )
@@ -5547,16 +5553,6 @@
 ;; SHRINK-NEXT: )
 
 ;; SHRINK:      (func $outlined_u (type $2) (param $0 i32) (result i32)
-;; SHRINK-NEXT:  (struct.get $Sub 1
-;; SHRINK-NEXT:   (ref.cast (ref null $Sub)
-;; SHRINK-NEXT:    (call $chain_maker
-;; SHRINK-NEXT:     (local.get $0)
-;; SHRINK-NEXT:    )
-;; SHRINK-NEXT:   )
-;; SHRINK-NEXT:  )
-;; SHRINK-NEXT: )
-
-;; SHRINK:      (func $outlined_u_9 (type $2) (param $0 i32) (result i32)
 ;; SHRINK-NEXT:  (i32.xor
 ;; SHRINK-NEXT:   (call $bin_target
 ;; SHRINK-NEXT:    (local.get $0)
@@ -6547,6 +6543,146 @@
       (i32.sub
         (struct.get $S 1 (ref.as_non_null (local.get $t)))
         (i32.const 200000)
+      )
+    )
+  )
+)
+
+;; Rank-aware shallow byte sizing in Mode::All (--shrink-level=1):
+;; For a top-64 struct type $S and field index 0 < 128, (struct.get $S 0 ...)
+;; and (ref.cast (ref $S) ...) each encode in 3 bytes (= CallBytes), so bare
+;; 1-instruction struct.get or ref.cast expressions are not outlined into
+;; 1-instruction helpers, while the 2-instruction (struct.get $S 0 (ref.cast ...))
+;; (6 fixed bytes > 3 CallBytes) still outlines.
+(module
+  ;; CHECK:      (type $S (struct (field i32)))
+  ;; SHRINK:      (type $S (struct (field i32)))
+  (type $S (struct (field i32)))
+
+  ;; CHECK:      (type $1 (func (param (ref null $S)) (result i32)))
+
+  ;; CHECK:      (type $2 (func (param anyref) (result (ref $S))))
+
+  ;; CHECK:      (type $3 (func (param anyref) (result i32)))
+
+  ;; CHECK:      (type $4 (func (param (ref null $S) anyref) (result i32)))
+
+  ;; CHECK:      (func $get0-helper (type $1) (param $x (ref null $S)) (result i32)
+  ;; CHECK-NEXT:  (struct.get $S 0
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (type $1 (func (param (ref null $S)) (result i32)))
+
+  ;; SHRINK:      (type $2 (func (param anyref) (result (ref $S))))
+
+  ;; SHRINK:      (type $3 (func (param anyref) (result i32)))
+
+  ;; SHRINK:      (type $4 (func (param (ref null $S) anyref) (result i32)))
+
+  ;; SHRINK:      (func $get0-helper (type $1) (param $x (ref null $S)) (result i32)
+  ;; SHRINK-NEXT:  (struct.get $S 0
+  ;; SHRINK-NEXT:   (local.get $x)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $get0-helper (param $x (ref null $S)) (result i32)
+    (struct.get $S 0 (local.get $x))
+  )
+
+  ;; CHECK:      (func $cast-helper (type $2) (param $x anyref) (result (ref $S))
+  ;; CHECK-NEXT:  (ref.cast (ref $S)
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $cast-helper (type $2) (param $x anyref) (result (ref $S))
+  ;; SHRINK-NEXT:  (ref.cast (ref $S)
+  ;; SHRINK-NEXT:   (local.get $x)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $cast-helper (param $x anyref) (result (ref $S))
+    (ref.cast (ref $S) (local.get $x))
+  )
+
+  ;; CHECK:      (func $cast-get-helper (type $3) (param $x anyref) (result i32)
+  ;; CHECK-NEXT:  (struct.get $S 0
+  ;; CHECK-NEXT:   (ref.cast (ref $S)
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $cast-get-helper (type $3) (param $x anyref) (result i32)
+  ;; SHRINK-NEXT:  (struct.get $S 0
+  ;; SHRINK-NEXT:   (ref.cast (ref $S)
+  ;; SHRINK-NEXT:    (local.get $x)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $cast-get-helper (param $x anyref) (result i32)
+    (struct.get $S 0 (ref.cast (ref $S) (local.get $x)))
+  )
+
+  ;; CHECK:      (func $test-rank-aware (type $4) (param $s (ref null $S)) (param $a anyref) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (struct.get $S 0
+  ;; CHECK-NEXT:    (local.get $s)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (if (result i32)
+  ;; CHECK-NEXT:     (ref.is_null
+  ;; CHECK-NEXT:      (ref.cast (ref $S)
+  ;; CHECK-NEXT:       (local.get $a)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (then
+  ;; CHECK-NEXT:      (i32.const 1)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (else
+  ;; CHECK-NEXT:      (i32.const 2)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (struct.get $S 0
+  ;; CHECK-NEXT:     (ref.cast (ref $S)
+  ;; CHECK-NEXT:      (local.get $a)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $test-rank-aware (type $4) (param $s (ref null $S)) (param $a anyref) (result i32)
+  ;; SHRINK-NEXT:  (i32.add
+  ;; SHRINK-NEXT:   (struct.get $S 0
+  ;; SHRINK-NEXT:    (local.get $s)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (i32.add
+  ;; SHRINK-NEXT:    (if (result i32)
+  ;; SHRINK-NEXT:     (ref.is_null
+  ;; SHRINK-NEXT:      (ref.cast (ref $S)
+  ;; SHRINK-NEXT:       (local.get $a)
+  ;; SHRINK-NEXT:      )
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:     (then
+  ;; SHRINK-NEXT:      (i32.const 1)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:     (else
+  ;; SHRINK-NEXT:      (i32.const 2)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (call $cast-get-helper
+  ;; SHRINK-NEXT:     (local.get $a)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $test-rank-aware (param $s (ref null $S)) (param $a anyref) (result i32)
+    (i32.add
+      (struct.get $S 0 (local.get $s))
+      (i32.add
+        (if (result i32)
+          (ref.is_null (ref.cast (ref $S) (local.get $a)))
+          (then (i32.const 1))
+          (else (i32.const 2))
+        )
+        (struct.get $S 0 (ref.cast (ref $S) (local.get $a)))
       )
     )
   )

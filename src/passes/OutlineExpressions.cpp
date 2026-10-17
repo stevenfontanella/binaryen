@@ -131,6 +131,16 @@ const Index HelperOverheadBytes = 6;
 // stack, up to 3 returned via module-level scratch globals).
 const Index MaxWrittenLocals = 4;
 
+// The number of bytes used to encode a value as an unsigned LEB128.
+int getULEBSize(uint64_t value) {
+  int size = 0;
+  do {
+    value >>= 7;
+    size++;
+  } while (value != 0);
+  return size;
+}
+
 // The number of bytes used to encode a value as a signed LEB128.
 int getSLEBSize(int64_t value) {
   int size = 0;
@@ -144,92 +154,169 @@ int getSLEBSize(int64_t value) {
   }
 }
 
-// The estimated binary size of an expression, not including its children.
-Index getShallowBytes(Expression* curr) {
-  switch (curr->_id) {
-    case Expression::BlockId:
-      // Unnamed blocks are not emitted at all.
-      return curr->cast<Block>()->name.is() ? 3 : 0;
-    case Expression::IfId:
-      return curr->cast<If>()->ifFalse ? 4 : 3;
-    case Expression::LoopId:
-      return 3;
-    case Expression::BreakId:
-      return 2;
-    case Expression::CallId:
-    case Expression::CallRefId:
-      return 3;
-    case Expression::CallIndirectId:
-      return 4;
-    case Expression::LocalGetId:
-    case Expression::LocalSetId:
-      return 2;
-    case Expression::GlobalGetId:
-    case Expression::GlobalSetId:
-      return 3;
-    case Expression::LoadId:
-    case Expression::StoreId:
-      return 3;
-    case Expression::ConstId: {
-      auto* c = curr->cast<Const>();
-      switch (c->type.getBasic()) {
-        case Type::i32:
-          return 1 + getSLEBSize(c->value.geti32());
-        case Type::i64:
-          return 1 + getSLEBSize(c->value.geti64());
-        case Type::f32:
-          return 5;
-        case Type::f64:
-          return 9;
-        case Type::v128:
-          return 18;
-        default:
-          WASM_UNREACHABLE("unexpected const type");
-      }
-    }
-    case Expression::UnaryId:
-    case Expression::BinaryId:
-    case Expression::DropId:
-    case Expression::ReturnId:
-    case Expression::NopId:
-    case Expression::UnreachableId:
-    case Expression::RefIsNullId:
-    case Expression::RefEqId:
-    case Expression::RefAsId:
-      return 1;
-    case Expression::SelectId:
-      return curr->type.isRef() ? 3 : 1;
-    case Expression::ThrowId:
-    case Expression::RefNullId:
-    case Expression::RefI31Id:
-    case Expression::I31GetId:
-    case Expression::ArrayLenId:
-      return 2;
-    case Expression::RefFuncId:
-    case Expression::StringConstId:
-      return 3;
-    case Expression::StructNewId:
-    case Expression::StructGetId:
-    case Expression::StructSetId:
-    case Expression::ArrayNewId:
-    case Expression::ArrayGetId:
-    case Expression::ArraySetId:
-    case Expression::ArrayFillId:
-    case Expression::RefCastId:
-    case Expression::RefTestId:
-      return 4;
-    case Expression::ArrayNewFixedId:
-      return 5;
-    case Expression::ArrayNewDataId:
-    case Expression::ArrayNewElemId:
-    case Expression::ArrayCopyId:
-    case Expression::ArrayInitDataId:
-    case Expression::ArrayInitElemId:
-      return 6;
-    default:
-      return 2;
+struct RankTables {
+  bool enabled = false;
+  std::unordered_map<Name, Index> funcRank;
+  std::unordered_map<Name, Index> globalRank;
+  std::unordered_map<HeapType, Index> typeRank;
+
+  Index getFuncRank(Name name) const {
+    auto it = funcRank.find(name);
+    return it != funcRank.end() ? it->second : 200;
   }
-}
+
+  Index getGlobalRank(Name name) const {
+    auto it = globalRank.find(name);
+    return it != globalRank.end() ? it->second : 200;
+  }
+
+  Index getTypeRank(HeapType ht) const {
+    auto it = typeRank.find(ht);
+    return it != typeRank.end() ? it->second : 200;
+  }
+
+  Index getFuncIndexBytes(Name name) const {
+    if (!enabled || funcRank.empty()) {
+      return 2;
+    }
+    return getULEBSize(getFuncRank(name));
+  }
+
+  Index getGlobalIndexBytes(Name name) const {
+    if (!enabled || globalRank.empty()) {
+      return 2;
+    }
+    return getULEBSize(getGlobalRank(name));
+  }
+
+  Index getTypeIndexBytes(Type t, bool isS33) const {
+    if (!enabled || typeRank.empty() || !t.isRef()) {
+      return 2;
+    }
+    HeapType ht = t.getHeapType();
+    if (ht.isBasic()) {
+      return 1;
+    }
+    Index rank = getTypeRank(ht);
+    if (isS33) {
+      return getSLEBSize(int64_t(rank));
+    }
+    return getULEBSize(rank);
+  }
+
+  // The estimated binary size of an expression, not including its children.
+  Index getShallowBytes(Expression* curr) const {
+    switch (curr->_id) {
+      case Expression::BlockId:
+        // Unnamed blocks are not emitted at all.
+        return curr->cast<Block>()->name.is() ? 3 : 0;
+      case Expression::IfId:
+        return curr->cast<If>()->ifFalse ? 4 : 3;
+      case Expression::LoopId:
+        return 3;
+      case Expression::BreakId:
+        return 2;
+      case Expression::CallId:
+        return 1 + getFuncIndexBytes(curr->cast<Call>()->target);
+      case Expression::CallRefId:
+        return 3;
+      case Expression::CallIndirectId:
+        return 4;
+      case Expression::LocalGetId:
+      case Expression::LocalSetId:
+        return 2;
+      case Expression::GlobalGetId:
+        return 1 + getGlobalIndexBytes(curr->cast<GlobalGet>()->name);
+      case Expression::GlobalSetId:
+        return 1 + getGlobalIndexBytes(curr->cast<GlobalSet>()->name);
+      case Expression::LoadId:
+      case Expression::StoreId:
+        return 3;
+      case Expression::ConstId: {
+        auto* c = curr->cast<Const>();
+        switch (c->type.getBasic()) {
+          case Type::i32:
+            return 1 + getSLEBSize(c->value.geti32());
+          case Type::i64:
+            return 1 + getSLEBSize(c->value.geti64());
+          case Type::f32:
+            return 5;
+          case Type::f64:
+            return 9;
+          case Type::v128:
+            return 18;
+          default:
+            WASM_UNREACHABLE("unexpected const type");
+        }
+      }
+      case Expression::UnaryId:
+      case Expression::BinaryId:
+      case Expression::DropId:
+      case Expression::ReturnId:
+      case Expression::NopId:
+      case Expression::UnreachableId:
+      case Expression::RefIsNullId:
+      case Expression::RefEqId:
+      case Expression::RefAsId:
+        return 1;
+      case Expression::SelectId:
+        return curr->type.isRef() ? 3 : 1;
+      case Expression::ThrowId:
+      case Expression::RefNullId:
+      case Expression::RefI31Id:
+      case Expression::I31GetId:
+      case Expression::ArrayLenId:
+        return 2;
+      case Expression::RefFuncId:
+        return 1 + getFuncIndexBytes(curr->cast<RefFunc>()->func);
+      case Expression::StringConstId:
+        return 3;
+      case Expression::StructNewId:
+      case Expression::ArrayNewId:
+        return 2 + getTypeIndexBytes(curr->type, /*isS33=*/false);
+      case Expression::ArrayGetId:
+        return 2 +
+               getTypeIndexBytes(curr->cast<ArrayGet>()->ref->type, false);
+      case Expression::ArraySetId:
+        return 2 +
+               getTypeIndexBytes(curr->cast<ArraySet>()->ref->type, false);
+      case Expression::ArrayFillId:
+        return 2 +
+               getTypeIndexBytes(curr->cast<ArrayFill>()->ref->type, false);
+      case Expression::StructGetId: {
+        auto* sg = curr->cast<StructGet>();
+        if (!enabled || typeRank.empty()) {
+          return 4;
+        }
+        return 1 + getTypeIndexBytes(sg->ref->type, false) +
+               getULEBSize(sg->index);
+      }
+      case Expression::StructSetId: {
+        auto* ss = curr->cast<StructSet>();
+        if (!enabled || typeRank.empty()) {
+          return 4;
+        }
+        return 1 + getTypeIndexBytes(ss->ref->type, false) +
+               getULEBSize(ss->index);
+      }
+      case Expression::RefCastId:
+        return 2 + getTypeIndexBytes(curr->type, /*isS33=*/true);
+      case Expression::RefTestId:
+        return 2 +
+               getTypeIndexBytes(curr->cast<RefTest>()->castType, /*isS33=*/true);
+      case Expression::ArrayNewFixedId:
+        return 5;
+      case Expression::ArrayNewDataId:
+      case Expression::ArrayNewElemId:
+      case Expression::ArrayCopyId:
+      case Expression::ArrayInitDataId:
+      case Expression::ArrayInitElemId:
+        return 6;
+      default:
+        return 2;
+    }
+  }
+};
 
 // Whether an expression is a constant that a round with constants as holes
 // treats as a hole.
@@ -671,6 +758,7 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
   Module& wasm;
   Function* func;
   FunctionInfo& info;
+  const RankTables& ranks;
   Mode mode;
   // Whether constants are holes in this round.
   bool constHoles;
@@ -689,11 +777,12 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
   Scanner(Module& wasm,
           Function* func,
           FunctionInfo& info,
+          const RankTables& ranks,
           Mode mode,
           bool constHoles,
           bool canonicalizeLocalHoles)
-    : wasm(wasm), func(func), info(info), mode(mode), constHoles(constHoles),
-      canonicalizeLocalHoles(canonicalizeLocalHoles) {
+    : wasm(wasm), func(func), info(info), ranks(ranks), mode(mode),
+      constHoles(constHoles), canonicalizeLocalHoles(canonicalizeLocalHoles) {
     LocalUseCounter counter(func->getNumLocals());
     counter.walk(func->body);
     totalReads = std::move(counter.reads);
@@ -727,7 +816,7 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
     }
     NodeInfo node;
     node.hash = getShallowHash(curr);
-    node.bytes = getShallowBytes(curr);
+    node.bytes = ranks.getShallowBytes(curr);
     Index numChildren = ChildIterator(curr).getNumChildren();
     assert(stack.size() >= numChildren);
     Index stackBase = stack.size() - numChildren;
@@ -1030,6 +1119,10 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
         }
         break;
       case Mode::All:
+        if (ranks.enabled && single &&
+            (curr->is<RefCast>() || curr->is<RefTest>())) {
+          return;
+        }
         break;
     }
     // Identify function-internal scratch locals whose reads and writes in the
@@ -1629,8 +1722,195 @@ struct OutlineExpressions : public Pass {
   bool canonicalizeLocalHoles = false;
   // Whether module functions have precomputed GlobalEffects summaries.
   bool hasModuleEffects = false;
+  RankTables ranks;
+  Index helperOverheadBytes = HelperOverheadBytes;
   ModuleUtils::ParallelFunctionAnalysis<FunctionInfo>* currentAnalysis =
     nullptr;
+
+  Index getShallowBytes(Expression* curr) const {
+    return ranks.getShallowBytes(curr);
+  }
+
+  void computeRankTables(Mode mode) {
+    ranks = RankTables{};
+    helperOverheadBytes = HelperOverheadBytes;
+    auto name = getArgumentOrDefault(
+      "outline-expressions",
+      getArgumentOrDefault("outline-expressions-mode", ""));
+    bool forceRankAware =
+      name == "rank-aware" || hasArgument("outline-expressions-rank-aware");
+    bool activeMode =
+      (name.empty() && mode == Mode::All && getPassOptions().shrinkLevel > 0) ||
+      forceRankAware;
+    if (!activeMode) {
+      return;
+    }
+    bool hasLargeFuncPool = wasm->functions.size() > 128;
+    bool hasLargeGlobalPool = wasm->globals.size() > 128;
+
+    InsertOrderedMap<HeapType, ModuleUtils::HeapTypeInfo> typeCounts;
+    if (wasm->features.hasGC()) {
+      typeCounts = ModuleUtils::collectHeapTypeInfo(
+        *wasm, WorldMode::Open, ModuleUtils::TypeInclusion::BinaryTypes);
+    }
+
+    bool hasLargeTypePool = typeCounts.size() > 64;
+    ranks.enabled = true;
+    helperOverheadBytes = (forceRankAware || hasLargeFuncPool ||
+                           hasLargeGlobalPool || hasLargeTypePool)
+                            ? 7
+                            : HelperOverheadBytes;
+
+    if (forceRankAware || hasLargeFuncPool || hasLargeGlobalPool) {
+      struct RefCounts {
+        std::unordered_map<Name, Index> funcRefs;
+        std::unordered_map<Name, Index> globalRefs;
+      };
+      struct RefScanner : public PostWalker<RefScanner> {
+        RefCounts& counts;
+        bool countFuncs;
+        bool countGlobals;
+        RefScanner(RefCounts& counts, bool countFuncs, bool countGlobals)
+          : counts(counts), countFuncs(countFuncs), countGlobals(countGlobals) {
+        }
+        void visitCall(Call* curr) {
+          if (countFuncs) {
+            counts.funcRefs[curr->target]++;
+          }
+        }
+        void visitRefFunc(RefFunc* curr) {
+          if (countFuncs) {
+            counts.funcRefs[curr->func]++;
+          }
+        }
+        void visitGlobalGet(GlobalGet* curr) {
+          if (countGlobals) {
+            counts.globalRefs[curr->name]++;
+          }
+        }
+        void visitGlobalSet(GlobalSet* curr) {
+          if (countGlobals) {
+            counts.globalRefs[curr->name]++;
+          }
+        }
+      };
+
+      bool doFuncs = forceRankAware || hasLargeFuncPool;
+      bool doGlobals = forceRankAware || hasLargeGlobalPool;
+      ModuleUtils::ParallelFunctionAnalysis<RefCounts> analysis(
+        *wasm, [&](Function* func, RefCounts& counts) {
+          if (!func->imported() && func->body) {
+            RefScanner(counts, doFuncs, doGlobals).walk(func->body);
+          }
+        });
+
+      std::unordered_map<Name, Index> totalFuncRefs;
+      std::unordered_map<Name, Index> totalGlobalRefs;
+      for (auto& [_, counts] : analysis.map) {
+        for (auto& [fName, cnt] : counts.funcRefs) {
+          totalFuncRefs[fName] += cnt;
+        }
+        for (auto& [gName, cnt] : counts.globalRefs) {
+          totalGlobalRefs[gName] += cnt;
+        }
+      }
+      RefCounts moduleCounts;
+      RefScanner modScanner(moduleCounts, doFuncs, doGlobals);
+      for (auto& g : wasm->globals) {
+        if (!g->imported() && g->init) {
+          modScanner.walk(g->init);
+        }
+      }
+      for (auto& seg : wasm->elementSegments) {
+        for (auto* e : seg->data) {
+          modScanner.walk(e);
+        }
+      }
+      for (auto& [fName, cnt] : moduleCounts.funcRefs) {
+        totalFuncRefs[fName] += cnt;
+      }
+      for (auto& [gName, cnt] : moduleCounts.globalRefs) {
+        totalGlobalRefs[gName] += cnt;
+      }
+
+      if (doFuncs) {
+        Index nextFuncRank = 0;
+        std::vector<Name> definedFuncs;
+        definedFuncs.reserve(wasm->functions.size());
+        for (auto& func : wasm->functions) {
+          if (func->imported()) {
+            ranks.funcRank[func->name] = nextFuncRank++;
+          } else {
+            definedFuncs.push_back(func->name);
+          }
+        }
+        std::sort(definedFuncs.begin(),
+                  definedFuncs.end(),
+                  [&](const Name& a, const Name& b) {
+                    Index ra = totalFuncRefs[a];
+                    Index rb = totalFuncRefs[b];
+                    if (ra != rb) {
+                      return ra > rb;
+                    }
+                    return a > b;
+                  });
+        for (auto& name : definedFuncs) {
+          ranks.funcRank[name] = nextFuncRank++;
+        }
+      }
+
+      if (doGlobals) {
+        Index nextGlobalRank = 0;
+        std::vector<Name> definedGlobals;
+        definedGlobals.reserve(wasm->globals.size());
+        for (auto& g : wasm->globals) {
+          if (g->imported()) {
+            ranks.globalRank[g->name] = nextGlobalRank++;
+          } else {
+            definedGlobals.push_back(g->name);
+          }
+        }
+        std::sort(definedGlobals.begin(),
+                  definedGlobals.end(),
+                  [&](const Name& a, const Name& b) {
+                    Index ra = totalGlobalRefs[a];
+                    Index rb = totalGlobalRefs[b];
+                    if (ra != rb) {
+                      return ra > rb;
+                    }
+                    return a < b;
+                  });
+        for (auto& name : definedGlobals) {
+          ranks.globalRank[name] = nextGlobalRank++;
+        }
+      }
+    }
+
+    if (wasm->features.hasGC()) {
+      std::unordered_map<HeapType, double> weights;
+      std::vector<HeapType> allTypes;
+      allTypes.reserve(typeCounts.size());
+      for (auto& [ht, info] : typeCounts) {
+        weights[ht] = info.useCount;
+        allTypes.push_back(ht);
+      }
+      for (auto it = allTypes.rbegin(); it != allTypes.rend(); ++it) {
+        if (auto sup = it->getSuperType()) {
+          if (weights.contains(*sup)) {
+            weights[*sup] = std::max(weights[*sup], weights[*it] + 0.5);
+          }
+        }
+      }
+      std::stable_sort(allTypes.begin(),
+                       allTypes.end(),
+                       [&](const HeapType& a, const HeapType& b) {
+                         return weights[a] > weights[b];
+                       });
+      for (Index i = 0; i < allTypes.size(); ++i) {
+        ranks.typeRank[allTypes[i]] = i;
+      }
+    }
+  }
 
   void run(Module* module) override {
     wasm = module;
@@ -1654,6 +1934,8 @@ struct OutlineExpressions : public Pass {
     }
 
     auto mode = getMode();
+    computeRankTables(mode);
+
     bool enableUnCseTees =
       getPassOptions().shrinkLevel > 0 || getPassOptions().trapsNeverHappen;
 
@@ -1686,6 +1968,7 @@ struct OutlineExpressions : public Pass {
     }
     foldCallRefDispatch(true);
     propagateScratchGlobalEffects();
+    computeRankTables(mode);
     if (enableUnCseTees) {
       if (reuseExistingHelpersWithSpecialArgs()) {
         propagateScratchGlobalEffects();
@@ -3163,7 +3446,8 @@ struct OutlineExpressions : public Pass {
         if (func->imported()) {
           return;
         }
-        Scanner(*wasm, func, info, mode, constHoles, canonicalizeLocalHoles)
+        Scanner(
+          *wasm, func, info, ranks, mode, constHoles, canonicalizeLocalHoles)
           .walk(func->body);
         noteParents(func->body, info);
       });
@@ -3236,7 +3520,7 @@ struct OutlineExpressions : public Pass {
           int64_t cost =
             int64_t(site->bytes) - int64_t(site->helperVaryingBytes) +
             LocalGetBytes * int64_t(info.numVarying + info.numDupVarying) +
-            HelperOverheadBytes +
+            helperOverheadBytes +
             LocalSetBytes * int64_t(site->internalLocals.size());
           if (!site->written.empty()) {
             // The helper returns written[0]'s final value, writes written[1..]
@@ -3356,11 +3640,11 @@ struct OutlineExpressions : public Pass {
     if (name == "trees") {
       return Mode::Trees;
     }
-    if (name == "all") {
+    if (name == "all" || name == "rank-aware") {
       return Mode::All;
     }
     Fatal() << "unknown outline-expressions-mode: " << name
-            << " (expected calls, guards, trees, or all)";
+            << " (expected calls, guards, trees, all, or rank-aware)";
     WASM_UNREACHABLE("unknown mode");
   }
 
@@ -3791,7 +4075,7 @@ struct OutlineExpressions : public Pass {
     }
     int64_t cost = int64_t(site0->bytes) - int64_t(helperVarBytes) +
                    LocalGetBytes * int64_t(numVarying + numDupVarying) +
-                   HelperOverheadBytes +
+                   helperOverheadBytes +
                    LocalSetBytes * int64_t(site0->internalLocals.size());
     if (!site0->written.empty()) {
       cost += LocalSetBytes + 4 * int64_t(site0->written.size() - 1);
@@ -7656,7 +7940,7 @@ struct OutlineExpressions : public Pass {
         outOp.fieldIdx = sg->index;
         outOp.signed_ = sg->signed_;
         outOp.resultType = sg->type;
-        outOp.opBytes = 4;
+        outOp.opBytes = getShallowBytes(sg);
         outInner = sg->ref;
         return true;
       }
@@ -7669,7 +7953,7 @@ struct OutlineExpressions : public Pass {
         outOp.structType = HeapType(HeapType::ext);
         outOp.resultType = rc->type;
         outOp.castType = rc->type;
-        outOp.opBytes = 4;
+        outOp.opBytes = getShallowBytes(rc);
         outInner = rc->ref;
         return true;
       }
@@ -7682,7 +7966,7 @@ struct OutlineExpressions : public Pass {
         outOp.structType = HeapType(HeapType::ext);
         outOp.resultType = rt->type;
         outOp.castType = rt->castType;
-        outOp.opBytes = 4;
+        outOp.opBytes = getShallowBytes(rt);
         outInner = rt->ref;
         return true;
       }
@@ -12340,8 +12624,8 @@ struct OutlineExpressions : public Pass {
       }
     }
 
-    auto getRootSkelHash = [](Expression* curr,
-                              bool isExprRoot = false) -> size_t {
+    auto getRootSkelHash = [&](Expression* curr,
+                               bool isExprRoot = false) -> size_t {
       size_t h = getLeafAgnosticShallowHash(curr);
       Index numCh = ChildIterator(curr).getNumChildren();
       rehash(h, numCh);
