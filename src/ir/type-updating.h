@@ -456,6 +456,10 @@ public:
   }
 
 protected:
+  // Number of types at the end of the sorted private type list to emit as
+  // singleton rec groups after the main private recursion group.
+  Index tailSingletonCount = 0;
+
   // Return the graph matching each private type to its private predecessors.
   PredecessorGraph getPrivatePredecessors();
 

@@ -492,3 +492,97 @@
   ;; CHECK-NEXT: )
   (func $g4 (type $sig2) (param i64))
 )
+
+(module
+  ;; Public singleton signature splitting and tail singleton detachment:
+  ;; $pub_split is used by 1 import and 5 private functions, so its private uses
+  ;; are split onto a private signature inside the rec group. $tail is a low-use
+  ;; private struct that is the sole private user of $pub_tail, so $tail is
+  ;; detached as a singleton after the main private rec group.
+  ;; CHECK:      (rec
+  ;; CHECK-NEXT:  (type $s1 (struct))
+
+  ;; CHECK:       (type $s2 (struct))
+
+  ;; CHECK:       (type $sig1 (func (param i64)))
+
+  ;; CHECK:       (type $sig2 (func (param f64)))
+
+  ;; CHECK:       (type $low (struct))
+
+  ;; CHECK:      (type $pub_tail (func (param i32) (result i32)))
+
+  ;; CHECK:      (type $tail (struct (field (ref null $pub_tail))))
+
+  ;; CHECK:      (type $pub_split (func))
+  (type $pub_split (func))
+  (type $pub_tail (func (param i32) (result i32)))
+  (rec
+    (type $tail (struct (field (ref null $pub_tail))))
+    (type $low (struct))
+    (type $s1 (struct))
+    (type $s2 (struct))
+    (type $sig1 (func (param i64)))
+    (type $sig2 (func (param f64)))
+  )
+
+  ;; CHECK:      (import "env" "imp1" (func $imp1 (type $pub_split)))
+  (import "env" "imp1" (func $imp1 (type $pub_split)))
+  ;; CHECK:      (import "env" "imp2" (func $imp2 (type $pub_tail) (param i32) (result i32)))
+  (import "env" "imp2" (func $imp2 (type $pub_tail) (param i32) (result i32)))
+
+  ;; CHECK:      (global $gt (ref null $tail) (ref.null none))
+  (global $gt (ref null $tail) (ref.null none))
+  ;; CHECK:      (global $gl (ref null $low) (ref.null none))
+  (global $gl (ref null $low) (ref.null none))
+
+  ;; CHECK:      (func $p1 (type $2)
+  ;; CHECK-NEXT:  (local $0 (ref $s1))
+  ;; CHECK-NEXT:  (local $1 (ref $s2))
+  ;; CHECK-NEXT: )
+  (func $p1 (type $pub_split)
+    (local (ref $s1) (ref $s2))
+  )
+  ;; CHECK:      (func $p2 (type $2)
+  ;; CHECK-NEXT:  (local $0 (ref $s1))
+  ;; CHECK-NEXT:  (local $1 (ref $s2))
+  ;; CHECK-NEXT: )
+  (func $p2 (type $pub_split)
+    (local (ref $s1) (ref $s2))
+  )
+  ;; CHECK:      (func $p3 (type $2)
+  ;; CHECK-NEXT:  (local $0 (ref $s1))
+  ;; CHECK-NEXT:  (local $1 (ref $s2))
+  ;; CHECK-NEXT: )
+  (func $p3 (type $pub_split)
+    (local (ref $s1) (ref $s2))
+  )
+  ;; CHECK:      (func $p4 (type $2)
+  ;; CHECK-NEXT:  (local $0 (ref $s1))
+  ;; CHECK-NEXT:  (local $1 (ref $s2))
+  ;; CHECK-NEXT: )
+  (func $p4 (type $pub_split)
+    (local (ref $s1) (ref $s2))
+  )
+  ;; CHECK:      (func $p5 (type $2)
+  ;; CHECK-NEXT: )
+  (func $p5 (type $pub_split))
+  ;; CHECK:      (func $q1 (type $sig1) (param $0 i64)
+  ;; CHECK-NEXT: )
+  (func $q1 (type $sig1) (param i64))
+  ;; CHECK:      (func $q2 (type $sig1) (param $0 i64)
+  ;; CHECK-NEXT: )
+  (func $q2 (type $sig1) (param i64))
+  ;; CHECK:      (func $q3 (type $sig1) (param $0 i64)
+  ;; CHECK-NEXT: )
+  (func $q3 (type $sig1) (param i64))
+  ;; CHECK:      (func $r1 (type $sig2) (param $0 f64)
+  ;; CHECK-NEXT: )
+  (func $r1 (type $sig2) (param f64))
+  ;; CHECK:      (func $r2 (type $sig2) (param $0 f64)
+  ;; CHECK-NEXT: )
+  (func $r2 (type $sig2) (param f64))
+  ;; CHECK:      (func $r3 (type $sig2) (param $0 f64)
+  ;; CHECK-NEXT: )
+  (func $r3 (type $sig2) (param f64))
+)

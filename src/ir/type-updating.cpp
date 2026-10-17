@@ -213,8 +213,13 @@ GlobalTypeRewriter::rebuildTypes(std::vector<HeapType> types) {
   // types are distinct as well. Further, the new types may have more
   // recursions than the original types, so the old recursion groups may not
   // be sufficient any more. Both of these problems are solved by putting all
-  // the new types into a single large recursion group.
-  typeBuilder.createRecGroup(0, typeBuilder.size());
+  // the new types into a single large recursion group (except any trailing
+  // acyclic leaf/tail types explicitly requested as singleton rec groups).
+  assert(tailSingletonCount <= typeBuilder.size());
+  Index mainGroupSize = typeBuilder.size() - tailSingletonCount;
+  if (mainGroupSize > 0) {
+    typeBuilder.createRecGroup(0, mainGroupSize);
+  }
 
   // Create the temporary heap types.
   auto map = [&](HeapType type) -> HeapType {
@@ -271,13 +276,18 @@ GlobalTypeRewriter::rebuildTypes(std::vector<HeapType> types) {
             << " at index " << err->index;
   }
 #endif
-  // Ensure the new types are different from any public rec group.
-  RecGroup newGroup = publicGroups.insert((*buildResults)[0].getRecGroup());
-
   // Map the old types to the new ones.
   TypeMap oldToNewTypes;
-  for (auto [type, index] : typeIndices) {
-    oldToNewTypes[type] = newGroup[index];
+  if (mainGroupSize > 0) {
+    // Ensure the new types are different from any public rec group.
+    RecGroup newGroup = publicGroups.insert((*buildResults)[0].getRecGroup());
+    for (Index i = 0; i < mainGroupSize; ++i) {
+      oldToNewTypes[types[i]] = newGroup[i];
+    }
+  }
+  for (Index i = mainGroupSize; i < types.size(); ++i) {
+    RecGroup newGroup = publicGroups.insert((*buildResults)[i].getRecGroup());
+    oldToNewTypes[types[i]] = newGroup[0];
   }
   mapTypeNamesAndIndices(oldToNewTypes);
   return oldToNewTypes;
