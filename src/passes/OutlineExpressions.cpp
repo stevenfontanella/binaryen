@@ -294,6 +294,17 @@ struct KeyInfo {
   Index numLocals = 0;
   Index numVarying = 0;
   Index numDupVarying = 0;
+  // The site whose function is used as the existing helper, if any.
+  struct Site* helperSite = nullptr;
+  // If non-empty, maps each helper parameter p (0..numLocals-1) to the hole
+  // index in site->holes when an existing helper has permuted parameter holes.
+  std::vector<Index> holeOfParam;
+  // If non-empty, widened parameter types to apply in-place to the existing
+  // helper when this key is outlined.
+  std::vector<Type> widenedHelperParams;
+  // If not Type::none, narrowed result type to apply in-place to the existing
+  // helper when this key is outlined.
+  Type narrowedHelperResults = Type::none;
 };
 
 // An expression tree (or contiguous block slice) in a function body that we may
@@ -1406,14 +1417,24 @@ struct Replacer : public WalkerPass<
     auto* site = replacement.site;
     auto& fixed = site->key->fixed;
     auto& dupOf = site->key->dupOf;
+    auto& holeOfParam = site->key->holeOfParam;
     Builder builder(*getModule());
     std::vector<Expression*> args;
-    for (Index i = 0; i < site->holes.size(); i++) {
-      if (!fixed[i] && dupOf[i] == Index(-1)) {
-        auto& hole = site->holes[i];
+    if (!holeOfParam.empty()) {
+      for (Index hIdx : holeOfParam) {
+        auto& hole = site->holes[hIdx];
         args.push_back(hole.expr
                          ? hole.expr
                          : builder.makeLocalGet(hole.localIndex, hole.type));
+      }
+    } else {
+      for (Index i = 0; i < site->holes.size(); i++) {
+        if (!fixed[i] && dupOf[i] == Index(-1)) {
+          auto& hole = site->holes[i];
+          args.push_back(hole.expr
+                           ? hole.expr
+                           : builder.makeLocalGet(hole.localIndex, hole.type));
+        }
       }
     }
     assert(args.size() == site->key->numLocals + site->key->numVarying);
@@ -1468,13 +1489,23 @@ struct Replacer : public WalkerPass<
           if (type == Type::unreachable) {
             auto& fixed = site->key->fixed;
             auto& dupOf = site->key->dupOf;
+            auto& holeOfParam = site->key->holeOfParam;
             std::vector<Expression*> args;
-            for (Index i = 0; i < site->holes.size(); i++) {
-              if (!fixed[i] && dupOf[i] == Index(-1)) {
-                auto& hole = site->holes[i];
+            if (!holeOfParam.empty()) {
+              for (Index hIdx : holeOfParam) {
+                auto& hole = site->holes[hIdx];
                 args.push_back(
                   hole.expr ? hole.expr
                             : builder.makeLocalGet(hole.localIndex, hole.type));
+              }
+            } else {
+              for (Index i = 0; i < site->holes.size(); i++) {
+                if (!fixed[i] && dupOf[i] == Index(-1)) {
+                  auto& hole = site->holes[i];
+                  args.push_back(
+                    hole.expr ? hole.expr
+                              : builder.makeLocalGet(hole.localIndex, hole.type));
+                }
               }
             }
             block->list[offset] =
@@ -1599,6 +1630,11 @@ struct OutlineExpressions : public Pass {
     }
     foldCallRefDispatch(true);
     propagateScratchGlobalEffects();
+    if (enableUnCseTees) {
+      if (reuseExistingHelpersWithSpecialArgs()) {
+        propagateScratchGlobalEffects();
+      }
+    }
     for (Index round = 0; round < 3; round++) {
       bool changed = sinkWrapperCalls();
       if (getPassOptions().shrinkLevel > 0) {
@@ -3076,11 +3112,12 @@ struct OutlineExpressions : public Pass {
 
     // Find existing helpers. This needs the keys to be complete, as whether a
     // function can be the helper for its key depends on all the sites.
+    std::unordered_set<Name> escapedFuncs = collectEscapedFunctions();
     for (auto& func : wasm->functions) {
       auto& info = analysis.map[func.get()];
       if (!info.sites.empty() && info.sites.back().expr == func->body &&
           info.sites.back().sliceLen == 0) {
-        noteExistingHelper(func.get(), info.sites.back());
+        noteExistingHelper(func.get(), info.sites.back(), escapedFuncs);
       }
     }
 
@@ -3183,7 +3220,54 @@ struct OutlineExpressions : public Pass {
       return false;
     }
 
+    std::unordered_map<Name, Type> narrowedHelpers;
+    for (auto& info : keys) {
+      if (!info.outline || !info.helper) {
+        continue;
+      }
+      bool helperModified = false;
+      if (!info.widenedHelperParams.empty()) {
+        info.helper->setParams(Type(info.widenedHelperParams));
+        for (auto* lg : FindAll<LocalGet>(info.helper->body).list) {
+          if (lg->index < info.widenedHelperParams.size()) {
+            lg->type = info.widenedHelperParams[lg->index];
+          }
+        }
+        helperModified = true;
+      }
+      if (info.narrowedHelperResults != Type::none) {
+        info.helper->setResults(info.narrowedHelperResults);
+        narrowedHelpers[info.helper->name] = info.narrowedHelperResults;
+        helperModified = true;
+      }
+      if (helperModified) {
+        ReFinalize().walkFunctionInModule(info.helper, wasm);
+        refreshFuncEffects(info.helper);
+      }
+    }
+
     Replacer(replacements, sliceReplacements).run(getPassRunner(), wasm);
+    if (!narrowedHelpers.empty()) {
+      for (auto& func : wasm->functions) {
+        if (func->imported() || !func->body) {
+          continue;
+        }
+        bool changedCall = false;
+        for (auto* c : FindAll<Call>(func->body).list) {
+          if (!c->isReturn && c->type != Type::unreachable) {
+            if (auto it = narrowedHelpers.find(c->target);
+                it != narrowedHelpers.end() && c->type != it->second) {
+              c->type = it->second;
+              changedCall = true;
+            }
+          }
+        }
+        if (changedCall) {
+          ReFinalize().walkFunctionInModule(func.get(), wasm);
+          refreshFuncEffects(func.get());
+        }
+      }
+    }
     return true;
   }
 
@@ -3915,68 +3999,164 @@ struct OutlineExpressions : public Pass {
     return type == Type::unreachable ? Type::none : type;
   }
 
-  // If the function's body is just a tree whose holes are its params, in
-  // order, note it as the helper for the tree's key. With constants as holes,
-  // all the constants in the body must be fixed, as the function has them
-  // baked in. (The helpers of trees that write a local are blocks that end in
-  // a read of the local, which we do not try to recognize.)
-  void noteExistingHelper(Function* func, Site& site) {
+  std::unordered_set<Name> collectEscapedFunctions() {
+    std::unordered_set<Name> escaped;
+    for (auto& ex : wasm->exports) {
+      if (ex->kind == ExternalKind::Function) {
+        escaped.insert(*ex->getInternalName());
+      }
+    }
+    for (auto& seg : wasm->elementSegments) {
+      for (auto* expr : seg->data) {
+        for (auto* rf : FindAll<RefFunc>(expr).list) {
+          escaped.insert(rf->func);
+        }
+      }
+    }
+    for (auto& g : wasm->globals) {
+      if (!g->imported() && g->init) {
+        for (auto* rf : FindAll<RefFunc>(g->init).list) {
+          escaped.insert(rf->func);
+        }
+      }
+    }
+    for (auto& f : wasm->functions) {
+      if (!f->imported() && f->body) {
+        for (auto* rf : FindAll<RefFunc>(f->body).list) {
+          escaped.insert(rf->func);
+        }
+      }
+    }
+    return escaped;
+  }
+
+  // If the function's body is just a tree whose holes are its params, note it
+  // as the helper for the tree's key. With constants as holes, all the
+  // constants in the body must be fixed, as the function has them baked in.
+  // (The helpers of trees that write a local are blocks that end in a read of
+  // the local, which we do not try to recognize.)
+  void noteExistingHelper(Function* func,
+                          Site& site,
+                          const std::unordered_set<Name>& escapedFuncs) {
     if (!site.written.empty() ||
         (!site.internalLocals.empty() &&
-         func->vars.size() != site.internalLocals.size()) ||
-        func->getResults() != getHelperResults(&site)) {
+         func->vars.size() != site.internalLocals.size())) {
       return;
+    }
+    bool isEscaped = escapedFuncs.count(func->name) > 0;
+    Type targetResults = getHelperResults(&site);
+    bool needsResultNarrow = false;
+    if (func->getResults() != targetResults) {
+      if (!canonicalizeLocalHoles || isEscaped ||
+          targetResults == Type::none || func->getResults() == Type::none ||
+          !Type::isSubType(targetResults, func->getResults()) ||
+          !Type::isSubType(func->body->type, targetResults)) {
+        return;
+      }
+      needsResultNarrow = true;
     }
     auto& key = *site.key;
     prepareKey(key);
-    if (key.numVarying != 0 || key.numLocals != func->getNumParams()) {
+    Index numParams = func->getNumParams();
+    if (key.numVarying != 0 || key.numLocals != numParams) {
       return;
     }
-    Index i = 0;
-    for (Index hIdx = 0; hIdx < site.holes.size(); hIdx++) {
-      auto& hole = site.holes[hIdx];
-      if (!hole.isLocal) {
-        continue;
-      }
-      if (hole.localIndex != i) {
-        return;
-      }
-      Type paramType = func->getLocalType(i);
-      if (hole.type != paramType) {
-        if (!canonicalizeLocalHoles) {
-          return;
-        }
-        bool allSub = true;
-        for (auto* otherSite : key.sites) {
-          auto& otherHole = otherSite->holes[hIdx];
-          Type actualType =
-            otherSite->func->getLocalType(otherHole.localIndex);
-          if (!Type::isSubType(actualType, paramType)) {
-            allSub = false;
-            break;
-          }
-        }
-        if (!allSub) {
-          return;
-        }
-      }
-      i++;
-    }
     for (Index j = 0; j < site.internalLocals.size(); j++) {
-      Index expectedIdx = func->getNumParams() + j;
+      Index expectedIdx = numParams + j;
       if (site.internalLocals[j] != expectedIdx ||
           func->getLocalType(expectedIdx) !=
             site.func->getLocalType(site.internalLocals[j])) {
         return;
       }
     }
-    if (key.helper) {
-      // We already have a helper for this key. This function can just call it
-      // like any other site.
+    std::vector<Index> candHoleOfParam(numParams, Index(-1));
+    std::vector<Type> candWidenedParams(numParams);
+    for (Index p = 0; p < numParams; p++) {
+      candWidenedParams[p] = func->getLocalType(p);
+    }
+    bool hasPermutation = false;
+    bool needsParamWiden = false;
+    Index i = 0;
+    for (Index hIdx = 0; hIdx < site.holes.size(); hIdx++) {
+      auto& hole = site.holes[hIdx];
+      if (!hole.isLocal) {
+        continue;
+      }
+      Index p = hole.localIndex;
+      if (p != i) {
+        return;
+      }
+      candHoleOfParam[p] = hIdx;
+      Type paramType = func->getLocalType(p);
+      if (hole.type != paramType) {
+        if (!canonicalizeLocalHoles) {
+          return;
+        }
+        Type lub = paramType;
+        bool allOk = true;
+        for (auto* otherSite : key.sites) {
+          auto& otherHole = otherSite->holes[hIdx];
+          Type actualType =
+            otherSite->func->getLocalType(otherHole.localIndex);
+          if (!Type::isSubType(actualType, paramType)) {
+            if (isEscaped || !Type::isSubType(actualType, hole.type)) {
+              allOk = false;
+              break;
+            }
+            lub = Type::getLeastUpperBound(lub, actualType);
+          }
+        }
+        if (!allOk || lub == Type::unreachable ||
+            !Type::isSubType(lub, hole.type)) {
+          return;
+        }
+        if (lub != paramType) {
+          candWidenedParams[p] = lub;
+          needsParamWiden = true;
+        }
+      }
+      i++;
+    }
+    if (i != numParams) {
       return;
+    }
+    if (key.helper) {
+      auto rankHelper = [](bool escaped, bool resNarrow, bool paramWiden) {
+        if (escaped) {
+          return 3;
+        }
+        if (!resNarrow && !paramWiden) {
+          return 2;
+        }
+        if (!resNarrow) {
+          return 1;
+        }
+        return 0;
+      };
+      int curRank = rankHelper(escapedFuncs.count(key.helper->name) > 0,
+                               key.narrowedHelperResults != Type::none,
+                               !key.widenedHelperParams.empty());
+      int newRank = rankHelper(isEscaped, needsResultNarrow, needsParamWiden);
+      if (newRank <= curRank) {
+        return;
+      }
+      key.helperSite->helperBody = false;
     }
     site.helperBody = true;
     key.helper = func;
+    key.helperSite = &site;
+    if (hasPermutation) {
+      key.holeOfParam = std::move(candHoleOfParam);
+    } else {
+      key.holeOfParam.clear();
+    }
+    if (needsParamWiden) {
+      key.widenedHelperParams = std::move(candWidenedParams);
+    } else {
+      key.widenedHelperParams.clear();
+    }
+    key.narrowedHelperResults =
+      needsResultNarrow ? targetResults : Type(Type::none);
   }
 
   // Turns the non-fixed holes of a copied tree into local.gets of the params,
@@ -11228,6 +11408,1299 @@ struct OutlineExpressions : public Pass {
     for (Function* func : modifiedFuncs) {
       ReFinalize().walkFunctionInModule(func, wasm);
       refreshFuncEffects(func);
+    }
+    return anyChanged;
+  }
+
+  static bool isMovableZeroVarNode(Expression* curr) {
+    if (!curr || curr->type.isTuple() || curr->is<LocalSet>()) {
+      return false;
+    }
+    switch (curr->_id) {
+      case Expression::ReturnId:
+      case Expression::TryId:
+      case Expression::TryTableId:
+      case Expression::RethrowId:
+      case Expression::PopId:
+      case Expression::TupleMakeId:
+      case Expression::TupleExtractId:
+      case Expression::ContNewId:
+      case Expression::ContBindId:
+      case Expression::SuspendId:
+      case Expression::ResumeId:
+      case Expression::ResumeThrowId:
+      case Expression::StackSwitchId:
+        return false;
+      case Expression::CallId:
+        return !curr->cast<Call>()->isReturn;
+      case Expression::CallIndirectId:
+        return !curr->cast<CallIndirect>()->isReturn;
+      case Expression::CallRefId:
+        return !curr->cast<CallRef>()->isReturn;
+      case Expression::GlobalSetId:
+        return !curr->cast<GlobalSet>()->name.startsWith("oe$out_");
+      default:
+        return true;
+    }
+  }
+
+  static bool isPureReuseLeaf(Expression* e) {
+    if (!e || e->type == Type::unreachable || !e->type.isSingle()) {
+      return false;
+    }
+    return e->is<LocalGet>() || e->is<Const>() || e->is<RefNull>() ||
+           e->is<RefFunc>() || e->is<GlobalGet>();
+  }
+
+  static size_t getLeafAgnosticShallowHash(Expression* curr) {
+    if (isPureReuseLeaf(curr)) {
+      return wasm::hash(0x9e3779b97f4a7c15ULL);
+    }
+    if (auto* br = curr->dynCast<Break>()) {
+      auto digest = wasm::hash(curr->_id);
+      rehash(digest, curr->type.getID());
+      rehash(digest, !!br->condition);
+      rehash(digest, !!br->value);
+      return digest;
+    }
+    if (auto* sw = curr->dynCast<Switch>()) {
+      auto digest = wasm::hash(curr->_id);
+      rehash(digest, curr->type.getID());
+      rehash(digest, sw->targets.size());
+      rehash(digest, !!sw->value);
+      return digest;
+    }
+    if (auto* brOn = curr->dynCast<BrOn>()) {
+      auto digest = wasm::hash(curr->_id);
+      rehash(digest, curr->type.getID());
+      rehash(digest, brOn->op);
+      rehash(digest, brOn->castType.getID());
+      return digest;
+    }
+    return ExpressionAnalyzer::shallowHash(curr);
+  }
+
+  bool callsFunctionTransitively(Function* start,
+                                 Function* target,
+                                 std::unordered_set<Function*>& visited,
+                                 int depth = 0) {
+    if (!start || !target || depth > 8 || !visited.insert(start).second) {
+      return false;
+    }
+    if (start == target) {
+      return true;
+    }
+    if (start->imported() || !start->body) {
+      return false;
+    }
+    for (auto* c : FindAll<Call>(start->body).list) {
+      Function* next = wasm->getFunctionOrNull(c->target);
+      if (next == target ||
+          callsFunctionTransitively(next, target, visited, depth + 1)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool callsFunctionTransitively(Function* start, Function* target) {
+    std::unordered_set<Function*> visited;
+    return callsFunctionTransitively(start, target, visited, 0);
+  }
+
+  bool unifyDuplicateZeroVarFunctions(
+    const std::unordered_set<Name>& escapedFuncs) {
+    if (!canonicalizeLocalHoles) {
+      return false;
+    }
+    bool allowSigAlign = canonicalizeLocalHoles;
+    std::unordered_map<Name, std::vector<std::pair<Function*, Call*>>>
+      callsByTarget;
+    for (auto& f : wasm->functions) {
+      if (f->imported() || !f->body) {
+        continue;
+      }
+      for (auto* c : FindAll<Call>(f->body).list) {
+        callsByTarget[c->target].push_back({f.get(), c});
+      }
+    }
+
+    struct DupCand {
+      Function* func = nullptr;
+      Index numParams = 0;
+      size_t exactHash = 0;
+      bool isEscaped = false;
+      Index callCount = 0;
+      std::vector<Type> demandedParams;
+      std::vector<Type> currentParams;
+      Type currentResults = Type::none;
+    };
+
+    std::vector<DupCand> cands;
+    for (auto& f : wasm->functions) {
+      if (f->imported() || !f->body || !f->vars.empty() ||
+          f->getResults().isTuple()) {
+        continue;
+      }
+      Index P = f->getNumParams();
+      if (P == 0 || P > 16) {
+        continue;
+      }
+      // Skip identity forwarding thunks (call $X (local.get 0..P-1)).
+      if (auto* topCall = f->body->dynCast<Call>()) {
+        if (!topCall->isReturn && topCall->operands.size() == P) {
+          bool isIdent = true;
+          for (Index i = 0; i < P; i++) {
+            auto* lg = topCall->operands[i]->dynCast<LocalGet>();
+            if (!lg || lg->index != i) {
+              isIdent = false;
+              break;
+            }
+          }
+          if (isIdent) {
+            continue;
+          }
+        }
+      }
+      std::vector<Index> reads(P, 0);
+      std::vector<Type> demanded(P);
+      std::vector<bool> hasDemanded(P, false);
+      for (Index p = 0; p < P; p++) {
+        demanded[p] = f->getLocalType(p);
+      }
+      bool ok = true;
+      std::function<size_t(Expression*, Expression*)> walkExact =
+        [&](Expression* curr, Expression* par) -> size_t {
+        if (!ok || !isMovableZeroVarNode(curr)) {
+          ok = false;
+          return 0;
+        }
+        size_t h = 0;
+        if (auto* lg = curr->dynCast<LocalGet>()) {
+          if (lg->index >= P) {
+            ok = false;
+            return 0;
+          }
+          reads[lg->index]++;
+          if (allowSigAlign) {
+            Type d = getChildDemandedType(*wasm, par, lg);
+            if (!Type::isSubType(lg->type, d)) {
+              d = lg->type;
+            }
+            demanded[lg->index] =
+              hasDemanded[lg->index]
+                ? Type::getGreatestLowerBound(demanded[lg->index], d)
+                : d;
+            hasDemanded[lg->index] = true;
+          }
+          h = wasm::hash(Expression::Id(Expression::LocalGetId));
+          rehash(h, lg->index);
+          return h;
+        }
+        if (isPureReuseLeaf(curr)) {
+          return ExpressionAnalyzer::shallowHash(curr);
+        }
+        h = getLeafAgnosticShallowHash(curr);
+        for (auto* ch : ChildIterator(curr)) {
+          hash_combine(h, walkExact(ch, curr));
+          if (!ok) {
+            return 0;
+          }
+        }
+        return h;
+      };
+      size_t h = walkExact(f->body, nullptr);
+      if (!ok) {
+        continue;
+      }
+      for (Index p = 0; p < P; p++) {
+        if (reads[p] == 0) {
+          ok = false;
+          break;
+        }
+        if (!Type::isSubType(f->getLocalType(p), demanded[p])) {
+          demanded[p] = f->getLocalType(p);
+        }
+      }
+      if (!ok) {
+        continue;
+      }
+      DupCand dc;
+      dc.func = f.get();
+      dc.numParams = P;
+      dc.exactHash = h;
+      dc.isEscaped = escapedFuncs.count(f->name) > 0;
+      auto it = callsByTarget.find(f->name);
+      dc.callCount = it != callsByTarget.end() ? it->second.size() : 0;
+      dc.demandedParams = std::move(demanded);
+      dc.currentParams.resize(P);
+      for (Index p = 0; p < P; p++) {
+        dc.currentParams[p] = f->getLocalType(p);
+      }
+      dc.currentResults = f->getResults();
+      cands.push_back(std::move(dc));
+    }
+
+    std::sort(cands.begin(), cands.end(), [](const DupCand& a, const DupCand& b) {
+      if (a.isEscaped != b.isEscaped) {
+        return a.isEscaped > b.isEscaped;
+      }
+      if (a.callCount != b.callCount) {
+        return a.callCount > b.callCount;
+      }
+      return a.func->name < b.func->name;
+    });
+
+    std::unordered_map<size_t, std::vector<Index>> buckets;
+    for (Index i = 0; i < cands.size(); i++) {
+      size_t key = cands[i].exactHash;
+      rehash(key, cands[i].numParams);
+      buckets[key].push_back(i);
+    }
+
+    auto bodiesEqualExactLocals = [](Expression* a, Expression* b) -> bool {
+      bool mismatch = false;
+      ExpressionAnalyzer::ExprComparer cmp = [&](Expression* left,
+                                                 Expression* right) {
+        if (auto* lGet = left->dynCast<LocalGet>()) {
+          auto* rGet = right->dynCast<LocalGet>();
+          if (!rGet || lGet->index != rGet->index) {
+            mismatch = true;
+          }
+          return true;
+        }
+        return false;
+      };
+      return ExpressionAnalyzer::flexibleEqual(a, b, cmp) && !mismatch;
+    };
+
+    Builder builder(*wasm);
+    std::unordered_set<Index> unified;
+    std::unordered_set<Function*> modifiedFuncs;
+    std::unordered_map<Name, Type> narrowedResults;
+    bool anyChanged = false;
+
+    for (auto& [_, bucket] : buckets) {
+      if (bucket.size() < 2) {
+        continue;
+      }
+      for (Index bi = 0; bi < bucket.size(); bi++) {
+        Index idxBest = bucket[bi];
+        if (unified.count(idxBest)) {
+          continue;
+        }
+        auto& best = cands[idxBest];
+        for (Index bj = bi + 1; bj < bucket.size(); bj++) {
+          Index idxCand = bucket[bj];
+          if (unified.count(idxCand)) {
+            continue;
+          }
+          auto& cand = cands[idxCand];
+          if (cand.isEscaped ||
+              (cand.callCount == 0 &&
+               cand.currentParams == best.currentParams &&
+               cand.currentResults == best.currentResults)) {
+            continue;
+          }
+          if (callsFunctionTransitively(best.func, cand.func) ||
+              !bodiesEqualExactLocals(best.func->body, cand.func->body)) {
+            continue;
+          }
+          Type targetRes = best.currentResults;
+          bool narrowBestRes = false;
+          if (!Type::isSubType(best.currentResults, cand.currentResults)) {
+            if (!allowSigAlign || best.isEscaped ||
+                cand.currentResults == Type::none ||
+                best.currentResults == Type::none ||
+                !Type::isSubType(cand.currentResults, best.currentResults) ||
+                !Type::isSubType(best.func->body->type, cand.currentResults)) {
+              continue;
+            }
+            targetRes = cand.currentResults;
+            narrowBestRes = true;
+          }
+          Index P = best.numParams;
+          std::vector<Type> newBestParams = best.currentParams;
+          bool widenBestParams = false;
+          bool paramsOk = true;
+          auto candCallsIt = callsByTarget.find(cand.func->name);
+          for (Index p = 0; p < P; p++) {
+            if (Type::isSubType(cand.currentParams[p], best.currentParams[p])) {
+              continue;
+            }
+            bool allCallersFitBest = true;
+            Type lub = best.currentParams[p];
+            if (candCallsIt != callsByTarget.end()) {
+              for (auto& [callerF, callNode] : candCallsIt->second) {
+                if (callNode->isReturn ||
+                    callNode->operands.size() != P ||
+                    callNode->operands[p]->type == Type::unreachable) {
+                  allCallersFitBest = false;
+                  paramsOk = false;
+                  break;
+                }
+                Type opType = callNode->operands[p]->type;
+                if (!Type::isSubType(opType, best.currentParams[p])) {
+                  allCallersFitBest = false;
+                  lub = Type::getLeastUpperBound(lub, opType);
+                }
+              }
+            }
+            if (!paramsOk) {
+              break;
+            }
+            if (allCallersFitBest) {
+              continue;
+            }
+            if (!allowSigAlign || best.isEscaped || lub == Type::unreachable ||
+                !Type::isSubType(lub, best.demandedParams[p])) {
+              paramsOk = false;
+              break;
+            }
+            newBestParams[p] = lub;
+            widenBestParams = true;
+          }
+          if (!paramsOk) {
+            continue;
+          }
+          if (widenBestParams) {
+            best.currentParams = newBestParams;
+            best.func->setParams(Type(best.currentParams));
+            for (auto* lg : FindAll<LocalGet>(best.func->body).list) {
+              if (lg->index < P) {
+                lg->type = best.currentParams[lg->index];
+              }
+            }
+            modifiedFuncs.insert(best.func);
+          }
+          if (narrowBestRes) {
+            best.currentResults = targetRes;
+            best.func->setResults(targetRes);
+            narrowedResults[best.func->name] = targetRes;
+            modifiedFuncs.insert(best.func);
+          }
+          if (candCallsIt != callsByTarget.end()) {
+            for (auto& [callerF, callNode] : candCallsIt->second) {
+              callNode->target = best.func->name;
+              if (!callNode->isReturn && callNode->type != Type::unreachable &&
+                  callNode->type != best.currentResults) {
+                callNode->type = best.currentResults;
+              }
+              callsByTarget[best.func->name].push_back({callerF, callNode});
+              modifiedFuncs.insert(callerF);
+            }
+            candCallsIt->second.clear();
+          }
+          cand.currentParams = best.currentParams;
+          cand.currentResults = best.currentResults;
+          cand.func->setParams(Type(best.currentParams));
+          cand.func->setResults(best.currentResults);
+          std::vector<Expression*> fArgs(P);
+          for (Index p = 0; p < P; p++) {
+            fArgs[p] = builder.makeLocalGet(p, best.currentParams[p]);
+          }
+          cand.func->body =
+            builder.makeCall(best.func->name, fArgs, best.currentResults);
+          modifiedFuncs.insert(cand.func);
+          unified.insert(idxCand);
+          anyChanged = true;
+        }
+      }
+    }
+
+    if (!narrowedResults.empty()) {
+      for (auto& f : wasm->functions) {
+        if (f->imported() || !f->body) {
+          continue;
+        }
+        for (auto* c : FindAll<Call>(f->body).list) {
+          if (!c->isReturn && c->type != Type::unreachable) {
+            if (auto it = narrowedResults.find(c->target);
+                it != narrowedResults.end() && c->type != it->second) {
+              c->type = it->second;
+              modifiedFuncs.insert(f.get());
+            }
+          }
+        }
+      }
+    }
+    for (Function* f : modifiedFuncs) {
+      ReFinalize().walkFunctionInModule(f, wasm);
+      refreshFuncEffects(f);
+    }
+    return anyChanged;
+  }
+
+  bool reuseExistingHelpersWithSpecialArgs() {
+    bool allowSigAlign =
+      getPassOptions().shrinkLevel > 0 || getPassOptions().trapsNeverHappen;
+    std::unordered_set<Name> escapedFuncs = collectEscapedFunctions();
+    bool anyChanged = unifyDuplicateZeroVarFunctions(escapedFuncs);
+
+    std::unordered_set<Name> immutableGlobals;
+    for (auto& g : wasm->globals) {
+      if (!g->mutable_) {
+        immutableGlobals.insert(g->name);
+      }
+    }
+
+    std::unordered_map<Name, Index> directCallCounts;
+    for (auto& f : wasm->functions) {
+      if (!f->imported() && f->body) {
+        for (auto* c : FindAll<Call>(f->body).list) {
+          directCallCounts[c->target]++;
+        }
+      }
+    }
+
+    struct HelperCand {
+      Function* func = nullptr;
+      Index numParams = 0;
+      Index bodyBytes = 0;
+      size_t bodyHash = 0;
+      size_t sliceHash = 0;
+      Index sliceLen = 0;
+      bool isEscaped = false;
+      Index callCount = 0;
+      std::vector<Type> demandedParams;
+      std::vector<Type> currentParams;
+      Type currentResults = Type::none;
+      bool preEffectsComputed = false;
+      std::vector<bool> callBeforeParam;
+      std::vector<std::unordered_set<Name>> globalsWrittenBeforeParam;
+    };
+
+    auto ensureHelperPreEffects = [&](HelperCand& h) {
+      if (h.preEffectsComputed) {
+        return;
+      }
+      h.preEffectsComputed = true;
+      Index P = h.numParams;
+      h.callBeforeParam.assign(P, false);
+      h.globalsWrittenBeforeParam.resize(P);
+      bool seenUnknownCall = false;
+      std::unordered_set<Name> seenGlobalWrites;
+      std::function<void(Expression*)> walkEff = [&](Expression* curr) {
+        if (!curr) {
+          return;
+        }
+        if (auto* iff = curr->dynCast<If>()) {
+          walkEff(iff->condition);
+          bool condCall = seenUnknownCall;
+          auto condWrites = seenGlobalWrites;
+          walkEff(iff->ifTrue);
+          bool trueCall = seenUnknownCall;
+          auto trueWrites = seenGlobalWrites;
+          if (iff->ifFalse) {
+            seenUnknownCall = condCall;
+            seenGlobalWrites = std::move(condWrites);
+            walkEff(iff->ifFalse);
+            seenUnknownCall = seenUnknownCall || trueCall;
+            for (Name g : trueWrites) {
+              seenGlobalWrites.insert(g);
+            }
+          }
+          return;
+        }
+        if (auto* loop = curr->dynCast<Loop>()) {
+          EffectAnalyzer lEff(getPassOptions(), *wasm, loop->body);
+          if (lEff.calls) {
+            seenUnknownCall = true;
+          }
+          for (Name g : lEff.globalsWritten) {
+            seenGlobalWrites.insert(g);
+          }
+          walkEff(loop->body);
+          return;
+        }
+        for (auto* ch : ChildIterator(curr)) {
+          walkEff(ch);
+        }
+        if (auto* lg = curr->dynCast<LocalGet>()) {
+          if (lg->index < P) {
+            if (seenUnknownCall) {
+              h.callBeforeParam[lg->index] = true;
+            }
+            for (Name g : seenGlobalWrites) {
+              h.globalsWrittenBeforeParam[lg->index].insert(g);
+            }
+          }
+        } else {
+          ShallowEffectAnalyzer sEff(getPassOptions(), *wasm, curr);
+          if (sEff.calls) {
+            seenUnknownCall = true;
+          }
+          for (Name g : sEff.globalsWritten) {
+            seenGlobalWrites.insert(g);
+          }
+        }
+      };
+      walkEff(h.func->body);
+    };
+
+    auto helperBetter = [](const HelperCand& a, const HelperCand& b) {
+      if (a.isEscaped != b.isEscaped) {
+        return a.isEscaped > b.isEscaped;
+      }
+      if (a.callCount != b.callCount) {
+        return a.callCount > b.callCount;
+      }
+      return a.func->name < b.func->name;
+    };
+
+    std::vector<HelperCand> helpers;
+    for (auto& f : wasm->functions) {
+      if (f->imported() || !f->body || !f->vars.empty() ||
+          f->getResults().isTuple()) {
+        continue;
+      }
+      Index P = f->getNumParams();
+      if (P == 0 || P > 16) {
+        continue;
+      }
+      std::vector<Index> reads(P, 0);
+      std::vector<Type> demanded(P);
+      std::vector<bool> hasDemanded(P, false);
+      for (Index p = 0; p < P; p++) {
+        demanded[p] = f->getLocalType(p);
+      }
+      bool ok = true;
+      Index totalBytes = 0;
+      std::unordered_map<Expression*, size_t> nodeHashes;
+
+      std::function<size_t(Expression*, Expression*)> walkHelper =
+        [&](Expression* curr, Expression* par) -> size_t {
+        if (!ok || !isMovableZeroVarNode(curr)) {
+          ok = false;
+          return 0;
+        }
+        totalBytes += getShallowBytes(curr);
+        size_t h = getLeafAgnosticShallowHash(curr);
+        for (auto* ch : ChildIterator(curr)) {
+          hash_combine(h, walkHelper(ch, curr));
+          if (!ok) {
+            return 0;
+          }
+        }
+        if (auto* lg = curr->dynCast<LocalGet>()) {
+          if (lg->index >= P) {
+            ok = false;
+            return 0;
+          }
+          reads[lg->index]++;
+          if (allowSigAlign) {
+            Type d = getChildDemandedType(*wasm, par, lg);
+            if (!Type::isSubType(lg->type, d)) {
+              d = lg->type;
+            }
+            demanded[lg->index] =
+              hasDemanded[lg->index]
+                ? Type::getGreatestLowerBound(demanded[lg->index], d)
+                : d;
+            hasDemanded[lg->index] = true;
+          }
+        }
+        if (par == f->body) {
+          nodeHashes[curr] = h;
+        }
+        return h;
+      };
+
+      size_t bodyH = walkHelper(f->body, nullptr);
+      if (!ok || totalBytes <= CallBytes + LocalGetBytes * P) {
+        continue;
+      }
+      for (Index p = 0; p < P; p++) {
+        if (reads[p] == 0) {
+          ok = false;
+          break;
+        }
+        if (!Type::isSubType(f->getLocalType(p), demanded[p])) {
+          demanded[p] = f->getLocalType(p);
+        }
+      }
+      if (!ok) {
+        continue;
+      }
+
+      HelperCand hc;
+      hc.func = f.get();
+      hc.numParams = P;
+      hc.bodyBytes = totalBytes;
+      hc.bodyHash = bodyH;
+      hc.isEscaped = escapedFuncs.count(f->name) > 0;
+      auto cIt = directCallCounts.find(f->name);
+      hc.callCount = cIt != directCallCounts.end() ? cIt->second : 0;
+      hc.demandedParams = std::move(demanded);
+      hc.currentParams.resize(P);
+      for (Index p = 0; p < P; p++) {
+        hc.currentParams[p] = f->getLocalType(p);
+      }
+      hc.currentResults = f->getResults();
+
+      if (auto* blk = f->body->dynCast<Block>()) {
+        if (!blk->name.is() && blk->list.size() >= 2 &&
+            blk->list.size() <= 8) {
+          bool sliceOk = true;
+          for (Index j = 0; j + 1 < blk->list.size(); j++) {
+            if (blk->list[j]->type != Type::none) {
+              sliceOk = false;
+              break;
+            }
+          }
+          if (sliceOk) {
+            size_t sh = wasm::hash(0);
+            rehash(sh, Expression::Id(Expression::BlockId));
+            rehash(sh, blk->list.back()->type.getID());
+            for (Expression* elem : blk->list) {
+              hash_combine(sh, nodeHashes[elem]);
+            }
+            hc.sliceHash = sh;
+            hc.sliceLen = blk->list.size();
+          }
+        }
+      }
+      helpers.push_back(std::move(hc));
+    }
+
+    if (helpers.empty()) {
+      return anyChanged;
+    }
+
+    std::sort(helpers.begin(), helpers.end(), helperBetter);
+    std::unordered_map<Function*, HelperCand*> helperByFunc;
+    std::unordered_map<size_t, std::vector<HelperCand*>> exprHelpersByHash;
+    std::unordered_map<size_t, std::vector<HelperCand*>> sliceHelpersByHash;
+    for (auto& h : helpers) {
+      helperByFunc[h.func] = &h;
+      exprHelpersByHash[h.bodyHash].push_back(&h);
+      if (h.sliceLen >= 2) {
+        sliceHelpersByHash[h.sliceHash].push_back(&h);
+      }
+    }
+
+    auto isValidArgForParam = [&](Expression* arg,
+                                  Index p,
+                                  HelperCand& h) -> bool {
+      if (!isPureReuseLeaf(arg)) {
+        return false;
+      }
+      if (auto* gg = arg->dynCast<GlobalGet>()) {
+        if (!immutableGlobals.count(gg->name)) {
+          ensureHelperPreEffects(h);
+          if (h.callBeforeParam[p] ||
+              h.globalsWrittenBeforeParam[p].count(gg->name)) {
+            return false;
+          }
+        }
+      }
+      return true;
+    };
+
+    struct MatchCand {
+      Expression* expr = nullptr;
+      Block* sliceBlock = nullptr;
+      Index sliceOffset = 0;
+      Index sliceLen = 0;
+      bool trailingSet = false;
+      bool omitUnreachable = false;
+      Index tin = 0;
+      Index tout = 0;
+      int savedBytes = 0;
+      HelperCand* helper = nullptr;
+      std::vector<Expression*> args;
+      std::vector<Type> widenedParams;
+      Type narrowedResult = Type::none;
+    };
+
+    Builder builder(*wasm);
+    std::unordered_set<Function*> modifiedHelpers;
+    std::unordered_set<Function*> disabledHelpers;
+    std::unordered_set<Function*> modifiedCallers;
+    std::unordered_map<Name, Type> narrowedHelperResults;
+
+    for (auto& f : wasm->functions) {
+      if (f->imported() || !f->body) {
+        continue;
+      }
+      Function* caller = f.get();
+      HelperCand* callerAsHelper = nullptr;
+      if (auto it = helperByFunc.find(caller); it != helperByFunc.end()) {
+        callerAsHelper = it->second;
+      }
+
+      struct ScanNode {
+        Index tin = 0;
+        Index tout = 0;
+        size_t hash = 0;
+        size_t setValueHash = 0;
+        Index bytes = 0;
+        Index setValueBytes = 0;
+        bool movable = true;
+        bool hasCleanSetValue = false;
+        SmallVector<Name, 2> openLabels;
+      };
+
+      Index timer = 0;
+      std::vector<MatchCand> cands;
+
+      auto tryMatchHelper = [&](HelperCand* h,
+                                Expression* curr,
+                                Block* sliceBlk,
+                                Index offset,
+                                Index len,
+                                bool trailingSet,
+                                Index siteBytes,
+                                Index tin,
+                                Index tout,
+                                Expression* parentExpr) {
+        if (h->func == caller || disabledHelpers.count(h->func)) {
+          return;
+        }
+        Index P = h->numParams;
+        if (siteBytes <= CallBytes + LocalGetBytes * P) {
+          return;
+        }
+        std::vector<Expression*> boundArgs(P, nullptr);
+        bool mismatch = false;
+        ExpressionAnalyzer::ExprComparer cmp = [&](Expression* left,
+                                                   Expression* right) {
+          if (auto* lGet = left->dynCast<LocalGet>()) {
+            Index p = lGet->index;
+            if (p >= P || !isValidArgForParam(right, p, *h)) {
+              mismatch = true;
+              return true;
+            }
+            if (!boundArgs[p]) {
+              boundArgs[p] = right;
+            } else if (!ExpressionAnalyzer::equal(boundArgs[p], right)) {
+              mismatch = true;
+            }
+            return true;
+          }
+          return false;
+        };
+
+        if (len == 0) {
+          if (!ExpressionAnalyzer::flexibleEqual(h->func->body, curr, cmp) ||
+              mismatch) {
+            return;
+          }
+        } else {
+          auto* hBlk = h->func->body->cast<Block>();
+          for (Index j = 0; j < len; j++) {
+            Expression* sElem = sliceBlk->list[offset + j];
+            if (trailingSet && j + 1 == len) {
+              sElem = sElem->cast<LocalSet>()->value;
+            }
+            if (!ExpressionAnalyzer::flexibleEqual(
+                  hBlk->list[j], sElem, cmp) ||
+                mismatch) {
+              return;
+            }
+          }
+        }
+
+        Index argBytes = 0;
+        bool allDistinctOrderedLocalGets = true;
+        bool allExactParamTypes = true;
+        SmallVector<Index, 8> seenLocalIndices;
+        Index prevLocalIdx = 0;
+        for (Index p = 0; p < P; p++) {
+          if (!boundArgs[p]) {
+            return;
+          }
+          argBytes += getShallowBytes(boundArgs[p]);
+          if (boundArgs[p]->type != h->currentParams[p]) {
+            allExactParamTypes = false;
+          }
+          if (auto* lg = boundArgs[p]->dynCast<LocalGet>()) {
+            for (Index prev : seenLocalIndices) {
+              if (prev == lg->index) {
+                allDistinctOrderedLocalGets = false;
+                break;
+              }
+            }
+            if (p > 0 && lg->index < prevLocalIdx) {
+              allDistinctOrderedLocalGets = false;
+            }
+            seenLocalIndices.push_back(lg->index);
+            prevLocalIdx = lg->index;
+          } else {
+            allDistinctOrderedLocalGets = false;
+          }
+        }
+        if (allDistinctOrderedLocalGets && !allExactParamTypes &&
+            !canonicalizeLocalHoles) {
+          return;
+        }
+
+        Type exprType;
+        if (len == 0) {
+          exprType = curr->type;
+        } else if (trailingSet) {
+          exprType =
+            sliceBlk->list[offset + len - 1]->cast<LocalSet>()->value->type;
+        } else {
+          exprType = sliceBlk->list[offset + len - 1]->type;
+        }
+
+        Index extraBytes = 0;
+        bool omitUnreachable = false;
+        if (exprType == Type::unreachable) {
+          bool atCallerTail =
+            (len == 0 && curr == caller->body) ||
+            (len > 0 && !trailingSet && offset + len == sliceBlk->list.size() &&
+             sliceBlk == caller->body);
+          if (atCallerTail &&
+              Type::isSubType(h->currentResults, caller->getResults())) {
+            omitUnreachable = true;
+            extraBytes = 0;
+          } else if (h->currentResults == Type::none) {
+            extraBytes = 1;
+          } else {
+            return;
+          }
+        }
+
+        int savedBytes = int(siteBytes) - int(CallBytes + extraBytes + argBytes);
+        if (savedBytes <= 0) {
+          return;
+        }
+        if (len == 0 && curr == caller->body && siteBytes == h->bodyBytes &&
+            callerAsHelper && !helperBetter(*h, *callerAsHelper)) {
+          return;
+        }
+        if (callsFunctionTransitively(h->func, caller)) {
+          return;
+        }
+
+        std::vector<Type> widenedParams;
+        for (Index p = 0; p < P; p++) {
+          Type actualType = boundArgs[p]->type;
+          if (!Type::isSubType(actualType, h->currentParams[p])) {
+            if (!allowSigAlign || h->isEscaped ||
+                !Type::isSubType(actualType, h->demandedParams[p])) {
+              return;
+            }
+            Type lub = Type::getLeastUpperBound(h->currentParams[p], actualType);
+            if (lub == Type::unreachable ||
+                !Type::isSubType(lub, h->demandedParams[p])) {
+              return;
+            }
+            if (widenedParams.empty()) {
+              widenedParams = h->currentParams;
+            }
+            widenedParams[p] = lub;
+          }
+        }
+
+        Type narrowedRes = Type::none;
+        if (exprType != Type::unreachable) {
+          if (exprType == Type::none) {
+            if (h->currentResults != Type::none) {
+              return;
+            }
+          } else if (!Type::isSubType(h->currentResults, exprType)) {
+            bool contextAcceptsWider = false;
+            if (len == 0 && curr == caller->body &&
+                Type::isSubType(h->currentResults, caller->getResults())) {
+              contextAcceptsWider = true;
+            } else if (len == 0 && parentExpr &&
+                       Type::isSubType(
+                         h->currentResults,
+                         getChildDemandedType(*wasm, parentExpr, curr))) {
+              contextAcceptsWider = true;
+            } else if (len > 0 && trailingSet) {
+              auto* ls = sliceBlk->list[offset + len - 1]->cast<LocalSet>();
+              if (!ls->isTee() &&
+                  Type::isSubType(h->currentResults,
+                                  caller->getLocalType(ls->index))) {
+                contextAcceptsWider = true;
+              }
+            }
+            if (!contextAcceptsWider) {
+              if (!allowSigAlign || h->isEscaped ||
+                  h->currentResults == Type::none ||
+                  !Type::isSubType(exprType, h->currentResults) ||
+                  !Type::isSubType(h->func->body->type, exprType)) {
+                return;
+              }
+              narrowedRes = exprType;
+            }
+          }
+        }
+
+        MatchCand mc;
+        mc.expr = len == 0 ? curr : nullptr;
+        mc.sliceBlock = sliceBlk;
+        mc.sliceOffset = offset;
+        mc.sliceLen = len;
+        mc.trailingSet = trailingSet;
+        mc.omitUnreachable = omitUnreachable;
+        mc.tin = tin;
+        mc.tout = tout;
+        mc.savedBytes = savedBytes;
+        mc.helper = h;
+        mc.args = std::move(boundArgs);
+        mc.widenedParams = std::move(widenedParams);
+        mc.narrowedResult = narrowedRes;
+        cands.push_back(std::move(mc));
+      };
+
+      auto addUniqueLabel = [](SmallVector<Name, 2>& vec, Name label) {
+        if (!label.is()) {
+          return;
+        }
+        for (Name other : vec) {
+          if (other == label) {
+            return;
+          }
+        }
+        vec.push_back(label);
+      };
+
+      std::function<ScanNode(Expression*, Expression*)> scanCaller =
+        [&](Expression* curr, Expression* par) -> ScanNode {
+        ScanNode node;
+        node.tin = ++timer;
+        node.hash = getLeafAgnosticShallowHash(curr);
+        node.bytes = getShallowBytes(curr);
+        node.movable = isMovableZeroVarNode(curr);
+
+        Index numCh = ChildIterator(curr).getNumChildren();
+        std::vector<ScanNode> chNodes;
+        chNodes.reserve(numCh);
+        for (auto* ch : ChildIterator(curr)) {
+          chNodes.push_back(scanCaller(ch, curr));
+          const auto& cn = chNodes.back();
+          hash_combine(node.hash, cn.hash);
+          node.bytes += cn.bytes;
+          node.movable = node.movable && cn.movable;
+          for (Name lbl : cn.openLabels) {
+            addUniqueLabel(node.openLabels, lbl);
+          }
+        }
+
+        if (auto* ls = curr->dynCast<LocalSet>()) {
+          const auto& valNode = chNodes[0];
+          if (valNode.movable && valNode.openLabels.empty() &&
+              ls->value->type.isConcrete() && !ls->value->type.isTuple()) {
+            node.hasCleanSetValue = true;
+            node.setValueHash = valNode.hash;
+            node.setValueBytes = valNode.bytes;
+          }
+        }
+
+        Name defined;
+        if (auto* blk = curr->dynCast<Block>()) {
+          defined = blk->name;
+        } else if (auto* loop = curr->dynCast<Loop>()) {
+          defined = loop->name;
+        } else if (auto* br = curr->dynCast<Break>()) {
+          addUniqueLabel(node.openLabels, br->name);
+        } else if (auto* sw = curr->dynCast<Switch>()) {
+          for (Name t : sw->targets) {
+            addUniqueLabel(node.openLabels, t);
+          }
+          addUniqueLabel(node.openLabels, sw->default_);
+        } else if (auto* brOn = curr->dynCast<BrOn>()) {
+          addUniqueLabel(node.openLabels, brOn->name);
+        }
+        if (defined.is()) {
+          for (Index i = 0; i < node.openLabels.size(); i++) {
+            if (node.openLabels[i] == defined) {
+              node.openLabels[i] = node.openLabels.back();
+              node.openLabels.pop_back();
+              break;
+            }
+          }
+        }
+
+        node.tout = ++timer;
+
+        if (node.movable && node.openLabels.empty()) {
+          if (auto it = exprHelpersByHash.find(node.hash);
+              it != exprHelpersByHash.end()) {
+            for (HelperCand* h : it->second) {
+              tryMatchHelper(h,
+                             curr,
+                             nullptr,
+                             0,
+                             0,
+                             false,
+                             node.bytes,
+                             node.tin,
+                             node.tout,
+                             par);
+            }
+          }
+        }
+
+        if (auto* blk = curr->dynCast<Block>()) {
+          Index n = blk->list.size();
+          for (Index k = 2; k <= 8 && k <= n; k++) {
+            for (Index offset = 0; offset + k <= n; offset++) {
+              bool prefixOk = true;
+              Index prefixBytes = 0;
+              size_t baseHash = wasm::hash(0);
+              rehash(baseHash, Expression::Id(Expression::BlockId));
+              for (Index j = offset; j + 1 < offset + k; j++) {
+                if (blk->list[j]->type != Type::none ||
+                    !chNodes[j].movable || !chNodes[j].openLabels.empty()) {
+                  prefixOk = false;
+                  break;
+                }
+                prefixBytes += chNodes[j].bytes;
+              }
+              if (!prefixOk) {
+                continue;
+              }
+              Expression* lastExpr = blk->list[offset + k - 1];
+              const auto& lastNode = chNodes[offset + k - 1];
+              if (lastNode.movable && lastNode.openLabels.empty()) {
+                if (offset + k < n && lastExpr->type != Type::none &&
+                    lastExpr->type != Type::unreachable) {
+                  // Concrete slice in the middle of a block is invalid.
+                } else {
+                  size_t sh = baseHash;
+                  rehash(sh, lastExpr->type.getID());
+                  for (Index j = offset; j < offset + k; j++) {
+                    hash_combine(sh, chNodes[j].hash);
+                  }
+                  if (auto it = sliceHelpersByHash.find(sh);
+                      it != sliceHelpersByHash.end()) {
+                    for (HelperCand* h : it->second) {
+                      if (h->sliceLen == k) {
+                        tryMatchHelper(h,
+                                       nullptr,
+                                       blk,
+                                       offset,
+                                       k,
+                                       false,
+                                       prefixBytes + lastNode.bytes,
+                                       chNodes[offset].tin,
+                                       lastNode.tout,
+                                       blk);
+                      }
+                    }
+                  }
+                }
+              }
+              if (lastNode.hasCleanSetValue) {
+                Type valType = lastExpr->cast<LocalSet>()->value->type;
+                size_t sh = baseHash;
+                rehash(sh, valType.getID());
+                for (Index j = offset; j + 1 < offset + k; j++) {
+                  hash_combine(sh, chNodes[j].hash);
+                }
+                hash_combine(sh, lastNode.setValueHash);
+                if (auto it = sliceHelpersByHash.find(sh);
+                    it != sliceHelpersByHash.end()) {
+                  for (HelperCand* h : it->second) {
+                    if (h->sliceLen == k) {
+                      tryMatchHelper(h,
+                                     nullptr,
+                                     blk,
+                                     offset,
+                                     k,
+                                     true,
+                                     prefixBytes + lastNode.setValueBytes,
+                                     chNodes[offset].tin,
+                                     lastNode.tout,
+                                     blk);
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        return node;
+      };
+
+      scanCaller(caller->body, nullptr);
+      if (cands.empty()) {
+        continue;
+      }
+
+      std::sort(cands.begin(),
+                cands.end(),
+                [&](const MatchCand& a, const MatchCand& b) {
+                  if (a.savedBytes != b.savedBytes) {
+                    return a.savedBytes > b.savedBytes;
+                  }
+                  if ((a.sliceLen == 0) != (b.sliceLen == 0)) {
+                    return a.sliceLen == 0;
+                  }
+                  if (a.helper != b.helper) {
+                    return helperBetter(*a.helper, *b.helper);
+                  }
+                  return a.tin < b.tin;
+                });
+
+      std::vector<const MatchCand*> chosen;
+      std::unordered_map<Expression*, const MatchCand*> chosenExprs;
+      std::unordered_map<Block*, std::vector<const MatchCand*>> chosenSlices;
+      for (const auto& mc : cands) {
+        if (disabledHelpers.count(mc.helper->func)) {
+          continue;
+        }
+        bool overlaps = false;
+        for (const auto* prev : chosen) {
+          if (mc.tin <= prev->tout && prev->tin <= mc.tout) {
+            overlaps = true;
+            break;
+          }
+        }
+        if (overlaps) {
+          continue;
+        }
+        chosen.push_back(&mc);
+        if (mc.sliceLen == 0) {
+          chosenExprs[mc.expr] = &mc;
+        } else {
+          chosenSlices[mc.sliceBlock].push_back(&mc);
+        }
+        if (!mc.widenedParams.empty()) {
+          for (Index p = 0; p < mc.helper->numParams; p++) {
+            mc.helper->currentParams[p] = Type::getLeastUpperBound(
+              mc.helper->currentParams[p], mc.widenedParams[p]);
+          }
+          modifiedHelpers.insert(mc.helper->func);
+        }
+        if (mc.narrowedResult != Type::none &&
+            mc.helper->currentResults != mc.narrowedResult) {
+          mc.helper->currentResults = mc.narrowedResult;
+          narrowedHelperResults[mc.helper->func->name] = mc.narrowedResult;
+          modifiedHelpers.insert(mc.helper->func);
+        }
+      }
+
+      if (chosen.empty()) {
+        continue;
+      }
+      if (callerAsHelper) {
+        disabledHelpers.insert(caller);
+      }
+
+      auto buildCallForCand = [&](const MatchCand& mc) -> Expression* {
+        Index P = mc.helper->numParams;
+        std::vector<Expression*> callArgs(P);
+        for (Index p = 0; p < P; p++) {
+          callArgs[p] = ExpressionManipulator::copy(mc.args[p], *wasm);
+        }
+        Expression* call = builder.makeCall(
+          mc.helper->func->name, callArgs, mc.helper->currentResults);
+        if (mc.sliceLen == 0 && mc.expr->type == Type::unreachable &&
+            !mc.omitUnreachable) {
+          return builder.makeSequence(call, builder.makeUnreachable());
+        }
+        return call;
+      };
+
+      struct CallerReplacer
+        : public PostWalker<CallerReplacer,
+                            UnifiedExpressionVisitor<CallerReplacer>> {
+        const std::unordered_map<Expression*, const MatchCand*>& chosenExprs;
+        const std::unordered_map<Block*, std::vector<const MatchCand*>>&
+          chosenSlices;
+        std::function<Expression*(const MatchCand&)>& buildCallForCand;
+        Builder& builder;
+
+        CallerReplacer(
+          const std::unordered_map<Expression*, const MatchCand*>& chosenExprs,
+          const std::unordered_map<Block*, std::vector<const MatchCand*>>&
+            chosenSlices,
+          std::function<Expression*(const MatchCand&)>& buildCallForCand,
+          Builder& builder)
+          : chosenExprs(chosenExprs), chosenSlices(chosenSlices),
+            buildCallForCand(buildCallForCand), builder(builder) {}
+
+        void visitExpression(Expression* curr) {
+          if (auto* blk = curr->dynCast<Block>()) {
+            if (auto sIt = chosenSlices.find(blk); sIt != chosenSlices.end()) {
+              auto sorted = sIt->second;
+              std::sort(sorted.begin(),
+                        sorted.end(),
+                        [](const MatchCand* a, const MatchCand* b) {
+                          return a->sliceOffset > b->sliceOffset;
+                        });
+              for (const MatchCand* mc : sorted) {
+                Index offset = mc->sliceOffset;
+                Index len = mc->sliceLen;
+                Expression* callExpr = buildCallForCand(*mc);
+                Type lastType = blk->list[offset + len - 1]->type;
+                if (!mc->trailingSet && lastType == Type::unreachable &&
+                    !mc->omitUnreachable) {
+                  blk->list[offset] = callExpr;
+                  blk->list[offset + 1] = builder.makeUnreachable();
+                  blk->list.erase(blk->list.begin() + offset + 2,
+                                  blk->list.begin() + offset + len);
+                } else if (mc->trailingSet) {
+                  auto* ls = blk->list[offset + len - 1]->cast<LocalSet>();
+                  ls->value = callExpr;
+                  blk->list[offset] = ls;
+                  blk->list.erase(blk->list.begin() + offset + 1,
+                                  blk->list.begin() + offset + len);
+                } else {
+                  blk->list[offset] = callExpr;
+                  blk->list.erase(blk->list.begin() + offset + 1,
+                                  blk->list.begin() + offset + len);
+                }
+              }
+            }
+          }
+          if (auto eIt = chosenExprs.find(curr); eIt != chosenExprs.end()) {
+            replaceCurrent(buildCallForCand(*eIt->second));
+          }
+        }
+      };
+
+      std::function<Expression*(const MatchCand&)> buildFn = buildCallForCand;
+      CallerReplacer(chosenExprs, chosenSlices, buildFn, builder)
+        .walk(caller->body);
+      modifiedCallers.insert(caller);
+      anyChanged = true;
+    }
+
+    for (Function* hFunc : modifiedHelpers) {
+      HelperCand* h = helperByFunc.at(hFunc);
+      hFunc->setParams(Type(h->currentParams));
+      for (auto* lg : FindAll<LocalGet>(hFunc->body).list) {
+        if (lg->index < h->numParams) {
+          lg->type = h->currentParams[lg->index];
+        }
+      }
+      hFunc->setResults(h->currentResults);
+      ReFinalize().walkFunctionInModule(hFunc, wasm);
+      refreshFuncEffects(hFunc);
+    }
+
+    if (!narrowedHelperResults.empty()) {
+      for (auto& f : wasm->functions) {
+        if (f->imported() || !f->body) {
+          continue;
+        }
+        for (auto* c : FindAll<Call>(f->body).list) {
+          if (!c->isReturn && c->type != Type::unreachable) {
+            if (auto it = narrowedHelperResults.find(c->target);
+                it != narrowedHelperResults.end() && c->type != it->second) {
+              c->type = it->second;
+              modifiedCallers.insert(f.get());
+            }
+          }
+        }
+      }
+    }
+
+    for (Function* f : modifiedCallers) {
+      ReFinalize().walkFunctionInModule(f, wasm);
+      refreshFuncEffects(f);
+    }
+
+    if (anyChanged) {
+      unifyDuplicateZeroVarFunctions(escapedFuncs);
     }
     return anyChanged;
   }
