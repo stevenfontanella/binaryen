@@ -1618,3 +1618,124 @@
   )
 )
 
+;; Cross-invocation palette compaction after nullification.
+(module
+  ;; CHECK:      (type $vt (struct (field i32) (field i32) (field i32) (field i32) (field i32)))
+  (type $vt (struct (field i32) (field i32) (field i32) (field i32) (field i32)))
+  (type $vt_arr (array (ref $vt)))
+  ;; CHECK:      (type $1 (array (mut (ref null $vt))))
+
+  ;; CHECK:      (type $u8_arr (array (mut i8)))
+  (type $u8_arr (array (mut i8)))
+
+  ;; CHECK:      (type $3 (func (param i32) (result (ref $vt))))
+
+  ;; CHECK:      (type $4 (func (result (ref $vt))))
+
+  ;; CHECK:      (type $5 (func (param (ref $1) i32) (result (ref $vt))))
+
+  ;; CHECK:      (global $keep (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 9)
+  ;; CHECK-NEXT:  (i32.const 9)
+  ;; CHECK-NEXT:  (i32.const 9)
+  ;; CHECK-NEXT:  (i32.const 9)
+  ;; CHECK-NEXT:  (i32.const 9)
+  ;; CHECK-NEXT: ))
+  (global $keep (ref $vt) (struct.new $vt (i32.const 9) (i32.const 9) (i32.const 9) (i32.const 9) (i32.const 9)))
+  (global $v0 (ref $vt) (struct.new $vt (i32.const 1) (i32.const 2) (i32.const 3) (i32.const 4) (i32.const 5)))
+  (global $v1 (ref $vt) (struct.new $vt (i32.const 1) (i32.const 2) (i32.const 3) (i32.const 4) (i32.const 5)))
+  (global $v2 (ref $vt) (struct.new $vt (i32.const 1) (i32.const 2) (i32.const 3) (i32.const 4) (i32.const 5)))
+  (global $v3 (ref $vt) (struct.new $vt (i32.const 1) (i32.const 2) (i32.const 3) (i32.const 4) (i32.const 5)))
+
+  ;; CHECK:      (global $pal (ref $1) (array.new_fixed $1 2
+  ;; CHECK-NEXT:  (ref.null none)
+  ;; CHECK-NEXT:  (global.get $keep)
+  ;; CHECK-NEXT: ))
+  (global $pal (ref $vt_arr) (array.new_fixed $vt_arr 5
+    (global.get $v0)
+    (global.get $v1)
+    (global.get $keep)
+    (global.get $v2)
+    (global.get $v3)
+  ))
+
+  ;; CHECK:      (global $idx_table (mut (ref null $u8_arr)) (ref.null none))
+  (global $idx_table (mut (ref null $u8_arr)) (ref.null none))
+
+  ;; CHECK:      (data $prev_data "\00\00\01\00\00")
+  (data $prev_data "\00\01\02\03\04")
+
+  ;; CHECK:      (export "factory" (func $factory))
+
+  ;; CHECK:      (export "use_keep" (func $use_keep))
+
+  ;; CHECK:      (func $factory (type $3) (param $0 i32) (result (ref $vt))
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (ref.is_null
+  ;; CHECK-NEXT:    (global.get $idx_table)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (global.set $idx_table
+  ;; CHECK-NEXT:     (array.new_data $u8_arr $prev_data
+  ;; CHECK-NEXT:      (i32.const 0)
+  ;; CHECK-NEXT:      (i32.const 5)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (call $defer$pal$vt
+  ;; CHECK-NEXT:   (global.get $pal)
+  ;; CHECK-NEXT:   (array.get_u $u8_arr
+  ;; CHECK-NEXT:    (global.get $idx_table)
+  ;; CHECK-NEXT:    (local.get $0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $factory (export "factory") (param $0 i32) (result (ref $vt))
+    (if (ref.is_null (global.get $idx_table))
+      (then
+        (global.set $idx_table
+          (array.new_data $u8_arr $prev_data (i32.const 0) (i32.const 5))
+        )
+      )
+    )
+    (array.get $vt_arr
+      (global.get $pal)
+      (array.get_u $u8_arr (global.get $idx_table) (local.get $0))
+    )
+  )
+
+  ;; CHECK:      (func $use_keep (type $4) (result (ref $vt))
+  ;; CHECK-NEXT:  (global.get $keep)
+  ;; CHECK-NEXT: )
+  (func $use_keep (export "use_keep") (result (ref $vt))
+    (global.get $keep)
+  )
+)
+
+
+;; CHECK:      (func $defer$pal$vt (type $5) (param $0 (ref $1)) (param $1 i32) (result (ref $vt))
+;; CHECK-NEXT:  (local $2 (ref $vt))
+;; CHECK-NEXT:  (block $cached (result (ref $vt))
+;; CHECK-NEXT:   (br_on_non_null $cached
+;; CHECK-NEXT:    (array.get $1
+;; CHECK-NEXT:     (local.get $0)
+;; CHECK-NEXT:     (local.get $1)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (array.set $1
+;; CHECK-NEXT:    (local.get $0)
+;; CHECK-NEXT:    (local.get $1)
+;; CHECK-NEXT:    (local.tee $2
+;; CHECK-NEXT:     (struct.new $vt
+;; CHECK-NEXT:      (i32.const 1)
+;; CHECK-NEXT:      (i32.const 2)
+;; CHECK-NEXT:      (i32.const 3)
+;; CHECK-NEXT:      (i32.const 4)
+;; CHECK-NEXT:      (i32.const 5)
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (local.get $2)
+;; CHECK-NEXT:  )
+;; CHECK-NEXT: )

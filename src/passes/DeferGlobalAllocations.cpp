@@ -852,15 +852,28 @@ struct DeferGlobalAllocations : public Pass {
     // Record sole-use flat StructNew candidates (used only in candidate/array
     // initializers) so palette profitability accounts for post-deferral
     // nullification.
-    soleCandidateStructInits.clear();
+    if (!skipPreservedThunkGroups) {
+      soleCandidateStructInits.clear();
+    } else {
+      for (auto it = soleCandidateStructInits.begin();
+           it != soleCandidateStructInits.end();) {
+        if (!module->getGlobalOrNull(it->first) ||
+            otherNonCodeUses.count(it->first) ||
+            initGlobalUses[it->first] == 0) {
+          it = soleCandidateStructInits.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
     for (auto& [key, group] : groups) {
-      if (isPreservedThunkGroup(group) ||
-          group.leafFields.size() != group.type.getStruct().fields.size()) {
+      if (group.leafFields.size() != group.type.getStruct().fields.size()) {
         continue;
       }
       for (auto& cand : group.members) {
         if (cand.uses == 0 && !otherNonCodeUses.count(cand.global->name) &&
-            initGlobalUses[cand.global->name] > 0) {
+            initGlobalUses[cand.global->name] > 0 &&
+            !(preserveThunkTypes && hasImmutableSigRefFunc(cand.init))) {
           soleCandidateStructInits[cand.global->name] = cand.init;
         }
       }
@@ -2349,8 +2362,23 @@ private:
     return false;
   }
 
-  bool isPreservedThunkType(HeapType ht) const {
-    return preserveThunkTypes && hasImmutableSigField(Type(ht, NonNullable));
+  static bool hasImmutableSigRefFunc(StructNew* sn) {
+    if (!sn || !sn->type.isRef() || !sn->type.getHeapType().isStruct()) {
+      return false;
+    }
+    auto& fields = sn->type.getHeapType().getStruct().fields;
+    if (sn->operands.size() != fields.size()) {
+      return false;
+    }
+    for (Index i = 0; i < fields.size(); i++) {
+      auto& field = fields[i];
+      if (field.mutable_ == Immutable && field.type.isRef() &&
+          field.type.getHeapType().isSignature() &&
+          sn->operands[i]->is<RefFunc>()) {
+        return true;
+      }
+    }
+    return false;
   }
 
   bool isPreservedThunkGroup(const Group& g) const {
@@ -2930,8 +2958,11 @@ private:
 
     struct CodeScanInfo {
       std::unordered_map<Name, Index> gets;
+      std::unordered_map<Name, Index> refIsNullGets;
+      std::unordered_map<Name, std::vector<GlobalSet*>> globalSets;
       std::unordered_map<Name, std::vector<Expression**>> arrayGets;
       std::unordered_map<Name, std::vector<Name>> palCallTargets;
+      std::unordered_map<Name, std::vector<Call*>> palCalls;
     };
     ModuleUtils::ParallelFunctionAnalysis<CodeScanInfo> codeScan(
       *module, [&](Function* func, CodeScanInfo& info) {
@@ -2942,6 +2973,14 @@ private:
           CodeScanInfo& info;
           Walker(CodeScanInfo& info) : info(info) {}
           void visitGlobalGet(GlobalGet* curr) { info.gets[curr->name]++; }
+          void visitGlobalSet(GlobalSet* curr) {
+            info.globalSets[curr->name].push_back(curr);
+          }
+          void visitRefIsNull(RefIsNull* curr) {
+            if (auto* gg = curr->value->dynCast<GlobalGet>()) {
+              info.refIsNullGets[gg->name]++;
+            }
+          }
           void visitArrayGet(ArrayGet* curr) {
             if (curr->order != MemoryOrder::Unordered) {
               return;
@@ -2954,6 +2993,7 @@ private:
             if (curr->operands.size() == 2) {
               if (auto* gg = curr->operands[0]->dynCast<GlobalGet>()) {
                 info.palCallTargets[gg->name].push_back(curr->target);
+                info.palCalls[gg->name].push_back(curr);
               }
             }
           }
@@ -2962,9 +3002,14 @@ private:
       });
 
     std::unordered_map<Name, Index> codeGlobalGets;
+    std::unordered_map<Name, Index> allRefIsNullGets;
+    std::unordered_map<Name, std::vector<std::pair<Function*, GlobalSet*>>>
+      allGlobalSets;
     std::unordered_map<Name, std::vector<std::pair<Function*, Expression**>>>
       arrayGetSites;
     std::unordered_map<Name, std::vector<Name>> allPalCallTargets;
+    std::unordered_map<Name, std::vector<std::pair<Function*, Call*>>>
+      allPalCalls;
     for (auto& func : module->functions) {
       if (func->imported()) {
         continue;
@@ -2972,6 +3017,14 @@ private:
       auto& info = codeScan.map[func.get()];
       for (auto& [name, count] : info.gets) {
         codeGlobalGets[name] += count;
+      }
+      for (auto& [name, count] : info.refIsNullGets) {
+        allRefIsNullGets[name] += count;
+      }
+      for (auto& [name, sets] : info.globalSets) {
+        for (auto* gs : sets) {
+          allGlobalSets[name].push_back({func.get(), gs});
+        }
       }
       for (auto& [name, sites] : info.arrayGets) {
         for (auto** site : sites) {
@@ -2981,6 +3034,11 @@ private:
       for (auto& [name, targets] : info.palCallTargets) {
         auto& dst = allPalCallTargets[name];
         dst.insert(dst.end(), targets.begin(), targets.end());
+      }
+      for (auto& [name, calls] : info.palCalls) {
+        for (auto* c : calls) {
+          allPalCalls[name].push_back({func.get(), c});
+        }
       }
     }
 
@@ -2995,7 +3053,8 @@ private:
       Name existingHelper;
     };
     InsertOrderedMap<HeapType, std::vector<SoleSlot>> byStructType;
-    std::unordered_map<HeapType, std::pair<Name, StructNew*>> existingPalHelpers;
+    std::unordered_map<HeapType, std::vector<std::pair<Name, StructNew*>>>
+      existingPalHelpers;
     for (auto& g : module->globals) {
       if (g->imported() || g->mutable_ || nonCodeUses.count(g->name) ||
           initGlobalUses[g->name] > 0) {
@@ -3021,8 +3080,7 @@ private:
         continue;
       }
       HeapType structHt = elemField.type.getHeapType();
-      if (!structHt.isStruct() || structHt.isShared() ||
-          isPreservedThunkType(structHt)) {
+      if (!structHt.isStruct() || structHt.isShared()) {
         continue;
       }
       Name existingHelper;
@@ -3097,7 +3155,17 @@ private:
                   ExpressionManipulator::copy(cSn, *module)->cast<StructNew>();
                 bool ok = true;
                 for (auto*& op : synthSn->operands) {
-                  if (auto* lg = op->dynCast<LocalGet>()) {
+                  Expression* baseOp = op;
+                  while (true) {
+                    if (auto* ra = baseOp->dynCast<RefAs>()) {
+                      baseOp = ra->value;
+                    } else if (auto* rc = baseOp->dynCast<RefCast>()) {
+                      baseOp = rc->ref;
+                    } else {
+                      break;
+                    }
+                  }
+                  if (auto* lg = baseOp->dynCast<LocalGet>()) {
                     if (lg->index < c->operands.size() &&
                         isValidLeaf(c->operands[lg->index])) {
                       op = ExpressionManipulator::copy(c->operands[lg->index],
@@ -3118,7 +3186,8 @@ private:
             }
           }
         }
-        if (!existingTempl) {
+        if (!existingTempl ||
+            (preserveThunkTypes && hasImmutableSigRefFunc(existingTempl))) {
           continue;
         }
         bool validVals = true;
@@ -3132,7 +3201,7 @@ private:
           continue;
         }
         existingHelper = commonTarget;
-        existingPalHelpers[structHt] = {existingHelper, existingTempl};
+        existingPalHelpers[structHt].push_back({existingHelper, existingTempl});
       } else {
         continue;
       }
@@ -3154,7 +3223,8 @@ private:
         auto* sn = eg->init->dynCast<StructNew>();
         if (!sn || sn->desc || !sn->type.isRef() ||
             sn->type.getHeapType() != structHt ||
-            sn->operands.size() != structHt.getStruct().fields.size()) {
+            sn->operands.size() != structHt.getStruct().fields.size() ||
+            (preserveThunkTypes && hasImmutableSigRefFunc(sn))) {
           continue;
         }
         if (existingTempl && !ExpressionAnalyzer::equal(existingTempl, sn)) {
@@ -3216,122 +3286,142 @@ private:
       if (groups.empty()) {
         continue;
       }
-      auto bestIt = std::max_element(
+      std::stable_sort(
         groups.begin(),
         groups.end(),
         [](const std::vector<SoleSlot>& a, const std::vector<SoleSlot>& b) {
-          return a.size() < b.size();
+          return a.size() > b.size();
         });
-      auto& bestGroup = *bestIt;
-      StructNew* templ = bestGroup[0].sn;
-
-      // Ensure no operand of templ references any global being removed.
-      std::unordered_set<Name> removingSet;
-      bool hasNewArray = false;
-      Name reusedHelper;
-      for (auto& slot : bestGroup) {
-        removingSet.insert(slot.elemGlobalName);
-        if (slot.existingHelper.is()) {
-          reusedHelper = slot.existingHelper;
-        } else {
-          hasNewArray = true;
-        }
-      }
-      if (!reusedHelper.is()) {
-        auto exIt = existingPalHelpers.find(structHt);
-        if (exIt != existingPalHelpers.end() &&
-            ExpressionAnalyzer::equal(exIt->second.second, templ)) {
-          reusedHelper = exIt->second.first;
-        }
-      }
-      Index totalSavings =
-        removingSet.size() * getGlobalEntryBytes(templ) + bestGroup.size();
-      Index helperCost = reusedHelper.is() ? 0 : 45;
-      if (!always && totalSavings <= helperCost) {
-        continue;
-      }
-
-      bool selfRef = false;
-      for (auto* op : templ->operands) {
-        if (auto* gg = op->dynCast<GlobalGet>()) {
-          if (removingSet.count(gg->name)) {
-            selfRef = true;
+      std::unordered_set<Global*> claimedArrays;
+      for (auto& bestGroup : groups) {
+        bool conflict = false;
+        for (auto& slot : bestGroup) {
+          if (claimedArrays.count(slot.arrGlobal)) {
+            conflict = true;
             break;
           }
         }
-      }
-      if (selfRef) {
-        continue;
-      }
-
-      Type nonNullStructType(structHt, NonNullable);
-      Type nullStructType(structHt, Nullable);
-      HeapType mutArrHt(Array(Field(nullStructType, Mutable)));
-      Type mutArrRefType(mutArrHt, NonNullable);
-
-      Name helperName = reusedHelper;
-      if (!helperName.is() && hasNewArray) {
-        std::string typeName;
-        if (auto iter = module->typeNames.find(structHt);
-            iter != module->typeNames.end()) {
-          typeName = iter->second.name.toString();
-        } else {
-          typeName = std::to_string(numFactories);
+        if (conflict) {
+          continue;
         }
-        numFactories++;
-        helperName =
-          Names::getValidFunctionName(*module, "defer$pal$" + typeName);
-        Name label("cached");
-        auto* cacheGet =
-          builder.makeArrayGet(builder.makeLocalGet(0, mutArrRefType),
-                               builder.makeLocalGet(1, Type::i32),
-                               MemoryOrder::Unordered,
-                               nullStructType);
-        auto* brOn = builder.makeBrOn(BrOnNonNull, label, cacheGet);
-        auto* tee = builder.makeLocalTee(
-          2, ExpressionManipulator::copy(templ, *module), nonNullStructType);
-        auto* cacheSet =
-          builder.makeArraySet(builder.makeLocalGet(0, mutArrRefType),
-                               builder.makeLocalGet(1, Type::i32),
-                               tee,
-                               MemoryOrder::Unordered);
-        auto* body = builder.makeBlock(
-          label,
-          {brOn, cacheSet, builder.makeLocalGet(2, nonNullStructType)},
-          nonNullStructType);
-        module->addFunction(builder.makeFunction(
-          helperName,
-          Signature({mutArrRefType, Type::i32}, nonNullStructType),
-          {nonNullStructType},
-          body));
-      }
+        StructNew* templ = bestGroup[0].sn;
 
-      std::unordered_set<Global*> touchedNewArrays;
-      for (auto& slot : bestGroup) {
-        slot.anf->values[slot.slotIdx] = builder.makeRefNull(HeapTypes::none);
-        if (!slot.existingHelper.is()) {
-          touchedNewArrays.insert(slot.arrGlobal);
-        }
-        if (globalsToRemoveSet.insert(slot.elemGlobalName).second) {
-          globalsToRemove.push_back(slot.elemGlobalName);
-        }
-      }
-      for (auto* arrG : touchedNewArrays) {
-        arrG->type = mutArrRefType;
-        auto* anf = arrG->init->cast<ArrayNewFixed>();
-        anf->type = Type(mutArrHt, NonNullable, Exact);
-        anf->finalize();
-        Type helperRes = module->getFunction(helperName)->getResults();
-        for (auto& [fn, site] : arrayGetSites[arrG->name]) {
-          auto* ag = (*site)->cast<ArrayGet>();
-          ag->ref->cast<GlobalGet>()->type = mutArrRefType;
-          Expression* call =
-            builder.makeCall(helperName, {ag->ref, ag->index}, helperRes);
-          if (helperRes.isNullable()) {
-            call = builder.makeRefAs(RefAsNonNull, call);
+        // Ensure no operand of templ references any global being removed.
+        std::unordered_set<Name> removingSet;
+        bool hasNewArray = false;
+        Name reusedHelper;
+        for (auto& slot : bestGroup) {
+          removingSet.insert(slot.elemGlobalName);
+          if (slot.existingHelper.is()) {
+            reusedHelper = slot.existingHelper;
+          } else {
+            hasNewArray = true;
           }
-          *site = call;
-          refinalizeFuncs.insert(fn);
+        }
+        if (!reusedHelper.is()) {
+          auto exIt = existingPalHelpers.find(structHt);
+          if (exIt != existingPalHelpers.end()) {
+            for (auto& [hName, hTempl] : exIt->second) {
+              if (ExpressionAnalyzer::equal(hTempl, templ)) {
+                reusedHelper = hName;
+                break;
+              }
+            }
+          }
+        }
+        Index totalSavings =
+          removingSet.size() * getGlobalEntryBytes(templ) + bestGroup.size();
+        Index helperCost = reusedHelper.is() ? 0 : 45;
+        if (!always && totalSavings <= helperCost) {
+          continue;
+        }
+
+        bool selfRef = false;
+        for (auto* op : templ->operands) {
+          if (auto* gg = op->dynCast<GlobalGet>()) {
+            if (removingSet.count(gg->name)) {
+              selfRef = true;
+              break;
+            }
+          }
+        }
+        if (selfRef) {
+          continue;
+        }
+
+        Type nonNullStructType(structHt, NonNullable);
+        Type nullStructType(structHt, Nullable);
+        HeapType mutArrHt(Array(Field(nullStructType, Mutable)));
+        Type mutArrRefType(mutArrHt, NonNullable);
+
+        Name helperName = reusedHelper;
+        if (!helperName.is() && hasNewArray) {
+          std::string typeName;
+          if (auto iter = module->typeNames.find(structHt);
+              iter != module->typeNames.end()) {
+            typeName = iter->second.name.toString();
+          } else {
+            typeName = std::to_string(numFactories);
+          }
+          numFactories++;
+          helperName =
+            Names::getValidFunctionName(*module, "defer$pal$" + typeName);
+          Name label("cached");
+          auto* cacheGet =
+            builder.makeArrayGet(builder.makeLocalGet(0, mutArrRefType),
+                                 builder.makeLocalGet(1, Type::i32),
+                                 MemoryOrder::Unordered,
+                                 nullStructType);
+          auto* brOn = builder.makeBrOn(BrOnNonNull, label, cacheGet);
+          auto* tee = builder.makeLocalTee(
+            2, ExpressionManipulator::copy(templ, *module), nonNullStructType);
+          auto* cacheSet =
+            builder.makeArraySet(builder.makeLocalGet(0, mutArrRefType),
+                                 builder.makeLocalGet(1, Type::i32),
+                                 tee,
+                                 MemoryOrder::Unordered);
+          auto* body = builder.makeBlock(
+            label,
+            {brOn, cacheSet, builder.makeLocalGet(2, nonNullStructType)},
+            nonNullStructType);
+          module->addFunction(builder.makeFunction(
+            helperName,
+            Signature({mutArrRefType, Type::i32}, nonNullStructType),
+            {nonNullStructType},
+            body));
+          existingPalHelpers[structHt].push_back({helperName, templ});
+        }
+
+        std::unordered_set<Global*> touchedNewArrays;
+        for (auto& slot : bestGroup) {
+          claimedArrays.insert(slot.arrGlobal);
+          slot.anf->values[slot.slotIdx] = builder.makeRefNull(HeapTypes::none);
+          if (!slot.existingHelper.is()) {
+            touchedNewArrays.insert(slot.arrGlobal);
+          }
+          if (globalsToRemoveSet.insert(slot.elemGlobalName).second) {
+            globalsToRemove.push_back(slot.elemGlobalName);
+          }
+        }
+        for (auto* arrG : touchedNewArrays) {
+          arrG->type = mutArrRefType;
+          auto* anf = arrG->init->cast<ArrayNewFixed>();
+          anf->type = Type(mutArrHt, NonNullable, Exact);
+          anf->finalize();
+          Type helperRes = module->getFunction(helperName)->getResults();
+          for (auto& [fn, site] : arrayGetSites[arrG->name]) {
+            auto* ag = (*site)->cast<ArrayGet>();
+            ag->ref->cast<GlobalGet>()->type = mutArrRefType;
+            Call* rawCall =
+              builder.makeCall(helperName, {ag->ref, ag->index}, helperRes);
+            allPalCalls[arrG->name].push_back({fn, rawCall});
+            Expression* call = rawCall;
+            if (helperRes.isNullable()) {
+              call = builder.makeRefAs(RefAsNonNull, call);
+            }
+            *site = call;
+            refinalizeFuncs.insert(fn);
+          }
         }
       }
     }
@@ -3343,22 +3433,133 @@ private:
       module->removeGlobal(gname);
     }
 
+    auto evalConstI32 = [&](Expression* expr,
+                            Function* fn,
+                            uint32_t& out) -> bool {
+      while (auto* lt = expr->dynCast<LocalSet>()) {
+        if (!lt->isTee()) {
+          return false;
+        }
+        expr = lt->value;
+      }
+      if (auto* c = expr->dynCast<Const>()) {
+        if (c->type == Type::i32) {
+          out = uint32_t(c->value.geti32());
+          return true;
+        }
+        return false;
+      }
+      if (auto* gg = expr->dynCast<GlobalGet>()) {
+        auto* g = module->getGlobalOrNull(gg->name);
+        if (g && !g->imported() && !g->mutable_ && g->init) {
+          if (auto* c = g->init->dynCast<Const>(); c && c->type == Type::i32) {
+            out = uint32_t(c->value.geti32());
+            return true;
+          }
+        }
+        return false;
+      }
+      if (auto* lg = expr->dynCast<LocalGet>()) {
+        if (!fn || lg->index < fn->getNumParams()) {
+          return false;
+        }
+        Const* soleConst = nullptr;
+        for (auto* ls : FindAll<LocalSet>(fn->body).list) {
+          if (ls->index == lg->index) {
+            auto* c = ls->value->dynCast<Const>();
+            if (!c || c->type != Type::i32 || soleConst) {
+              return false;
+            }
+            soleConst = c;
+          }
+        }
+        if (soleConst) {
+          out = uint32_t(soleConst->value.geti32());
+          return true;
+        }
+      }
+      return false;
+    };
+
+    auto evalElemOffset = [&](Expression* idxExpr,
+                              Function* fn,
+                              Index& elemOffsetOut) -> bool {
+      if (auto* lg = idxExpr->dynCast<LocalGet>()) {
+        if (lg->index == 0) {
+          elemOffsetOut = 0;
+          return true;
+        }
+        return false;
+      }
+      if (auto* bin = idxExpr->dynCast<Binary>()) {
+        uint32_t cval = 0;
+        if (bin->op == AddInt32) {
+          if (auto* lg = bin->left->dynCast<LocalGet>();
+              lg && lg->index == 0 && evalConstI32(bin->right, fn, cval)) {
+            elemOffsetOut = Index(cval);
+            return true;
+          }
+          if (auto* lg = bin->right->dynCast<LocalGet>();
+              lg && lg->index == 0 && evalConstI32(bin->left, fn, cval)) {
+            elemOffsetOut = Index(cval);
+            return true;
+          }
+        } else if (bin->op == SubInt32) {
+          if (auto* lg = bin->left->dynCast<LocalGet>();
+              lg && lg->index == 0 && evalConstI32(bin->right, fn, cval)) {
+            elemOffsetOut = Index(uint32_t(-int32_t(cval)));
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+
+    auto getFactoryRowCount = [&](Function* fn, Index& rowCountOut) -> bool {
+      for (auto* as : FindAll<ArraySet>(fn->body).list) {
+        auto* gg = as->ref->dynCast<GlobalGet>();
+        auto* lg = as->index->dynCast<LocalGet>();
+        if (!gg || !lg || lg->index != 0) {
+          continue;
+        }
+        auto* cg = module->getGlobalOrNull(gg->name);
+        if (!cg || cg->imported() || cg->mutable_ || !cg->init) {
+          continue;
+        }
+        if (auto* an = cg->init->dynCast<ArrayNew>(); an && !an->init) {
+          uint32_t n = 0;
+          if (evalConstI32(an->size, nullptr, n) && n > 0) {
+            rowCountOut = Index(n);
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+
     // Compact any palette array.new_fixed global whose elements now contain
     // duplicate entries (such as multiple ref.null slots after nullification)
-    // when all of its uses are accounted for by paletteSlices, and remap the
-    // corresponding u8 index slices in segmentData.
+    // when all of its uses are accounted for by paletteSlices or by
+    // array.new_data index tables from earlier invocations, and remap the
+    // corresponding u8 index slices.
     for (auto& g : module->globals) {
-      if (g->imported() || !g->init || nonCodeUses.count(g->name) ||
-          initGlobalUses[g->name] > 0) {
-        continue;
-      }
-      auto palIt = paletteSlices.find(g->name);
-      if (palIt == paletteSlices.end() ||
-          codeGlobalGets[g->name] != palIt->second.size()) {
+      if (g->imported() || g->mutable_ || !g->init ||
+          nonCodeUses.count(g->name) || initGlobalUses[g->name] > 0) {
         continue;
       }
       auto* anf = g->init->dynCast<ArrayNewFixed>();
-      if (!anf || anf->values.size() < 2) {
+      if (!anf || anf->values.size() < 2 || anf->values.size() > 256) {
+        continue;
+      }
+      bool allLeaves = true;
+      for (auto* val : anf->values) {
+        if (!val->is<RefNull>() && !val->is<GlobalGet>() &&
+            !val->is<RefFunc>()) {
+          allLeaves = false;
+          break;
+        }
+      }
+      if (!allLeaves) {
         continue;
       }
       std::vector<Expression*> compacted;
@@ -3375,13 +3576,175 @@ private:
         }
         remap[oldIdx] = uint8_t(newIdx);
       }
-      if (compacted.size() < anf->values.size()) {
+      if (compacted.size() >= anf->values.size()) {
+        continue;
+      }
+      auto palIt = paletteSlices.find(g->name);
+      if (palIt != paletteSlices.end()) {
+        if (codeGlobalGets[g->name] != palIt->second.size()) {
+          continue;
+        }
         anf->values.set(compacted);
         for (auto& slice : palIt->second) {
           for (Index j = 0; j < slice.length; j++) {
             uint8_t oldIdx = uint8_t(segmentData[slice.offset + j]);
             assert(oldIdx < remap.size());
             segmentData[slice.offset + j] = char(remap[oldIdx]);
+          }
+        }
+        continue;
+      }
+
+      Index totalGets = codeGlobalGets[g->name];
+      if (totalGets == 0) {
+        continue;
+      }
+      std::vector<std::pair<Function*, Expression**>> idxSlots;
+      auto& palCalls = allPalCalls[g->name];
+      if (palCalls.size() == totalGets) {
+        for (auto& [fn, call] : palCalls) {
+          idxSlots.push_back({fn, &call->operands[1]});
+        }
+      } else if (palCalls.empty() &&
+                 arrayGetSites[g->name].size() == totalGets) {
+        for (auto& [fn, site] : arrayGetSites[g->name]) {
+          idxSlots.push_back({fn, &(*site)->cast<ArrayGet>()->index});
+        }
+      } else {
+        continue;
+      }
+
+      struct ExternalSlice {
+        DataSegment* seg;
+        Index offset;
+        Index length;
+      };
+      std::vector<ExternalSlice> extSlices;
+      bool slicesOk = true;
+      for (auto& [fn, idxSlot] : idxSlots) {
+        auto* idxAg = (*idxSlot)->dynCast<ArrayGet>();
+        if (!idxAg || idxAg->order != MemoryOrder::Unordered ||
+            idxAg->signed_) {
+          slicesOk = false;
+          break;
+        }
+        auto* tableGG = idxAg->ref->dynCast<GlobalGet>();
+        if (!tableGG) {
+          slicesOk = false;
+          break;
+        }
+        Name tname = tableGG->name;
+        auto* tg = module->getGlobalOrNull(tname);
+        if (!tg || tg->imported() || !tg->mutable_ || !tg->init ||
+            !tg->init->is<RefNull>() || nonCodeUses.count(tname) ||
+            initGlobalUses[tname] > 0) {
+          slicesOk = false;
+          break;
+        }
+        auto& tSets = allGlobalSets[tname];
+        if (tSets.size() != 1 || tSets[0].first != fn) {
+          slicesOk = false;
+          break;
+        }
+        auto* and_ = tSets[0].second->value->dynCast<ArrayNewData>();
+        if (!and_ || and_->segment == segmentName) {
+          slicesOk = false;
+          break;
+        }
+        DataSegment* seg = module->getDataSegmentOrNull(and_->segment);
+        uint32_t segStartOffset = 0, totalElems = 0;
+        if (!seg || !evalConstI32(and_->offset, fn, segStartOffset) ||
+            !evalConstI32(and_->size, fn, totalElems)) {
+          slicesOk = false;
+          break;
+        }
+        auto& tAgSites = arrayGetSites[tname];
+        if (allRefIsNullGets[tname] + tAgSites.size() !=
+            codeGlobalGets[tname]) {
+          slicesOk = false;
+          break;
+        }
+        for (auto& [agFn, _] : tAgSites) {
+          if (agFn != fn) {
+            slicesOk = false;
+            break;
+          }
+        }
+        if (!slicesOk) {
+          break;
+        }
+        Index elemOffset = 0;
+        if (!evalElemOffset(idxAg->index, fn, elemOffset)) {
+          slicesOk = false;
+          break;
+        }
+        Index sliceLen = 0;
+        if (!getFactoryRowCount(fn, sliceLen)) {
+          if (tAgSites.size() == 1 && elemOffset == 0) {
+            sliceLen = Index(totalElems);
+          } else {
+            slicesOk = false;
+            break;
+          }
+        }
+        if (sliceLen == 0 ||
+            uint64_t(elemOffset) + uint64_t(sliceLen) > uint64_t(totalElems) ||
+            uint64_t(segStartOffset) + uint64_t(elemOffset) +
+                uint64_t(sliceLen) >
+              seg->data.size()) {
+          slicesOk = false;
+          break;
+        }
+        for (auto& [_, otherSite] : tAgSites) {
+          auto* otherAg = (*otherSite)->cast<ArrayGet>();
+          if (otherAg == idxAg) {
+            continue;
+          }
+          Index otherOffset = 0;
+          if (!evalElemOffset(otherAg->index, fn, otherOffset) ||
+              !(uint64_t(otherOffset) + uint64_t(sliceLen) <=
+                  uint64_t(elemOffset) ||
+                uint64_t(elemOffset) + uint64_t(sliceLen) <=
+                  uint64_t(otherOffset))) {
+            slicesOk = false;
+            break;
+          }
+        }
+        if (!slicesOk) {
+          break;
+        }
+        Index absOffset = Index(segStartOffset) + elemOffset;
+        for (Index j = 0; j < sliceLen; j++) {
+          if (uint8_t(seg->data[absOffset + j]) >= anf->values.size()) {
+            slicesOk = false;
+            break;
+          }
+        }
+        if (!slicesOk) {
+          break;
+        }
+        for (auto& prev : extSlices) {
+          if (prev.seg == seg &&
+              !(uint64_t(prev.offset) + uint64_t(prev.length) <=
+                  uint64_t(absOffset) ||
+                uint64_t(absOffset) + uint64_t(sliceLen) <=
+                  uint64_t(prev.offset))) {
+            slicesOk = false;
+            break;
+          }
+        }
+        if (!slicesOk) {
+          break;
+        }
+        extSlices.push_back({seg, absOffset, sliceLen});
+      }
+      if (slicesOk && extSlices.size() == idxSlots.size()) {
+        anf->values.set(compacted);
+        for (auto& slice : extSlices) {
+          for (Index j = 0; j < slice.length; j++) {
+            uint8_t oldIdx = uint8_t(slice.seg->data[slice.offset + j]);
+            assert(oldIdx < remap.size());
+            slice.seg->data[slice.offset + j] = char(remap[oldIdx]);
           }
         }
       }
