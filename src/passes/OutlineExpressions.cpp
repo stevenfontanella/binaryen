@@ -11582,14 +11582,27 @@ struct OutlineExpressions : public Pass {
            e->is<RefFunc>() || e->is<GlobalGet>();
   }
 
+  static Type normalizeReuseRootType(Type t) {
+    if (t.isRef()) {
+      return Type(t.getHeapType().getTop(), Nullable);
+    }
+    return t;
+  }
+
   static size_t getLeafAgnosticShallowHash(Expression* curr) {
     if (isPureReuseLeaf(curr)) {
       return wasm::hash(0x9e3779b97f4a7c15ULL);
     }
-    if (auto* ra = curr->dynCast<RefAs>();
-        ra && ra->op == RefAsNonNull && ra->value->is<LocalGet>()) {
+    if (auto* ra = curr->dynCast<RefAs>(); ra && ra->op == RefAsNonNull) {
       auto digest = wasm::hash(curr->_id);
       rehash(digest, ra->op);
+      return digest;
+    }
+    if ((curr->is<Block>() || curr->is<If>() || curr->is<Loop>() ||
+         curr->is<Select>()) &&
+        curr->type.isRef()) {
+      auto digest = wasm::hash(curr->_id);
+      rehash(digest, normalizeReuseRootType(curr->type).getID());
       return digest;
     }
     if (auto* br = curr->dynCast<Break>()) {
@@ -12222,15 +12235,19 @@ struct OutlineExpressions : public Pass {
       bool isEscaped = false;
       Index callCount = 0;
       std::vector<Index> paramReads;
+      std::vector<Expression*> firstReadGet;
       std::vector<Type> demandedParams;
       std::vector<Type> currentParams;
       Type currentResults = Type::none;
       bool preEffectsComputed = false;
       std::vector<bool> paramUnconditional;
       std::vector<Index> firstReadOrder;
+      std::vector<Index> lastReadOrder;
       std::vector<bool> callBeforeParam;
+      std::vector<bool> callBeforeFirstParam;
       std::vector<std::unordered_set<Name>> globalsWrittenBeforeParam;
       std::vector<EffectAnalyzer> preEffects;
+      std::vector<EffectAnalyzer> firstPreEffects;
     };
 
     auto ensureHelperPreEffects = [&](HelperCand& h) {
@@ -12241,11 +12258,15 @@ struct OutlineExpressions : public Pass {
       Index P = h.numParams;
       h.paramUnconditional.assign(P, false);
       h.firstReadOrder.assign(P, Index(-1));
+      h.lastReadOrder.assign(P, Index(-1));
       h.callBeforeParam.assign(P, false);
+      h.callBeforeFirstParam.assign(P, false);
       h.globalsWrittenBeforeParam.resize(P);
       h.preEffects.reserve(P);
+      h.firstPreEffects.reserve(P);
       for (Index p = 0; p < P; p++) {
         h.preEffects.emplace_back(getPassOptions(), *wasm);
+        h.firstPreEffects.emplace_back(getPassOptions(), *wasm);
       }
       Index nextReadOrder = 0;
       bool seenUnknownCall = false;
@@ -12304,12 +12325,16 @@ struct OutlineExpressions : public Pass {
         }
         if (auto* lg = curr->dynCast<LocalGet>()) {
           if (lg->index < P) {
+            Index order = nextReadOrder++;
             if (h.firstReadOrder[lg->index] == Index(-1)) {
-              h.firstReadOrder[lg->index] = nextReadOrder++;
+              h.firstReadOrder[lg->index] = order;
               if (unconditional && !seenBranch) {
                 h.paramUnconditional[lg->index] = true;
               }
+              h.callBeforeFirstParam[lg->index] = seenUnknownCall;
+              h.firstPreEffects[lg->index].mergeIn(curEff);
             }
+            h.lastReadOrder[lg->index] = order;
             if (seenUnknownCall) {
               h.callBeforeParam[lg->index] = true;
             }
@@ -12362,6 +12387,7 @@ struct OutlineExpressions : public Pass {
         continue;
       }
       std::vector<Index> reads(P, 0);
+      std::vector<Expression*> firstReadGet(P, nullptr);
       std::vector<Type> demanded(P);
       std::vector<bool> hasDemanded(P, false);
       for (Index p = 0; p < P; p++) {
@@ -12391,6 +12417,9 @@ struct OutlineExpressions : public Pass {
           if (lg->index >= P) {
             ok = false;
             return 0;
+          }
+          if (reads[lg->index] == 0) {
+            firstReadGet[lg->index] = lg;
           }
           reads[lg->index]++;
           if (allowSigAlign) {
@@ -12435,6 +12464,7 @@ struct OutlineExpressions : public Pass {
       auto cIt = directCallCounts.find(f->name);
       hc.callCount = cIt != directCallCounts.end() ? cIt->second : 0;
       hc.paramReads = std::move(reads);
+      hc.firstReadGet = std::move(firstReadGet);
       hc.demandedParams = std::move(demanded);
       hc.currentParams.resize(P);
       for (Index p = 0; p < P; p++) {
@@ -12455,8 +12485,9 @@ struct OutlineExpressions : public Pass {
           if (sliceOk) {
             size_t sh = wasm::hash(0);
             rehash(sh, Expression::Id(Expression::BlockId));
-            rehash(sh, blk->list.back()->type.getID());
             size_t srh = sh;
+            rehash(sh, blk->list.back()->type.getID());
+            rehash(srh, normalizeReuseRootType(blk->list.back()->type).getID());
             rehash(srh, blk->list.size());
             for (Index j = 0; j < blk->list.size(); j++) {
               Expression* elem = blk->list[j];
@@ -12552,6 +12583,7 @@ struct OutlineExpressions : public Pass {
       auto isValidArgForParam = [&](Expression* arg,
                                     Index p,
                                     HelperCand& h,
+                                    bool isTeeMultiRead,
                                     bool& outImpure) -> bool {
         outImpure = false;
         if (isPureReuseLeaf(arg)) {
@@ -12571,7 +12603,7 @@ struct OutlineExpressions : public Pass {
           return false;
         }
         ensureHelperPreEffects(h);
-        if (!h.paramUnconditional[p]) {
+        if (isTeeMultiRead && !h.paramUnconditional[p]) {
           return false;
         }
         EffectAnalyzer eff(getPassOptions(), *wasm, arg);
@@ -12585,19 +12617,23 @@ struct OutlineExpressions : public Pass {
         }
         bool isImpure =
           eff.hasUnremovableSideEffects() || !eff.localsWritten.empty();
-        if (h.paramReads[p] > 1) {
+        const EffectAnalyzer& preEff =
+          isTeeMultiRead ? h.firstPreEffects[p] : h.preEffects[p];
+        bool callBefore =
+          isTeeMultiRead ? h.callBeforeFirstParam[p] : h.callBeforeParam[p];
+        if (!h.paramUnconditional[p] ||
+            (h.paramReads[p] > 1 && !isTeeMultiRead)) {
           if (isImpure || eff.generative) {
             return false;
           }
         } else if (isImpure) {
-          if (h.preEffects[p].mayNotReturn) {
+          if (preEff.mayNotReturn) {
             return false;
           }
           outImpure = true;
         }
         eff.localsWritten.clear();
-        if ((eff.calls && h.callBeforeParam[p]) ||
-            eff.invalidates(h.preEffects[p])) {
+        if ((eff.calls && callBefore) || eff.invalidates(preEff)) {
           return false;
         }
         return true;
@@ -12621,9 +12657,9 @@ struct OutlineExpressions : public Pass {
         if (siteBytes <= CallBytes + LocalGetBytes * P) {
           return;
         }
-        std::vector<Expression*> boundArgs(P, nullptr);
+        std::vector<Expression*> firstReadArg(P, nullptr);
+        std::vector<Expression*> otherReadArg(P, nullptr);
         bool mismatch = false;
-        bool hasImpureArg = false;
         ExpressionAnalyzer::ExprComparer cmp = [&](Expression* left,
                                                    Expression* right) {
           if (auto* lGet = left->dynCast<LocalGet>()) {
@@ -12641,22 +12677,16 @@ struct OutlineExpressions : public Pass {
                 right = rra->value;
               }
             }
-            if (!boundArgs[p]) {
-              bool argImpure = false;
-              if (!isValidArgForParam(right, p, *h, argImpure)) {
-                mismatch = true;
-                return true;
-              }
-              boundArgs[p] = right;
-              if (argImpure) {
-                hasImpureArg = true;
-              }
-            } else if (!ExpressionAnalyzer::equal(boundArgs[p], right)) {
+            if (left == h->firstReadGet[p]) {
+              firstReadArg[p] = right;
+            } else if (!otherReadArg[p]) {
+              otherReadArg[p] = right;
+            } else if (!ExpressionAnalyzer::equal(otherReadArg[p], right)) {
               mismatch = true;
             }
             return true;
           }
-          if (allowSigAlign && left != h->func->body) {
+          if (allowSigAlign) {
             if (auto* lra = left->dynCast<RefAs>();
                 lra && lra->op == RefAsNonNull &&
                 lra->value->is<LocalGet>()) {
@@ -12670,13 +12700,75 @@ struct OutlineExpressions : public Pass {
                     return cmp(lra->value, rra->value);
                   }
                 } else if (right->type.isRef() &&
-                           right->type.isNonNullable()) {
+                           right->type.isNonNullable() &&
+                           left != h->func->body) {
                   if (Type::isSubType(right->type, h->demandedParams[p]) &&
                       (Type::isSubType(right->type, lra->type) ||
                        !h->isEscaped)) {
                     return cmp(lra->value, right);
                   }
                 }
+              }
+            }
+            if (left->_id == right->_id && left->type != right->type &&
+                left->type.isRef() && right->type.isRef() &&
+                normalizeReuseRootType(left->type) ==
+                  normalizeReuseRootType(right->type)) {
+              if (auto* lra = left->dynCast<RefAs>();
+                  lra && lra->op == RefAsNonNull) {
+                auto* rra = right->cast<RefAs>();
+                if (rra->op != RefAsNonNull) {
+                  return false;
+                }
+                if (!ExpressionAnalyzer::flexibleEqual(
+                      lra->value, rra->value, cmp)) {
+                  mismatch = true;
+                }
+                return true;
+              }
+              if (auto* lBlk = left->dynCast<Block>()) {
+                auto* rBlk = right->cast<Block>();
+                if (lBlk->name.is() || rBlk->name.is() ||
+                    lBlk->list.size() != rBlk->list.size()) {
+                  return false;
+                }
+                for (Index i = 0; i < lBlk->list.size(); i++) {
+                  if (!ExpressionAnalyzer::flexibleEqual(
+                        lBlk->list[i], rBlk->list[i], cmp) ||
+                      mismatch) {
+                    mismatch = true;
+                    break;
+                  }
+                }
+                return true;
+              }
+              if (auto* lIf = left->dynCast<If>()) {
+                auto* rIf = right->cast<If>();
+                if (!!lIf->ifFalse != !!rIf->ifFalse) {
+                  return false;
+                }
+                if (!ExpressionAnalyzer::flexibleEqual(
+                      lIf->condition, rIf->condition, cmp) ||
+                    !ExpressionAnalyzer::flexibleEqual(
+                      lIf->ifTrue, rIf->ifTrue, cmp) ||
+                    (lIf->ifFalse &&
+                     !ExpressionAnalyzer::flexibleEqual(
+                       lIf->ifFalse, rIf->ifFalse, cmp))) {
+                  mismatch = true;
+                }
+                return true;
+              }
+              if (auto* lSel = left->dynCast<Select>()) {
+                auto* rSel = right->cast<Select>();
+                if (!ExpressionAnalyzer::flexibleEqual(
+                      lSel->ifTrue, rSel->ifTrue, cmp) ||
+                    !ExpressionAnalyzer::flexibleEqual(
+                      lSel->ifFalse, rSel->ifFalse, cmp) ||
+                    !ExpressionAnalyzer::flexibleEqual(
+                      lSel->condition, rSel->condition, cmp)) {
+                  mismatch = true;
+                }
+                return true;
               }
             }
           }
@@ -12703,15 +12795,92 @@ struct OutlineExpressions : public Pass {
           }
         }
 
+        std::vector<Expression*> boundArgs(P, nullptr);
+        std::vector<bool> isTeeMultiRead(P, false);
+        bool hasImpureArg = false;
+        auto countSubtreeLocalReadsWrites =
+          [&](Index localIdx, Index& outReads, Index& outWrites) {
+            outReads = 0;
+            outWrites = 0;
+            auto accum = [&](Expression* root) {
+              for (auto* lg : FindAll<LocalGet>(root).list) {
+                if (lg->index == localIdx) {
+                  outReads++;
+                }
+              }
+              for (auto* ls : FindAll<LocalSet>(root).list) {
+                if (ls->index == localIdx) {
+                  outWrites++;
+                }
+              }
+            };
+            if (len == 0) {
+              accum(curr);
+            } else {
+              for (Index j = 0; j < len; j++) {
+                Expression* sElem = sliceBlk->list[offset + j];
+                if (trailingSet && j + 1 == len) {
+                  sElem = sElem->cast<LocalSet>()->value;
+                }
+                accum(sElem);
+              }
+            }
+          };
+
+        for (Index p = 0; p < P; p++) {
+          if (!firstReadArg[p]) {
+            return;
+          }
+          if (h->paramReads[p] == 1) {
+            boundArgs[p] = firstReadArg[p];
+          } else {
+            if (!otherReadArg[p]) {
+              return;
+            }
+            if (ExpressionAnalyzer::equal(firstReadArg[p], otherReadArg[p])) {
+              boundArgs[p] = firstReadArg[p];
+            } else if (auto* tee = firstReadArg[p]->dynCast<LocalSet>();
+                       tee && tee->isTee()) {
+              auto* subGet = otherReadArg[p]->dynCast<LocalGet>();
+              if (!subGet || subGet->index != tee->index) {
+                return;
+              }
+              Index totReads = 0, totWrites = 0;
+              countSubtreeLocalReadsWrites(tee->index, totReads, totWrites);
+              Index teeValReads = 0;
+              for (auto* lg : FindAll<LocalGet>(tee->value).list) {
+                if (lg->index == tee->index) {
+                  teeValReads++;
+                }
+              }
+              if (totWrites != 1 ||
+                  totReads < teeValReads ||
+                  totReads - teeValReads != h->paramReads[p] - 1) {
+                return;
+              }
+              isTeeMultiRead[p] = true;
+              boundArgs[p] = firstReadArg[p];
+            } else {
+              return;
+            }
+          }
+          bool argImpure = false;
+          if (!isValidArgForParam(
+                boundArgs[p], p, *h, isTeeMultiRead[p], argImpure)) {
+            return;
+          }
+          if (argImpure) {
+            hasImpureArg = true;
+          }
+        }
+
         Index argBytes = 0;
         bool allDistinctOrderedLocalGets = true;
+        bool allDistinctLocalGets = true;
         bool allExactParamTypes = true;
         SmallVector<Index, 8> seenLocalIndices;
         Index prevLocalIdx = 0;
         for (Index p = 0; p < P; p++) {
-          if (!boundArgs[p]) {
-            return;
-          }
           if (isPureReuseLeaf(boundArgs[p])) {
             argBytes += getShallowBytes(boundArgs[p]);
           } else {
@@ -12728,6 +12897,7 @@ struct OutlineExpressions : public Pass {
             for (Index prev : seenLocalIndices) {
               if (prev == lg->index) {
                 allDistinctOrderedLocalGets = false;
+                allDistinctLocalGets = false;
                 break;
               }
             }
@@ -12738,6 +12908,7 @@ struct OutlineExpressions : public Pass {
             prevLocalIdx = lg->index;
           } else {
             allDistinctOrderedLocalGets = false;
+            allDistinctLocalGets = false;
           }
         }
         if (allDistinctOrderedLocalGets && !allExactParamTypes &&
@@ -12756,11 +12927,11 @@ struct OutlineExpressions : public Pass {
           }
           for (Index p = 0; p < P; p++) {
             for (Index q = p + 1; q < P; q++) {
-              bool sameSingleOrder =
-                h->paramReads[p] == 1 && h->paramReads[q] == 1 &&
-                h->paramUnconditional[p] && h->paramUnconditional[q] &&
-                h->firstReadOrder[p] < h->firstReadOrder[q];
-              if (!sameSingleOrder) {
+              bool sameEvalOrder =
+                (h->paramReads[p] == 1 || isTeeMultiRead[p])
+                  ? (h->firstReadOrder[p] < h->firstReadOrder[q])
+                  : (h->lastReadOrder[p] < h->firstReadOrder[q]);
+              if (!sameEvalOrder) {
                 if ((argEffs[p].calls && argEffs[q].calls) ||
                     argEffs[p].invalidates(argEffs[q])) {
                   return;
@@ -12802,8 +12973,10 @@ struct OutlineExpressions : public Pass {
         if (savedBytes <= 0) {
           return;
         }
-        if (len == 0 && curr == caller->body && siteBytes == h->bodyBytes &&
-            callerAsHelper && !helperBetter(*h, *callerAsHelper)) {
+        if (len == 0 && curr == caller->body &&
+            (allDistinctLocalGets || savedBytes < 4) &&
+            siteBytes == h->bodyBytes && callerAsHelper &&
+            !helperBetter(*h, *callerAsHelper)) {
           return;
         }
         if (callsFunctionTransitively(h->func, caller)) {
@@ -13009,7 +13182,8 @@ struct OutlineExpressions : public Pass {
               for (HelperCand* h : it->second) {
                 if ((!node.movable || h->bodyHash != node.hash) &&
                     node.bytes > CallBytes + LocalGetBytes * h->numParams &&
-                    curr->type == h->func->body->type) {
+                    normalizeReuseRootType(curr->type) ==
+                      normalizeReuseRootType(h->func->body->type)) {
                   tryMatchHelper(h,
                                  curr,
                                  nullptr,
@@ -13059,8 +13233,9 @@ struct OutlineExpressions : public Pass {
                 } else {
                   bool allMovable = prefixMovable && lastNode.movable;
                   size_t sh = baseHash;
+                  size_t srh = baseHash;
                   rehash(sh, lastExpr->type.getID());
-                  size_t srh = sh;
+                  rehash(srh, normalizeReuseRootType(lastExpr->type).getID());
                   rehash(srh, k);
                   for (Index j = offset; j < offset + k; j++) {
                     hash_combine(sh, chNodes[j].hash);
@@ -13118,8 +13293,9 @@ struct OutlineExpressions : public Pass {
                 Expression* setVal = lastExpr->cast<LocalSet>()->value;
                 Type valType = setVal->type;
                 size_t sh = baseHash;
+                size_t srh = baseHash;
                 rehash(sh, valType.getID());
-                size_t srh = sh;
+                rehash(srh, normalizeReuseRootType(valType).getID());
                 rehash(srh, k);
                 for (Index j = offset; j + 1 < offset + k; j++) {
                   hash_combine(sh, chNodes[j].hash);

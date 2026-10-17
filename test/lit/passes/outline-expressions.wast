@@ -6130,3 +6130,168 @@
     )
   )
 )
+
+;; Multi-read parameter matched by a local.tee at first read and local.get at subsequent reads.
+(module
+  ;; CHECK:      (type $0 (func (param i32) (result i32)))
+
+  ;; CHECK:      (type $1 (func (param i32 i32) (result i32)))
+
+  ;; CHECK:      (func $multi-read-helper (type $0) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (i32.mul
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (i32.const 100000)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.sub
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (i32.const 200000)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (type $0 (func (param i32) (result i32)))
+
+  ;; SHRINK:      (type $1 (func (param i32 i32) (result i32)))
+
+  ;; SHRINK:      (func $multi-read-helper (type $0) (param $x i32) (result i32)
+  ;; SHRINK-NEXT:  (i32.add
+  ;; SHRINK-NEXT:   (i32.mul
+  ;; SHRINK-NEXT:    (local.get $x)
+  ;; SHRINK-NEXT:    (i32.const 100000)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (i32.sub
+  ;; SHRINK-NEXT:    (local.get $x)
+  ;; SHRINK-NEXT:    (i32.const 200000)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $multi-read-helper (param $x i32) (result i32)
+    (i32.add
+      (i32.mul (local.get $x) (i32.const 100000))
+      (i32.sub (local.get $x) (i32.const 200000))
+    )
+  )
+
+  ;; CHECK:      (func $multi-read-tee-arg (type $0) (param $a i32) (result i32)
+  ;; CHECK-NEXT:  (local $t i32)
+  ;; CHECK-NEXT:  (i32.xor
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (i32.mul
+  ;; CHECK-NEXT:     (local.tee $t
+  ;; CHECK-NEXT:      (i32.xor
+  ;; CHECK-NEXT:       (local.get $a)
+  ;; CHECK-NEXT:       (i32.const 100000)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.const 100000)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.sub
+  ;; CHECK-NEXT:     (local.get $t)
+  ;; CHECK-NEXT:     (i32.const 200000)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.get $t)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $multi-read-tee-arg (type $0) (param $a i32) (result i32)
+  ;; SHRINK-NEXT:  (local $t i32)
+  ;; SHRINK-NEXT:  (i32.xor
+  ;; SHRINK-NEXT:   (call $multi-read-helper
+  ;; SHRINK-NEXT:    (local.tee $t
+  ;; SHRINK-NEXT:     (i32.xor
+  ;; SHRINK-NEXT:      (local.get $a)
+  ;; SHRINK-NEXT:      (i32.const 100000)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (local.get $t)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $multi-read-tee-arg (param $a i32) (result i32) (local $t i32)
+    (i32.xor
+      (i32.add
+        (i32.mul (local.tee $t (i32.xor (local.get $a) (i32.const 100000))) (i32.const 100000))
+        (i32.sub (local.get $t) (i32.const 200000))
+      )
+      (local.get $t)
+    )
+  )
+
+  ;; CHECK:      (func $cond-helper (type $1) (param $x i32) (param $y i32) (result i32)
+  ;; CHECK-NEXT:  (if (result i32)
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (local.get $y)
+  ;; CHECK-NEXT:     (i32.const 300000)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (else
+  ;; CHECK-NEXT:    (i32.const 400000)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $cond-helper (type $1) (param $x i32) (param $y i32) (result i32)
+  ;; SHRINK-NEXT:  (if (result i32)
+  ;; SHRINK-NEXT:   (local.get $x)
+  ;; SHRINK-NEXT:   (then
+  ;; SHRINK-NEXT:    (i32.add
+  ;; SHRINK-NEXT:     (local.get $y)
+  ;; SHRINK-NEXT:     (i32.const 300000)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (else
+  ;; SHRINK-NEXT:    (i32.const 400000)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $cond-helper (param $x i32) (param $y i32) (result i32)
+    (if (result i32)
+      (local.get $x)
+      (then
+        (i32.add (local.get $y) (i32.const 300000))
+      )
+      (else
+        (i32.const 400000)
+      )
+    )
+  )
+
+  ;; CHECK:      (func $cond-pure-arg (type $1) (param $a i32) (param $b i32) (result i32)
+  ;; CHECK-NEXT:  (if (result i32)
+  ;; CHECK-NEXT:   (local.get $a)
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (i32.xor
+  ;; CHECK-NEXT:      (local.get $a)
+  ;; CHECK-NEXT:      (local.get $b)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.const 300000)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (else
+  ;; CHECK-NEXT:    (i32.const 400000)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $cond-pure-arg (type $1) (param $a i32) (param $b i32) (result i32)
+  ;; SHRINK-NEXT:  (call $cond-helper
+  ;; SHRINK-NEXT:   (local.get $a)
+  ;; SHRINK-NEXT:   (i32.xor
+  ;; SHRINK-NEXT:    (local.get $a)
+  ;; SHRINK-NEXT:    (local.get $b)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $cond-pure-arg (param $a i32) (param $b i32) (result i32)
+    (if (result i32)
+      (local.get $a)
+      (then
+        (i32.add (i32.xor (local.get $a) (local.get $b)) (i32.const 300000))
+      )
+      (else
+        (i32.const 400000)
+      )
+    )
+  )
+)
