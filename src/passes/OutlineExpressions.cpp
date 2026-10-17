@@ -1699,6 +1699,9 @@ struct OutlineExpressions : public Pass {
       if (!changed) {
         break;
       }
+      if (enableUnCseTees && reuseExistingHelpersWithSpecialArgs()) {
+        propagateScratchGlobalEffects();
+      }
     }
     if (enableUnCseTees) {
       unCseOverCsedTees();
@@ -11561,6 +11564,16 @@ struct OutlineExpressions : public Pass {
     }
   }
 
+  static bool isValidCallerArgNode(Expression* curr) {
+    if (!curr || curr->type.isTuple()) {
+      return false;
+    }
+    if (curr->is<LocalSet>()) {
+      return true;
+    }
+    return isMovableZeroVarNode(curr);
+  }
+
   static bool isPureReuseLeaf(Expression* e) {
     if (!e || e->type == Type::unreachable || !e->type.isSingle()) {
       return false;
@@ -12185,10 +12198,7 @@ struct OutlineExpressions : public Pass {
       size_t h = getLeafAgnosticShallowHash(curr);
       Index numCh = ChildIterator(curr).getNumChildren();
       rehash(h, numCh);
-      if (numCh == 1 && getShallowBytes(curr) <= 3) {
-        Expression* ch = *ChildIterator(curr).begin();
-        hash_combine(h, getLeafAgnosticShallowHash(ch));
-      } else if (auto* blk = curr->dynCast<Block>()) {
+      if (auto* blk = curr->dynCast<Block>()) {
         if (!blk->list.empty() && blk->list[0]->type == Type::none) {
           hash_combine(h, getLeafAgnosticShallowHash(blk->list[0]));
         }
@@ -12217,6 +12227,7 @@ struct OutlineExpressions : public Pass {
       Type currentResults = Type::none;
       bool preEffectsComputed = false;
       std::vector<bool> paramUnconditional;
+      std::vector<Index> firstReadOrder;
       std::vector<bool> callBeforeParam;
       std::vector<std::unordered_set<Name>> globalsWrittenBeforeParam;
       std::vector<EffectAnalyzer> preEffects;
@@ -12229,12 +12240,14 @@ struct OutlineExpressions : public Pass {
       h.preEffectsComputed = true;
       Index P = h.numParams;
       h.paramUnconditional.assign(P, false);
+      h.firstReadOrder.assign(P, Index(-1));
       h.callBeforeParam.assign(P, false);
       h.globalsWrittenBeforeParam.resize(P);
       h.preEffects.reserve(P);
       for (Index p = 0; p < P; p++) {
         h.preEffects.emplace_back(getPassOptions(), *wasm);
       }
+      Index nextReadOrder = 0;
       bool seenUnknownCall = false;
       std::unordered_set<Name> seenGlobalWrites;
       EffectAnalyzer rootEff(getPassOptions(), *wasm);
@@ -12291,8 +12304,11 @@ struct OutlineExpressions : public Pass {
         }
         if (auto* lg = curr->dynCast<LocalGet>()) {
           if (lg->index < P) {
-            if (unconditional && !seenBranch) {
-              h.paramUnconditional[lg->index] = true;
+            if (h.firstReadOrder[lg->index] == Index(-1)) {
+              h.firstReadOrder[lg->index] = nextReadOrder++;
+              if (unconditional && !seenBranch) {
+                h.paramUnconditional[lg->index] = true;
+              }
             }
             if (seenUnknownCall) {
               h.callBeforeParam[lg->index] = true;
@@ -12316,7 +12332,8 @@ struct OutlineExpressions : public Pass {
             seenGlobalWrites.insert(g);
           }
           curEff.mergeIn(sEff);
-          if (curr->is<Break>() || curr->is<Switch>() || curr->is<BrOn>()) {
+          if (curr->is<Break>() || curr->is<Switch>() || curr->is<BrOn>() ||
+              sEff.throws() || sEff.transfersControlFlow()) {
             seenBranch = true;
           }
         }
@@ -12522,7 +12539,9 @@ struct OutlineExpressions : public Pass {
         Index bytes = 0;
         Index setValueBytes = 0;
         bool movable = true;
+        bool argMovable = true;
         bool hasCleanSetValue = false;
+        bool setValueMovable = false;
         SmallVector<Name, 2> openLabels;
       };
 
@@ -12532,7 +12551,9 @@ struct OutlineExpressions : public Pass {
 
       auto isValidArgForParam = [&](Expression* arg,
                                     Index p,
-                                    HelperCand& h) -> bool {
+                                    HelperCand& h,
+                                    bool& outImpure) -> bool {
+        outImpure = false;
         if (isPureReuseLeaf(arg)) {
           if (auto* gg = arg->dynCast<GlobalGet>()) {
             if (!immutableGlobals.count(gg->name)) {
@@ -12558,9 +12579,24 @@ struct OutlineExpressions : public Pass {
         if (getPassOptions().trapsNeverHappen) {
           eff.trap = false;
         }
-        if (eff.hasUnremovableSideEffects() || eff.throws() ||
-            eff.transfersControlFlow() || !eff.localsWritten.empty() ||
-            (eff.generative && h.paramReads[p] > 1) ||
+        if (eff.throws() || eff.transfersControlFlow() || eff.danglingPop ||
+            eff.hasSynchronization()) {
+          return false;
+        }
+        bool isImpure =
+          eff.hasUnremovableSideEffects() || !eff.localsWritten.empty();
+        if (h.paramReads[p] > 1) {
+          if (isImpure || eff.generative) {
+            return false;
+          }
+        } else if (isImpure) {
+          if (h.preEffects[p].mayNotReturn) {
+            return false;
+          }
+          outImpure = true;
+        }
+        eff.localsWritten.clear();
+        if ((eff.calls && h.callBeforeParam[p]) ||
             eff.invalidates(h.preEffects[p])) {
           return false;
         }
@@ -12576,7 +12612,8 @@ struct OutlineExpressions : public Pass {
                                 Index siteBytes,
                                 Index tin,
                                 Index tout,
-                                Expression* parentExpr) {
+                                Expression* parentExpr,
+                                Expression* grandParentExpr) {
         if (h->func == caller || disabledHelpers.count(h->func)) {
           return;
         }
@@ -12586,6 +12623,7 @@ struct OutlineExpressions : public Pass {
         }
         std::vector<Expression*> boundArgs(P, nullptr);
         bool mismatch = false;
+        bool hasImpureArg = false;
         ExpressionAnalyzer::ExprComparer cmp = [&](Expression* left,
                                                    Expression* right) {
           if (auto* lGet = left->dynCast<LocalGet>()) {
@@ -12603,12 +12641,16 @@ struct OutlineExpressions : public Pass {
                 right = rra->value;
               }
             }
-            if (!isValidArgForParam(right, p, *h)) {
-              mismatch = true;
-              return true;
-            }
             if (!boundArgs[p]) {
+              bool argImpure = false;
+              if (!isValidArgForParam(right, p, *h, argImpure)) {
+                mismatch = true;
+                return true;
+              }
               boundArgs[p] = right;
+              if (argImpure) {
+                hasImpureArg = true;
+              }
             } else if (!ExpressionAnalyzer::equal(boundArgs[p], right)) {
               mismatch = true;
             }
@@ -12670,9 +12712,15 @@ struct OutlineExpressions : public Pass {
           if (!boundArgs[p]) {
             return;
           }
-          argBytes += isPureReuseLeaf(boundArgs[p])
-                        ? getShallowBytes(boundArgs[p])
-                        : compoundArgBytes.at(boundArgs[p]);
+          if (isPureReuseLeaf(boundArgs[p])) {
+            argBytes += getShallowBytes(boundArgs[p]);
+          } else {
+            auto cIt = compoundArgBytes.find(boundArgs[p]);
+            if (cIt == compoundArgBytes.end()) {
+              return;
+            }
+            argBytes += cIt->second;
+          }
           if (boundArgs[p]->type != h->currentParams[p]) {
             allExactParamTypes = false;
           }
@@ -12695,6 +12743,31 @@ struct OutlineExpressions : public Pass {
         if (allDistinctOrderedLocalGets && !allExactParamTypes &&
             !canonicalizeLocalHoles) {
           return;
+        }
+        if (hasImpureArg && P > 1) {
+          ensureHelperPreEffects(*h);
+          std::vector<EffectAnalyzer> argEffs;
+          argEffs.reserve(P);
+          for (Index p = 0; p < P; p++) {
+            argEffs.emplace_back(getPassOptions(), *wasm, boundArgs[p]);
+            if (getPassOptions().trapsNeverHappen) {
+              argEffs.back().trap = false;
+            }
+          }
+          for (Index p = 0; p < P; p++) {
+            for (Index q = p + 1; q < P; q++) {
+              bool sameSingleOrder =
+                h->paramReads[p] == 1 && h->paramReads[q] == 1 &&
+                h->paramUnconditional[p] && h->paramUnconditional[q] &&
+                h->firstReadOrder[p] < h->firstReadOrder[q];
+              if (!sameSingleOrder) {
+                if ((argEffs[p].calls && argEffs[q].calls) ||
+                    argEffs[p].invalidates(argEffs[q])) {
+                  return;
+                }
+              }
+            }
+          }
         }
 
         Type exprType;
@@ -12768,11 +12841,31 @@ struct OutlineExpressions : public Pass {
             if (len == 0 && curr == caller->body &&
                 Type::isSubType(h->currentResults, caller->getResults())) {
               contextAcceptsWider = true;
-            } else if (len == 0 && parentExpr &&
-                       Type::isSubType(
-                         h->currentResults,
-                         getChildDemandedType(*wasm, parentExpr, curr))) {
-              contextAcceptsWider = true;
+            } else if (len == 0 && parentExpr) {
+              if (auto* ls = parentExpr->dynCast<LocalSet>()) {
+                if (!ls->isTee() &&
+                    Type::isSubType(h->currentResults,
+                                    caller->getLocalType(ls->index))) {
+                  contextAcceptsWider = true;
+                } else if (ls->isTee() && grandParentExpr &&
+                           Type::isSubType(h->currentResults,
+                                           caller->getLocalType(ls->index)) &&
+                           Type::isSubType(
+                             h->currentResults,
+                             getChildDemandedType(
+                               *wasm, grandParentExpr, ls))) {
+                  contextAcceptsWider = true;
+                }
+              } else if (auto* ret = parentExpr->dynCast<Return>()) {
+                if (ret->value == curr &&
+                    Type::isSubType(h->currentResults, caller->getResults())) {
+                  contextAcceptsWider = true;
+                }
+              } else if (Type::isSubType(
+                           h->currentResults,
+                           getChildDemandedType(*wasm, parentExpr, curr))) {
+                contextAcceptsWider = true;
+              }
             } else if (len > 0 && trailingSet) {
               auto* ls = sliceBlk->list[offset + len - 1]->cast<LocalSet>();
               if (!ls->isTee() &&
@@ -12822,23 +12915,27 @@ struct OutlineExpressions : public Pass {
         vec.push_back(label);
       };
 
-      std::function<ScanNode(Expression*, Expression*)> scanCaller =
-        [&](Expression* curr, Expression* par) -> ScanNode {
+      std::function<ScanNode(Expression*, Expression*, Expression*)> scanCaller =
+        [&](Expression* curr,
+            Expression* par,
+            Expression* grandPar) -> ScanNode {
         ScanNode node;
         node.tin = ++timer;
         node.hash = getLeafAgnosticShallowHash(curr);
         node.bytes = getShallowBytes(curr);
         node.movable = isMovableZeroVarNode(curr);
+        node.argMovable = isValidCallerArgNode(curr);
 
         Index numCh = ChildIterator(curr).getNumChildren();
         std::vector<ScanNode> chNodes;
         chNodes.reserve(numCh);
         for (auto* ch : ChildIterator(curr)) {
-          chNodes.push_back(scanCaller(ch, curr));
+          chNodes.push_back(scanCaller(ch, curr, par));
           const auto& cn = chNodes.back();
           hash_combine(node.hash, cn.hash);
           node.bytes += cn.bytes;
           node.movable = node.movable && cn.movable;
+          node.argMovable = node.argMovable && cn.argMovable;
           for (Name lbl : cn.openLabels) {
             addUniqueLabel(node.openLabels, lbl);
           }
@@ -12846,9 +12943,10 @@ struct OutlineExpressions : public Pass {
 
         if (auto* ls = curr->dynCast<LocalSet>()) {
           const auto& valNode = chNodes[0];
-          if (valNode.movable && valNode.openLabels.empty() &&
+          if (valNode.argMovable && valNode.openLabels.empty() &&
               ls->value->type.isConcrete() && !ls->value->type.isTuple()) {
             node.hasCleanSetValue = true;
+            node.setValueMovable = valNode.movable;
             node.setValueHash = valNode.hash;
             node.setValueBytes = valNode.bytes;
           }
@@ -12881,32 +12979,35 @@ struct OutlineExpressions : public Pass {
 
         node.tout = ++timer;
 
-        if (node.movable && node.openLabels.empty()) {
+        if (node.argMovable && node.openLabels.empty()) {
           if (!isPureReuseLeaf(curr) && curr->type.isConcrete() &&
               curr->type.isSingle()) {
             compoundArgBytes[curr] = node.bytes;
           }
-          if (auto it = exprHelpersByHash.find(node.hash);
-              it != exprHelpersByHash.end()) {
-            for (HelperCand* h : it->second) {
-              tryMatchHelper(h,
-                             curr,
-                             nullptr,
-                             0,
-                             0,
-                             false,
-                             node.bytes,
-                             node.tin,
-                             node.tout,
-                             par);
+          if (node.movable) {
+            if (auto it = exprHelpersByHash.find(node.hash);
+                it != exprHelpersByHash.end()) {
+              for (HelperCand* h : it->second) {
+                tryMatchHelper(h,
+                               curr,
+                               nullptr,
+                               0,
+                               0,
+                               false,
+                               node.bytes,
+                               node.tin,
+                               node.tout,
+                               par,
+                               grandPar);
+              }
             }
           }
-          if (allowSigAlign && !isPureReuseLeaf(curr)) {
+          if (allowSigAlign && !isPureReuseLeaf(curr) && !curr->is<LocalSet>()) {
             size_t rHash = getRootSkelHash(curr);
             if (auto it = exprHelpersByRootHash.find(rHash);
                 it != exprHelpersByRootHash.end()) {
               for (HelperCand* h : it->second) {
-                if (h->bodyHash != node.hash &&
+                if ((!node.movable || h->bodyHash != node.hash) &&
                     node.bytes > CallBytes + LocalGetBytes * h->numParams &&
                     curr->type == h->func->body->type) {
                   tryMatchHelper(h,
@@ -12918,7 +13019,8 @@ struct OutlineExpressions : public Pass {
                                  node.bytes,
                                  node.tin,
                                  node.tout,
-                                 par);
+                                 par,
+                                 grandPar);
                 }
               }
             }
@@ -12930,15 +13032,18 @@ struct OutlineExpressions : public Pass {
           for (Index k = 2; k <= 8 && k <= n; k++) {
             for (Index offset = 0; offset + k <= n; offset++) {
               bool prefixOk = true;
+              bool prefixMovable = true;
               Index prefixBytes = 0;
               size_t baseHash = wasm::hash(0);
               rehash(baseHash, Expression::Id(Expression::BlockId));
               for (Index j = offset; j + 1 < offset + k; j++) {
                 if (blk->list[j]->type != Type::none ||
-                    !chNodes[j].movable || !chNodes[j].openLabels.empty()) {
+                    blk->list[j]->is<LocalSet>() ||
+                    !chNodes[j].argMovable || !chNodes[j].openLabels.empty()) {
                   prefixOk = false;
                   break;
                 }
+                prefixMovable = prefixMovable && chNodes[j].movable;
                 prefixBytes += chNodes[j].bytes;
               }
               if (!prefixOk) {
@@ -12946,11 +13051,13 @@ struct OutlineExpressions : public Pass {
               }
               Expression* lastExpr = blk->list[offset + k - 1];
               const auto& lastNode = chNodes[offset + k - 1];
-              if (lastNode.movable && lastNode.openLabels.empty()) {
+              if (lastNode.argMovable && !lastExpr->is<LocalSet>() &&
+                  lastNode.openLabels.empty()) {
                 if (offset + k < n && lastExpr->type != Type::none &&
                     lastExpr->type != Type::unreachable) {
                   // Concrete slice in the middle of a block is invalid.
                 } else {
+                  bool allMovable = prefixMovable && lastNode.movable;
                   size_t sh = baseHash;
                   rehash(sh, lastExpr->type.getID());
                   size_t srh = sh;
@@ -12961,20 +13068,23 @@ struct OutlineExpressions : public Pass {
                       hash_combine(srh, getRootSkelHash(blk->list[j]));
                     }
                   }
-                  if (auto it = sliceHelpersByHash.find(sh);
-                      it != sliceHelpersByHash.end()) {
-                    for (HelperCand* h : it->second) {
-                      if (h->sliceLen == k) {
-                        tryMatchHelper(h,
-                                       nullptr,
-                                       blk,
-                                       offset,
-                                       k,
-                                       false,
-                                       prefixBytes + lastNode.bytes,
-                                       chNodes[offset].tin,
-                                       lastNode.tout,
-                                       blk);
+                  if (allMovable) {
+                    if (auto it = sliceHelpersByHash.find(sh);
+                        it != sliceHelpersByHash.end()) {
+                      for (HelperCand* h : it->second) {
+                        if (h->sliceLen == k) {
+                          tryMatchHelper(h,
+                                         nullptr,
+                                         blk,
+                                         offset,
+                                         k,
+                                         false,
+                                         prefixBytes + lastNode.bytes,
+                                         chNodes[offset].tin,
+                                         lastNode.tout,
+                                         blk,
+                                         par);
+                        }
                       }
                     }
                   }
@@ -12982,7 +13092,8 @@ struct OutlineExpressions : public Pass {
                     if (auto it = sliceHelpersByRootHash.find(srh);
                         it != sliceHelpersByRootHash.end()) {
                       for (HelperCand* h : it->second) {
-                        if (h->sliceLen == k && h->sliceHash != sh &&
+                        if (h->sliceLen == k &&
+                            (!allMovable || h->sliceHash != sh) &&
                             prefixBytes + lastNode.bytes >
                               CallBytes + LocalGetBytes * h->numParams) {
                           tryMatchHelper(h,
@@ -12994,7 +13105,8 @@ struct OutlineExpressions : public Pass {
                                          prefixBytes + lastNode.bytes,
                                          chNodes[offset].tin,
                                          lastNode.tout,
-                                         blk);
+                                         blk,
+                                         par);
                         }
                       }
                     }
@@ -13002,6 +13114,7 @@ struct OutlineExpressions : public Pass {
                 }
               }
               if (lastNode.hasCleanSetValue) {
+                bool allMovable = prefixMovable && lastNode.setValueMovable;
                 Expression* setVal = lastExpr->cast<LocalSet>()->value;
                 Type valType = setVal->type;
                 size_t sh = baseHash;
@@ -13016,20 +13129,23 @@ struct OutlineExpressions : public Pass {
                 if (!isPureReuseLeaf(setVal)) {
                   hash_combine(srh, getRootSkelHash(setVal));
                 }
-                if (auto it = sliceHelpersByHash.find(sh);
-                    it != sliceHelpersByHash.end()) {
-                  for (HelperCand* h : it->second) {
-                    if (h->sliceLen == k) {
-                      tryMatchHelper(h,
-                                     nullptr,
-                                     blk,
-                                     offset,
-                                     k,
-                                     true,
-                                     prefixBytes + lastNode.setValueBytes,
-                                     chNodes[offset].tin,
-                                     lastNode.tout,
-                                     blk);
+                if (allMovable) {
+                  if (auto it = sliceHelpersByHash.find(sh);
+                      it != sliceHelpersByHash.end()) {
+                    for (HelperCand* h : it->second) {
+                      if (h->sliceLen == k) {
+                        tryMatchHelper(h,
+                                       nullptr,
+                                       blk,
+                                       offset,
+                                       k,
+                                       true,
+                                       prefixBytes + lastNode.setValueBytes,
+                                       chNodes[offset].tin,
+                                       lastNode.tout,
+                                       blk,
+                                       par);
+                      }
                     }
                   }
                 }
@@ -13037,7 +13153,8 @@ struct OutlineExpressions : public Pass {
                   if (auto it = sliceHelpersByRootHash.find(srh);
                       it != sliceHelpersByRootHash.end()) {
                     for (HelperCand* h : it->second) {
-                      if (h->sliceLen == k && h->sliceHash != sh &&
+                      if (h->sliceLen == k &&
+                          (!allMovable || h->sliceHash != sh) &&
                           prefixBytes + lastNode.setValueBytes >
                             CallBytes + LocalGetBytes * h->numParams) {
                         tryMatchHelper(h,
@@ -13049,7 +13166,8 @@ struct OutlineExpressions : public Pass {
                                        prefixBytes + lastNode.setValueBytes,
                                        chNodes[offset].tin,
                                        lastNode.tout,
-                                       blk);
+                                       blk,
+                                       par);
                       }
                     }
                   }
@@ -13061,7 +13179,7 @@ struct OutlineExpressions : public Pass {
         return node;
       };
 
-      scanCaller(caller->body, nullptr);
+      scanCaller(caller->body, nullptr, nullptr);
       if (cands.empty()) {
         continue;
       }
@@ -13109,11 +13227,19 @@ struct OutlineExpressions : public Pass {
             mc.helper->currentParams[p] = Type::getLeastUpperBound(
               mc.helper->currentParams[p], mc.widenedParams[p]);
           }
+          mc.helper->func->setParams(Type(mc.helper->currentParams));
+          for (auto* lg : FindAll<LocalGet>(mc.helper->func->body).list) {
+            if (lg->index < mc.helper->numParams) {
+              lg->type = mc.helper->currentParams[lg->index];
+            }
+          }
+          ReFinalize().walkFunctionInModule(mc.helper->func, wasm);
           modifiedHelpers.insert(mc.helper->func);
         }
         if (mc.narrowedResult != Type::none &&
             mc.helper->currentResults != mc.narrowedResult) {
           mc.helper->currentResults = mc.narrowedResult;
+          mc.helper->func->setResults(mc.narrowedResult);
           narrowedHelperResults[mc.helper->func->name] = mc.narrowedResult;
           modifiedHelpers.insert(mc.helper->func);
         }
@@ -13207,14 +13333,6 @@ struct OutlineExpressions : public Pass {
     }
 
     for (Function* hFunc : modifiedHelpers) {
-      HelperCand* h = helperByFunc.at(hFunc);
-      hFunc->setParams(Type(h->currentParams));
-      for (auto* lg : FindAll<LocalGet>(hFunc->body).list) {
-        if (lg->index < h->numParams) {
-          lg->type = h->currentParams[lg->index];
-        }
-      }
-      hFunc->setResults(h->currentResults);
       ReFinalize().walkFunctionInModule(hFunc, wasm);
       refreshFuncEffects(hFunc);
     }
