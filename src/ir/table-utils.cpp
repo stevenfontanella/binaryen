@@ -21,7 +21,8 @@
 
 namespace wasm::TableUtils {
 
-std::set<Name> getFunctionsNeedingElemDeclare(Module& wasm) {
+std::set<Name> getFunctionsNeedingElemDeclare(Module& wasm,
+                                              bool includeGlobalsAndExports) {
   // Without reference types there are no ref.funcs or elem declare.
   if (!wasm.features.hasReferenceTypes()) {
     return {};
@@ -32,6 +33,28 @@ std::set<Name> getFunctionsNeedingElemDeclare(Module& wasm) {
   std::unordered_set<Name> tableNames;
   ElementUtils::iterAllElementFunctionNames(
     &wasm, [&](Name name) { tableNames.insert(name); });
+
+  if (!includeGlobalsAndExports) {
+    for (auto& global : wasm.globals) {
+      if (!global->imported() && global->init) {
+        for (auto* refFunc : FindAll<RefFunc>(global->init).list) {
+          tableNames.insert(refFunc->func);
+        }
+      }
+    }
+    for (auto& table : wasm.tables) {
+      if (!table->imported() && table->init) {
+        for (auto* refFunc : FindAll<RefFunc>(table->init).list) {
+          tableNames.insert(refFunc->func);
+        }
+      }
+    }
+    for (auto& ex : wasm.exports) {
+      if (ex->kind == ExternalKind::Function) {
+        tableNames.insert(*ex->getInternalName());
+      }
+    }
+  }
 
   // Find all the names in ref.funcs.
   using Names = std::unordered_set<Name>;

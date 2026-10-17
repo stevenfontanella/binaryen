@@ -57,3 +57,68 @@
     (call $b)
   )
 )
+
+;; Check that functions needing a declarative element segment in the binary
+;; format get an extra count for their elem-declare mention, while functions
+;; already declared in globals or exports are deduplicated and do not get an
+;; extra elem-declare count.
+;; - $code_and_call: 1 call + 1 code ref.func + 1 elem declare = 3
+;; - $code_only: 1 code ref.func + 1 elem declare = 2
+;; - $global_and_code: 1 global ref.func + 1 code ref.func (deduped) = 2
+;; - $export_and_code: 1 export + 1 code ref.func (deduped) = 2
+;; - $global_only: 1 global ref.func = 1
+(module
+  ;; CHECK:      (type $0 (func))
+
+  ;; CHECK:      (global $g1 funcref (ref.func $global_only))
+  (global $g1 funcref (ref.func $global_only))
+  ;; CHECK:      (global $g2 funcref (ref.func $global_and_code))
+  (global $g2 funcref (ref.func $global_and_code))
+  ;; CHECK:      (elem declare func $code_and_call $code_only $export_and_code $global_and_code)
+
+  ;; CHECK:      (export "exp" (func $export_and_code))
+  (export "exp" (func $export_and_code))
+
+  ;; CHECK:      (func $code_and_call (type $0)
+  ;; CHECK-NEXT: )
+
+  ;; CHECK:      (func $global_and_code (type $0)
+  ;; CHECK-NEXT: )
+
+  ;; CHECK:      (func $export_and_code (type $0)
+  ;; CHECK-NEXT: )
+
+  ;; CHECK:      (func $code_only (type $0)
+  ;; CHECK-NEXT: )
+
+  ;; CHECK:      (func $global_only (type $0)
+  ;; CHECK-NEXT: )
+  (func $global_only)
+  (func $code_only)
+  (func $global_and_code)
+  (func $export_and_code)
+  (func $code_and_call)
+
+  ;; CHECK:      (func $caller (type $0)
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (ref.func $code_only)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (ref.func $global_and_code)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (ref.func $export_and_code)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (ref.func $code_and_call)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (call $code_and_call)
+  ;; CHECK-NEXT: )
+  (func $caller
+    (drop (ref.func $code_only))
+    (drop (ref.func $global_and_code))
+    (drop (ref.func $export_and_code))
+    (drop (ref.func $code_and_call))
+    (call $code_and_call)
+  )
+)

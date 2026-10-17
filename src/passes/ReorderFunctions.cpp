@@ -29,6 +29,7 @@
 
 #include <memory>
 
+#include "ir/table-utils.h"
 #include <pass.h>
 #include <wasm.h>
 
@@ -87,7 +88,12 @@ struct ReorderFunctions : public Pass {
         counts[*curr->getInternalName()]++;
       }
     }
-    // TODO: count the declaration section as well, which adds another mention
+    // Count the declarative element segment, which adds another mention in the
+    // binary format for each function declared there.
+    for (auto name : TableUtils::getFunctionsNeedingElemDeclare(
+           *module, /*includeGlobalsAndExports=*/false)) {
+      counts[name]++;
+    }
     // sort
     std::sort(module->functions.begin(),
               module->functions.end(),

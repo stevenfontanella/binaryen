@@ -127,8 +127,14 @@ inline Index getOrAppend(Table& table, Name name, Module& wasm) {
 }
 
 // Functions that we take a reference to, but are not in a Table, but get an
-// "elem declare" mention in the text and binary formats.
-std::set<Name> getFunctionsNeedingElemDeclare(Module& wasm);
+// "elem declare" mention in the text and binary formats. When
+// `includeGlobalsAndExports` is false, functions already declared by a
+// global/table initializer or function export are excluded (per the Wasm spec's
+// C.refs validation rule, they do not need an additional declarative element
+// segment entry in the binary format).
+std::set<Name>
+getFunctionsNeedingElemDeclare(Module& wasm,
+                               bool includeGlobalsAndExports = true);
 
 // Returns whether a segment uses arbitrary wasm expressions, as opposed to the
 // original tables from the MVP that use function indices. (Some post-MVP tables

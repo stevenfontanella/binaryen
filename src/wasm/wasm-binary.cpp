@@ -930,7 +930,8 @@ void WasmBinaryWriter::writeTableDeclarations() {
 
 void WasmBinaryWriter::writeElementSegments() {
   size_t elemCount = wasm->elementSegments.size();
-  auto needingElemDecl = TableUtils::getFunctionsNeedingElemDeclare(*wasm);
+  auto needingElemDecl = TableUtils::getFunctionsNeedingElemDeclare(
+    *wasm, /*includeGlobalsAndExports=*/false);
   if (!needingElemDecl.empty()) {
     elemCount++;
   }
