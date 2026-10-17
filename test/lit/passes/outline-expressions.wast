@@ -4694,6 +4694,11 @@
     )
   )
 )
+
+;; Test sinkWrapperCalls v4:
+;; - Part A-Unary: 100%-caller in-place parameter unary-op (struct.get) sinking.
+;; - Step 1B-Unary: existing 0-var parameter-unary forwarding helper reuse.
+;; - Part B-Unary: partial-caller parameter unary-op specialization ($outlined_pu).
 ;; SHRINK:      (func $outlined_w (type $5) (param $0 i32) (param $1 i32) (param $2 i32) (result i32)
 ;; SHRINK-NEXT:  (call $self_op
 ;; SHRINK-NEXT:   (call $self_op
@@ -4708,6 +4713,302 @@
 ;; SHRINK-NEXT:  (struct.get $Box 1
 ;; SHRINK-NEXT:   (call $box_maker
 ;; SHRINK-NEXT:    (local.get $0)
+;; SHRINK-NEXT:   )
+;; SHRINK-NEXT:  )
+;; SHRINK-NEXT: )
+(module
+  ;; CHECK:      (type $Rec (struct (field i32) (field i32)))
+  ;; SHRINK:      (type $Rec (struct (field i32) (field i32)))
+  (type $Rec (struct (field i32) (field i32)))
+
+  ;; CHECK:      (type $1 (func (param (ref null $Rec) i32) (result i32)))
+
+  ;; CHECK:      (type $2 (func (param i32 i32) (result i32)))
+
+  ;; CHECK:      (type $3 (func (param (ref null $Rec) (ref null $Rec) i32) (result i32)))
+
+  ;; CHECK:      (export "caller_v4" (func $caller_v4))
+
+  ;; CHECK:      (func $sink_param_unary (type $1) (param $x (ref null $Rec)) (param $y i32) (result i32)
+  ;; CHECK-NEXT:  (i32.sub
+  ;; CHECK-NEXT:   (struct.get $Rec 1
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.get $y)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (type $1 (func (param (ref null $Rec) i32) (result i32)))
+
+  ;; SHRINK:      (type $2 (func (param i32 i32) (result i32)))
+
+  ;; SHRINK:      (type $3 (func (param (ref null $Rec) (ref null $Rec) i32) (result i32)))
+
+  ;; SHRINK:      (type $4 (func (param i32 (ref null $Rec)) (result i32)))
+
+  ;; SHRINK:      (export "caller_v4" (func $caller_v4))
+
+  ;; SHRINK:      (func $sink_param_unary (type $1) (param $x (ref null $Rec)) (param $y i32) (result i32)
+  ;; SHRINK-NEXT:  (i32.sub
+  ;; SHRINK-NEXT:   (struct.get $Rec 1
+  ;; SHRINK-NEXT:    (local.get $x)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (local.get $y)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $sink_param_unary (param $x i32) (param $y i32) (result i32)
+    (i32.sub (local.get $x) (local.get $y))
+  )
+
+  ;; CHECK:      (func $pu_target (type $2) (param $x i32) (param $y i32) (result i32)
+  ;; CHECK-NEXT:  (i32.mul
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (local.get $y)
+  ;; CHECK-NEXT:    (i32.const 3)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $pu_target (type $2) (param $x i32) (param $y i32) (result i32)
+  ;; SHRINK-NEXT:  (i32.mul
+  ;; SHRINK-NEXT:   (local.get $x)
+  ;; SHRINK-NEXT:   (i32.add
+  ;; SHRINK-NEXT:    (local.get $y)
+  ;; SHRINK-NEXT:    (i32.const 3)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $pu_target (param $x i32) (param $y i32) (result i32)
+    (i32.mul (local.get $x) (i32.add (local.get $y) (i32.const 3)))
+  )
+
+  ;; CHECK:      (func $existing_pu_helper (type $1) (param $r (ref null $Rec)) (param $y i32) (result i32)
+  ;; CHECK-NEXT:  (call $pu_target
+  ;; CHECK-NEXT:   (struct.get $Rec 0
+  ;; CHECK-NEXT:    (local.get $r)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.get $y)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $existing_pu_helper (type $1) (param $r (ref null $Rec)) (param $y i32) (result i32)
+  ;; SHRINK-NEXT:  (call $pu_target
+  ;; SHRINK-NEXT:   (struct.get $Rec 0
+  ;; SHRINK-NEXT:    (local.get $r)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (local.get $y)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $existing_pu_helper (param $r (ref null $Rec)) (param $y i32) (result i32)
+    (call $pu_target (struct.get $Rec 0 (local.get $r)) (local.get $y))
+  )
+
+  ;; CHECK:      (func $caller_v4 (type $3) (param $r1 (ref null $Rec)) (param $r2 (ref null $Rec)) (param $a i32) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (call $sink_param_unary
+  ;; CHECK-NEXT:     (local.get $r1)
+  ;; CHECK-NEXT:     (i32.eqz
+  ;; CHECK-NEXT:      (local.get $a)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (call $sink_param_unary
+  ;; CHECK-NEXT:     (local.get $r2)
+  ;; CHECK-NEXT:     (i32.clz
+  ;; CHECK-NEXT:      (local.get $a)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (call $existing_pu_helper
+  ;; CHECK-NEXT:      (local.get $r1)
+  ;; CHECK-NEXT:      (i32.ctz
+  ;; CHECK-NEXT:       (local.get $a)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (call $existing_pu_helper
+  ;; CHECK-NEXT:      (local.get $r2)
+  ;; CHECK-NEXT:      (i32.popcnt
+  ;; CHECK-NEXT:       (local.get $a)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (call $pu_target
+  ;; CHECK-NEXT:      (i32.eqz
+  ;; CHECK-NEXT:       (local.get $a)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (struct.get $Rec 1
+  ;; CHECK-NEXT:       (local.get $r1)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.add
+  ;; CHECK-NEXT:      (call $pu_target
+  ;; CHECK-NEXT:       (i32.clz
+  ;; CHECK-NEXT:        (local.get $a)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:       (struct.get $Rec 1
+  ;; CHECK-NEXT:        (local.get $r2)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (i32.add
+  ;; CHECK-NEXT:       (call $pu_target
+  ;; CHECK-NEXT:        (i32.ctz
+  ;; CHECK-NEXT:         (local.get $a)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:        (struct.get $Rec 1
+  ;; CHECK-NEXT:         (local.get $r1)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:       (i32.add
+  ;; CHECK-NEXT:        (call $pu_target
+  ;; CHECK-NEXT:         (i32.popcnt
+  ;; CHECK-NEXT:          (local.get $a)
+  ;; CHECK-NEXT:         )
+  ;; CHECK-NEXT:         (struct.get $Rec 1
+  ;; CHECK-NEXT:          (local.get $r2)
+  ;; CHECK-NEXT:         )
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:        (i32.add
+  ;; CHECK-NEXT:         (call $pu_target
+  ;; CHECK-NEXT:          (local.get $a)
+  ;; CHECK-NEXT:          (struct.get $Rec 1
+  ;; CHECK-NEXT:           (local.get $r1)
+  ;; CHECK-NEXT:          )
+  ;; CHECK-NEXT:         )
+  ;; CHECK-NEXT:         (call $pu_target
+  ;; CHECK-NEXT:          (i32.eqz
+  ;; CHECK-NEXT:           (local.get $a)
+  ;; CHECK-NEXT:          )
+  ;; CHECK-NEXT:          (struct.get $Rec 1
+  ;; CHECK-NEXT:           (local.get $r2)
+  ;; CHECK-NEXT:          )
+  ;; CHECK-NEXT:         )
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $caller_v4 (type $3) (param $r1 (ref null $Rec)) (param $r2 (ref null $Rec)) (param $a i32) (result i32)
+  ;; SHRINK-NEXT:  (i32.add
+  ;; SHRINK-NEXT:   (i32.add
+  ;; SHRINK-NEXT:    (call $sink_param_unary
+  ;; SHRINK-NEXT:     (local.get $r1)
+  ;; SHRINK-NEXT:     (i32.eqz
+  ;; SHRINK-NEXT:      (local.get $a)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (call $sink_param_unary
+  ;; SHRINK-NEXT:     (local.get $r2)
+  ;; SHRINK-NEXT:     (i32.clz
+  ;; SHRINK-NEXT:      (local.get $a)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (i32.add
+  ;; SHRINK-NEXT:    (i32.add
+  ;; SHRINK-NEXT:     (call $existing_pu_helper
+  ;; SHRINK-NEXT:      (local.get $r1)
+  ;; SHRINK-NEXT:      (i32.ctz
+  ;; SHRINK-NEXT:       (local.get $a)
+  ;; SHRINK-NEXT:      )
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:     (call $existing_pu_helper
+  ;; SHRINK-NEXT:      (local.get $r2)
+  ;; SHRINK-NEXT:      (i32.popcnt
+  ;; SHRINK-NEXT:       (local.get $a)
+  ;; SHRINK-NEXT:      )
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (i32.add
+  ;; SHRINK-NEXT:     (call $outlined_pu
+  ;; SHRINK-NEXT:      (i32.eqz
+  ;; SHRINK-NEXT:       (local.get $a)
+  ;; SHRINK-NEXT:      )
+  ;; SHRINK-NEXT:      (local.get $r1)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:     (i32.add
+  ;; SHRINK-NEXT:      (call $outlined_pu
+  ;; SHRINK-NEXT:       (i32.clz
+  ;; SHRINK-NEXT:        (local.get $a)
+  ;; SHRINK-NEXT:       )
+  ;; SHRINK-NEXT:       (local.get $r2)
+  ;; SHRINK-NEXT:      )
+  ;; SHRINK-NEXT:      (i32.add
+  ;; SHRINK-NEXT:       (call $outlined_pu
+  ;; SHRINK-NEXT:        (i32.ctz
+  ;; SHRINK-NEXT:         (local.get $a)
+  ;; SHRINK-NEXT:        )
+  ;; SHRINK-NEXT:        (local.get $r1)
+  ;; SHRINK-NEXT:       )
+  ;; SHRINK-NEXT:       (i32.add
+  ;; SHRINK-NEXT:        (call $outlined_pu
+  ;; SHRINK-NEXT:         (i32.popcnt
+  ;; SHRINK-NEXT:          (local.get $a)
+  ;; SHRINK-NEXT:         )
+  ;; SHRINK-NEXT:         (local.get $r2)
+  ;; SHRINK-NEXT:        )
+  ;; SHRINK-NEXT:        (i32.add
+  ;; SHRINK-NEXT:         (call $outlined_pu
+  ;; SHRINK-NEXT:          (local.get $a)
+  ;; SHRINK-NEXT:          (local.get $r1)
+  ;; SHRINK-NEXT:         )
+  ;; SHRINK-NEXT:         (call $outlined_pu
+  ;; SHRINK-NEXT:          (i32.eqz
+  ;; SHRINK-NEXT:           (local.get $a)
+  ;; SHRINK-NEXT:          )
+  ;; SHRINK-NEXT:          (local.get $r2)
+  ;; SHRINK-NEXT:         )
+  ;; SHRINK-NEXT:        )
+  ;; SHRINK-NEXT:       )
+  ;; SHRINK-NEXT:      )
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $caller_v4 (export "caller_v4") (param $r1 (ref null $Rec)) (param $r2 (ref null $Rec)) (param $a i32) (result i32)
+    (i32.add
+      ;; Part A-Unary: 100% of calls to $sink_param_unary pass (struct.get $Rec 1 ...) at param 0.
+      (i32.add
+        (call $sink_param_unary (struct.get $Rec 1 (local.get $r1)) (i32.eqz (local.get $a)))
+        (call $sink_param_unary (struct.get $Rec 1 (local.get $r2)) (i32.clz (local.get $a)))
+      )
+      (i32.add
+        ;; Step 1B-Unary: reuses $existing_pu_helper for (struct.get $Rec 0 ...) at param 0.
+        (i32.add
+          (call $pu_target (struct.get $Rec 0 (local.get $r1)) (i32.ctz (local.get $a)))
+          (call $pu_target (struct.get $Rec 0 (local.get $r2)) (i32.popcnt (local.get $a)))
+        )
+        ;; Part B-Unary: 6 calls to $pu_target passing (struct.get $Rec 1 ...) at param 1.
+        (i32.add
+          (call $pu_target (i32.eqz (local.get $a)) (struct.get $Rec 1 (local.get $r1)))
+          (i32.add
+            (call $pu_target (i32.clz (local.get $a)) (struct.get $Rec 1 (local.get $r2)))
+            (i32.add
+              (call $pu_target (i32.ctz (local.get $a)) (struct.get $Rec 1 (local.get $r1)))
+              (i32.add
+                (call $pu_target (i32.popcnt (local.get $a)) (struct.get $Rec 1 (local.get $r2)))
+                (i32.add
+                  (call $pu_target (local.get $a) (struct.get $Rec 1 (local.get $r1)))
+                  (call $pu_target (i32.eqz (local.get $a)) (struct.get $Rec 1 (local.get $r2)))
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+;; SHRINK:      (func $outlined_pu (type $4) (param $0 i32) (param $1 (ref null $Rec)) (result i32)
+;; SHRINK-NEXT:  (call $pu_target
+;; SHRINK-NEXT:   (local.get $0)
+;; SHRINK-NEXT:   (struct.get $Rec 1
+;; SHRINK-NEXT:    (local.get $1)
 ;; SHRINK-NEXT:   )
 ;; SHRINK-NEXT:  )
 ;; SHRINK-NEXT: )
