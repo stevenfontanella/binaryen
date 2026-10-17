@@ -47,8 +47,8 @@ struct RoundTrip : public Pass {
     bool preserveTypeOrder = !module->typeIndices.empty();
 
     // Preserve OutlineExpressions multi-write scratch global names (oe$out_*)
-    // across binary roundtripping so subsequent OutlineExpressions runs reuse
-    // them and recognize scratch-global read/write guards.
+    // and DeferGlobalAllocations PAL helper function names (defer$pal$*)
+    // across binary roundtripping so subsequent runs reuse them.
     Index numImportedGlobals = 0;
     ModuleUtils::iterImportedGlobals(
       *module, [&](Global* g) { numImportedGlobals += g->type.size(); });
@@ -60,6 +60,18 @@ struct RoundTrip : public Pass {
                                          g->name);
       }
       definedGlobalIdx += g->type.size();
+    });
+
+    Index numImportedFuncs = 0;
+    ModuleUtils::iterImportedFunctions(*module,
+                                       [&](Function*) { numImportedFuncs++; });
+    std::vector<std::pair<Index, Name>> savedPalFuncs;
+    Index definedFuncIdx = 0;
+    ModuleUtils::iterDefinedFunctions(*module, [&](Function* f) {
+      if (f->name.startsWith("defer$pal$")) {
+        savedPalFuncs.emplace_back(numImportedFuncs + definedFuncIdx, f->name);
+      }
+      definedFuncIdx++;
     });
 
     // Write, clear, and read the module
@@ -117,6 +129,22 @@ struct RoundTrip : public Pass {
             }
           }
         }
+      }
+    }
+
+    if (!savedPalFuncs.empty()) {
+      std::map<Name, Name> funcRenameMap;
+      for (auto& [idx, oldName] : savedPalFuncs) {
+        if (idx < module->functions.size() &&
+            !module->getFunctionOrNull(oldName)) {
+          Name currName = module->functions[idx]->name;
+          if (currName != oldName) {
+            funcRenameMap[currName] = oldName;
+          }
+        }
+      }
+      if (!funcRenameMap.empty()) {
+        ModuleUtils::renameFunctions(*module, funcRenameMap);
       }
     }
   }

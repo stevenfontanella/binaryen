@@ -56,4 +56,13 @@
   (global.set $oe$out_i32_1 (local.get $x))
   (global.get $oe$out_i32_1)
  )
+
+ ;; CHECK:      (func $defer$pal$helper (type $1) (param $x i32) (result i32)
+ ;; CHECK-NEXT:  (call $defer$pal$helper
+ ;; CHECK-NEXT:   (local.get $x)
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT: )
+ (func $defer$pal$helper (param $x i32) (result i32)
+  (call $defer$pal$helper (local.get $x))
+ )
 )

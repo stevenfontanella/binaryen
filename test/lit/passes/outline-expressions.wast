@@ -2545,11 +2545,11 @@
 ;; CHECK-NEXT:    )
 ;; CHECK-NEXT:   )
 ;; CHECK-NEXT:  )
-;; CHECK-NEXT:  (global.set $oe$out_i32_1
-;; CHECK-NEXT:   (local.get $1)
-;; CHECK-NEXT:  )
 ;; CHECK-NEXT:  (global.set $oe$out_i32_2
 ;; CHECK-NEXT:   (local.get $2)
+;; CHECK-NEXT:  )
+;; CHECK-NEXT:  (global.set $oe$out_i32_1
+;; CHECK-NEXT:   (local.get $1)
 ;; CHECK-NEXT:  )
 ;; CHECK-NEXT:  (local.get $3)
 ;; CHECK-NEXT: )
@@ -2587,11 +2587,11 @@
 ;; SHRINK-NEXT:    )
 ;; SHRINK-NEXT:   )
 ;; SHRINK-NEXT:  )
-;; SHRINK-NEXT:  (global.set $oe$out_i32_1
-;; SHRINK-NEXT:   (local.get $1)
-;; SHRINK-NEXT:  )
 ;; SHRINK-NEXT:  (global.set $oe$out_i32_2
 ;; SHRINK-NEXT:   (local.get $2)
+;; SHRINK-NEXT:  )
+;; SHRINK-NEXT:  (global.set $oe$out_i32_1
+;; SHRINK-NEXT:   (local.get $1)
 ;; SHRINK-NEXT:  )
 ;; SHRINK-NEXT:  (local.get $3)
 ;; SHRINK-NEXT: )
@@ -5649,6 +5649,15 @@
   ;; CHECK-NEXT:    (i32.const 2)
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $a
+  ;; CHECK-NEXT:   (call $use2
+  ;; CHECK-NEXT:    (local.get $b)
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (local.get $a)
+  ;; CHECK-NEXT:     (i32.const 3)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
   ;; CHECK-NEXT:  (call $use2
   ;; CHECK-NEXT:   (local.get $a)
   ;; CHECK-NEXT:   (local.get $b)
@@ -5690,6 +5699,15 @@
   ;; SHRINK-NEXT:    (i32.const 2)
   ;; SHRINK-NEXT:   )
   ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (local.set $a
+  ;; SHRINK-NEXT:   (call $use2
+  ;; SHRINK-NEXT:    (local.get $b)
+  ;; SHRINK-NEXT:    (i32.add
+  ;; SHRINK-NEXT:     (local.get $a)
+  ;; SHRINK-NEXT:     (i32.const 3)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
   ;; SHRINK-NEXT:  (call $use2
   ;; SHRINK-NEXT:   (local.get $a)
   ;; SHRINK-NEXT:   (local.get $b)
@@ -5723,6 +5741,9 @@
         (local.get $scratch)
       )
     )
+    ;; Sunk global.get $oe$out_i32_1 inside a subsequent Call statement.
+    (global.set $oe$out_i32_1 (i32.add (local.get $a) (i32.const 3)))
+    (local.set $a (call $use2 (local.get $b) (global.get $oe$out_i32_1)))
     (call $use2 (local.get $a) (local.get $b))
   )
 

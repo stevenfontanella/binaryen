@@ -3047,9 +3047,6 @@ private:
           continue;
         }
         Name commonTarget = targets[0];
-        if (!commonTarget.startsWith("defer$pal$")) {
-          continue;
-        }
         bool sameTarget = true;
         for (Name t : targets) {
           if (t != commonTarget) {
@@ -3061,12 +3058,67 @@ private:
           continue;
         }
         auto* helperFn = module->getFunctionOrNull(commonTarget);
-        if (!helperFn || helperFn->imported()) {
+        if (!helperFn || helperFn->imported() || !helperFn->body) {
           continue;
         }
+        if (!commonTarget.startsWith("defer$pal$")) {
+          if (helperFn->getNumParams() != 2 || helperFn->getNumVars() != 1 ||
+              !helperFn->getResults().isRef() ||
+              helperFn->getResults().getHeapType() != structHt ||
+              FindAll<BrOn>(helperFn->body).list.size() != 1 ||
+              FindAll<ArrayGet>(helperFn->body).list.size() != 1 ||
+              FindAll<ArraySet>(helperFn->body).list.size() != 1) {
+            continue;
+          }
+        }
         FindAll<StructNew> sns(helperFn->body);
-        if (sns.list.size() != 1 || !sns.list[0]->type.isRef() ||
-            sns.list[0]->type.getHeapType() != structHt) {
+        if (sns.list.size() == 1 && sns.list[0]->type.isRef() &&
+            sns.list[0]->type.getHeapType() == structHt) {
+          existingTempl = sns.list[0];
+        } else if (sns.list.empty()) {
+          FindAll<Call> calls(helperFn->body);
+          if (calls.list.size() == 1) {
+            Call* c = calls.list[0];
+            auto* callee = module->getFunctionOrNull(c->target);
+            if (callee && !callee->imported() && callee->body) {
+              Expression* cBody = callee->body;
+              while (auto* b = cBody->dynCast<Block>()) {
+                if (b->list.size() == 1) {
+                  cBody = b->list[0];
+                } else {
+                  break;
+                }
+              }
+              if (auto* cSn = cBody->dynCast<StructNew>();
+                  cSn && !cSn->desc && cSn->type.isRef() &&
+                  cSn->type.getHeapType() == structHt &&
+                  cSn->operands.size() == structHt.getStruct().fields.size()) {
+                auto* synthSn =
+                  ExpressionManipulator::copy(cSn, *module)->cast<StructNew>();
+                bool ok = true;
+                for (auto*& op : synthSn->operands) {
+                  if (auto* lg = op->dynCast<LocalGet>()) {
+                    if (lg->index < c->operands.size() &&
+                        isValidLeaf(c->operands[lg->index])) {
+                      op = ExpressionManipulator::copy(c->operands[lg->index],
+                                                       *module);
+                    } else {
+                      ok = false;
+                      break;
+                    }
+                  } else if (!isValidLeaf(op)) {
+                    ok = false;
+                    break;
+                  }
+                }
+                if (ok) {
+                  existingTempl = synthSn;
+                }
+              }
+            }
+          }
+        }
+        if (!existingTempl) {
           continue;
         }
         bool validVals = true;
@@ -3080,7 +3132,6 @@ private:
           continue;
         }
         existingHelper = commonTarget;
-        existingTempl = sns.list[0];
         existingPalHelpers[structHt] = {existingHelper, existingTempl};
       } else {
         continue;
@@ -3270,11 +3321,16 @@ private:
         auto* anf = arrG->init->cast<ArrayNewFixed>();
         anf->type = Type(mutArrHt, NonNullable, Exact);
         anf->finalize();
+        Type helperRes = module->getFunction(helperName)->getResults();
         for (auto& [fn, site] : arrayGetSites[arrG->name]) {
           auto* ag = (*site)->cast<ArrayGet>();
           ag->ref->cast<GlobalGet>()->type = mutArrRefType;
-          *site = builder.makeCall(
-            helperName, {ag->ref, ag->index}, nonNullStructType);
+          Expression* call =
+            builder.makeCall(helperName, {ag->ref, ag->index}, helperRes);
+          if (helperRes.isNullable()) {
+            call = builder.makeRefAs(RefAsNonNull, call);
+          }
+          *site = call;
           refinalizeFuncs.insert(fn);
         }
       }

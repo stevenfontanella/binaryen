@@ -1558,11 +1558,13 @@ struct OutlineExpressions : public Pass {
       getPassOptions().shrinkLevel > 0 && getPassOptions().trapsNeverHappen;
 
     recoverStrippedScratchGlobals();
-    propagateScratchGlobalEffects();
     cleanupInlinedScratchGlobals();
-    coalesceScratchGlobals();
-    populateScratchGlobals();
     propagateScratchGlobalEffects();
+    bool coalesced = coalesceScratchGlobals();
+    populateScratchGlobals();
+    if (coalesced) {
+      propagateScratchGlobalEffects();
+    }
 
     auto mode = getMode();
     bool enableUnCseTees =
@@ -1712,6 +1714,16 @@ struct OutlineExpressions : public Pass {
       while (true) {
         if (auto* gs = block->list[idx]->dynCast<GlobalSet>();
             gs && candidates.count(gs->name)) {
+          bool selfRead = false;
+          for (auto* gg : FindAll<GlobalGet>(gs->value).list) {
+            if (gg->name == gs->name) {
+              selfRead = true;
+              break;
+            }
+          }
+          if (selfRead) {
+            break;
+          }
           written.push_back(gs->name);
           if (idx == 0) {
             break;
@@ -1735,6 +1747,7 @@ struct OutlineExpressions : public Pass {
       if (f->imported() || !f->body) {
         continue;
       }
+      bool funcHasCandGet = false;
       for (auto* gs : FindAll<GlobalSet>(f->body).list) {
         if (candidates.count(gs->name)) {
           totalSets[gs->name]++;
@@ -1743,7 +1756,11 @@ struct OutlineExpressions : public Pass {
       for (auto* gg : FindAll<GlobalGet>(f->body).list) {
         if (candidates.count(gg->name)) {
           totalGets[gg->name]++;
+          funcHasCandGet = true;
         }
+      }
+      if (!funcHasCandGet) {
+        continue;
       }
       for (auto* block : FindAll<Block>(f->body).list) {
         for (Index i = 0; i < block->list.size(); i++) {
@@ -1751,39 +1768,39 @@ struct OutlineExpressions : public Pass {
           Call* call = stmt->dynCast<Call>();
           if (auto* lset = stmt->dynCast<LocalSet>()) {
             call = lset->value->dynCast<Call>();
+          } else if (auto* drop = stmt->dynCast<Drop>()) {
+            call = drop->value->dynCast<Call>();
           }
           if (call) {
             if (auto it = tailWrittenByFunc.find(call->target);
                 it != tailWrittenByFunc.end()) {
               for (Index j = i + 1; j < block->list.size() && j <= i + 6; j++) {
-                if (auto* nextSet = block->list[j]->dynCast<LocalSet>()) {
-                  for (auto* gg : FindAll<GlobalGet>(nextSet->value).list) {
-                    if (std::find(it->second.begin(),
-                                  it->second.end(),
-                                  gg->name) != it->second.end()) {
-                      recovered.insert(gg->name);
-                    }
+                Expression* nextStmt = block->list[j];
+                if (nextStmt->is<Block>() || nextStmt->is<Loop>() ||
+                    nextStmt->is<Try>()) {
+                  break;
+                }
+                Expression* scanRoot = nextStmt;
+                if (auto* iff = nextStmt->dynCast<If>()) {
+                  scanRoot = iff->condition;
+                }
+                for (auto* gg : FindAll<GlobalGet>(scanRoot).list) {
+                  if (std::find(it->second.begin(),
+                                it->second.end(),
+                                gg->name) != it->second.end()) {
+                    recovered.insert(gg->name);
                   }
-                } else {
+                }
+                if (nextStmt->is<If>()) {
                   break;
                 }
               }
             }
           }
-          SmallVector<GlobalSet*, 2> stmtCandSets;
           if (auto* gs = stmt->dynCast<GlobalSet>();
               gs && candidates.count(gs->name)) {
-            stmtCandSets.push_back(gs);
-          } else if (stmt->is<LocalSet>() || stmt->is<Block>()) {
-            for (auto* gs : FindAll<GlobalSet>(stmt).list) {
-              if (candidates.count(gs->name)) {
-                stmtCandSets.push_back(gs);
-              }
-            }
-          }
-          for (auto* gs : stmtCandSets) {
             bool selfRead = false;
-            for (auto* gg : FindAll<GlobalGet>(stmt).list) {
+            for (auto* gg : FindAll<GlobalGet>(gs->value).list) {
               if (gg->name == gs->name) {
                 selfRead = true;
                 break;
@@ -1791,18 +1808,27 @@ struct OutlineExpressions : public Pass {
             }
             if (!selfRead) {
               for (Index j = i + 1; j < block->list.size() && j <= i + 5; j++) {
-                if (auto* nextSet = block->list[j]->dynCast<LocalSet>();
-                    nextSet && !nextSet->isTee()) {
-                  Index getCount = 0;
-                  for (auto* gg : FindAll<GlobalGet>(nextSet->value).list) {
-                    if (gg->name == gs->name) {
-                      getCount++;
-                    }
+                Expression* nextStmt = block->list[j];
+                if (nextStmt->is<Block>() || nextStmt->is<Loop>() ||
+                    nextStmt->is<Try>()) {
+                  break;
+                }
+                Expression* scanRoot = nextStmt;
+                if (auto* iff = nextStmt->dynCast<If>()) {
+                  scanRoot = iff->condition;
+                }
+                Index getCount = 0;
+                for (auto* gg : FindAll<GlobalGet>(scanRoot).list) {
+                  if (gg->name == gs->name) {
+                    getCount++;
                   }
-                  if (getCount == 1) {
-                    matchedInlinedPairs[gs->name]++;
-                    break;
-                  }
+                }
+                if (getCount == 1) {
+                  matchedInlinedPairs[gs->name]++;
+                  break;
+                }
+                if (nextStmt->is<If>()) {
+                  break;
                 }
               }
             }
@@ -1838,7 +1864,85 @@ struct OutlineExpressions : public Pass {
     renameGlobalsInModule(renameMap);
   }
 
-  void coalesceScratchGlobals() {
+  static bool exprHasCall(Expression* e) {
+    return !FindAll<Call>(e).list.empty() ||
+           !FindAll<CallRef>(e).list.empty() ||
+           !FindAll<CallIndirect>(e).list.empty();
+  }
+
+  static bool isReadBeforeAnyCall(Expression* curr, GlobalGet* targetGet) {
+    if (curr == targetGet || !exprHasCall(curr)) {
+      return true;
+    }
+    if (auto* lset = curr->dynCast<LocalSet>()) {
+      return isReadBeforeAnyCall(lset->value, targetGet);
+    }
+    if (auto* gset = curr->dynCast<GlobalSet>()) {
+      return isReadBeforeAnyCall(gset->value, targetGet);
+    }
+    if (auto* u = curr->dynCast<Unary>()) {
+      return isReadBeforeAnyCall(u->value, targetGet);
+    }
+    if (auto* rc = curr->dynCast<RefCast>()) {
+      return !rc->desc && isReadBeforeAnyCall(rc->ref, targetGet);
+    }
+    if (auto* ra = curr->dynCast<RefAs>()) {
+      return isReadBeforeAnyCall(ra->value, targetGet);
+    }
+    if (auto* rt = curr->dynCast<RefTest>()) {
+      return isReadBeforeAnyCall(rt->ref, targetGet);
+    }
+    if (auto* sg = curr->dynCast<StructGet>()) {
+      return isReadBeforeAnyCall(sg->ref, targetGet);
+    }
+    if (auto* iff = curr->dynCast<If>()) {
+      for (auto* gg : FindAll<GlobalGet>(iff->condition).list) {
+        if (gg == targetGet) {
+          return isReadBeforeAnyCall(iff->condition, targetGet);
+        }
+      }
+      return false;
+    }
+    if (auto* brk = curr->dynCast<Break>()) {
+      if (!brk->value && brk->condition) {
+        return isReadBeforeAnyCall(brk->condition, targetGet);
+      }
+      return false;
+    }
+    if (auto* drop = curr->dynCast<Drop>()) {
+      return isReadBeforeAnyCall(drop->value, targetGet);
+    }
+    if (auto* ret = curr->dynCast<Return>()) {
+      return ret->value && isReadBeforeAnyCall(ret->value, targetGet);
+    }
+    if (auto* bin = curr->dynCast<Binary>()) {
+      for (auto* gg : FindAll<GlobalGet>(bin->left).list) {
+        if (gg == targetGet) {
+          return isReadBeforeAnyCall(bin->left, targetGet);
+        }
+      }
+      if (exprHasCall(bin->left)) {
+        return false;
+      }
+      return isReadBeforeAnyCall(bin->right, targetGet);
+    }
+    if (auto* call = curr->dynCast<Call>()) {
+      for (auto* op : call->operands) {
+        for (auto* gg : FindAll<GlobalGet>(op).list) {
+          if (gg == targetGet) {
+            return isReadBeforeAnyCall(op, targetGet);
+          }
+        }
+        if (exprHasCall(op)) {
+          return false;
+        }
+      }
+      return false;
+    }
+    return false;
+  }
+
+  bool coalesceScratchGlobals() {
     std::unordered_map<Type, SmallVector<Name, 4>> byType;
     std::unordered_set<Name> allScratch;
     for (auto& g : wasm->globals) {
@@ -1855,12 +1959,14 @@ struct OutlineExpressions : public Pass {
       }
     }
     if (!hasDuplicateType) {
-      return;
+      return false;
     }
 
     struct FuncScratchSummary {
       SmallVector<Name, 4> touched;
+      SmallVector<Name, 4> written;
       SmallVector<Name, 4> unclean;
+      std::vector<SmallVector<Name, 4>> postCallWindows;
     };
     ModuleUtils::ParallelFunctionAnalysis<FuncScratchSummary> scanner(
       *wasm, [&](Function* func, FuncScratchSummary& summary) {
@@ -1875,6 +1981,7 @@ struct OutlineExpressions : public Pass {
           if (allScratch.count(gs->name)) {
             if (++setCounts[gs->name] == 1) {
               summary.touched.push_back(gs->name);
+              summary.written.push_back(gs->name);
             }
           }
         }
@@ -1895,17 +2002,24 @@ struct OutlineExpressions : public Pass {
             bodyBlock && bodyBlock->list.size() >= 2 &&
             func->getResults() != Type::none) {
           Expression* retExpr = bodyBlock->list.back();
-          bool retHasCall = !FindAll<Call>(retExpr).list.empty() ||
-                            !FindAll<CallRef>(retExpr).list.empty() ||
-                            !FindAll<CallIndirect>(retExpr).list.empty();
-          if (!retHasCall) {
+          if (!exprHasCall(retExpr)) {
             for (Index k = bodyBlock->list.size() - 1; k > 0;) {
               k--;
               if (auto* gs = bodyBlock->list[k]->dynCast<GlobalSet>();
-                  gs && allScratch.count(gs->name) &&
-                  (gs->value->is<LocalGet>() || gs->value->is<Const>() ||
-                   gs->value->is<RefNull>())) {
-                cleanSets[gs->name]++;
+                  gs && allScratch.count(gs->name)) {
+                bool selfRead = false;
+                for (auto* gg : FindAll<GlobalGet>(gs->value).list) {
+                  if (gg->name == gs->name) {
+                    selfRead = true;
+                    break;
+                  }
+                }
+                if (!selfRead) {
+                  cleanSets[gs->name]++;
+                }
+                if (exprHasCall(gs->value)) {
+                  break;
+                }
               } else {
                 break;
               }
@@ -1913,22 +2027,48 @@ struct OutlineExpressions : public Pass {
           }
         }
 
+        std::unordered_set<GlobalGet*> cleanGetNodes;
         for (auto* block : FindAll<Block>(func->body).list) {
           for (Index i = 0; i < block->list.size(); i++) {
-            auto* firstSet = block->list[i]->dynCast<LocalSet>();
-            if (!firstSet || !firstSet->value->is<Call>()) {
+            Expression* stmt = block->list[i];
+            bool isCallEndStmt = stmt->is<Call>();
+            if (auto* lset = stmt->dynCast<LocalSet>()) {
+              isCallEndStmt = lset->value->is<Call>();
+            } else if (auto* drop = stmt->dynCast<Drop>()) {
+              isCallEndStmt = drop->value->is<Call>();
+            }
+            if (!isCallEndStmt) {
               continue;
             }
-            for (Index j = i + 1; j < block->list.size(); j++) {
-              if (auto* nextSet = block->list[j]->dynCast<LocalSet>();
-                  nextSet && !nextSet->isTee()) {
-                if (auto* gg = nextSet->value->dynCast<GlobalGet>();
-                    gg && allScratch.count(gg->name)) {
-                  cleanGets[gg->name]++;
-                  continue;
+            SmallVector<Name, 4> windowGets;
+            for (Index j = i + 1; j < block->list.size() && j <= i + 6; j++) {
+              Expression* nextStmt = block->list[j];
+              if (nextStmt->is<Block>() || nextStmt->is<Loop>() ||
+                  nextStmt->is<Try>()) {
+                break;
+              }
+              Expression* scanRoot = nextStmt;
+              if (auto* iff = nextStmt->dynCast<If>()) {
+                scanRoot = iff->condition;
+              }
+              for (auto* gg : FindAll<GlobalGet>(scanRoot).list) {
+                if (allScratch.count(gg->name) &&
+                    isReadBeforeAnyCall(scanRoot, gg) &&
+                    std::find(windowGets.begin(),
+                              windowGets.end(),
+                              gg->name) == windowGets.end()) {
+                  if (cleanGetNodes.insert(gg).second) {
+                    cleanGets[gg->name]++;
+                  }
+                  windowGets.push_back(gg->name);
                 }
               }
-              break;
+              if (nextStmt->is<If>() || exprHasCall(scanRoot)) {
+                break;
+              }
+            }
+            if (windowGets.size() >= 2) {
+              summary.postCallWindows.push_back(std::move(windowGets));
             }
           }
         }
@@ -1942,10 +2082,14 @@ struct OutlineExpressions : public Pass {
       });
 
     std::unordered_map<Name, std::unordered_set<Function*>> funcsTouching;
+    std::unordered_map<Name, std::unordered_set<Function*>> funcsWriting;
     std::unordered_set<Name> uncleanGlobals;
     for (auto& [func, summary] : scanner.map) {
       for (Name gName : summary.touched) {
         funcsTouching[gName].insert(func);
+      }
+      for (Name gName : summary.written) {
+        funcsWriting[gName].insert(func);
       }
       for (Name gName : summary.unclean) {
         uncleanGlobals.insert(gName);
@@ -1964,22 +2108,62 @@ struct OutlineExpressions : public Pass {
         }
         for (Index t = 0; t < r; t++) {
           Name gTarget = vec[t];
-          if (renameMap.count(gTarget) || uncleanGlobals.count(gTarget)) {
+          if (renameMap.count(gTarget)) {
             continue;
           }
-          bool disjoint = true;
+          bool targetClean = !uncleanGlobals.count(gTarget);
+          bool canCoalesce = true;
           for (Function* f : funcsTouching[gCand]) {
             if (funcsTouching[gTarget].count(f)) {
-              disjoint = false;
-              break;
+              if (!targetClean || funcsWriting[gCand].count(f) ||
+                  funcsWriting[gTarget].count(f)) {
+                canCoalesce = false;
+                break;
+              }
+              const auto& winList = scanner.map[f].postCallWindows;
+              for (const auto& win : winList) {
+                if (std::find(win.begin(), win.end(), gCand) != win.end() &&
+                    std::find(win.begin(), win.end(), gTarget) != win.end()) {
+                  canCoalesce = false;
+                  break;
+                }
+              }
+              if (!canCoalesce) {
+                break;
+              }
             }
           }
-          if (disjoint) {
+          if (canCoalesce && !targetClean) {
+            if (!hasModuleEffects) {
+              canCoalesce = false;
+            } else {
+              for (Function* f : funcsTouching[gTarget]) {
+                if (!f->effects ||
+                    f->effects->globalsWritten.count(gCand) ||
+                    f->effects->mutableGlobalsRead.count(gCand)) {
+                  canCoalesce = false;
+                  break;
+                }
+              }
+            }
+          }
+          if (canCoalesce) {
             renameMap[gCand] = gTarget;
             for (Function* f : funcsTouching[gCand]) {
               funcsTouching[gTarget].insert(f);
+              for (auto& win : scanner.map[f].postCallWindows) {
+                for (Name& wn : win) {
+                  if (wn == gCand) {
+                    wn = gTarget;
+                  }
+                }
+              }
+            }
+            for (Function* f : funcsWriting[gCand]) {
+              funcsWriting[gTarget].insert(f);
             }
             funcsTouching[gCand].clear();
+            funcsWriting[gCand].clear();
             break;
           }
         }
@@ -1988,7 +2172,9 @@ struct OutlineExpressions : public Pass {
 
     if (!renameMap.empty()) {
       renameGlobalsInModule(renameMap);
+      return true;
     }
+    return false;
   }
 
   void populateScratchGlobals() {
@@ -2056,53 +2242,91 @@ struct OutlineExpressions : public Pass {
     return false;
   }
 
-  bool replaceSingleScratchGetAlongSpine(Expression** currp,
-                                         GlobalGet* targetGet,
-                                         Expression* replacement,
-                                         SmallVector<Index, 4>& preReadLocals) {
+  Expression**
+  findSingleScratchGetSlotAlongSpine(Expression** currp,
+                                     GlobalGet* targetGet,
+                                     SmallVector<Index, 4>& preReadLocals) {
     Expression* curr = *currp;
     if (curr == targetGet) {
-      *currp = replacement;
-      return true;
+      return currp;
     }
     if (auto* lset = curr->dynCast<LocalSet>()) {
-      if (lset->isTee()) {
-        return false;
-      }
-      return replaceSingleScratchGetAlongSpine(
-        &lset->value, targetGet, replacement, preReadLocals);
+      return findSingleScratchGetSlotAlongSpine(
+        &lset->value, targetGet, preReadLocals);
+    }
+    if (auto* gset = curr->dynCast<GlobalSet>()) {
+      return findSingleScratchGetSlotAlongSpine(
+        &gset->value, targetGet, preReadLocals);
     }
     if (auto* u = curr->dynCast<Unary>()) {
-      return replaceSingleScratchGetAlongSpine(
-        &u->value, targetGet, replacement, preReadLocals);
+      return findSingleScratchGetSlotAlongSpine(
+        &u->value, targetGet, preReadLocals);
+    }
+    if (auto* rin = curr->dynCast<RefIsNull>()) {
+      return findSingleScratchGetSlotAlongSpine(
+        &rin->value, targetGet, preReadLocals);
+    }
+    if (auto* rt = curr->dynCast<RefTest>()) {
+      return findSingleScratchGetSlotAlongSpine(
+        &rt->ref, targetGet, preReadLocals);
     }
     if (auto* rc = curr->dynCast<RefCast>()) {
-      return replaceSingleScratchGetAlongSpine(
-        &rc->ref, targetGet, replacement, preReadLocals);
+      if (rc->desc) {
+        return nullptr;
+      }
+      return findSingleScratchGetSlotAlongSpine(
+        &rc->ref, targetGet, preReadLocals);
     }
     if (auto* ra = curr->dynCast<RefAs>()) {
-      return replaceSingleScratchGetAlongSpine(
-        &ra->value, targetGet, replacement, preReadLocals);
+      return findSingleScratchGetSlotAlongSpine(
+        &ra->value, targetGet, preReadLocals);
     }
     if (auto* sg = curr->dynCast<StructGet>()) {
-      return replaceSingleScratchGetAlongSpine(
-        &sg->ref, targetGet, replacement, preReadLocals);
+      return findSingleScratchGetSlotAlongSpine(
+        &sg->ref, targetGet, preReadLocals);
+    }
+    if (auto* iff = curr->dynCast<If>()) {
+      for (auto* gg : FindAll<GlobalGet>(iff->condition).list) {
+        if (gg == targetGet) {
+          return findSingleScratchGetSlotAlongSpine(
+            &iff->condition, targetGet, preReadLocals);
+        }
+      }
+      return nullptr;
+    }
+    if (auto* brk = curr->dynCast<Break>()) {
+      if (!brk->value && brk->condition) {
+        return findSingleScratchGetSlotAlongSpine(
+          &brk->condition, targetGet, preReadLocals);
+      }
+      return nullptr;
+    }
+    if (auto* drop = curr->dynCast<Drop>()) {
+      return findSingleScratchGetSlotAlongSpine(
+        &drop->value, targetGet, preReadLocals);
+    }
+    if (auto* ret = curr->dynCast<Return>()) {
+      if (ret->value) {
+        return findSingleScratchGetSlotAlongSpine(
+          &ret->value, targetGet, preReadLocals);
+      }
+      return nullptr;
     }
     if (auto* bin = curr->dynCast<Binary>()) {
       for (auto* gg : FindAll<GlobalGet>(bin->left).list) {
         if (gg == targetGet) {
-          return replaceSingleScratchGetAlongSpine(
-            &bin->left, targetGet, replacement, preReadLocals);
+          return findSingleScratchGetSlotAlongSpine(
+            &bin->left, targetGet, preReadLocals);
         }
       }
       if (!isPureEvalSpineLeaf(bin->left)) {
-        return false;
+        return nullptr;
       }
       if (auto* lg = bin->left->dynCast<LocalGet>()) {
         preReadLocals.push_back(lg->index);
       }
-      return replaceSingleScratchGetAlongSpine(
-        &bin->right, targetGet, replacement, preReadLocals);
+      return findSingleScratchGetSlotAlongSpine(
+        &bin->right, targetGet, preReadLocals);
     }
     if (auto* call = curr->dynCast<Call>()) {
       for (Index idx = 0; idx < call->operands.size(); idx++) {
@@ -2115,18 +2339,18 @@ struct OutlineExpressions : public Pass {
           }
         }
         if (hasTarget) {
-          return replaceSingleScratchGetAlongSpine(
-            &call->operands[idx], targetGet, replacement, preReadLocals);
+          return findSingleScratchGetSlotAlongSpine(
+            &call->operands[idx], targetGet, preReadLocals);
         }
         if (!isPureEvalSpineLeaf(call->operands[idx])) {
-          return false;
+          return nullptr;
         }
         if (auto* lg = call->operands[idx]->dynCast<LocalGet>()) {
           preReadLocals.push_back(lg->index);
         }
       }
     }
-    return false;
+    return nullptr;
   }
 
   void cleanupInlinedScratchGlobals() {
@@ -2146,14 +2370,6 @@ struct OutlineExpressions : public Pass {
             gg && gg->name == gs->name) {
           hasScratchOrSelfSet = true;
           break;
-        }
-      }
-      if (!hasScratchOrSelfSet) {
-        for (auto* gg : FindAll<GlobalGet>(func->body).list) {
-          if (gg->name.startsWith("oe$out_")) {
-            hasScratchOrSelfSet = true;
-            break;
-          }
         }
       }
       if (!hasScratchOrSelfSet) {
@@ -2363,10 +2579,9 @@ struct OutlineExpressions : public Pass {
 
               EffectAnalyzer effJ(parent.getPassOptions(), *parent.wasm, stmt);
               if (effJ.mutableGlobalsRead.count(gset->name)) {
-                // Check if stmt is a LocalSet into which SimplifyLocals sunk a
-                // single (global.get $oe$out).
-                if (auto* lset = stmt->dynCast<LocalSet>();
-                    lset && !lset->isTee() &&
+                // Check if stmt is an expression into which SimplifyLocals
+                // sunk a single (global.get $oe$out).
+                if (!stmt->is<Loop>() && !stmt->is<Try>() &&
                     !effJ.globalsWritten.count(gset->name)) {
                   SmallVector<GlobalGet*, 2> matchingGets;
                   for (auto* gg : FindAll<GlobalGet>(stmt).list) {
@@ -2405,11 +2620,10 @@ struct OutlineExpressions : public Pass {
                       // the spine before matchingGets[0].
                       if (effV.localsWritten.empty()) {
                         SmallVector<Index, 4> preRead;
-                        if (parent.replaceSingleScratchGetAlongSpine(
-                              &block->list[j],
-                              matchingGets[0],
-                              gset->value,
-                              preRead)) {
+                        if (Expression** slot =
+                              parent.findSingleScratchGetSlotAlongSpine(
+                                &block->list[j], matchingGets[0], preRead)) {
+                          *slot = gset->value;
                           block->list.erase(block->list.begin() + i);
                           changed = true;
                           folded = true;
@@ -2469,20 +2683,23 @@ struct OutlineExpressions : public Pass {
                         }
                         if (argsOk && innerTee) {
                           SmallVector<Index, 4> preRead;
-                          if (parent.replaceSingleScratchGetAlongSpine(
-                                &block->list[j],
-                                matchingGets[0],
-                                vCall,
-                                preRead)) {
-                            Expression* teeVal = innerTee->value;
-                            Index teeIdx = innerTee->index;
-                            vCall->operands[teeArgIdx] = builder.makeLocalGet(
-                              teeIdx, func->getLocalType(teeIdx));
-                            block->list[i] =
-                              builder.makeLocalSet(teeIdx, teeVal);
-                            changed = true;
-                            folded = true;
-                            break;
+                          if (Expression** slot =
+                                parent.findSingleScratchGetSlotAlongSpine(
+                                  &block->list[j], matchingGets[0], preRead)) {
+                            if (std::find(preRead.begin(),
+                                          preRead.end(),
+                                          innerTee->index) == preRead.end()) {
+                              *slot = vCall;
+                              Expression* teeVal = innerTee->value;
+                              Index teeIdx = innerTee->index;
+                              vCall->operands[teeArgIdx] = builder.makeLocalGet(
+                                teeIdx, func->getLocalType(teeIdx));
+                              block->list[i] =
+                                builder.makeLocalSet(teeIdx, teeVal);
+                              changed = true;
+                              folded = true;
+                              break;
+                            }
                           }
                         }
                       }
@@ -2511,6 +2728,11 @@ struct OutlineExpressions : public Pass {
       // non-interfering statements in the same block:
       //   (local.set $scratch V) ... (local.set $dst (local.get $scratch))
       // -> (local.set $dst V)
+      // Also uncross adjacent scratch-global shuffles:
+      //   (local.set $tmp (global.get $g0))
+      //   (global.set $g0 X)
+      //   (global.set $g1 (local.get $tmp))
+      // -> (global.set $g1 (global.get $g0)) (global.set $g0 X)
       if (cleaner.changed || func->getNumVars() > 0) {
         std::vector<Index> reads(func->getNumLocals(), 0);
         std::vector<Index> writes(func->getNumLocals(), 0);
@@ -2577,6 +2799,70 @@ struct OutlineExpressions : public Pass {
                       break;
                     }
                   }
+                } else if (auto* dstGSet = stmt->dynCast<GlobalSet>();
+                           dstGSet && dstGSet->name.startsWith("oe$out_")) {
+                  if (auto* lg = dstGSet->value->dynCast<LocalGet>();
+                      lg && lg->index == tmp) {
+                    if (auto* srcGGet = lset->value->dynCast<GlobalGet>();
+                        srcGGet && srcGGet->name == dstGSet->name) {
+                      bool untouched = true;
+                      for (const auto& effK : interveningEffects) {
+                        if (effK.calls ||
+                            effK.mutableGlobalsRead.count(srcGGet->name) ||
+                            effK.globalsWritten.count(srcGGet->name)) {
+                          untouched = false;
+                          break;
+                        }
+                      }
+                      if (untouched && block->list.size() >= 3) {
+                        block->list.erase(block->list.begin() + j);
+                        block->list.erase(block->list.begin() + i);
+                        reads[tmp] = 0;
+                        writes[tmp] = 0;
+                        changed = true;
+                        forwarded = true;
+                        break;
+                      }
+                    } else if (auto* srcGGet =
+                                 lset->value->dynCast<GlobalGet>();
+                               srcGGet && srcGGet->name != dstGSet->name &&
+                               j == i + 2) {
+                      if (auto* midGSet =
+                            block->list[i + 1]->dynCast<GlobalSet>();
+                          midGSet && midGSet->name == srcGGet->name) {
+                        EffectAnalyzer effMidVal(parent.getPassOptions(),
+                                                 *parent.wasm,
+                                                 midGSet->value);
+                        if (!effMidVal.hasSideEffects() &&
+                            !effMidVal.throws() &&
+                            !effMidVal.mutableGlobalsRead.count(
+                              srcGGet->name) &&
+                            !effMidVal.mutableGlobalsRead.count(
+                              dstGSet->name)) {
+                          block->list[i] =
+                            builder.makeGlobalSet(dstGSet->name, lset->value);
+                          block->list.erase(block->list.begin() + j);
+                          reads[tmp] = 0;
+                          writes[tmp] = 0;
+                          changed = true;
+                          forwarded = true;
+                          break;
+                        }
+                      }
+                    }
+                  }
+                } else if (j == i + 1 && j == block->list.size() - 1) {
+                  if (auto* lg = stmt->dynCast<LocalGet>();
+                      lg && lg->index == tmp &&
+                      Type::isSubType(lset->value->type, block->type)) {
+                    block->list[j] = lset->value;
+                    block->list.erase(block->list.begin() + i);
+                    reads[tmp] = 0;
+                    writes[tmp] = 0;
+                    changed = true;
+                    forwarded = true;
+                    break;
+                  }
                 }
                 EffectAnalyzer effJ(
                   parent.getPassOptions(), *parent.wasm, stmt);
@@ -2605,11 +2891,16 @@ struct OutlineExpressions : public Pass {
   }
 
   void propagateScratchGlobalEffects() {
-    if (!scratchGlobals.empty()) {
-      std::unordered_set<Name> scratchNames;
-      for (auto& [_, gName] : scratchGlobals) {
-        scratchNames.insert(gName);
+    std::unordered_set<Name> scratchNames;
+    for (auto& [_, gName] : scratchGlobals) {
+      scratchNames.insert(gName);
+    }
+    for (auto& g : wasm->globals) {
+      if (!g->imported() && g->mutable_ && g->name.startsWith("oe$out_")) {
+        scratchNames.insert(g->name);
       }
+    }
+    if (!scratchNames.empty()) {
       std::unordered_set<Name> escapedFuncs;
       for (auto& ex : wasm->exports) {
         if (ex->kind == ExternalKind::Function) {
@@ -2725,6 +3016,10 @@ struct OutlineExpressions : public Pass {
         }
         auto* mutableEffects =
           const_cast<EffectAnalyzer*>(func->effects.get());
+        for (Name g : scratchNames) {
+          mutableEffects->mutableGlobalsRead.erase(g);
+          mutableEffects->globalsWritten.erase(g);
+        }
         if (auto it = funcScratchR.find(func.get()); it != funcScratchR.end()) {
           for (Name g : it->second) {
             mutableEffects->mutableGlobalsRead.insert(g);
@@ -2736,16 +3031,18 @@ struct OutlineExpressions : public Pass {
           }
         }
       }
-      if (!indirectR.empty() || !indirectW.empty()) {
-        for (auto& [_, effects] : wasm->indirectCallEffects) {
-          if (effects) {
-            auto* mutableEffects = const_cast<EffectAnalyzer*>(effects.get());
-            for (Name g : indirectR) {
-              mutableEffects->mutableGlobalsRead.insert(g);
-            }
-            for (Name g : indirectW) {
-              mutableEffects->globalsWritten.insert(g);
-            }
+      for (auto& [_, effects] : wasm->indirectCallEffects) {
+        if (effects) {
+          auto* mutableEffects = const_cast<EffectAnalyzer*>(effects.get());
+          for (Name g : scratchNames) {
+            mutableEffects->mutableGlobalsRead.erase(g);
+            mutableEffects->globalsWritten.erase(g);
+          }
+          for (Name g : indirectR) {
+            mutableEffects->mutableGlobalsRead.insert(g);
+          }
+          for (Name g : indirectW) {
+            mutableEffects->globalsWritten.insert(g);
           }
         }
       }
@@ -3817,7 +4114,7 @@ struct OutlineExpressions : public Pass {
       auto& firstWritten = site->written[0];
       if (site->sliceLen > 0) {
         auto* block = body->cast<Block>();
-        for (Index j = 1; j < site->written.size(); j++) {
+        for (Index j = site->written.size() - 1; j >= 1; j--) {
           block->list.push_back(builder.makeGlobalSet(
             key.scratchGlobals[j - 1],
             builder.makeLocalGet(writtenHelperIndices[j],
@@ -3830,7 +4127,7 @@ struct OutlineExpressions : public Pass {
         std::vector<Expression*> list;
         list.reserve(site->written.size() + 1);
         list.push_back(body);
-        for (Index j = 1; j < site->written.size(); j++) {
+        for (Index j = site->written.size() - 1; j >= 1; j--) {
           list.push_back(builder.makeGlobalSet(
             key.scratchGlobals[j - 1],
             builder.makeLocalGet(writtenHelperIndices[j],
