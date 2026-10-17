@@ -2656,6 +2656,7 @@ struct RelaxNullability : public Pass {
     }
 
     std::unordered_map<HeapType, std::vector<Function*>> htFuncs;
+    std::vector<HeapType> htOrder;
     std::unordered_set<Signature> existingSigs;
     for (auto type : pinnedHTs) {
       if (type.isSignature()) {
@@ -2669,7 +2670,11 @@ struct RelaxNullability : public Pass {
         pinnedHTs.insert(ht);
         existingSigs.insert(func->getSig());
       } else {
-        htFuncs[ht].push_back(func.get());
+        auto& flist = htFuncs[ht];
+        if (flist.empty()) {
+          htOrder.push_back(ht);
+        }
+        flist.push_back(func.get());
       }
     }
 
@@ -2683,7 +2688,11 @@ struct RelaxNullability : public Pass {
     std::unordered_map<Name, std::vector<CallConsumerSite>> callsTo;
     std::unordered_map<Name, std::vector<std::pair<Function*, Call*>>>
       allCallsTo;
-    for (auto& [func, summary] : summaries.map) {
+    for (auto& func : module->functions) {
+      if (func->imported()) {
+        continue;
+      }
+      auto& summary = summaries.map[func.get()];
       for (auto& csite : summary.callSites) {
         callsTo[csite.call->target].push_back(csite);
       }
@@ -2776,7 +2785,8 @@ struct RelaxNullability : public Pass {
 
     // Count how many 1-group signatures map to the same canonical signature.
     std::unordered_map<Signature, size_t> canonSigCount;
-    for (auto& [ht, flist] : htFuncs) {
+    for (auto ht : htOrder) {
+      auto& flist = htFuncs[ht];
       if (pinnedHTs.count(ht) || flist.empty()) {
         continue;
       }
@@ -2853,6 +2863,96 @@ struct RelaxNullability : public Pass {
     std::unordered_map<Expression*, Type> strippedCastDemands;
     GlobalTypeRewriter::SignatureUpdates genUpdates;
 
+    auto getEffectiveType = [&](auto& self, Expression* expr) -> Type {
+      while (auto* block = expr->dynCast<Block>()) {
+        if (!block->name.is() && !block->list.empty()) {
+          expr = block->list.back();
+        } else {
+          break;
+        }
+      }
+      if (auto* as = expr->dynCast<RefAs>()) {
+        if (as->op == RefAsNonNull) {
+          Type innerT = self(self, as->value);
+          return innerT.isRef() ? innerT.with(NonNullable) : innerT;
+        }
+      }
+      if (auto* iff = expr->dynCast<If>()) {
+        if (iff->ifFalse && iff->type.isRef()) {
+          return Type::getLeastUpperBound(self(self, iff->ifTrue),
+                                          self(self, iff->ifFalse));
+        }
+      }
+      if (auto* sel = expr->dynCast<Select>()) {
+        if (sel->type.isRef()) {
+          return Type::getLeastUpperBound(self(self, sel->ifTrue),
+                                          self(self, sel->ifFalse));
+        }
+      }
+      return expr->type;
+    };
+
+    auto recordStrippedCastDemand =
+      [&](auto& self, Expression* expr, Type reqType) -> void {
+      while (auto* block = expr->dynCast<Block>()) {
+        if (!block->name.is() && !block->list.empty()) {
+          expr = block->list.back();
+        } else {
+          break;
+        }
+      }
+      if (auto* as = expr->dynCast<RefAs>()) {
+        if (as->op == RefAsNonNull) {
+          self(self, as->value, reqType.with(Nullable));
+          return;
+        }
+      }
+      if (auto* iff = expr->dynCast<If>()) {
+        if (iff->ifFalse && iff->type.isRef()) {
+          Nullability armNull =
+            reqType.isNullable() ? Nullable : iff->type.getNullability();
+          Type armReq(reqType.getHeapType(), armNull);
+          if (iff->ifTrue->type.isRef()) {
+            self(self, iff->ifTrue, armReq);
+          }
+          if (iff->ifFalse->type.isRef()) {
+            self(self, iff->ifFalse, armReq);
+          }
+          return;
+        }
+      }
+      if (auto* sel = expr->dynCast<Select>()) {
+        if (sel->type.isRef()) {
+          Nullability armNull =
+            reqType.isNullable() ? Nullable : sel->type.getNullability();
+          Type armReq(reqType.getHeapType(), armNull);
+          if (sel->ifTrue->type.isRef()) {
+            self(self, sel->ifTrue, armReq);
+          }
+          if (sel->ifFalse->type.isRef()) {
+            self(self, sel->ifFalse, armReq);
+          }
+          return;
+        }
+      }
+      auto sdIt = strippedCastDemands.find(expr);
+      if (sdIt == strippedCastDemands.end()) {
+        strippedCastDemands[expr] = reqType;
+      } else {
+        Nullability combNull =
+          (reqType.isNonNullable() || sdIt->second.isNonNullable())
+            ? NonNullable
+            : Nullable;
+        HeapType combHT = sdIt->second.getHeapType();
+        if (HeapType::isSubType(reqType.getHeapType(), combHT)) {
+          combHT = reqType.getHeapType();
+        } else if (!HeapType::isSubType(combHT, reqType.getHeapType())) {
+          combHT = expr->type.getHeapType();
+        }
+        strippedCastDemands[expr] = Type(combHT, combNull);
+      }
+    };
+
     auto tryGeneralizeGroup = [&](HeapType ht,
                                   const std::vector<Function*>& flist,
                                   bool canMutateHTInPlace) {
@@ -2906,20 +3006,22 @@ struct RelaxNullability : public Pass {
               }
               Expression* arg = call->operands[i];
               if (auto* cast = arg->dynCast<RefCast>()) {
-                if (!cast->desc && cast->ref->type.isRef() &&
-                    !cast->ref->type.isNull() &&
-                    cast->ref->type.getHeapType().getTop() == lubHT.getTop()) {
+                Type effCastRefT = getEffectiveType(getEffectiveType, cast->ref);
+                if (!cast->desc && effCastRefT.isRef() &&
+                    !effCastRefT.isNull() &&
+                    effCastRefT.getHeapType().getTop() == lubHT.getTop()) {
                   if (auto nextLub = HeapType::getLeastUpperBound(
-                        lubHT, cast->ref->type.getHeapType())) {
+                        lubHT, effCastRefT.getHeapType())) {
                     lubHT = *nextLub;
                     castCallers++;
                     continue;
                   }
                 }
               }
-              if (arg->type.isRef() && !arg->type.isNull()) {
+              Type effArgT = getEffectiveType(getEffectiveType, arg);
+              if (effArgT.isRef() && !effArgT.isNull()) {
                 if (auto nextLub = HeapType::getLeastUpperBound(
-                      lubHT, arg->type.getHeapType())) {
+                      lubHT, effArgT.getHeapType())) {
                   lubHT = *nextLub;
                 } else {
                   validLub = false;
@@ -3124,9 +3226,11 @@ struct RelaxNullability : public Pass {
                 if (i < call->operands.size()) {
                   Expression* arg = call->operands[i];
                   if (auto* cast = arg->dynCast<RefCast>()) {
-                    if (!cast->desc && cast->ref->type.isRef() &&
-                        !cast->ref->type.isNull() &&
-                        Type::isSubType(cast->ref->type, candParams[i])) {
+                    Type effCastRefT =
+                      getEffectiveType(getEffectiveType, cast->ref);
+                    if (!cast->desc && effCastRefT.isRef() &&
+                        !effCastRefT.isNull() &&
+                        Type::isSubType(effCastRefT, candParams[i])) {
                       castsSavedBytes += 3;
                     }
                   }
@@ -3177,12 +3281,27 @@ struct RelaxNullability : public Pass {
                 }
               }
               if (auto* cast = tail->dynCast<RefCast>()) {
-                if (!cast->desc && cast->ref->type.isRef() &&
-                    !cast->ref->type.isNull() &&
-                    HeapType::isSubType(cast->ref->type.getHeapType(),
+                Expression* refInner = cast->ref;
+                if (auto* as2 = refInner->dynCast<RefAs>()) {
+                  if (as2->op == RefAsNonNull) {
+                    refInner = as2->value;
+                  }
+                }
+                Type effRefType = getEffectiveType(getEffectiveType, cast->ref);
+                if (auto* lg = refInner->dynCast<LocalGet>()) {
+                  if (lg->index < candParams.size() &&
+                      candParams[lg->index] != origParams[lg->index]) {
+                    effRefType = (refInner != cast->ref)
+                                   ? candParams[lg->index].with(NonNullable)
+                                   : candParams[lg->index];
+                  }
+                }
+                if (!cast->desc && effRefType.isRef() &&
+                    !effRefType.isNull() &&
+                    HeapType::isSubType(effRefType.getHeapType(),
                                         candRes.getHeapType())) {
                   castsSavedBytes +=
-                    (candRes.isNonNullable() && cast->ref->type.isNullable())
+                    (candRes.isNonNullable() && effRefType.isNullable())
                       ? 2
                       : 3;
                 }
@@ -3240,6 +3359,9 @@ struct RelaxNullability : public Pass {
                                      bestSig.params.end());
       Type targetRes = bestSig.results;
 
+      // Step A: Update all widened parameter gets and call result sites first
+      // so `getEffectiveType` sees the updated types before any caller/return
+      // casts are stripped in Step B.
       for (auto* f : flist) {
         modifiedFuncs.insert(f);
         generalizedFuncs.insert(f);
@@ -3251,6 +3373,9 @@ struct RelaxNullability : public Pass {
           for (auto& site : sum.paramSites[i]) {
             site.get->type = targetParams[i];
             if (strippedCastDemands.count(site.get)) {
+              if (site.isWrappedInNonNull) {
+                (*site.loc)->type = targetParams[i].with(NonNullable);
+              }
               continue;
             }
             Type accType =
@@ -3269,58 +3394,9 @@ struct RelaxNullability : public Pass {
               *site.loc = builder.makeRefCast(site.get, castTarget);
             }
           }
-          auto callIt = allCallsTo.find(f->name);
-          if (callIt != allCallsTo.end()) {
-            for (auto& [caller, call] : callIt->second) {
-              if (i < call->operands.size()) {
-                Expression* arg = call->operands[i];
-                if (auto* cast = arg->dynCast<RefCast>()) {
-                  if (!cast->desc && cast->ref->type.isRef() &&
-                      !cast->ref->type.isNull() &&
-                      Type::isSubType(cast->ref->type, targetParams[i])) {
-                    call->operands[i] = cast->ref;
-                    modifiedFuncs.insert(caller);
-                    Expression* inner = cast->ref;
-                    Nullability reqNull = targetParams[i].getNullability();
-                    if (auto* as = inner->dynCast<RefAs>()) {
-                      if (as->op == RefAsNonNull) {
-                        inner = as->value;
-                        reqNull = NonNullable;
-                      }
-                    }
-                    Type reqType(targetParams[i].getHeapType(), reqNull);
-                    auto sdIt = strippedCastDemands.find(inner);
-                    if (sdIt == strippedCastDemands.end() ||
-                        Type::isSubType(reqType, sdIt->second)) {
-                      strippedCastDemands[inner] = reqType;
-                    }
-                  }
-                }
-              }
-            }
-          }
         }
 
         if (targetRes != origRes) {
-          for (auto* tailp : sum.returnValueLocs) {
-            if (auto* as = (*tailp)->dynCast<RefAs>()) {
-              if (as->op == RefAsNonNull && targetRes.isNullable()) {
-                *tailp = as->value;
-              }
-            }
-            if (auto* cast = (*tailp)->dynCast<RefCast>()) {
-              if (!cast->desc && cast->ref->type.isRef() &&
-                  !cast->ref->type.isNull() &&
-                  HeapType::isSubType(cast->ref->type.getHeapType(),
-                                      targetRes.getHeapType())) {
-                *tailp = cast->ref;
-                if (targetRes.isNonNullable() && (*tailp)->type.isNullable()) {
-                  *tailp = builder.makeRefAs(RefAsNonNull, *tailp);
-                }
-              }
-            }
-          }
-
           auto callIt = callsTo.find(f->name);
           if (callIt != callsTo.end()) {
             for (auto& csite : callIt->second) {
@@ -3329,6 +3405,9 @@ struct RelaxNullability : public Pass {
                 csite.call->type = targetRes;
               }
               if (strippedCastDemands.count(csite.call)) {
+                if (csite.isWrappedInNonNull) {
+                  (*csite.loc)->type = targetRes.with(NonNullable);
+                }
                 continue;
               }
               Type accType(csite.acceptedHT, csite.acceptedNull);
@@ -3350,6 +3429,67 @@ struct RelaxNullability : public Pass {
             }
           }
         }
+      }
+
+      // Step B: Strip redundant casts on caller arguments and return values,
+      // and propagate stripped cast demands through `Block`/`If`/`Select`.
+      for (auto* f : flist) {
+        auto& sum = summaries.map[f];
+        for (size_t i = 0; i < origParams.size(); ++i) {
+          if (targetParams[i] == origParams[i]) {
+            continue;
+          }
+          auto callIt = allCallsTo.find(f->name);
+          if (callIt != allCallsTo.end()) {
+            for (auto& [caller, call] : callIt->second) {
+              if (i < call->operands.size()) {
+                Expression* arg = call->operands[i];
+                if (auto* cast = arg->dynCast<RefCast>()) {
+                  Type effCastRefT =
+                    getEffectiveType(getEffectiveType, cast->ref);
+                  if (!cast->desc && effCastRefT.isRef() &&
+                      !effCastRefT.isNull() &&
+                      Type::isSubType(effCastRefT, targetParams[i])) {
+                    call->operands[i] = cast->ref;
+                    modifiedFuncs.insert(caller);
+                    recordStrippedCastDemand(
+                      recordStrippedCastDemand, cast->ref, targetParams[i]);
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        if (targetRes != origRes) {
+          for (auto* tailp : sum.returnValueLocs) {
+            bool stripped = false;
+            if (auto* as = (*tailp)->dynCast<RefAs>()) {
+              if (as->op == RefAsNonNull && targetRes.isNullable()) {
+                *tailp = as->value;
+                stripped = true;
+              }
+            }
+            if (auto* cast = (*tailp)->dynCast<RefCast>()) {
+              Type effCastRefT =
+                getEffectiveType(getEffectiveType, cast->ref);
+              if (!cast->desc && effCastRefT.isRef() &&
+                  !effCastRefT.isNull() &&
+                  HeapType::isSubType(effCastRefT.getHeapType(),
+                                      targetRes.getHeapType())) {
+                *tailp = cast->ref;
+                if (targetRes.isNonNullable() && effCastRefT.isNullable()) {
+                  *tailp = builder.makeRefAs(RefAsNonNull, *tailp);
+                }
+                stripped = true;
+              }
+            }
+            if (stripped) {
+              recordStrippedCastDemand(
+                recordStrippedCastDemand, *tailp, targetRes);
+            }
+          }
+        }
 
         f->type = f->type.with(targetHT);
       }
@@ -3357,7 +3497,8 @@ struct RelaxNullability : public Pass {
 
     // First pass: whole-HeapType groups where `ht` is unpinned and not shared
     // with escaped functions.
-    for (auto& [ht, flist] : htFuncs) {
+    for (auto ht : htOrder) {
+      auto& flist = htFuncs[ht];
       if (pinnedHTs.count(ht) || flist.empty()) {
         continue;
       }
@@ -3371,7 +3512,8 @@ struct RelaxNullability : public Pass {
     // Second pass: per-function fallback for any remaining non-escaped function
     // where switching to an already-existing signature saves casts in the code
     // section.
-    for (auto& [ht, flist] : htFuncs) {
+    for (auto ht : htOrder) {
+      auto& flist = htFuncs[ht];
       for (auto* f : flist) {
         if (!generalizedFuncs.count(f)) {
           tryGeneralizeGroup(ht, {f}, false);
@@ -3382,8 +3524,10 @@ struct RelaxNullability : public Pass {
     GlobalTypeRewriter::updateSignatures(
       genUpdates, *module, getPassOptions().worldMode);
 
-    for (auto* fn : modifiedFuncs) {
-      ReFinalize().walkFunctionInModule(fn, module);
+    for (auto& fn : module->functions) {
+      if (modifiedFuncs.count(fn.get())) {
+        ReFinalize().walkFunctionInModule(fn.get(), module);
+      }
     }
   }
 
@@ -3607,8 +3751,10 @@ struct RelaxNullability : public Pass {
       }
     };
 
-    for (const auto& [_, sum] : summaries.map) {
-      mergeSummary(sum);
+    for (auto& fn : module->functions) {
+      if (!fn->imported()) {
+        mergeSummary(summaries.map[fn.get()]);
+      }
     }
     mergeSummary(moduleRootSummary);
 
@@ -3971,7 +4117,12 @@ struct RelaxNullability : public Pass {
 
     callsTo.clear();
     hasReturnCall.clear();
-    for (auto& [func, scan] : callScanner.map) {
+    for (auto& fn : module->functions) {
+      if (fn->imported()) {
+        continue;
+      }
+      auto* func = fn.get();
+      auto& scan = callScanner.map[func];
       if (scan.hasTailCall) {
         hasReturnCall.insert(func->name);
       }
@@ -4138,7 +4289,11 @@ struct RelaxNullability : public Pass {
             }
           }
         });
-      for (auto& [_, scan] : crScanner.map) {
+      for (auto& fn : module->functions) {
+        if (fn->imported()) {
+          continue;
+        }
+        auto& scan = crScanner.map[fn.get()];
         for (auto sigHT : scan.pinnedSigs) {
           pinnedResultSigs.insert(sigHT);
         }
@@ -4290,7 +4445,11 @@ struct RelaxNullability : public Pass {
             verifyOnly ? curDem.ht : getRootAncestor(origResHT),
             verifyOnly ? curDem.acceptsNull : true};
         }
-        for (auto& [caller, res] : analysis.map) {
+        for (auto& fn : module->functions) {
+          if (fn->imported()) {
+            continue;
+          }
+          auto& res = analysis.map[fn.get()];
           for (auto& [calleeName, cDem] : res.callDemands) {
             auto* callee = module->getFunction(calleeName);
             auto it = nextResDemands.find(callee);
@@ -4439,7 +4598,13 @@ struct RelaxNullability : public Pass {
     }
 
     if (widenTypes) {
-      for (auto& [f, paramHTs] : curFuncParamHTs) {
+      for (auto& func : module->functions) {
+        Function* f = func.get();
+        auto pIt = curFuncParamHTs.find(f);
+        if (pIt == curFuncParamHTs.end()) {
+          continue;
+        }
+        auto& paramHTs = pIt->second;
         auto sig = f->getSig();
         std::vector<Type> newParams;
         newParams.reserve(sig.params.size());
@@ -4482,7 +4647,7 @@ struct RelaxNullability : public Pass {
           HeapType freshHT(newSig);
           targetSigToHT.emplace(newSig, freshHT);
           f->type = f->type.with(freshHT);
-          updates[freshHT] = newSig;
+          updates.try_emplace(freshHT, newSig);
         }
       }
     }
