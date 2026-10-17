@@ -6295,3 +6295,152 @@
     )
   )
 )
+
+;; Dead local.tee unwrap (with impure/throwing call arg and unused local drop)
+;; and Select helper matching an If in the caller.
+(module
+  ;; CHECK:      (type $0 (func (param i32) (result i32)))
+
+  ;; CHECK:      (import "env" "impure" (func $impure (type $0) (param i32) (result i32)))
+  ;; SHRINK:      (type $0 (func (param i32) (result i32)))
+
+  ;; SHRINK:      (import "env" "impure" (func $impure (type $0) (param i32) (result i32)))
+  (import "env" "impure" (func $impure (param i32) (result i32)))
+
+  ;; CHECK:      (func $multi-read-helper (type $0) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (i32.mul
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (i32.const 100000)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.sub
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (i32.const 200000)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $multi-read-helper (type $0) (param $x i32) (result i32)
+  ;; SHRINK-NEXT:  (i32.add
+  ;; SHRINK-NEXT:   (i32.mul
+  ;; SHRINK-NEXT:    (local.get $x)
+  ;; SHRINK-NEXT:    (i32.const 100000)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (i32.sub
+  ;; SHRINK-NEXT:    (local.get $x)
+  ;; SHRINK-NEXT:    (i32.const 200000)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $multi-read-helper (param $x i32) (result i32)
+    (i32.add
+      (i32.mul (local.get $x) (i32.const 100000))
+      (i32.sub (local.get $x) (i32.const 200000))
+    )
+  )
+
+  ;; CHECK:      (func $dead-tee-impure-arg (type $0) (param $a i32) (result i32)
+  ;; CHECK-NEXT:  (local $t i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (i32.mul
+  ;; CHECK-NEXT:    (local.tee $t
+  ;; CHECK-NEXT:     (call $impure
+  ;; CHECK-NEXT:      (local.get $a)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.const 100000)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.sub
+  ;; CHECK-NEXT:    (local.get $t)
+  ;; CHECK-NEXT:    (i32.const 200000)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $dead-tee-impure-arg (type $0) (param $a i32) (result i32)
+  ;; SHRINK-NEXT:  (call $multi-read-helper
+  ;; SHRINK-NEXT:   (call $impure
+  ;; SHRINK-NEXT:    (local.get $a)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $dead-tee-impure-arg (param $a i32) (result i32) (local $t i32)
+    (i32.add
+      (i32.mul (local.tee $t (call $impure (local.get $a))) (i32.const 100000))
+      (i32.sub (local.get $t) (i32.const 200000))
+    )
+  )
+
+  ;; CHECK:      (func $select-helper (type $0) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (select
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (i32.const 100000)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.const 200000)
+  ;; CHECK-NEXT:   (i32.gt_s
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (i32.const 300000)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $select-helper (type $0) (param $x i32) (result i32)
+  ;; SHRINK-NEXT:  (select
+  ;; SHRINK-NEXT:   (i32.add
+  ;; SHRINK-NEXT:    (local.get $x)
+  ;; SHRINK-NEXT:    (i32.const 100000)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (i32.const 200000)
+  ;; SHRINK-NEXT:   (i32.gt_s
+  ;; SHRINK-NEXT:    (local.get $x)
+  ;; SHRINK-NEXT:    (i32.const 300000)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $select-helper (param $x i32) (result i32)
+    (select
+      (i32.add (local.get $x) (i32.const 100000))
+      (i32.const 200000)
+      (i32.gt_s (local.get $x) (i32.const 300000))
+    )
+  )
+
+  ;; CHECK:      (func $caller-if-matches-select (type $0) (param $a i32) (result i32)
+  ;; CHECK-NEXT:  (local $t i32)
+  ;; CHECK-NEXT:  (if (result i32)
+  ;; CHECK-NEXT:   (i32.gt_s
+  ;; CHECK-NEXT:    (local.tee $t
+  ;; CHECK-NEXT:     (call $impure
+  ;; CHECK-NEXT:      (local.get $a)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.const 300000)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (local.get $t)
+  ;; CHECK-NEXT:     (i32.const 100000)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (else
+  ;; CHECK-NEXT:    (i32.const 200000)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $caller-if-matches-select (type $0) (param $a i32) (result i32)
+  ;; SHRINK-NEXT:  (call $select-helper
+  ;; SHRINK-NEXT:   (call $impure
+  ;; SHRINK-NEXT:    (local.get $a)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $caller-if-matches-select (param $a i32) (result i32) (local $t i32)
+    (if (result i32)
+      (i32.gt_s (local.tee $t (call $impure (local.get $a))) (i32.const 300000))
+      (then
+        (i32.add (local.get $t) (i32.const 100000))
+      )
+      (else
+        (i32.const 200000)
+      )
+    )
+  )
+)
