@@ -6054,4 +6054,35 @@
       (i32.sub (local.get $a) (i32.const 200000))
     )
   )
+
+  ;; CHECK:      (func $compound-arg (type $0) (param $a i32) (param $b i32) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (i32.mul
+  ;; CHECK-NEXT:    (i32.xor
+  ;; CHECK-NEXT:     (local.get $a)
+  ;; CHECK-NEXT:     (local.get $b)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.const 100000)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.sub
+  ;; CHECK-NEXT:    (local.get $a)
+  ;; CHECK-NEXT:    (i32.const 200000)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $compound-arg (type $0) (param $a i32) (param $b i32) (result i32)
+  ;; SHRINK-NEXT:  (call $helper
+  ;; SHRINK-NEXT:   (i32.xor
+  ;; SHRINK-NEXT:    (local.get $a)
+  ;; SHRINK-NEXT:    (local.get $b)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (local.get $a)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $compound-arg (param $a i32) (param $b i32) (result i32)
+    (i32.add
+      (i32.mul (i32.xor (local.get $a) (local.get $b)) (i32.const 100000))
+      (i32.sub (local.get $a) (i32.const 200000))
+    )
+  )
 )
