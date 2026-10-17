@@ -79,8 +79,8 @@ enum Table : uint8_t {
   NumTables
 };
 
-// A byte of the token stream and its class.
-using Symbol = std::pair<Table, uint8_t>;
+// A symbol of the token stream and its class.
+using Symbol = std::pair<Table, uint16_t>;
 
 static constexpr Index MaxCodeLength = 15;
 static constexpr Index MinMatch = 2;
@@ -92,8 +92,11 @@ struct Segment {
   std::vector<char> data;
   // Whether the bytes are Huffman-coded.
   bool huffman = false;
-  // The offset of the table of each class in the data (unused: 0, raw 8-bit:
-  // RawByteOffset).
+  // Number of low distance bits for long matches (8 by default, 10 for large
+  // Huffman-coded streams).
+  Index distLoBits = 8;
+  // The offset of the table of each class in the data (unused: 0, raw N-bit:
+  // Index(-N)).
   std::array<Index, NumTables> tableOffsets{};
   // The bit offset of the first code.
   Index firstBit = 0;
@@ -117,12 +120,13 @@ struct Encoder {
   // Whether to split tokens into two Huffman tables by previous token kind
   // (< 2 after a literal run vs >= 2 after a match).
   bool splitToken = true;
+  Index distLoBits = 8;
 
   // The largest length a token can hold: 63 + one extra byte.
   static constexpr Index MaxTokenLength = 63 + 255;
   static constexpr Index MaxMatch = MaxTokenLength + MinMatch;
   static constexpr Index ShortDistance = 256;
-  static constexpr Index MaxDistance = 65536;
+  Index maxDistance() const { return Index(256) << distLoBits; }
   static constexpr Index HashBits = 17;
   static constexpr Index MaxChain = 2048;
   static constexpr Index MaxChain2 = 128;
@@ -151,8 +155,9 @@ struct Encoder {
   // Huffman code plus the amortized 1-byte table-entry cost.
   struct CostModel {
     std::array<std::array<Index, 256>, NumTables> cost;
+    Index distLoBits = 8;
 
-    CostModel() {
+    CostModel(Index distLoBits = 8) : distLoBits(distLoBits) {
       for (auto& table : cost) {
         table.fill(8 * CostScale);
       }
@@ -185,8 +190,10 @@ struct Encoder {
       if (distance < ShortDistance) {
         return cost[ShortDistTable][distance];
       }
-      return cost[DistLoTable][distance & 0xFF] +
-             cost[DistHiTable][distance >> 8];
+      Index loCost =
+        distLoBits <= 8 ? cost[DistLoTable][distance & ((1 << distLoBits) - 1)]
+                        : distLoBits * CostScale;
+      return loCost + cost[DistHiTable][distance >> distLoBits];
     }
 
     Index matchCost(Index length, Index distance, bool afterLit = false) const {
@@ -272,7 +279,7 @@ struct Encoder {
         Index firstDist = 0;
         while (j2 != Index(-1) && chain2++ < MaxChain2) {
           Index distance = i - j2;
-          if (distance > MaxDistance) {
+          if (distance > maxDistance()) {
             break;
           }
           if (units[j2] == units[i] && units[j2 + 1] == units[i + 1]) {
@@ -306,7 +313,7 @@ struct Encoder {
         Index chain2 = 0;
         while (j2 != Index(-1) && chain2++ < MaxChain2) {
           Index distance = i - j2;
-          if (distance > MaxDistance) {
+          if (distance > maxDistance()) {
             break;
           }
           if (units[j2] == units[i] && units[j2 + 1] == units[i + 1]) {
@@ -328,7 +335,7 @@ struct Encoder {
         Index chain = 0;
         while (j != Index(-1) && chain++ < MaxChain) {
           Index distance = i - j;
-          if (distance > MaxDistance) {
+          if (distance > maxDistance()) {
             break;
           }
           Index length = 0;
@@ -463,6 +470,10 @@ struct Encoder {
             : (wideUnit + costAfterWide[i + 1] +
                model.runTokenCost(1, nextLenW + 2, false) -
                model.runTokenCost(1, nextLenW + 1, false));
+        if (cWideNewAfterLit < cWideSame) {
+          cWideSame = cWideNewAfterLit;
+          nextLenW = MaxTokenLength - 1;
+        }
       }
 
       Index cNarSame = Index(-1), cNarNewAfterMatch = Index(-1),
@@ -482,6 +493,10 @@ struct Encoder {
             : (narUnit + costAfterNarrow[i + 1] +
                model.runTokenCost(0, nextLenN + 2, false) -
                model.runTokenCost(0, nextLenN + 1, false));
+        if (cNarNewAfterLit < cNarSame) {
+          cNarSame = cNarNewAfterLit;
+          nextLenN = MaxTokenLength - 1;
+        }
       }
 
       costAfterWide[i] = bestCostAfterLit;
@@ -554,26 +569,53 @@ struct Encoder {
       while (i < count) {
         bool wide = pending[i].second;
         Index j = i;
-        while (j < count && pending[j].second == wide &&
-               j - i < MaxTokenLength) {
+        while (j < count && pending[j].second == wide) {
           j++;
         }
-        emitToken(wide ? 1 : 0, j - i);
-        for (Index k = i; k < j; k++) {
-          Index pos = pending[k].first;
-          uint16_t u = units[pos];
-          if (wide) {
-            auto [lo, hi] = encodeWide(u, prevWide);
-            prevWide = u;
-            out.emplace_back(WideLoTable, lo);
-            out.emplace_back(WideHiTable, hi);
-          } else {
-            uint16_t prev = pos == 0 ? 0 : units[pos - 1];
-            out.emplace_back(
-              (splitNarrow && prev >= NarrowCtxThreshold) ? NarrowTable2
-                                                          : NarrowTable,
-              uint8_t(u));
+        Index kind = wide ? 1 : 0;
+        Index rem = j - i;
+        std::vector<Index> dpAfterMatch(rem + 1, Index(-1));
+        std::vector<Index> dpAfterLit(rem + 1, Index(-1));
+        std::vector<Index> stepAfterMatch(rem + 1, 0);
+        std::vector<Index> stepAfterLit(rem + 1, 0);
+        dpAfterMatch[0] = dpAfterLit[0] = 0;
+        for (Index r = 1; r <= rem; r++) {
+          Index maxL = std::min(r, MaxTokenLength);
+          for (Index L = 1; L <= maxL; L++) {
+            Index cM = model.runTokenCost(kind, L, false) + dpAfterLit[r - L];
+            if (cM <= dpAfterMatch[r]) {
+              dpAfterMatch[r] = cM;
+              stepAfterMatch[r] = L;
+            }
+            Index cL = model.runTokenCost(kind, L, true) + dpAfterLit[r - L];
+            if (cL <= dpAfterLit[r]) {
+              dpAfterLit[r] = cL;
+              stepAfterLit[r] = L;
+            }
           }
+        }
+        Index cur = i;
+        while (cur < j) {
+          Index r = j - cur;
+          Index L = afterLit ? stepAfterLit[r] : stepAfterMatch[r];
+          emitToken(kind, L);
+          for (Index k = cur; k < cur + L; k++) {
+            Index pos = pending[k].first;
+            uint16_t u = units[pos];
+            if (wide) {
+              auto [lo, hi] = encodeWide(u, prevWide);
+              prevWide = u;
+              out.emplace_back(WideLoTable, lo);
+              out.emplace_back(WideHiTable, hi);
+            } else {
+              uint16_t prev = pos == 0 ? 0 : units[pos - 1];
+              out.emplace_back(
+                (splitNarrow && prev >= NarrowCtxThreshold) ? NarrowTable2
+                                                            : NarrowTable,
+                uint8_t(u));
+            }
+          }
+          cur += L;
         }
         i = j;
       }
@@ -603,8 +645,9 @@ struct Encoder {
       if (distance < ShortDistance) {
         out.emplace_back(ShortDistTable, uint8_t(distance));
       } else {
-        out.emplace_back(DistLoTable, uint8_t(distance & 0xFF));
-        out.emplace_back(DistHiTable, uint8_t(distance >> 8));
+        out.emplace_back(DistLoTable,
+                         uint16_t(distance & ((1 << distLoBits) - 1)));
+        out.emplace_back(DistHiTable, uint8_t(distance >> distLoBits));
       }
       state = 0;
       i += choice.length;
@@ -636,6 +679,9 @@ struct Encoder {
   static constexpr Index MaxParses = 7;
 
   Segment encode() {
+    if (compress && huffman != 0 && units.size() > 131072) {
+      distLoBits = 10;
+    }
     HashChains chains;
     std::vector<Candidates> matches;
     if (compress) {
@@ -665,7 +711,7 @@ struct Encoder {
         }
       }
     }
-    CostModel model;
+    CostModel model(distLoBits);
     Segment best;
     for (Index pass = 0; pass < MaxParses; pass++) {
       if (pass > 0 && compress) {
@@ -687,6 +733,9 @@ struct Encoder {
       }
       std::array<std::array<Index, 256>, NumTables> counts{};
       for (auto& symbol : symbols) {
+        if (symbol.first == DistLoTable && distLoBits > 8) {
+          continue;
+        }
         counts[symbol.first][symbol.second]++;
       }
       if (segment.tableOffsets[TokenTable2] ==
@@ -711,8 +760,9 @@ struct Encoder {
       // canonical Huffman table symbol entry cost. Unused symbols cost the
       // longest code length plus the 8-bit table entry penalty.
       for (Index table = 0; table < NumTables; table++) {
-        if (segment.tableOffsets[table] == RawByteOffset) {
-          model.cost[table].fill(8 * CostScale);
+        if (int32_t(segment.tableOffsets[table]) < 0) {
+          model.cost[table].fill(
+            (table == DistLoTable ? distLoBits : 8) * CostScale);
           continue;
         }
         auto& lengths = lengthsOf[table];
@@ -822,11 +872,15 @@ struct Encoder {
 
     Segment coded;
     coded.huffman = true;
+    coded.distLoBits = distLoBits;
     std::array<std::vector<uint64_t>, NumTables> counts;
     for (auto& count : counts) {
       count.assign(256, 0);
     }
     for (auto& symbol : symbols) {
+      if (symbol.first == DistLoTable && distLoBits > 8) {
+        continue;
+      }
       counts[symbol.first][symbol.second]++;
     }
     auto tableBitCost =
@@ -883,6 +937,10 @@ struct Encoder {
     std::array<std::vector<uint8_t>, NumTables> lengths;
     std::array<std::array<uint32_t, 256>, NumTables> codes{};
     for (Index table = 0; table < NumTables; table++) {
+      if (table == DistLoTable && distLoBits > 8) {
+        coded.tableOffsets[table] = Index(-int32_t(distLoBits));
+        continue;
+      }
       lengths[table] = computeCodeLengths(counts[table]);
       Index used = 0;
       uint64_t huffBits = 0, rawBits = 0;
@@ -941,8 +999,12 @@ struct Encoder {
     coded.lengths = lengths;
     Index bits = 0;
     for (auto& symbol : symbols) {
-      auto length = lengths[symbol.first][symbol.second];
-      auto code = codes[symbol.first][symbol.second];
+      Index length = (symbol.first == DistLoTable && distLoBits > 8)
+                       ? distLoBits
+                       : lengths[symbol.first][symbol.second];
+      uint32_t code = (symbol.first == DistLoTable && distLoBits > 8)
+                        ? symbol.second
+                        : codes[symbol.first][symbol.second];
       for (Index i = length; i > 0; i--) {
         if (bits % 8 == 0) {
           coded.data.push_back(0);
@@ -973,8 +1035,8 @@ inline const char* BitsGlobalName = "lz$bits";
 
 // Finds an existing symbol decoder in the module, if any. Matches structurally
 // as well as by name so that a decoder created by an earlier pass can still be
-// shared after passes that strip names (--roundtrip) or relax parameter
-// nullability (--relax-nullability).
+// shared after passes that strip names (--roundtrip), relax parameter
+// nullability (--relax-nullability), or outline helpers (--outline-expressions).
 inline std::optional<SymbolDecoder> findSymbolDecoder(Module& module,
                                                       HeapType i8ArrayType) {
   auto check = [&](Function* func) -> std::optional<SymbolDecoder> {
@@ -998,6 +1060,7 @@ inline std::optional<SymbolDecoder> findSymbolDecoder(Module& module,
       Index globalSets = 0;
       Index loops = 0;
       Index arrayGets = 0;
+      Index calls = 0;
       Name getGlobal;
       Name setGlobal;
       bool hasMaxLen = false;
@@ -1028,7 +1091,7 @@ inline std::optional<SymbolDecoder> findSymbolDecoder(Module& module,
           hasMaxLen = true;
         }
       }
-      void visitCall(Call* curr) { bad = true; }
+      void visitCall(Call* curr) { calls++; }
       void visitCallRef(CallRef* curr) { bad = true; }
       void visitCallIndirect(CallIndirect* curr) { bad = true; }
       void visitArraySet(ArraySet* curr) { bad = true; }
@@ -1040,7 +1103,8 @@ inline std::optional<SymbolDecoder> findSymbolDecoder(Module& module,
     if (scanner.bad || scanner.globalGets != 1 ||
         (scanner.globalSets != 1 && scanner.globalSets != 2) ||
         scanner.getGlobal != scanner.setGlobal || scanner.loops != 1 ||
-        scanner.arrayGets != 3 || !scanner.hasMaxLen) {
+        scanner.arrayGets == 0 || scanner.arrayGets + scanner.calls != 3 ||
+        !scanner.hasMaxLen) {
       return std::nullopt;
     }
     auto* global = module.getGlobalOrNull(scanner.getGlobal);
@@ -1307,11 +1371,11 @@ makeDecoder(Module& module, const Segment& segment, const DecoderOptions& o) {
       i32,
       false);
   };
-  auto readPair = [&](Table lo, Table hi) {
+  auto readPair = [&](Table lo, Table hi, int32_t shift = 8) {
     return builder.makeBinary(
       OrInt32,
       readByte(lo),
-      builder.makeBinary(ShlInt32, readByte(hi), builder.makeConst(8)));
+      builder.makeBinary(ShlInt32, readByte(hi), builder.makeConst(shift)));
   };
   auto setDst = [&](Expression* value) {
     if (splitNarrow) {
@@ -1385,7 +1449,10 @@ makeDecoder(Module& module, const Segment& segment, const DecoderOptions& o) {
   Name copyLabel("copy");
   auto* setD =
     builder.makeIf(builder.makeBinary(EqInt32, get(tok), builder.makeConst(3)),
-                   builder.makeLocalSet(d, readPair(DistLoTable, DistHiTable)),
+                   builder.makeLocalSet(
+                     d,
+                     readPair(
+                       DistLoTable, DistHiTable, int32_t(segment.distLoBits))),
                    builder.makeLocalSet(d, readByte(ShortDistTable)));
   auto* copy = builder.makeLoop(
     copyLabel,

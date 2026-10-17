@@ -1014,16 +1014,23 @@ private:
             StructNew* firstSn = getStructNew(arrayNew->values[i]);
             bool allSame = canConstructStruct(shapes[i], firstSn);
             bool hasInline = false;
+            bool allSingleUseGlobals = true;
             for (Index k = i; k < j && allSame; k++) {
               if (arrayNew->values[k]->is<StructNew>()) {
                 hasInline = true;
+              } else if (auto* get = arrayNew->values[k]->dynCast<GlobalGet>()) {
+                if (allGlobalUses[get->name] != 1) {
+                  allSingleUseGlobals = false;
+                }
+              } else {
+                allSingleUseGlobals = false;
               }
               if (!sameConstructedStruct(
                     shapes[i], firstSn, getStructNew(arrayNew->values[k]))) {
                 allSame = false;
               }
             }
-            if (allSame && hasInline) {
+            if (allSame && (hasInline || allSingleUseGlobals)) {
               templ = firstSn;
               for (Index k = i; k < j; k++) {
                 if (auto* get = arrayNew->values[k]->dynCast<GlobalGet>()) {
@@ -1207,6 +1214,15 @@ private:
     // identical-shape fills stay together for loop rolling and outlining), and
     // by content within each shape group for the compressor.
     if (sort) {
+      auto getFieldOwner = [](HeapType type, Index index) {
+        while (auto super = type.getDeclaredSuperType()) {
+          if (super->getStruct().fields.size() <= index) {
+            break;
+          }
+          type = *super;
+        }
+        return type;
+      };
       std::function<void(Expression*, std::string&)> appendShapeKey =
         [&](Expression* curr, std::string& out) {
           if (curr->is<GlobalGet>()) {
@@ -1218,15 +1234,17 @@ private:
             return;
           }
           if (auto* ss = curr->dynCast<StructSet>()) {
-            out += "SS:" + std::to_string(ss->ref->type.getHeapType().getID()) +
-                   ":" + std::to_string(ss->index) + "(";
+            auto owner = getFieldOwner(ss->ref->type.getHeapType(), ss->index);
+            out += "SS:" + std::to_string(owner.getID()) + ":" +
+                   std::to_string(ss->index) + "(";
             appendShapeKey(ss->ref, out);
             out += ");";
             return;
           }
           if (auto* sg = curr->dynCast<StructGet>()) {
-            out += "SG:" + std::to_string(sg->ref->type.getHeapType().getID()) +
-                   ":" + std::to_string(sg->index) + "(";
+            auto owner = getFieldOwner(sg->ref->type.getHeapType(), sg->index);
+            out += "SG:" + std::to_string(owner.getID()) + ":" +
+                   std::to_string(sg->index) + "(";
             appendShapeKey(sg->ref, out);
             out += ");";
             return;
@@ -1313,15 +1331,26 @@ private:
           continue;
         }
         Type elemType = firstLeaf->type;
+        Index fieldIdx = firstHop ? firstHop->index : firstSs->index;
         Index j = i + 1;
         while (j < items.size() && items[j].code.size() == 1 &&
                items[j].shapeKey == items[i].shapeKey) {
           GlobalGet* leaf = nullptr;
           StructGet* hop = nullptr;
-          if (!extractGlobalLeaf(items[j].code[0], leaf, hop) ||
-              leaf->type != elemType) {
+          if (!extractGlobalLeaf(items[j].code[0], leaf, hop)) {
             break;
           }
+          Type lub = Type::getLeastUpperBound(elemType, leaf->type);
+          if (!lub.isRef() || !lub.getHeapType().isStruct() ||
+              fieldIdx >= lub.getHeapType().getStruct().fields.size()) {
+            break;
+          }
+          if (firstHop &&
+              hop->type !=
+                lub.getHeapType().getStruct().fields[fieldIdx].type) {
+            break;
+          }
+          elemType = lub;
           j++;
         }
         if (j - i >= 4) {
@@ -1333,7 +1362,7 @@ private:
             GlobalGet* leaf = nullptr;
             StructGet* hop = nullptr;
             extractGlobalLeaf(items[k].code[0], leaf, hop);
-            vals.push_back(builder.makeGlobalGet(leaf->name, elemType));
+            vals.push_back(builder.makeGlobalGet(leaf->name, leaf->type));
             merged.contents.insert(merged.contents.end(),
                                    items[k].contents.begin(),
                                    items[k].contents.end());
@@ -1629,10 +1658,8 @@ private:
       builder.makeLocalTee(
         t,
         builder.makeArrayNew(
-          tableType, builder.makeConst(int32_t(2 * totalTableStrings))),
+          tableType, builder.makeConst(int32_t(totalTableStrings + 1))),
         tableRef)));
-    auto* setStart = builder.makeArraySet(
-      builder.makeLocalGet(t, tableRef), get(i), get(p), MemoryOrder::Unordered);
     Name scanLabel("scan");
     auto* scan = builder.makeLoop(
       scanLabel,
@@ -1643,22 +1670,21 @@ private:
                              i32,
                              false),
         builder.makeBlock({incP(), builder.makeBreak(scanLabel)})));
-    auto* setEnd = builder.makeArraySet(
+    auto* setNextStart = builder.makeArraySet(
       builder.makeLocalGet(t, tableRef),
-      builder.makeBinary(OrInt32, get(i), builder.makeConst(1)),
-      get(p),
+      builder.makeLocalTee(
+        i, builder.makeBinary(AddInt32, get(i), builder.makeConst(1)), i32),
+      builder.makeLocalTee(
+        p, builder.makeBinary(AddInt32, get(p), builder.makeConst(1)), i32),
       MemoryOrder::Unordered);
     Name label("next");
     auto* next = builder.makeBreak(
       label,
       nullptr,
       builder.makeBinary(
-        LtUInt32,
-        builder.makeLocalTee(
-          i, builder.makeBinary(AddInt32, get(i), builder.makeConst(2)), i32),
-        builder.makeConst(int32_t(2 * totalTableStrings))));
-    initBody.push_back(builder.makeLoop(
-      label, builder.makeBlock({setStart, scan, setEnd, incP(), next})));
+        LtUInt32, get(i), builder.makeConst(int32_t(totalTableStrings))));
+    initBody.push_back(
+      builder.makeLoop(label, builder.makeBlock({scan, setNextStart, next})));
     auto* init = builder.makeIf(
       builder.makeRefIsNull(
         builder.makeGlobalGet(tableGlobalName, tableGlobalType)),
@@ -1671,12 +1697,12 @@ private:
         i32,
         false);
     };
-    auto* startIdx = builder.makeLocalTee(
-      i, builder.makeBinary(ShlInt32, get(k), builder.makeConst(1)), i32);
-    auto* endIdx = builder.makeBinary(OrInt32, get(i), builder.makeConst(1));
+    auto* nextIdx = builder.makeBinary(AddInt32, get(k), builder.makeConst(1));
+    auto* endPos =
+      builder.makeBinary(SubInt32, readTable(nextIdx), builder.makeConst(1));
     auto* make = builder.makeCall(
       fromCharCodeArray,
-      {getData(arrayParamNonNullable), readTable(startIdx), readTable(endIdx)},
+      {getData(arrayParamNonNullable), readTable(get(k)), endPos},
       refExtern);
     return {init, make};
   }

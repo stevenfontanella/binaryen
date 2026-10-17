@@ -293,16 +293,11 @@
 ;; CHECK-NEXT:     (global.set $string.consts$table
 ;; CHECK-NEXT:      (local.tee $4
 ;; CHECK-NEXT:       (array.new_default $5
-;; CHECK-NEXT:        (i32.const 4)
+;; CHECK-NEXT:        (i32.const 3)
 ;; CHECK-NEXT:       )
 ;; CHECK-NEXT:      )
 ;; CHECK-NEXT:     )
 ;; CHECK-NEXT:     (loop $next
-;; CHECK-NEXT:      (array.set $5
-;; CHECK-NEXT:       (local.get $4)
-;; CHECK-NEXT:       (local.get $1)
-;; CHECK-NEXT:       (local.get $2)
-;; CHECK-NEXT:      )
 ;; CHECK-NEXT:      (loop $scan
 ;; CHECK-NEXT:       (if
 ;; CHECK-NEXT:        (array.get_u $0
@@ -322,27 +317,23 @@
 ;; CHECK-NEXT:      )
 ;; CHECK-NEXT:      (array.set $5
 ;; CHECK-NEXT:       (local.get $4)
-;; CHECK-NEXT:       (i32.or
-;; CHECK-NEXT:        (local.get $1)
-;; CHECK-NEXT:        (i32.const 1)
+;; CHECK-NEXT:       (local.tee $1
+;; CHECK-NEXT:        (i32.add
+;; CHECK-NEXT:         (local.get $1)
+;; CHECK-NEXT:         (i32.const 1)
+;; CHECK-NEXT:        )
 ;; CHECK-NEXT:       )
-;; CHECK-NEXT:       (local.get $2)
-;; CHECK-NEXT:      )
-;; CHECK-NEXT:      (local.set $2
-;; CHECK-NEXT:       (i32.add
-;; CHECK-NEXT:        (local.get $2)
-;; CHECK-NEXT:        (i32.const 1)
+;; CHECK-NEXT:       (local.tee $2
+;; CHECK-NEXT:        (i32.add
+;; CHECK-NEXT:         (local.get $2)
+;; CHECK-NEXT:         (i32.const 1)
+;; CHECK-NEXT:        )
 ;; CHECK-NEXT:       )
 ;; CHECK-NEXT:      )
 ;; CHECK-NEXT:      (br_if $next
 ;; CHECK-NEXT:       (i32.lt_u
-;; CHECK-NEXT:        (local.tee $1
-;; CHECK-NEXT:         (i32.add
-;; CHECK-NEXT:          (local.get $1)
-;; CHECK-NEXT:          (i32.const 2)
-;; CHECK-NEXT:         )
-;; CHECK-NEXT:        )
-;; CHECK-NEXT:        (i32.const 4)
+;; CHECK-NEXT:        (local.get $1)
+;; CHECK-NEXT:        (i32.const 2)
 ;; CHECK-NEXT:       )
 ;; CHECK-NEXT:      )
 ;; CHECK-NEXT:     )
@@ -356,19 +347,17 @@
 ;; CHECK-NEXT:      (global.get $string.consts$data)
 ;; CHECK-NEXT:      (array.get $5
 ;; CHECK-NEXT:       (global.get $string.consts$table)
-;; CHECK-NEXT:       (local.tee $1
-;; CHECK-NEXT:        (i32.shl
+;; CHECK-NEXT:       (local.get $0)
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:      (i32.sub
+;; CHECK-NEXT:       (array.get $5
+;; CHECK-NEXT:        (global.get $string.consts$table)
+;; CHECK-NEXT:        (i32.add
 ;; CHECK-NEXT:         (local.get $0)
 ;; CHECK-NEXT:         (i32.const 1)
 ;; CHECK-NEXT:        )
 ;; CHECK-NEXT:       )
-;; CHECK-NEXT:      )
-;; CHECK-NEXT:      (array.get $5
-;; CHECK-NEXT:       (global.get $string.consts$table)
-;; CHECK-NEXT:       (i32.or
-;; CHECK-NEXT:        (local.get $1)
-;; CHECK-NEXT:        (i32.const 1)
-;; CHECK-NEXT:       )
+;; CHECK-NEXT:       (i32.const 1)
 ;; CHECK-NEXT:      )
 ;; CHECK-NEXT:     )
 ;; CHECK-NEXT:    )
