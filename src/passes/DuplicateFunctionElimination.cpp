@@ -190,6 +190,19 @@ struct DuplicateFunctionElimination : public Pass {
       }
     }
 
+    std::unordered_set<HeapType> referencedInPrivateHeapType;
+    Index numPrivateTypes = 0;
+    for (auto& [ht, info] : typeInfo) {
+      if (info.visibility == ModuleUtils::Visibility::Private) {
+        ++numPrivateTypes;
+        for (auto child : ht.getReferencedHeapTypes()) {
+          if (!child.isBasic()) {
+            referencedInPrivateHeapType.insert(child);
+          }
+        }
+      }
+    }
+
     std::unordered_map<HeapType, HeapType> typeReplacements;
     for (auto& [type, info] : typeInfo) {
       if (info.visibility != ModuleUtils::Visibility::Private ||
@@ -205,6 +218,20 @@ struct DuplicateFunctionElimination : public Pass {
         continue;
       }
       if (!unlocksThunk.count(type)) {
+        // If `type` is referenced inside private HeapType definitions and the
+        // private recursion group has > 128 types, unifying `type -> pubSig`
+        // introduces a `G_priv -> pubSig` dependency that forces `pubSig`
+        // before `G_priv` and displaces one slot in 0..63 and one slot in
+        // 0..127. Only do so if `pubSig` is already referenced by `G_priv` or
+        // the combined uses justify the ~190 B boundary cost.
+        if (numPrivateTypes > 128 && referencedInPrivateHeapType.count(type) &&
+            !referencedInPrivateHeapType.count(pubIt->second)) {
+          Index combinedUses =
+            info.useCount + typeInfo.at(pubIt->second).useCount;
+          if (combinedUses < 190) {
+            continue;
+          }
+        }
         // Avoid merging into a public signature if any parameter is unused
         // across all defined functions of `type`, so SignaturePruning can still
         // prune it.

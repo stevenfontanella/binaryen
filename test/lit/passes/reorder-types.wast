@@ -416,3 +416,79 @@
     )
   )
 )
+
+(module
+  ;; Two-tier S33 (< 2 in testing mode) vs U32 (< 4 in testing mode) density
+  ;; ordering: $parent and $child have S33 uses (via subtype and local types) so
+  ;; their ancestor closure is placed in indices 0..1 ahead of $sig1 and $sig2
+  ;; (which have higher total uses, but only U32 function-type uses and zero S33
+  ;; uses), while $sig1 and $sig2 are placed in indices 2..3 ahead of $low1 and
+  ;; $low2.
+  (rec
+    ;; CHECK:      (rec
+    ;; CHECK-NEXT:  (type $parent (sub (struct)))
+
+    ;; CHECK:       (type $child (sub $parent (struct)))
+
+    ;; CHECK:       (type $sig1 (func (param i32)))
+
+    ;; CHECK:       (type $sig2 (func (param i64)))
+
+    ;; CHECK:       (type $low1 (struct))
+    (type $low1 (struct))
+    ;; CHECK:       (type $low2 (struct))
+    (type $low2 (struct))
+    (type $sig1 (func (param i32)))
+    (type $sig2 (func (param i64)))
+    (type $parent (sub (struct)))
+    (type $child (sub $parent (struct)))
+  )
+
+  ;; CHECK:      (global $k1 (ref null $low1) (ref.null none))
+  (global $k1 (ref null $low1) (ref.null none))
+  ;; CHECK:      (global $k2 (ref null $low2) (ref.null none))
+  (global $k2 (ref null $low2) (ref.null none))
+
+  ;; CHECK:      (func $f1 (type $sig1) (param $0 i32)
+  ;; CHECK-NEXT:  (local $1 (ref $child))
+  ;; CHECK-NEXT: )
+  (func $f1 (type $sig1) (param i32)
+    (local (ref $child))
+  )
+  ;; CHECK:      (func $f2 (type $sig1) (param $0 i32)
+  ;; CHECK-NEXT:  (local $1 (ref $child))
+  ;; CHECK-NEXT: )
+  (func $f2 (type $sig1) (param i32)
+    (local (ref $child))
+  )
+  ;; CHECK:      (func $f3 (type $sig1) (param $0 i32)
+  ;; CHECK-NEXT:  (local $1 (ref $child))
+  ;; CHECK-NEXT: )
+  (func $f3 (type $sig1) (param i32)
+    (local (ref $child))
+  )
+  ;; CHECK:      (func $f4 (type $sig1) (param $0 i32)
+  ;; CHECK-NEXT:  (local $1 (ref $child))
+  ;; CHECK-NEXT: )
+  (func $f4 (type $sig1) (param i32)
+    (local (ref $child))
+  )
+  ;; CHECK:      (func $f5 (type $sig1) (param $0 i32)
+  ;; CHECK-NEXT:  (local $1 (ref $child))
+  ;; CHECK-NEXT: )
+  (func $f5 (type $sig1) (param i32)
+    (local (ref $child))
+  )
+  ;; CHECK:      (func $g1 (type $sig2) (param $0 i64)
+  ;; CHECK-NEXT: )
+  (func $g1 (type $sig2) (param i64))
+  ;; CHECK:      (func $g2 (type $sig2) (param $0 i64)
+  ;; CHECK-NEXT: )
+  (func $g2 (type $sig2) (param i64))
+  ;; CHECK:      (func $g3 (type $sig2) (param $0 i64)
+  ;; CHECK-NEXT: )
+  (func $g3 (type $sig2) (param i64))
+  ;; CHECK:      (func $g4 (type $sig2) (param $0 i64)
+  ;; CHECK-NEXT: )
+  (func $g4 (type $sig2) (param i64))
+)

@@ -362,10 +362,25 @@ struct TypeInfos {
   // final) doesn't matter. Save them for the end to see if we can reuse an
   // existing function type with the necessary signature.
   InsertOrderedMap<Signature, size_t> controlFlowSignatures;
+  InsertOrderedMap<Signature, size_t> emittedControlFlowSignatures;
 
   void note(HeapType type) {
     if (!type.isBasic()) {
       ++info[type].useCount;
+    }
+  }
+  void noteS33(HeapType type) {
+    if (!type.isBasic()) {
+      auto& entry = info[type];
+      ++entry.useCount;
+      ++entry.s33UseCount;
+    }
+  }
+  void noteU32(HeapType type) {
+    if (!type.isBasic()) {
+      auto& entry = info[type];
+      ++entry.useCount;
+      ++entry.u32UseCount;
     }
   }
   void note(Type type) {
@@ -377,6 +392,32 @@ struct TypeInfos {
     if (type.isTuple()) {
       for (HeapType ht : type.getHeapTypeChildren()) {
         note(ht);
+      }
+    }
+  }
+  void noteS33(Type type) {
+    if (type.isRef()) {
+      noteS33(type.getHeapType());
+      return;
+    }
+    if (type.isTuple()) {
+      for (Type elem : type) {
+        if (elem.isRef()) {
+          noteS33(elem.getHeapType());
+        }
+      }
+    }
+  }
+  void noteU32(Type type) {
+    if (type.isRef()) {
+      noteU32(type.getHeapType());
+      return;
+    }
+    if (type.isTuple()) {
+      for (Type elem : type) {
+        if (elem.isRef()) {
+          noteU32(elem.getHeapType());
+        }
       }
     }
   }
@@ -397,16 +438,23 @@ struct TypeInfos {
       }
     }
   }
-  void noteControlFlow(Signature sig) {
+  void noteControlFlow(Signature sig, bool emittedInBinary = true) {
     // TODO: support control flow input parameters.
     assert(sig.params.size() == 0);
     if (sig.results.isTuple()) {
       // We have to use a function type.
       ++controlFlowSignatures[sig];
+      if (emittedInBinary) {
+        ++emittedControlFlowSignatures[sig];
+      }
     } else if (sig.results != Type::none) {
       // The result type can be emitted directly instead of using a function
       // type.
-      note(sig.results);
+      if (emittedInBinary) {
+        noteS33(sig.results);
+      } else {
+        note(sig.results);
+      }
     }
   }
   bool contains(HeapType type) { return info.contains(type); }
@@ -423,59 +471,63 @@ struct CodeScanner : PostWalker<CodeScanner> {
     setModule(&wasm);
   }
 
-  void visitCallIndirect(CallIndirect* curr) { info.note(curr->heapType); }
-  void visitCallRef(CallRef* curr) { info.note(curr->target->type); }
-  void visitRefNull(RefNull* curr) { info.note(curr->type); }
+  void visitCallIndirect(CallIndirect* curr) { info.noteU32(curr->heapType); }
+  void visitCallRef(CallRef* curr) { info.noteU32(curr->target->type); }
+  void visitRefNull(RefNull* curr) { info.noteS33(curr->type); }
   void visitSelect(Select* curr) {
     if (curr->type.isRef()) {
       // This select will be annotated in the binary, so note it.
-      info.note(curr->type);
+      info.noteS33(curr->type);
     }
   }
-  void visitStructNew(StructNew* curr) { info.note(curr->type); }
-  void visitArrayNew(ArrayNew* curr) { info.note(curr->type); }
-  void visitArrayNewData(ArrayNewData* curr) { info.note(curr->type); }
-  void visitArrayNewElem(ArrayNewElem* curr) { info.note(curr->type); }
-  void visitArrayNewFixed(ArrayNewFixed* curr) { info.note(curr->type); }
+  void visitStructNew(StructNew* curr) { info.noteU32(curr->type); }
+  void visitArrayNew(ArrayNew* curr) { info.noteU32(curr->type); }
+  void visitArrayNewData(ArrayNewData* curr) { info.noteU32(curr->type); }
+  void visitArrayNewElem(ArrayNewElem* curr) { info.noteU32(curr->type); }
+  void visitArrayNewFixed(ArrayNewFixed* curr) { info.noteU32(curr->type); }
   void visitArrayCopy(ArrayCopy* curr) {
-    info.note(curr->destRef->type);
-    info.note(curr->srcRef->type);
+    info.noteU32(curr->destRef->type);
+    info.noteU32(curr->srcRef->type);
   }
-  void visitArrayFill(ArrayFill* curr) { info.note(curr->ref->type); }
-  void visitArrayInitData(ArrayInitData* curr) { info.note(curr->ref->type); }
-  void visitArrayInitElem(ArrayInitElem* curr) { info.note(curr->ref->type); }
-  void visitRefCast(RefCast* curr) { info.note(curr->type); }
-  void visitRefTest(RefTest* curr) { info.note(curr->castType); }
+  void visitArrayFill(ArrayFill* curr) { info.noteU32(curr->ref->type); }
+  void visitArrayInitData(ArrayInitData* curr) {
+    info.noteU32(curr->ref->type);
+  }
+  void visitArrayInitElem(ArrayInitElem* curr) {
+    info.noteU32(curr->ref->type);
+  }
+  void visitRefCast(RefCast* curr) { info.noteS33(curr->type); }
+  void visitRefTest(RefTest* curr) { info.noteS33(curr->castType); }
   void visitBrOn(BrOn* curr) {
     if (curr->op == BrOnCast || curr->op == BrOnCastFail) {
-      info.note(curr->ref->type);
-      info.note(curr->castType);
+      info.noteS33(curr->ref->type);
+      info.noteS33(curr->castType);
     }
   }
-  void visitStructGet(StructGet* curr) { info.note(curr->ref->type); }
-  void visitStructSet(StructSet* curr) { info.note(curr->ref->type); }
-  void visitStructWait(StructWait* curr) { info.note(curr->ref->type); }
-  void visitArrayGet(ArrayGet* curr) { info.note(curr->ref->type); }
-  void visitArraySet(ArraySet* curr) { info.note(curr->ref->type); }
+  void visitStructGet(StructGet* curr) { info.noteU32(curr->ref->type); }
+  void visitStructSet(StructSet* curr) { info.noteU32(curr->ref->type); }
+  void visitStructWait(StructWait* curr) { info.noteU32(curr->ref->type); }
+  void visitArrayGet(ArrayGet* curr) { info.noteU32(curr->ref->type); }
+  void visitArraySet(ArraySet* curr) { info.noteU32(curr->ref->type); }
   void visitContBind(ContBind* curr) {
-    info.note(curr->cont->type);
-    info.note(curr->type);
+    info.noteU32(curr->cont->type);
+    info.noteU32(curr->type);
   }
-  void visitContNew(ContNew* curr) { info.note(curr->type); }
+  void visitContNew(ContNew* curr) { info.noteU32(curr->type); }
   void visitResume(Resume* curr) {
-    info.note(curr->cont->type);
+    info.noteU32(curr->cont->type);
     info.note(curr->type);
   }
   void visitResumeThrow(ResumeThrow* curr) {
-    info.note(curr->cont->type);
+    info.noteU32(curr->cont->type);
     info.note(curr->type);
   }
   void visitStackSwitch(StackSwitch* curr) {
-    info.note(curr->cont->type);
+    info.noteU32(curr->cont->type);
     info.note(curr->type);
   }
   void visitBlock(Block* curr) {
-    info.noteControlFlow(Signature(Type::none, curr->type));
+    info.noteControlFlow(Signature(Type::none, curr->type), curr->name.is());
   }
   void visitIf(If* curr) {
     info.noteControlFlow(Signature(Type::none, curr->type));
@@ -512,24 +564,31 @@ collectHeapTypeInfo(Module& wasm,
   }
   CodeScanner(wasm, info, referencedFuncs).walkModuleCode(&wasm);
   for (const auto& curr : wasm.globals) {
-    info.note(curr->type);
+    info.noteS33(curr->type);
   }
   for (const auto& curr : wasm.tags) {
-    info.note(curr->type);
+    info.noteU32(curr->type);
   }
   for (const auto& curr : wasm.tables) {
-    info.note(curr->type);
+    info.noteS33(curr->type);
   }
   for (const auto& curr : wasm.elementSegments) {
-    info.note(curr->type);
+    info.noteS33(curr->type);
   }
 
   // Collect info from functions in parallel.
   ModuleUtils::ParallelFunctionAnalysis<TypeInfos, Immutable, InsertOrderedMap>
     analysis(wasm, [&](Function* func, TypeInfos& info) {
-      info.note(func->type);
+      info.noteU32(func->type);
+      std::unordered_set<Type> seenVarTypes;
       for (auto type : func->vars) {
         info.note(type);
+        for (auto elem : type) {
+          if (elem.isRef() && !elem.getHeapType().isBasic() &&
+              seenVarTypes.insert(elem).second) {
+            ++info.info[elem.getHeapType()].s33UseCount;
+          }
+        }
       }
       // Don't just use `func->imported()` here because we also might be
       // printing an error message on a partially parsed module whose declared
@@ -542,10 +601,16 @@ collectHeapTypeInfo(Module& wasm,
   // Combine the function info with the module info.
   for (const auto& [func, functionInfo] : analysis.map) {
     for (const auto& [type, typeInfo] : functionInfo.info) {
-      info.info[type].useCount += typeInfo.useCount;
+      auto& dst = info.info[type];
+      dst.useCount += typeInfo.useCount;
+      dst.s33UseCount += typeInfo.s33UseCount;
+      dst.u32UseCount += typeInfo.u32UseCount;
     }
     for (const auto& [sig, count] : functionInfo.controlFlowSignatures) {
       info.controlFlowSignatures[sig] += count;
+    }
+    for (const auto& [sig, count] : functionInfo.emittedControlFlowSignatures) {
+      info.emittedControlFlowSignatures[sig] += count;
     }
     if (!referencedFuncs.at(func->name)) {
       auto funcType = func->type.getHeapType();
@@ -582,7 +647,7 @@ collectHeapTypeInfo(Module& wasm,
           if (!info.contains(child)) {
             noteNewType(child);
           }
-          info.note(child);
+          info.noteS33(child);
         }
       }
 
@@ -618,6 +683,10 @@ collectHeapTypeInfo(Module& wasm,
       }
       sigInfo->useCount += count;
       sigInfo->controlFlowUseCount += count;
+      if (auto emIt = info.emittedControlFlowSignatures.find(sig);
+          emIt != info.emittedControlFlowSignatures.end()) {
+        sigInfo->s33UseCount += emIt->second;
+      }
       if (newType) {
         break;
       }
@@ -1027,15 +1096,41 @@ IndexedHeapTypes getOptimizedIndexedHeapTypes(Module& wasm) {
   constexpr double childFactor = 0.25;
 
   // Each rec group's weight, adjusted for its size and incorporating the weight
-  // of its users.
+  // of its users. For large recursion groups (> 128 types), placing a singleton
+  // group ahead of the large group shifts one type across the 64 (S33LEB)
+  // 1-byte/2-byte boundary and one type across the 128 (U32LEB) 1-byte/2-byte
+  // boundary, so weight the large group by that marginal boundary cost rather
+  // than diluting it by thousands of 1-use tail types.
   std::vector<double> weights(groups.size());
   for (size_t i = 0; i < groups.size(); ++i) {
-    weights[i] = double(groupCounts[i]) / groups[i].size();
+    if (groups[i].size() > 128) {
+      std::vector<Index> s33Vals;
+      std::vector<Index> u32Vals;
+      s33Vals.reserve(groups[i].size());
+      u32Vals.reserve(groups[i].size());
+      for (auto type : groups[i]) {
+        const auto& info = counts.at(type);
+        s33Vals.push_back(info.s33UseCount);
+        u32Vals.push_back(info.u32UseCount);
+      }
+      std::nth_element(s33Vals.begin(),
+                       s33Vals.begin() + 63,
+                       s33Vals.end(),
+                       std::greater<Index>());
+      std::nth_element(u32Vals.begin(),
+                       u32Vals.begin() + 127,
+                       u32Vals.end(),
+                       std::greater<Index>());
+      weights[i] = double(s33Vals[63] + u32Vals[127]);
+    } else {
+      weights[i] = double(groupCounts[i]) / groups[i].size();
+    }
   }
   auto sorted = TopologicalSort::sort(deps);
   for (auto it = sorted.rbegin(); it != sorted.rend(); ++it) {
     for (auto user : deps[*it]) {
-      weights[*it] += childFactor * weights[user];
+      double factor = groups[user].size() > 128 ? 1.0 : childFactor;
+      weights[*it] += factor * weights[user];
     }
   }
 
