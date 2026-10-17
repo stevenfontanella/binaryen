@@ -4,6 +4,8 @@
 (module
  ;; CHECK:      (type $none (func))
  (type $none (func))
+ ;; CHECK:      (global $oe$out_i32_1 (mut i32) (i32.const 0))
+
  ;; CHECK:      (func $foo (type $none)
  ;; CHECK-NEXT:  (local $scratch (tuple funcref (ref $none)))
  ;; CHECK-NEXT:  (local $scratch_1 funcref)
@@ -12,7 +14,7 @@
  ;; CHECK-NEXT:    (local.set $scratch_1
  ;; CHECK-NEXT:     (tuple.extract 2 0
  ;; CHECK-NEXT:      (local.tee $scratch
- ;; CHECK-NEXT:       (block $block (type $1) (result funcref (ref $none))
+ ;; CHECK-NEXT:       (block $block (type $2) (result funcref (ref $none))
  ;; CHECK-NEXT:        (tuple.make 2
  ;; CHECK-NEXT:         (ref.null nofunc)
  ;; CHECK-NEXT:         (ref.func $foo)
@@ -40,5 +42,18 @@
     )
    )
   )
+ )
+
+ (global $oe$out_i32_1 (mut i32) (i32.const 0))
+
+ ;; CHECK:      (func $preserve-oe-scratch-global (type $1) (param $x i32) (result i32)
+ ;; CHECK-NEXT:  (global.set $oe$out_i32_1
+ ;; CHECK-NEXT:   (local.get $x)
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (global.get $oe$out_i32_1)
+ ;; CHECK-NEXT: )
+ (func $preserve-oe-scratch-global (param $x i32) (result i32)
+  (global.set $oe$out_i32_1 (local.get $x))
+  (global.get $oe$out_i32_1)
  )
 )

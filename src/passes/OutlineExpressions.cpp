@@ -95,6 +95,7 @@
 #include <deque>
 #include <map>
 
+#include "ir/branch-utils.h"
 #include "ir/effects.h"
 #include "ir/find_all.h"
 #include "ir/intrinsics.h"
@@ -943,6 +944,13 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
       return false;
     }
     for (Index j = 2; j < len; j++) {
+      if (j == len - 1) {
+        if (auto* lastGet = block->list[offset + j]->dynCast<LocalGet>()) {
+          if (lastGet->index == firstSet->index) {
+            return true;
+          }
+        }
+      }
       if (!isScratchGlobalReadStmt(block->list[offset + j])) {
         return false;
       }
@@ -1539,7 +1547,6 @@ struct OutlineExpressions : public Pass {
 
   void run(Module* module) override {
     wasm = module;
-    scratchGlobals.clear();
     hasModuleEffects = false;
     for (auto& f : wasm->functions) {
       if (f->effects) {
@@ -1549,6 +1556,13 @@ struct OutlineExpressions : public Pass {
     }
     canonicalizeLocalHoles =
       getPassOptions().shrinkLevel > 0 && getPassOptions().trapsNeverHappen;
+
+    recoverStrippedScratchGlobals();
+    propagateScratchGlobalEffects();
+    cleanupInlinedScratchGlobals();
+    coalesceScratchGlobals();
+    populateScratchGlobals();
+    propagateScratchGlobalEffects();
 
     auto mode = getMode();
     bool enableUnCseTees =
@@ -1582,6 +1596,7 @@ struct OutlineExpressions : public Pass {
       }
     }
     foldCallRefDispatch(true);
+    propagateScratchGlobalEffects();
     for (Index round = 0; round < 3; round++) {
       bool changed = sinkWrapperCalls();
       if (getPassOptions().shrinkLevel > 0) {
@@ -1595,6 +1610,1001 @@ struct OutlineExpressions : public Pass {
       unCseOverCsedTees();
     }
 
+    propagateScratchGlobalEffects();
+  }
+
+  void renameGlobalsInModule(const std::unordered_map<Name, Name>& renameMap) {
+    if (renameMap.empty()) {
+      return;
+    }
+    struct Renamer : public PostWalker<Renamer> {
+      const std::unordered_map<Name, Name>& renameMap;
+      Renamer(const std::unordered_map<Name, Name>& renameMap)
+        : renameMap(renameMap) {}
+      void visitGlobalGet(GlobalGet* curr) {
+        if (auto it = renameMap.find(curr->name); it != renameMap.end()) {
+          curr->name = it->second;
+        }
+      }
+      void visitGlobalSet(GlobalSet* curr) {
+        if (auto it = renameMap.find(curr->name); it != renameMap.end()) {
+          curr->name = it->second;
+        }
+      }
+    };
+    ModuleUtils::ParallelFunctionAnalysis<int> runner(
+      *wasm, [&](Function* func, int&) {
+        if (!func->imported() && func->body) {
+          Renamer(renameMap).walk(func->body);
+        }
+      });
+    for (auto& f : wasm->functions) {
+      if (f->effects) {
+        bool changed = false;
+        for (const auto& [oldName, _] : renameMap) {
+          if (f->effects->mutableGlobalsRead.count(oldName) ||
+              f->effects->globalsWritten.count(oldName)) {
+            changed = true;
+            break;
+          }
+        }
+        if (changed) {
+          auto eff = std::make_shared<EffectAnalyzer>(*f->effects);
+          for (const auto& [oldName, newName] : renameMap) {
+            if (eff->mutableGlobalsRead.erase(oldName)) {
+              eff->mutableGlobalsRead.insert(newName);
+            }
+            if (eff->globalsWritten.erase(oldName)) {
+              eff->globalsWritten.insert(newName);
+            }
+          }
+          f->effects = std::move(eff);
+        }
+      }
+    }
+  }
+
+  void recoverStrippedScratchGlobals() {
+    std::unordered_set<Name> exportedGlobals;
+    for (auto& exp : wasm->exports) {
+      if (exp->kind == ExternalKind::Global) {
+        exportedGlobals.insert(*exp->getInternalName());
+      }
+    }
+    std::unordered_set<Name> candidates;
+    for (auto& g : wasm->globals) {
+      if (g->imported() || !g->mutable_ || g->hasExplicitName ||
+          g->name.startsWith("oe$out_") || exportedGlobals.count(g->name) ||
+          !g->init) {
+        continue;
+      }
+      bool zeroOrNullInit = false;
+      if (auto* c = g->init->dynCast<Const>()) {
+        zeroOrNullInit = c->value.isZero();
+      } else if (g->init->is<RefNull>()) {
+        zeroOrNullInit = true;
+      }
+      if (zeroOrNullInit) {
+        candidates.insert(g->name);
+      }
+    }
+    if (candidates.empty()) {
+      return;
+    }
+
+    std::unordered_map<Name, SmallVector<Name, 4>> tailWrittenByFunc;
+    for (auto& f : wasm->functions) {
+      if (f->imported() || !f->body) {
+        continue;
+      }
+      auto* block = f->body->dynCast<Block>();
+      if (!block || block->list.size() < 2) {
+        continue;
+      }
+      Index idx = block->list.size() - 1;
+      if (f->getResults() != Type::none) {
+        if (idx == 0) {
+          continue;
+        }
+        idx--;
+      }
+      SmallVector<Name, 4> written;
+      while (true) {
+        if (auto* gs = block->list[idx]->dynCast<GlobalSet>();
+            gs && candidates.count(gs->name)) {
+          written.push_back(gs->name);
+          if (idx == 0) {
+            break;
+          }
+          idx--;
+        } else {
+          break;
+        }
+      }
+      if (!written.empty()) {
+        tailWrittenByFunc[f->name] = std::move(written);
+      }
+    }
+
+    std::unordered_set<Name> recovered;
+    std::unordered_map<Name, Index> totalSets;
+    std::unordered_map<Name, Index> totalGets;
+    std::unordered_map<Name, Index> matchedInlinedPairs;
+
+    for (auto& f : wasm->functions) {
+      if (f->imported() || !f->body) {
+        continue;
+      }
+      for (auto* gs : FindAll<GlobalSet>(f->body).list) {
+        if (candidates.count(gs->name)) {
+          totalSets[gs->name]++;
+        }
+      }
+      for (auto* gg : FindAll<GlobalGet>(f->body).list) {
+        if (candidates.count(gg->name)) {
+          totalGets[gg->name]++;
+        }
+      }
+      for (auto* block : FindAll<Block>(f->body).list) {
+        for (Index i = 0; i < block->list.size(); i++) {
+          Expression* stmt = block->list[i];
+          Call* call = stmt->dynCast<Call>();
+          if (auto* lset = stmt->dynCast<LocalSet>()) {
+            call = lset->value->dynCast<Call>();
+          }
+          if (call) {
+            if (auto it = tailWrittenByFunc.find(call->target);
+                it != tailWrittenByFunc.end()) {
+              for (Index j = i + 1; j < block->list.size() && j <= i + 6; j++) {
+                if (auto* nextSet = block->list[j]->dynCast<LocalSet>()) {
+                  for (auto* gg : FindAll<GlobalGet>(nextSet->value).list) {
+                    if (std::find(it->second.begin(),
+                                  it->second.end(),
+                                  gg->name) != it->second.end()) {
+                      recovered.insert(gg->name);
+                    }
+                  }
+                } else {
+                  break;
+                }
+              }
+            }
+          }
+          SmallVector<GlobalSet*, 2> stmtCandSets;
+          if (auto* gs = stmt->dynCast<GlobalSet>();
+              gs && candidates.count(gs->name)) {
+            stmtCandSets.push_back(gs);
+          } else if (stmt->is<LocalSet>() || stmt->is<Block>()) {
+            for (auto* gs : FindAll<GlobalSet>(stmt).list) {
+              if (candidates.count(gs->name)) {
+                stmtCandSets.push_back(gs);
+              }
+            }
+          }
+          for (auto* gs : stmtCandSets) {
+            bool selfRead = false;
+            for (auto* gg : FindAll<GlobalGet>(stmt).list) {
+              if (gg->name == gs->name) {
+                selfRead = true;
+                break;
+              }
+            }
+            if (!selfRead) {
+              for (Index j = i + 1; j < block->list.size() && j <= i + 5; j++) {
+                if (auto* nextSet = block->list[j]->dynCast<LocalSet>();
+                    nextSet && !nextSet->isTee()) {
+                  Index getCount = 0;
+                  for (auto* gg : FindAll<GlobalGet>(nextSet->value).list) {
+                    if (gg->name == gs->name) {
+                      getCount++;
+                    }
+                  }
+                  if (getCount == 1) {
+                    matchedInlinedPairs[gs->name]++;
+                    break;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    for (const auto& [gName, pairs] : matchedInlinedPairs) {
+      if (pairs > 0 && totalSets[gName] == pairs && totalGets[gName] == pairs) {
+        recovered.insert(gName);
+      }
+    }
+
+    if (recovered.empty()) {
+      return;
+    }
+
+    std::unordered_map<Name, Name> renameMap;
+    Index recCounter = 0;
+    for (auto& g : wasm->globals) {
+      if (!recovered.count(g->name)) {
+        continue;
+      }
+      Name newName;
+      do {
+        newName = Name("oe$out_rec_" + std::to_string(++recCounter));
+      } while (wasm->getGlobalOrNull(newName));
+      renameMap[g->name] = newName;
+      g->name = newName;
+    }
+    wasm->updateMaps();
+    renameGlobalsInModule(renameMap);
+  }
+
+  void coalesceScratchGlobals() {
+    std::unordered_map<Type, SmallVector<Name, 4>> byType;
+    std::unordered_set<Name> allScratch;
+    for (auto& g : wasm->globals) {
+      if (!g->imported() && g->mutable_ && g->name.startsWith("oe$out_")) {
+        byType[g->type].push_back(g->name);
+        allScratch.insert(g->name);
+      }
+    }
+    bool hasDuplicateType = false;
+    for (const auto& [_, vec] : byType) {
+      if (vec.size() >= 2) {
+        hasDuplicateType = true;
+        break;
+      }
+    }
+    if (!hasDuplicateType) {
+      return;
+    }
+
+    struct FuncScratchSummary {
+      SmallVector<Name, 4> touched;
+      SmallVector<Name, 4> unclean;
+    };
+    ModuleUtils::ParallelFunctionAnalysis<FuncScratchSummary> scanner(
+      *wasm, [&](Function* func, FuncScratchSummary& summary) {
+        if (func->imported() || !func->body) {
+          return;
+        }
+        auto sets = FindAll<GlobalSet>(func->body).list;
+        auto gets = FindAll<GlobalGet>(func->body).list;
+        std::unordered_map<Name, Index> setCounts;
+        std::unordered_map<Name, Index> getCounts;
+        for (auto* gs : sets) {
+          if (allScratch.count(gs->name)) {
+            if (++setCounts[gs->name] == 1) {
+              summary.touched.push_back(gs->name);
+            }
+          }
+        }
+        for (auto* gg : gets) {
+          if (allScratch.count(gg->name)) {
+            if (++getCounts[gg->name] == 1 && !setCounts.count(gg->name)) {
+              summary.touched.push_back(gg->name);
+            }
+          }
+        }
+        if (summary.touched.empty()) {
+          return;
+        }
+
+        std::unordered_map<Name, Index> cleanSets;
+        std::unordered_map<Name, Index> cleanGets;
+        if (auto* bodyBlock = func->body->dynCast<Block>();
+            bodyBlock && bodyBlock->list.size() >= 2 &&
+            func->getResults() != Type::none) {
+          Expression* retExpr = bodyBlock->list.back();
+          bool retHasCall = !FindAll<Call>(retExpr).list.empty() ||
+                            !FindAll<CallRef>(retExpr).list.empty() ||
+                            !FindAll<CallIndirect>(retExpr).list.empty();
+          if (!retHasCall) {
+            for (Index k = bodyBlock->list.size() - 1; k > 0;) {
+              k--;
+              if (auto* gs = bodyBlock->list[k]->dynCast<GlobalSet>();
+                  gs && allScratch.count(gs->name) &&
+                  (gs->value->is<LocalGet>() || gs->value->is<Const>() ||
+                   gs->value->is<RefNull>())) {
+                cleanSets[gs->name]++;
+              } else {
+                break;
+              }
+            }
+          }
+        }
+
+        for (auto* block : FindAll<Block>(func->body).list) {
+          for (Index i = 0; i < block->list.size(); i++) {
+            auto* firstSet = block->list[i]->dynCast<LocalSet>();
+            if (!firstSet || !firstSet->value->is<Call>()) {
+              continue;
+            }
+            for (Index j = i + 1; j < block->list.size(); j++) {
+              if (auto* nextSet = block->list[j]->dynCast<LocalSet>();
+                  nextSet && !nextSet->isTee()) {
+                if (auto* gg = nextSet->value->dynCast<GlobalGet>();
+                    gg && allScratch.count(gg->name)) {
+                  cleanGets[gg->name]++;
+                  continue;
+                }
+              }
+              break;
+            }
+          }
+        }
+
+        for (Name gName : summary.touched) {
+          if (cleanSets[gName] != setCounts[gName] ||
+              cleanGets[gName] != getCounts[gName]) {
+            summary.unclean.push_back(gName);
+          }
+        }
+      });
+
+    std::unordered_map<Name, std::unordered_set<Function*>> funcsTouching;
+    std::unordered_set<Name> uncleanGlobals;
+    for (auto& [func, summary] : scanner.map) {
+      for (Name gName : summary.touched) {
+        funcsTouching[gName].insert(func);
+      }
+      for (Name gName : summary.unclean) {
+        uncleanGlobals.insert(gName);
+      }
+    }
+
+    std::unordered_map<Name, Name> renameMap;
+    for (const auto& [_, vec] : byType) {
+      if (vec.size() < 2) {
+        continue;
+      }
+      for (Index r = 1; r < vec.size(); r++) {
+        Name gCand = vec[r];
+        if (funcsTouching[gCand].empty() || uncleanGlobals.count(gCand)) {
+          continue;
+        }
+        for (Index t = 0; t < r; t++) {
+          Name gTarget = vec[t];
+          if (renameMap.count(gTarget) || uncleanGlobals.count(gTarget)) {
+            continue;
+          }
+          bool disjoint = true;
+          for (Function* f : funcsTouching[gCand]) {
+            if (funcsTouching[gTarget].count(f)) {
+              disjoint = false;
+              break;
+            }
+          }
+          if (disjoint) {
+            renameMap[gCand] = gTarget;
+            for (Function* f : funcsTouching[gCand]) {
+              funcsTouching[gTarget].insert(f);
+            }
+            funcsTouching[gCand].clear();
+            break;
+          }
+        }
+      }
+    }
+
+    if (!renameMap.empty()) {
+      renameGlobalsInModule(renameMap);
+    }
+  }
+
+  void populateScratchGlobals() {
+    scratchGlobals.clear();
+    std::unordered_set<Name> usedScratch;
+    for (auto& f : wasm->functions) {
+      if (f->imported() || !f->body) {
+        continue;
+      }
+      for (auto* gs : FindAll<GlobalSet>(f->body).list) {
+        if (gs->name.startsWith("oe$out_")) {
+          usedScratch.insert(gs->name);
+        }
+      }
+      for (auto* gg : FindAll<GlobalGet>(f->body).list) {
+        if (gg->name.startsWith("oe$out_")) {
+          usedScratch.insert(gg->name);
+        }
+      }
+    }
+    std::unordered_map<Type, Index> existingScratchRanks;
+    for (auto& g : wasm->globals) {
+      if (!g->imported() && g->mutable_ && g->name.startsWith("oe$out_") &&
+          usedScratch.count(g->name)) {
+        Index rank = existingScratchRanks[g->type]++;
+        scratchGlobals[{g->type, rank}] = g->name;
+      }
+    }
+    for (auto& g : wasm->globals) {
+      if (!g->imported() && g->mutable_ && g->name.startsWith("oe$out_") &&
+          !usedScratch.count(g->name)) {
+        Index rank = existingScratchRanks[g->type]++;
+        scratchGlobals[{g->type, rank}] = g->name;
+      }
+    }
+  }
+
+  static bool containsScratchGlobalAccess(Expression* e) {
+    for (auto* gs : FindAll<GlobalSet>(e).list) {
+      if (gs->name.startsWith("oe$out_")) {
+        return true;
+      }
+    }
+    for (auto* gg : FindAll<GlobalGet>(e).list) {
+      if (gg->name.startsWith("oe$out_")) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool isPureEvalSpineLeaf(Expression* e) {
+    if (!e || e->type == Type::unreachable) {
+      return false;
+    }
+    if (e->is<LocalGet>() || e->is<Const>() || e->is<RefNull>() ||
+        e->is<RefFunc>()) {
+      return true;
+    }
+    if (auto* gg = e->dynCast<GlobalGet>()) {
+      if (auto* g = wasm->getGlobalOrNull(gg->name)) {
+        return !g->mutable_;
+      }
+    }
+    return false;
+  }
+
+  bool replaceSingleScratchGetAlongSpine(Expression** currp,
+                                         GlobalGet* targetGet,
+                                         Expression* replacement,
+                                         SmallVector<Index, 4>& preReadLocals) {
+    Expression* curr = *currp;
+    if (curr == targetGet) {
+      *currp = replacement;
+      return true;
+    }
+    if (auto* lset = curr->dynCast<LocalSet>()) {
+      if (lset->isTee()) {
+        return false;
+      }
+      return replaceSingleScratchGetAlongSpine(
+        &lset->value, targetGet, replacement, preReadLocals);
+    }
+    if (auto* u = curr->dynCast<Unary>()) {
+      return replaceSingleScratchGetAlongSpine(
+        &u->value, targetGet, replacement, preReadLocals);
+    }
+    if (auto* rc = curr->dynCast<RefCast>()) {
+      return replaceSingleScratchGetAlongSpine(
+        &rc->ref, targetGet, replacement, preReadLocals);
+    }
+    if (auto* ra = curr->dynCast<RefAs>()) {
+      return replaceSingleScratchGetAlongSpine(
+        &ra->value, targetGet, replacement, preReadLocals);
+    }
+    if (auto* sg = curr->dynCast<StructGet>()) {
+      return replaceSingleScratchGetAlongSpine(
+        &sg->ref, targetGet, replacement, preReadLocals);
+    }
+    if (auto* bin = curr->dynCast<Binary>()) {
+      for (auto* gg : FindAll<GlobalGet>(bin->left).list) {
+        if (gg == targetGet) {
+          return replaceSingleScratchGetAlongSpine(
+            &bin->left, targetGet, replacement, preReadLocals);
+        }
+      }
+      if (!isPureEvalSpineLeaf(bin->left)) {
+        return false;
+      }
+      if (auto* lg = bin->left->dynCast<LocalGet>()) {
+        preReadLocals.push_back(lg->index);
+      }
+      return replaceSingleScratchGetAlongSpine(
+        &bin->right, targetGet, replacement, preReadLocals);
+    }
+    if (auto* call = curr->dynCast<Call>()) {
+      for (Index idx = 0; idx < call->operands.size(); idx++) {
+        auto gets = FindAll<GlobalGet>(call->operands[idx]).list;
+        bool hasTarget = false;
+        for (auto* gg : gets) {
+          if (gg == targetGet) {
+            hasTarget = true;
+            break;
+          }
+        }
+        if (hasTarget) {
+          return replaceSingleScratchGetAlongSpine(
+            &call->operands[idx], targetGet, replacement, preReadLocals);
+        }
+        if (!isPureEvalSpineLeaf(call->operands[idx])) {
+          return false;
+        }
+        if (auto* lg = call->operands[idx]->dynCast<LocalGet>()) {
+          preReadLocals.push_back(lg->index);
+        }
+      }
+    }
+    return false;
+  }
+
+  void cleanupInlinedScratchGlobals() {
+    Builder builder(*wasm);
+    for (auto& f : wasm->functions) {
+      if (f->imported() || !f->body) {
+        continue;
+      }
+      Function* func = f.get();
+      bool hasScratchOrSelfSet = false;
+      for (auto* gs : FindAll<GlobalSet>(func->body).list) {
+        if (gs->name.startsWith("oe$out_")) {
+          hasScratchOrSelfSet = true;
+          break;
+        }
+        if (auto* gg = gs->value->dynCast<GlobalGet>();
+            gg && gg->name == gs->name) {
+          hasScratchOrSelfSet = true;
+          break;
+        }
+      }
+      if (!hasScratchOrSelfSet) {
+        for (auto* gg : FindAll<GlobalGet>(func->body).list) {
+          if (gg->name.startsWith("oe$out_")) {
+            hasScratchOrSelfSet = true;
+            break;
+          }
+        }
+      }
+      if (!hasScratchOrSelfSet) {
+        continue;
+      }
+
+      struct BlockFlattener : public PostWalker<BlockFlattener> {
+        OutlineExpressions& parent;
+        Function* func;
+        Builder& builder;
+        bool changed = false;
+
+        BlockFlattener(OutlineExpressions& parent,
+                       Function* func,
+                       Builder& builder)
+          : parent(parent), func(func), builder(builder) {}
+
+        void spliceBlockAt(Block* block, Index idx, Block* inner) {
+          std::vector<Expression*> newList;
+          newList.reserve(block->list.size() - 1 + inner->list.size());
+          for (Index k = 0; k < idx; k++) {
+            newList.push_back(block->list[k]);
+          }
+          for (auto* e : inner->list) {
+            newList.push_back(e);
+          }
+          for (Index k = idx + 1; k < block->list.size(); k++) {
+            newList.push_back(block->list[k]);
+          }
+          block->list.set(newList);
+        }
+
+        void visitBlock(Block* block) {
+          // Flatten unbranched inner blocks containing oe$out_* accesses so
+          // inlined multi-write helpers and WasmBinaryReader hoisted blocks
+          // become flat sequences in block->list before folding.
+          for (Index i = 0; i < block->list.size();) {
+            Expression* item = block->list[i];
+            if (auto* inner = item->dynCast<Block>()) {
+              if (inner->type == Type::none && !inner->list.empty() &&
+                  (!inner->name.is() ||
+                   !BranchUtils::BranchSeeker::has(inner, inner->name)) &&
+                  containsScratchGlobalAccess(inner)) {
+                spliceBlockAt(block, i, inner);
+                changed = true;
+                continue;
+              }
+            } else if (auto* lset = item->dynCast<LocalSet>();
+                       lset && !lset->isTee()) {
+              if (auto* inner = lset->value->dynCast<Block>()) {
+                if (inner->list.size() >= 2 &&
+                    inner->list.back()->type != Type::unreachable &&
+                    Type::isSubType(inner->list.back()->type,
+                                    func->getLocalType(lset->index)) &&
+                    (!inner->name.is() ||
+                     !BranchUtils::BranchSeeker::has(inner, inner->name)) &&
+                    containsScratchGlobalAccess(inner)) {
+                  inner->list.back() =
+                    builder.makeLocalSet(lset->index, inner->list.back());
+                  spliceBlockAt(block, i, inner);
+                  changed = true;
+                  continue;
+                }
+              }
+            } else if (auto* gset = item->dynCast<GlobalSet>()) {
+              if (auto* inner = gset->value->dynCast<Block>()) {
+                auto* g = parent.wasm->getGlobalOrNull(gset->name);
+                if (g && inner->list.size() >= 2 &&
+                    inner->list.back()->type != Type::unreachable &&
+                    Type::isSubType(inner->list.back()->type, g->type) &&
+                    (!inner->name.is() ||
+                     !BranchUtils::BranchSeeker::has(inner, inner->name)) &&
+                    containsScratchGlobalAccess(inner)) {
+                  inner->list.back() =
+                    builder.makeGlobalSet(gset->name, inner->list.back());
+                  spliceBlockAt(block, i, inner);
+                  changed = true;
+                  continue;
+                }
+              }
+            }
+            i++;
+          }
+        }
+      } flattener(*this, func, builder);
+      flattener.walk(func->body);
+
+      struct BlockCleaner : public PostWalker<BlockCleaner> {
+        OutlineExpressions& parent;
+        Function* func;
+        Builder& builder;
+        bool changed = false;
+
+        BlockCleaner(OutlineExpressions& parent,
+                     Function* func,
+                     Builder& builder)
+          : parent(parent), func(func), builder(builder) {}
+
+        void eraseStmt(Block* block, Index idx) {
+          if (block->list.size() <= 1) {
+            block->list[idx] = builder.makeNop();
+          } else {
+            block->list.erase(block->list.begin() + idx);
+          }
+        }
+
+        void visitBlock(Block* block) {
+          // Phase 2: Fold self-sets and inlined (global.set $oe$out V) followed
+          // by (local.set $x (global.get $oe$out)) (or sunk into a LocalSet).
+          for (Index i = 0; i < block->list.size();) {
+            Expression* item = block->list[i];
+            if (auto* lset = item->dynCast<LocalSet>();
+                lset && !lset->isTee()) {
+              if (auto* lget = lset->value->dynCast<LocalGet>();
+                  lget && lget->index == lset->index &&
+                  func->getLocalType(lset->index).isDefaultable()) {
+                eraseStmt(block, i);
+                changed = true;
+                continue;
+              }
+              i++;
+              continue;
+            }
+            auto* gset = item->dynCast<GlobalSet>();
+            if (!gset) {
+              i++;
+              continue;
+            }
+            if (auto* gget = gset->value->dynCast<GlobalGet>();
+                gget && gget->name == gset->name) {
+              eraseStmt(block, i);
+              changed = true;
+              continue;
+            }
+            if (!gset->name.startsWith("oe$out_") ||
+                gset->value->type == Type::unreachable) {
+              i++;
+              continue;
+            }
+
+            bool folded = false;
+            Index limit = std::min<Index>(block->list.size(), i + 9);
+            std::vector<EffectAnalyzer> interveningEffects;
+            for (Index j = i + 1; j < limit; j++) {
+              Expression* stmt = block->list[j];
+              if (auto* lset = stmt->dynCast<LocalSet>();
+                  lset && !lset->isTee()) {
+                if (auto* gget = lset->value->dynCast<GlobalGet>();
+                    gget && gget->name == gset->name &&
+                    Type::isSubType(gset->value->type,
+                                    func->getLocalType(lset->index))) {
+                  bool laterReadBeforeClobber = false;
+                  for (Index m = j + 1; m < block->list.size(); m++) {
+                    if (auto* gs2 = block->list[m]->dynCast<GlobalSet>();
+                        gs2 && gs2->name == gset->name) {
+                      break;
+                    }
+                    EffectAnalyzer effM(
+                      parent.getPassOptions(), *parent.wasm, block->list[m]);
+                    if (effM.calls || effM.globalsWritten.count(gset->name)) {
+                      break;
+                    }
+                    if (effM.mutableGlobalsRead.count(gset->name)) {
+                      laterReadBeforeClobber = true;
+                      break;
+                    }
+                  }
+                  if (!laterReadBeforeClobber) {
+                    bool canPlaceAtI = true;
+                    for (const auto& effK : interveningEffects) {
+                      if (effK.localsRead.count(lset->index) ||
+                          effK.localsWritten.count(lset->index)) {
+                        canPlaceAtI = false;
+                        break;
+                      }
+                    }
+                    if (canPlaceAtI) {
+                      block->list[i] =
+                        builder.makeLocalSet(lset->index, gset->value);
+                      block->list.erase(block->list.begin() + j);
+                      changed = true;
+                      folded = true;
+                      break;
+                    }
+                    EffectAnalyzer effV(
+                      parent.getPassOptions(), *parent.wasm, gset->value);
+                    if (!effV.hasSideEffects() && !effV.throws()) {
+                      bool canPlaceAtJ = true;
+                      for (auto& effK : interveningEffects) {
+                        if (effV.invalidates(effK) || effK.invalidates(effV)) {
+                          canPlaceAtJ = false;
+                          break;
+                        }
+                      }
+                      if (canPlaceAtJ) {
+                        block->list[j] =
+                          builder.makeLocalSet(lset->index, gset->value);
+                        block->list.erase(block->list.begin() + i);
+                        changed = true;
+                        folded = true;
+                        break;
+                      }
+                    }
+                  }
+                }
+              }
+
+              EffectAnalyzer effJ(parent.getPassOptions(), *parent.wasm, stmt);
+              if (effJ.mutableGlobalsRead.count(gset->name)) {
+                // Check if stmt is a LocalSet into which SimplifyLocals sunk a
+                // single (global.get $oe$out).
+                if (auto* lset = stmt->dynCast<LocalSet>();
+                    lset && !lset->isTee() &&
+                    !effJ.globalsWritten.count(gset->name)) {
+                  SmallVector<GlobalGet*, 2> matchingGets;
+                  for (auto* gg : FindAll<GlobalGet>(stmt).list) {
+                    if (gg->name == gset->name) {
+                      matchingGets.push_back(gg);
+                    }
+                  }
+                  bool laterReadBeforeClobber = false;
+                  for (Index m = j + 1; m < block->list.size(); m++) {
+                    if (auto* gs2 = block->list[m]->dynCast<GlobalSet>();
+                        gs2 && gs2->name == gset->name) {
+                      break;
+                    }
+                    EffectAnalyzer effM(
+                      parent.getPassOptions(), *parent.wasm, block->list[m]);
+                    if (effM.calls || effM.globalsWritten.count(gset->name)) {
+                      break;
+                    }
+                    if (effM.mutableGlobalsRead.count(gset->name)) {
+                      laterReadBeforeClobber = true;
+                      break;
+                    }
+                  }
+                  if (matchingGets.size() == 1 && !laterReadBeforeClobber) {
+                    EffectAnalyzer effV(
+                      parent.getPassOptions(), *parent.wasm, gset->value);
+                    bool interveningOk = true;
+                    for (auto& effK : interveningEffects) {
+                      if (effV.invalidates(effK) || effK.invalidates(effV)) {
+                        interveningOk = false;
+                        break;
+                      }
+                    }
+                    if (interveningOk) {
+                      // Subcase 2a: gset->value writes no locals read along
+                      // the spine before matchingGets[0].
+                      if (effV.localsWritten.empty()) {
+                        SmallVector<Index, 4> preRead;
+                        if (parent.replaceSingleScratchGetAlongSpine(
+                              &block->list[j],
+                              matchingGets[0],
+                              gset->value,
+                              preRead)) {
+                          block->list.erase(block->list.begin() + i);
+                          changed = true;
+                          folded = true;
+                          break;
+                        }
+                      } else if (auto* vCall = gset->value->dynCast<Call>();
+                                 vCall && effV.localsWritten.size() == 1) {
+                        // Subcase 2b: gset->value is (call $f ... (local.tee $x
+                        // A) ...) where all args before the tee are pure leaves
+                        // and args after have no local writes.
+                        Index teeArgIdx = Index(-1);
+                        LocalSet* innerTee = nullptr;
+                        bool argsOk = true;
+                        for (Index a = 0; a < vCall->operands.size(); a++) {
+                          if (auto* ls =
+                                vCall->operands[a]->dynCast<LocalSet>();
+                              ls && ls->isTee() && teeArgIdx == Index(-1)) {
+                            EffectAnalyzer effAfter(parent.getPassOptions(),
+                                                    *parent.wasm,
+                                                    ls->value);
+                            if (effAfter.localsWritten.empty()) {
+                              teeArgIdx = a;
+                              innerTee = ls;
+                              continue;
+                            }
+                          }
+                          if (teeArgIdx == Index(-1)) {
+                            if (!parent.isPureEvalSpineLeaf(
+                                  vCall->operands[a])) {
+                              argsOk = false;
+                              break;
+                            }
+                            if (auto* lg =
+                                  vCall->operands[a]->dynCast<LocalGet>();
+                                lg &&
+                                effV.localsWritten.count(lg->index)) {
+                              argsOk = false;
+                              break;
+                            }
+                          } else {
+                            EffectAnalyzer effPost(parent.getPassOptions(),
+                                                   *parent.wasm,
+                                                   vCall->operands[a]);
+                            if (!effPost.localsWritten.empty()) {
+                              argsOk = false;
+                              break;
+                            }
+                          }
+                        }
+                        if (argsOk && innerTee) {
+                          for (const auto& effK : interveningEffects) {
+                            if (effK.localsWritten.count(innerTee->index)) {
+                              argsOk = false;
+                              break;
+                            }
+                          }
+                        }
+                        if (argsOk && innerTee) {
+                          SmallVector<Index, 4> preRead;
+                          if (parent.replaceSingleScratchGetAlongSpine(
+                                &block->list[j],
+                                matchingGets[0],
+                                vCall,
+                                preRead)) {
+                            Expression* teeVal = innerTee->value;
+                            Index teeIdx = innerTee->index;
+                            vCall->operands[teeArgIdx] = builder.makeLocalGet(
+                              teeIdx, func->getLocalType(teeIdx));
+                            block->list[i] =
+                              builder.makeLocalSet(teeIdx, teeVal);
+                            changed = true;
+                            folded = true;
+                            break;
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+                break;
+              }
+              if (effJ.calls || effJ.throws() ||
+                  effJ.hasExternalBreakTargets() ||
+                  effJ.globalsWritten.count(gset->name)) {
+                break;
+              }
+              interveningEffects.push_back(std::move(effJ));
+            }
+            if (!folded) {
+              i++;
+            }
+          }
+        }
+      } cleaner(*this, func, builder);
+      cleaner.walk(func->body);
+      cleaner.changed |= flattener.changed;
+
+      // Phase 3: Forward single-read, single-write scratch local sets across
+      // non-interfering statements in the same block:
+      //   (local.set $scratch V) ... (local.set $dst (local.get $scratch))
+      // -> (local.set $dst V)
+      if (cleaner.changed || func->getNumVars() > 0) {
+        std::vector<Index> reads(func->getNumLocals(), 0);
+        std::vector<Index> writes(func->getNumLocals(), 0);
+        for (auto* lg : FindAll<LocalGet>(func->body).list) {
+          reads[lg->index]++;
+        }
+        for (auto* ls : FindAll<LocalSet>(func->body).list) {
+          writes[ls->index]++;
+        }
+        struct ScratchLocalForwarder
+          : public PostWalker<ScratchLocalForwarder> {
+          OutlineExpressions& parent;
+          Function* func;
+          Builder& builder;
+          std::vector<Index>& reads;
+          std::vector<Index>& writes;
+          bool changed = false;
+
+          ScratchLocalForwarder(OutlineExpressions& parent,
+                                Function* func,
+                                Builder& builder,
+                                std::vector<Index>& reads,
+                                std::vector<Index>& writes)
+            : parent(parent), func(func), builder(builder), reads(reads),
+              writes(writes) {}
+
+          void visitBlock(Block* block) {
+            for (Index i = 0; i < block->list.size();) {
+              auto* lset = block->list[i]->dynCast<LocalSet>();
+              if (!lset || lset->isTee() || !func->isVar(lset->index) ||
+                  reads[lset->index] != 1 || writes[lset->index] != 1 ||
+                  lset->value->type == Type::unreachable) {
+                i++;
+                continue;
+              }
+              Index tmp = lset->index;
+              bool forwarded = false;
+              Index limit = std::min<Index>(block->list.size(), i + 7);
+              std::vector<EffectAnalyzer> interveningEffects;
+              for (Index j = i + 1; j < limit; j++) {
+                Expression* stmt = block->list[j];
+                if (auto* dstSet = stmt->dynCast<LocalSet>();
+                    dstSet && !dstSet->isTee()) {
+                  if (auto* lg = dstSet->value->dynCast<LocalGet>();
+                      lg && lg->index == tmp &&
+                      Type::isSubType(lset->value->type,
+                                      func->getLocalType(dstSet->index))) {
+                    bool canForward = true;
+                    for (const auto& effK : interveningEffects) {
+                      if (effK.localsRead.count(dstSet->index) ||
+                          effK.localsWritten.count(dstSet->index)) {
+                        canForward = false;
+                        break;
+                      }
+                    }
+                    if (canForward) {
+                      block->list[i] =
+                        builder.makeLocalSet(dstSet->index, lset->value);
+                      block->list.erase(block->list.begin() + j);
+                      reads[tmp] = 0;
+                      writes[tmp] = 0;
+                      changed = true;
+                      forwarded = true;
+                      break;
+                    }
+                  }
+                }
+                EffectAnalyzer effJ(
+                  parent.getPassOptions(), *parent.wasm, stmt);
+                if (effJ.localsRead.count(tmp) ||
+                    effJ.localsWritten.count(tmp) || effJ.throws() ||
+                    effJ.hasExternalBreakTargets()) {
+                  break;
+                }
+                interveningEffects.push_back(std::move(effJ));
+              }
+              if (!forwarded) {
+                i++;
+              }
+            }
+          }
+        } forwarder(*this, func, builder, reads, writes);
+        forwarder.walk(func->body);
+        cleaner.changed |= forwarder.changed;
+      }
+
+      if (cleaner.changed) {
+        ReFinalize().walkFunctionInModule(func, wasm);
+        refreshFuncEffects(func);
+      }
+    }
+  }
+
+  void propagateScratchGlobalEffects() {
     if (!scratchGlobals.empty()) {
       std::unordered_set<Name> scratchNames;
       for (auto& [_, gName] : scratchGlobals) {

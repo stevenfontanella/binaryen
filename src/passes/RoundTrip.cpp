@@ -23,6 +23,7 @@
 #include "ir/module-utils.h"
 #include "pass.h"
 #include "wasm-binary.h"
+#include "wasm-traversal.h"
 #include "wasm.h"
 
 namespace wasm {
@@ -45,6 +46,22 @@ struct RoundTrip : public Pass {
     // the module back in.
     bool preserveTypeOrder = !module->typeIndices.empty();
 
+    // Preserve OutlineExpressions multi-write scratch global names (oe$out_*)
+    // across binary roundtripping so subsequent OutlineExpressions runs reuse
+    // them and recognize scratch-global read/write guards.
+    Index numImportedGlobals = 0;
+    ModuleUtils::iterImportedGlobals(
+      *module, [&](Global* g) { numImportedGlobals += g->type.size(); });
+    std::vector<std::pair<Index, Name>> savedScratchGlobals;
+    Index definedGlobalIdx = 0;
+    ModuleUtils::iterDefinedGlobals(*module, [&](Global* g) {
+      if (g->name.startsWith("oe$out_") && g->type.size() == 1) {
+        savedScratchGlobals.emplace_back(numImportedGlobals + definedGlobalIdx,
+                                         g->name);
+      }
+      definedGlobalIdx += g->type.size();
+    });
+
     // Write, clear, and read the module
     WasmBinaryWriter(module, buffer, getPassOptions()).write();
     ModuleUtils::clearModule(*module);
@@ -61,6 +78,46 @@ struct RoundTrip : public Pass {
 
     if (!preserveTypeOrder) {
       module->typeIndices.clear();
+    }
+
+    if (!savedScratchGlobals.empty()) {
+      std::unordered_map<Name, Name> globalRenameMap;
+      for (auto& [idx, oldName] : savedScratchGlobals) {
+        if (idx < module->globals.size() && !module->getGlobalOrNull(oldName)) {
+          Name currName = module->globals[idx]->name;
+          if (currName != oldName) {
+            globalRenameMap[currName] = oldName;
+            module->globals[idx]->name = oldName;
+          }
+        }
+      }
+      if (!globalRenameMap.empty()) {
+        module->updateMaps();
+        struct GlobalRenamer : public PostWalker<GlobalRenamer> {
+          const std::unordered_map<Name, Name>& renameMap;
+          GlobalRenamer(const std::unordered_map<Name, Name>& renameMap)
+            : renameMap(renameMap) {}
+          void visitGlobalGet(GlobalGet* curr) {
+            if (auto it = renameMap.find(curr->name); it != renameMap.end()) {
+              curr->name = it->second;
+            }
+          }
+          void visitGlobalSet(GlobalSet* curr) {
+            if (auto it = renameMap.find(curr->name); it != renameMap.end()) {
+              curr->name = it->second;
+            }
+          }
+        } renamer(globalRenameMap);
+        renamer.walkModule(module);
+        for (auto& ex : module->exports) {
+          if (ex->kind == ExternalKind::Global) {
+            if (auto it = globalRenameMap.find(*ex->getInternalName());
+                it != globalRenameMap.end()) {
+              *ex->getInternalName() = it->second;
+            }
+          }
+        }
+      }
     }
   }
 };

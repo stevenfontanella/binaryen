@@ -5532,6 +5532,9 @@
     )
   )
 )
+
+;; Reuse existing oe$out_* scratch globals and fold inlined scratch global
+;; write/read pairs, self-sets, and roundtrip hoisted scratch local blocks.
 ;; SHRINK:      (func $outlined_w2 (type $8) (param $0 (ref null $Sub)) (param $1 (ref null $Sub)) (result i32)
 ;; SHRINK-NEXT:  (call $two_arg_target
 ;; SHRINK-NEXT:   (struct.get $Sub 0
@@ -5560,4 +5563,356 @@
 ;; SHRINK-NEXT:   )
 ;; SHRINK-NEXT:   (global.get $mask)
 ;; SHRINK-NEXT:  )
+;; SHRINK-NEXT: )
+(module
+  ;; CHECK:      (type $0 (func (param i32 i32 i32) (result i32)))
+
+  ;; CHECK:      (type $1 (func (param i32) (result i32)))
+
+  ;; CHECK:      (type $2 (func (param i32 i32) (result i32)))
+
+  ;; CHECK:      (global $oe$out_i32_1 (mut i32) (i32.const 0))
+  ;; SHRINK:      (type $0 (func (param i32 i32 i32) (result i32)))
+
+  ;; SHRINK:      (type $1 (func (param i32) (result i32)))
+
+  ;; SHRINK:      (type $2 (func (param i32 i32) (result i32)))
+
+  ;; SHRINK:      (global $oe$out_i32_1 (mut i32) (i32.const 0))
+  (global $oe$out_i32_1 (mut i32) (i32.const 0))
+
+  ;; CHECK:      (func $calc (type $1) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (i32.mul
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (i32.const 7)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $calc (type $1) (param $x i32) (result i32)
+  ;; SHRINK-NEXT:  (i32.mul
+  ;; SHRINK-NEXT:   (local.get $x)
+  ;; SHRINK-NEXT:   (i32.const 7)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $calc (param $x i32) (result i32)
+    (i32.mul (local.get $x) (i32.const 7))
+  )
+
+  ;; CHECK:      (func $use2 (type $2) (param $a i32) (param $b i32) (result i32)
+  ;; CHECK-NEXT:  (i32.sub
+  ;; CHECK-NEXT:   (local.get $a)
+  ;; CHECK-NEXT:   (local.get $b)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $use2 (type $2) (param $a i32) (param $b i32) (result i32)
+  ;; SHRINK-NEXT:  (i32.sub
+  ;; SHRINK-NEXT:   (local.get $a)
+  ;; SHRINK-NEXT:   (local.get $b)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $use2 (param $a i32) (param $b i32) (result i32)
+    (i32.sub (local.get $a) (local.get $b))
+  )
+
+  ;; CHECK:      (func $fold-inlined-scratch (type $1) (param $p i32) (result i32)
+  ;; CHECK-NEXT:  (local $a i32)
+  ;; CHECK-NEXT:  (local $b i32)
+  ;; CHECK-NEXT:  (local $scratch i32)
+  ;; CHECK-NEXT:  (local.set $b
+  ;; CHECK-NEXT:   (call $calc
+  ;; CHECK-NEXT:    (local.get $p)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $a
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (local.get $p)
+  ;; CHECK-NEXT:    (i32.const 1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $b
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (local.get $b)
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (local.get $a)
+  ;; CHECK-NEXT:     (i32.const 10)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $a
+  ;; CHECK-NEXT:   (i32.mul
+  ;; CHECK-NEXT:    (local.get $b)
+  ;; CHECK-NEXT:    (i32.const 7)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $b
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (local.get $b)
+  ;; CHECK-NEXT:    (i32.const 2)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (call $use2
+  ;; CHECK-NEXT:   (local.get $a)
+  ;; CHECK-NEXT:   (local.get $b)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $fold-inlined-scratch (type $1) (param $p i32) (result i32)
+  ;; SHRINK-NEXT:  (local $a i32)
+  ;; SHRINK-NEXT:  (local $b i32)
+  ;; SHRINK-NEXT:  (local $scratch i32)
+  ;; SHRINK-NEXT:  (local.set $b
+  ;; SHRINK-NEXT:   (call $calc
+  ;; SHRINK-NEXT:    (local.get $p)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (local.set $a
+  ;; SHRINK-NEXT:   (i32.add
+  ;; SHRINK-NEXT:    (local.get $p)
+  ;; SHRINK-NEXT:    (i32.const 1)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (local.set $b
+  ;; SHRINK-NEXT:   (i32.add
+  ;; SHRINK-NEXT:    (local.get $b)
+  ;; SHRINK-NEXT:    (i32.add
+  ;; SHRINK-NEXT:     (local.get $a)
+  ;; SHRINK-NEXT:     (i32.const 10)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (local.set $a
+  ;; SHRINK-NEXT:   (i32.mul
+  ;; SHRINK-NEXT:    (local.get $b)
+  ;; SHRINK-NEXT:    (i32.const 7)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (local.set $b
+  ;; SHRINK-NEXT:   (i32.add
+  ;; SHRINK-NEXT:    (local.get $b)
+  ;; SHRINK-NEXT:    (i32.const 2)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (call $use2
+  ;; SHRINK-NEXT:   (local.get $a)
+  ;; SHRINK-NEXT:   (local.get $b)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $fold-inlined-scratch (param $p i32) (result i32)
+    (local $a i32)
+    (local $b i32)
+    (local $scratch i32)
+    ;; Inlined multi-write helper pattern: global.set $oe$out_i32_1 followed by
+    ;; primary return local.set and scratch global read local.set.
+    (block
+      (global.set $oe$out_i32_1 (call $calc (local.get $p)))
+      (local.set $a (i32.add (local.get $p) (i32.const 1)))
+      (local.set $b (global.get $oe$out_i32_1))
+      (global.set $oe$out_i32_1 (global.get $oe$out_i32_1))
+    )
+    ;; Sunk global.get $oe$out_i32_1 inside a subsequent LocalSet.
+    (global.set $oe$out_i32_1 (i32.add (local.get $a) (i32.const 10)))
+    (local.set $b (i32.add (local.get $b) (global.get $oe$out_i32_1)))
+    ;; Hoisted WasmBinaryReader block with inlined multi-write and single-use $scratch local.
+    (local.set $a
+      (block (result i32)
+        (local.set $scratch
+          (block (result i32)
+            (global.set $oe$out_i32_1 (i32.add (local.get $b) (i32.const 2)))
+            (i32.mul (local.get $b) (i32.const 7))
+          )
+        )
+        (local.set $b (global.get $oe$out_i32_1))
+        (local.get $scratch)
+      )
+    )
+    (call $use2 (local.get $a) (local.get $b))
+  )
+
+  ;; CHECK:      (func $reuse-scratch-1 (type $0) (param $p i32) (param $a i32) (param $b i32) (result i32)
+  ;; CHECK-NEXT:  (block
+  ;; CHECK-NEXT:   (local.set $a
+  ;; CHECK-NEXT:    (call $outlined
+  ;; CHECK-NEXT:     (local.get $p)
+  ;; CHECK-NEXT:     (local.get $b)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.set $b
+  ;; CHECK-NEXT:    (global.get $oe$out_i32_1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (call $use2
+  ;; CHECK-NEXT:   (local.get $a)
+  ;; CHECK-NEXT:   (local.get $b)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $reuse-scratch-1 (type $0) (param $p i32) (param $a i32) (param $b i32) (result i32)
+  ;; SHRINK-NEXT:  (block
+  ;; SHRINK-NEXT:   (local.set $a
+  ;; SHRINK-NEXT:    (call $outlined
+  ;; SHRINK-NEXT:     (local.get $p)
+  ;; SHRINK-NEXT:     (local.get $b)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (local.set $b
+  ;; SHRINK-NEXT:    (global.get $oe$out_i32_1)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (call $use2
+  ;; SHRINK-NEXT:   (local.get $a)
+  ;; SHRINK-NEXT:   (local.get $b)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $reuse-scratch-1 (param $p i32) (param $a i32) (param $b i32) (result i32)
+    (if (i32.gt_s (local.tee $a (call $calc (i32.add (local.get $p) (i32.const 100000)))) (i32.const 10))
+      (then
+        (local.set $b (call $calc (i32.add (local.get $a) (i32.const 200000))))
+      )
+    )
+    (call $use2 (local.get $a) (local.get $b))
+  )
+
+  ;; CHECK:      (func $reuse-scratch-2 (type $0) (param $p i32) (param $a i32) (param $b i32) (result i32)
+  ;; CHECK-NEXT:  (block
+  ;; CHECK-NEXT:   (local.set $a
+  ;; CHECK-NEXT:    (call $outlined
+  ;; CHECK-NEXT:     (local.get $p)
+  ;; CHECK-NEXT:     (local.get $b)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.set $b
+  ;; CHECK-NEXT:    (global.get $oe$out_i32_1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (call $use2
+  ;; CHECK-NEXT:   (local.get $b)
+  ;; CHECK-NEXT:   (local.get $a)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $reuse-scratch-2 (type $0) (param $p i32) (param $a i32) (param $b i32) (result i32)
+  ;; SHRINK-NEXT:  (block
+  ;; SHRINK-NEXT:   (local.set $a
+  ;; SHRINK-NEXT:    (call $outlined
+  ;; SHRINK-NEXT:     (local.get $p)
+  ;; SHRINK-NEXT:     (local.get $b)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (local.set $b
+  ;; SHRINK-NEXT:    (global.get $oe$out_i32_1)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (call $use2
+  ;; SHRINK-NEXT:   (local.get $b)
+  ;; SHRINK-NEXT:   (local.get $a)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $reuse-scratch-2 (param $p i32) (param $a i32) (param $b i32) (result i32)
+    (if (i32.gt_s (local.tee $a (call $calc (i32.add (local.get $p) (i32.const 100000)))) (i32.const 10))
+      (then
+        (local.set $b (call $calc (i32.add (local.get $a) (i32.const 200000))))
+      )
+    )
+    (call $use2 (local.get $b) (local.get $a))
+  )
+
+  ;; CHECK:      (func $reuse-scratch-3 (type $0) (param $p i32) (param $a i32) (param $b i32) (result i32)
+  ;; CHECK-NEXT:  (block
+  ;; CHECK-NEXT:   (local.set $a
+  ;; CHECK-NEXT:    (call $outlined
+  ;; CHECK-NEXT:     (local.get $p)
+  ;; CHECK-NEXT:     (local.get $b)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.set $b
+  ;; CHECK-NEXT:    (global.get $oe$out_i32_1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (local.get $a)
+  ;; CHECK-NEXT:   (local.get $b)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $reuse-scratch-3 (type $0) (param $p i32) (param $a i32) (param $b i32) (result i32)
+  ;; SHRINK-NEXT:  (block
+  ;; SHRINK-NEXT:   (local.set $a
+  ;; SHRINK-NEXT:    (call $outlined
+  ;; SHRINK-NEXT:     (local.get $p)
+  ;; SHRINK-NEXT:     (local.get $b)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (local.set $b
+  ;; SHRINK-NEXT:    (global.get $oe$out_i32_1)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (i32.add
+  ;; SHRINK-NEXT:   (local.get $a)
+  ;; SHRINK-NEXT:   (local.get $b)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $reuse-scratch-3 (param $p i32) (param $a i32) (param $b i32) (result i32)
+    (if (i32.gt_s (local.tee $a (call $calc (i32.add (local.get $p) (i32.const 100000)))) (i32.const 10))
+      (then
+        (local.set $b (call $calc (i32.add (local.get $a) (i32.const 200000))))
+      )
+    )
+    (i32.add (local.get $a) (local.get $b))
+  )
+)
+;; CHECK:      (func $outlined (type $2) (param $0 i32) (param $1 i32) (result i32)
+;; CHECK-NEXT:  (local $2 i32)
+;; CHECK-NEXT:  (if
+;; CHECK-NEXT:   (i32.gt_s
+;; CHECK-NEXT:    (local.tee $2
+;; CHECK-NEXT:     (call $calc
+;; CHECK-NEXT:      (i32.add
+;; CHECK-NEXT:       (local.get $0)
+;; CHECK-NEXT:       (i32.const 100000)
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:    (i32.const 10)
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (then
+;; CHECK-NEXT:    (local.set $1
+;; CHECK-NEXT:     (call $calc
+;; CHECK-NEXT:      (i32.add
+;; CHECK-NEXT:       (local.get $2)
+;; CHECK-NEXT:       (i32.const 200000)
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:  )
+;; CHECK-NEXT:  (global.set $oe$out_i32_1
+;; CHECK-NEXT:   (local.get $1)
+;; CHECK-NEXT:  )
+;; CHECK-NEXT:  (local.get $2)
+;; CHECK-NEXT: )
+
+;; SHRINK:      (func $outlined (type $2) (param $0 i32) (param $1 i32) (result i32)
+;; SHRINK-NEXT:  (local $2 i32)
+;; SHRINK-NEXT:  (if
+;; SHRINK-NEXT:   (i32.gt_s
+;; SHRINK-NEXT:    (local.tee $2
+;; SHRINK-NEXT:     (call $calc
+;; SHRINK-NEXT:      (i32.add
+;; SHRINK-NEXT:       (local.get $0)
+;; SHRINK-NEXT:       (i32.const 100000)
+;; SHRINK-NEXT:      )
+;; SHRINK-NEXT:     )
+;; SHRINK-NEXT:    )
+;; SHRINK-NEXT:    (i32.const 10)
+;; SHRINK-NEXT:   )
+;; SHRINK-NEXT:   (then
+;; SHRINK-NEXT:    (local.set $1
+;; SHRINK-NEXT:     (call $calc
+;; SHRINK-NEXT:      (i32.add
+;; SHRINK-NEXT:       (local.get $2)
+;; SHRINK-NEXT:       (i32.const 200000)
+;; SHRINK-NEXT:      )
+;; SHRINK-NEXT:     )
+;; SHRINK-NEXT:    )
+;; SHRINK-NEXT:   )
+;; SHRINK-NEXT:  )
+;; SHRINK-NEXT:  (global.set $oe$out_i32_1
+;; SHRINK-NEXT:   (local.get $1)
+;; SHRINK-NEXT:  )
+;; SHRINK-NEXT:  (local.get $2)
 ;; SHRINK-NEXT: )
