@@ -20,6 +20,7 @@
 //
 
 #include "ir/effects.h"
+#include "ir/find_all.h"
 #include "ir/intrinsics.h"
 #include "ir/module-utils.h"
 #include "ir/subtypes.h"
@@ -360,6 +361,96 @@ CallGraph buildCallGraph(const Module& module,
 }
 
 constexpr auto UnknownEffects = nullptr;
+
+static bool SubtreeTargetsName(Expression* root, Name target) {
+  if (!target.is() || !root) {
+    return false;
+  }
+  struct Finder : public PostWalker<Finder> {
+    Name target;
+    bool found = false;
+    Finder(Name target) : target(target) {}
+    void visitBreak(Break* curr) {
+      if (curr->name == target) {
+        found = true;
+      }
+    }
+    void visitSwitch(Switch* curr) {
+      if (curr->default_ == target) {
+        found = true;
+        return;
+      }
+      for (auto t : curr->targets) {
+        if (t == target) {
+          found = true;
+          return;
+        }
+      }
+    }
+    void visitBrOn(BrOn* curr) {
+      if (curr->name == target) {
+        found = true;
+      }
+    }
+    void visitTryTable(TryTable* curr) {
+      for (auto t : curr->catchDests) {
+        if (t == target) {
+          found = true;
+          return;
+        }
+      }
+    }
+  } finder(target);
+  finder.walk(root);
+  return finder.found;
+}
+
+static bool exprDoesNotReturn(Expression* e, const Module& module) {
+  if (!e) {
+    return false;
+  }
+  if (e->type == Type::unreachable) {
+    return true;
+  }
+  if (auto* b = e->dynCast<Block>()) {
+    for (auto* elem : b->list) {
+      if (SubtreeTargetsName(elem, b->name)) {
+        return false;
+      }
+      if (exprDoesNotReturn(elem, module)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (auto* iff = e->dynCast<If>()) {
+    if (exprDoesNotReturn(iff->condition, module)) {
+      return true;
+    }
+    return iff->ifFalse && exprDoesNotReturn(iff->ifTrue, module) &&
+           exprDoesNotReturn(iff->ifFalse, module);
+  }
+  if (auto* d = e->dynCast<Drop>()) {
+    return exprDoesNotReturn(d->value, module);
+  }
+  if (auto* ls = e->dynCast<LocalSet>()) {
+    return exprDoesNotReturn(ls->value, module);
+  }
+  if (auto* call = e->dynCast<Call>()) {
+    if (auto* target = module.getFunctionOrNull(call->target)) {
+      if (target->effects && target->effects->mustNotReturn) {
+        return true;
+      }
+    }
+    for (auto* op : call->operands) {
+      if (exprDoesNotReturn(op, module)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  return false;
+}
 
 // Merges effects from another connected component (const EffectAnalyzer*) or a
 // function (std::optional<EffectAnalyzer>&).
@@ -718,6 +809,110 @@ void propagateEffects(
         const auto& effects = funcInfos.at(f).effects;
         mergeMaybeEffects(ccEffects, effects);
       }
+    }
+
+    if (ccEffects && cc.size() == 1 && ccFuncs.size() == 1) {
+      Function* f = ccFuncs[0];
+      if (!f->imported() && f->body &&
+          !funcInfos.at(f).calledFunctions.contains(f->name)) {
+        struct ReturnOrTailCallFinder
+          : public PostWalker<ReturnOrTailCallFinder> {
+          bool found = false;
+          void visitReturn(Return*) { found = true; }
+          void visitCall(Call* curr) {
+            if (curr->isReturn) {
+              found = true;
+            }
+          }
+          void visitCallIndirect(CallIndirect* curr) {
+            if (curr->isReturn) {
+              found = true;
+            }
+          }
+          void visitCallRef(CallRef* curr) {
+            if (curr->isReturn) {
+              found = true;
+            }
+          }
+        } finder;
+        finder.walk(f->body);
+        if (!finder.found && exprDoesNotReturn(f->body, module)) {
+          ccEffects->mustNotReturn = true;
+        }
+
+        if (!ccEffects->hasNonTrapSideEffects() && !ccEffects->generative &&
+            !ccEffects->throws() && ccEffects->readsMutableStruct &&
+            !ccEffects->readsSharedMutableStruct && !ccEffects->calls) {
+          bool ok = FindAll<CallRef>(f->body).list.empty() &&
+                    FindAll<CallIndirect>(f->body).list.empty();
+          if (ok) {
+            for (auto* subCall : FindAll<Call>(f->body).list) {
+              auto* subTarget = module.getFunctionOrNull(subCall->target);
+              if (!subTarget || !subTarget->effects) {
+                ok = false;
+                break;
+              }
+              if (subTarget->effects->readsMutableStruct ||
+                  subTarget->effects->readsSharedMutableStruct) {
+                if (subTarget->effects->hasUnknownMutableStructRead ||
+                    subTarget->effects->readsSharedMutableStruct) {
+                  ok = false;
+                  break;
+                }
+                for (const auto& key :
+                     subTarget->effects->mutableStructFieldsRead) {
+                  if (std::find(ccEffects->mutableStructFieldsRead.begin(),
+                                ccEffects->mutableStructFieldsRead.end(),
+                                key) ==
+                      ccEffects->mutableStructFieldsRead.end()) {
+                    ccEffects->mutableStructFieldsRead.push_back(key);
+                  }
+                }
+              }
+            }
+          }
+          if (ok) {
+            for (auto* sg : FindAll<StructGet>(f->body).list) {
+              if (sg->ref->type == Type::unreachable) {
+                continue;
+              }
+              if (!sg->ref->type.isRef()) {
+                ok = false;
+                break;
+              }
+              HeapType ht = sg->ref->type.getHeapType();
+              if (!ht.isStruct() ||
+                  sg->index >= ht.getStruct().fields.size()) {
+                ok = false;
+                break;
+              }
+              if (ht.getStruct().fields[sg->index].mutable_ == Mutable) {
+                std::pair<HeapType, wasm::Index> key{ht, sg->index};
+                if (std::find(ccEffects->mutableStructFieldsRead.begin(),
+                              ccEffects->mutableStructFieldsRead.end(),
+                              key) ==
+                    ccEffects->mutableStructFieldsRead.end()) {
+                  ccEffects->mutableStructFieldsRead.push_back(key);
+                }
+              }
+            }
+          }
+          if (!ok) {
+            ccEffects->hasUnknownMutableStructRead = true;
+            ccEffects->mutableStructFieldsRead.clear();
+          }
+        } else if (ccEffects->readsMutableStruct ||
+                   ccEffects->readsSharedMutableStruct) {
+          ccEffects->hasUnknownMutableStructRead = true;
+        }
+      } else if (ccEffects->readsMutableStruct ||
+                 ccEffects->readsSharedMutableStruct) {
+        ccEffects->hasUnknownMutableStructRead = true;
+      }
+    } else if (ccEffects &&
+               (ccEffects->readsMutableStruct ||
+                ccEffects->readsSharedMutableStruct)) {
+      ccEffects->hasUnknownMutableStructRead = true;
     }
 
     if (passOptions.shrinkLevel > 0 && ccEffects && cc.size() == 1 &&

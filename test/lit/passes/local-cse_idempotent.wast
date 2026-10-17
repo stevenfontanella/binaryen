@@ -834,8 +834,8 @@
   ;; SHRINK:      (type $A (struct (field (mut (ref null $A))) (field (mut i32))))
   (type $A (struct (field (mut (ref null $A))) (field (mut i32))))
 
+  ;; CHECK-NEXT-NOT: local
   ;; CHECK:      (type $1 (func (param (ref $A)) (result i32)))
-  ;; SHRINK:      (type $1 (func (param (ref $A)) (result i32)))
 
   ;; CHECK:      (func $uncse-tee-across-disjoint-field (type $1) (param $a (ref $A)) (result i32)
   ;; CHECK-NEXT:  (local $x (ref null $A))
@@ -854,6 +854,8 @@
   ;; CHECK-NEXT:   (local.get $a)
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
+  ;; SHRINK:      (type $1 (func (param (ref $A)) (result i32)))
+
   ;; SHRINK:      (func $uncse-tee-across-disjoint-field (type $1) (param $a (ref $A)) (result i32)
   ;; SHRINK-NEXT:  (struct.set $A 1
   ;; SHRINK-NEXT:   (local.get $a)
@@ -862,7 +864,6 @@
   ;; SHRINK-NEXT:     (local.get $a)
   ;; SHRINK-NEXT:    )
   ;; SHRINK-NEXT:   )
-  ;; CHECK-NEXT-NOT: local
   ;; SHRINK-NEXT:  )
   ;; SHRINK-NEXT:  (ref.eq
   ;; SHRINK-NEXT:   (struct.get $A 0
@@ -947,6 +948,390 @@
         (struct.get $A 0
           (local.get $a)
         )
+      )
+    )
+  )
+)
+
+(module
+  ;; CHECK:      (type $S (struct (field (mut i32)) (field (mut i32))))
+  ;; SHRINK:      (type $S (struct (field (mut i32)) (field (mut i32))))
+  (type $S (struct (field (mut i32)) (field (mut i32))))
+  ;; CHECK:      (type $1 (func (param i32)))
+
+  ;; CHECK:      (type $2 (func (param (ref $S)) (result i32)))
+
+  ;; CHECK:      (type $3 (func (param (ref null $S)) (result i32)))
+
+  ;; CHECK:      (type $4 (func (param anyref) (result i32)))
+
+  ;; CHECK:      (tag $e (type $1) (param i32))
+  ;; SHRINK:      (type $1 (func (param i32)))
+
+  ;; SHRINK:      (type $2 (func (param (ref $S)) (result i32)))
+
+  ;; SHRINK:      (type $3 (func (param (ref null $S)) (result i32)))
+
+  ;; SHRINK:      (type $4 (func (param anyref) (result i32)))
+
+  ;; SHRINK:      (tag $e (type $1) (param i32))
+  (tag $e (param i32))
+
+  ;; CHECK:      (func $throw_helper (type $1) (param $code i32)
+  ;; CHECK-NEXT:  (throw $e
+  ;; CHECK-NEXT:   (local.get $code)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $throw_helper (type $1) (param $code i32)
+  ;; SHRINK-NEXT:  (throw $e
+  ;; SHRINK-NEXT:   (local.get $code)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $throw_helper (param $code i32)
+    (throw $e (local.get $code))
+  )
+
+  ;; CHECK:      (func $pure_get_f0 (type $2) (param $s (ref $S)) (result i32)
+  ;; CHECK-NEXT:  (struct.get $S 0
+  ;; CHECK-NEXT:   (local.get $s)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $pure_get_f0 (type $2) (param $s (ref $S)) (result i32)
+  ;; SHRINK-NEXT:  (struct.get $S 0
+  ;; SHRINK-NEXT:   (local.get $s)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $pure_get_f0 (param $s (ref $S)) (result i32)
+    (struct.get $S 0 (local.get $s))
+  )
+
+  ;; CHECK:      (func $noreturn-then-guards (type $3) (param $s (ref null $S)) (result i32)
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (i32.eqz
+  ;; CHECK-NEXT:    (struct.get $S 0
+  ;; CHECK-NEXT:     (local.get $s)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (struct.set $S 0
+  ;; CHECK-NEXT:     (local.get $s)
+  ;; CHECK-NEXT:     (i32.const 99)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (return
+  ;; CHECK-NEXT:     (i32.const -1)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (i32.lt_s
+  ;; CHECK-NEXT:    (struct.get $S 0
+  ;; CHECK-NEXT:     (local.get $s)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.const 0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (call $throw_helper
+  ;; CHECK-NEXT:     (i32.const 1)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (struct.get $S 0
+  ;; CHECK-NEXT:   (local.get $s)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $noreturn-then-guards (type $3) (param $s (ref null $S)) (result i32)
+  ;; SHRINK-NEXT:  (local $1 i32)
+  ;; SHRINK-NEXT:  (if
+  ;; SHRINK-NEXT:   (i32.eqz
+  ;; SHRINK-NEXT:    (local.tee $1
+  ;; SHRINK-NEXT:     (struct.get $S 0
+  ;; SHRINK-NEXT:      (local.get $s)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (then
+  ;; SHRINK-NEXT:    (struct.set $S 0
+  ;; SHRINK-NEXT:     (local.get $s)
+  ;; SHRINK-NEXT:     (i32.const 99)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (return
+  ;; SHRINK-NEXT:     (i32.const -1)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (if
+  ;; SHRINK-NEXT:   (i32.lt_s
+  ;; SHRINK-NEXT:    (local.get $1)
+  ;; SHRINK-NEXT:    (i32.const 0)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (then
+  ;; SHRINK-NEXT:    (call $throw_helper
+  ;; SHRINK-NEXT:     (i32.const 1)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (local.get $1)
+  ;; SHRINK-NEXT: )
+  (func $noreturn-then-guards (param $s (ref null $S)) (result i32)
+    ;; The then arm modifies field 0 but returns, so it cannot reach after the if.
+    (if
+      (i32.eqz
+        (struct.get $S 0 (local.get $s))
+      )
+      (then
+        (block
+          (struct.set $S 0 (local.get $s) (i32.const 99))
+          (return (i32.const -1))
+        )
+      )
+    )
+    ;; The then arm calls a noreturn throw helper, so field 0 is still valid after.
+    (if
+      (i32.lt_s
+        (struct.get $S 0 (local.get $s))
+        (i32.const 0)
+      )
+      (then
+        (call $throw_helper (i32.const 1))
+      )
+    )
+    (struct.get $S 0 (local.get $s))
+  )
+
+  ;; CHECK:      (func $short-circuit-and-or (type $4) (param $a anyref) (result i32)
+  ;; CHECK-NEXT:  (local $1 (ref null $S))
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (if (result i32)
+  ;; CHECK-NEXT:    (ref.is_null
+  ;; CHECK-NEXT:     (local.get $a)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (then
+  ;; CHECK-NEXT:     (i32.const 1)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (else
+  ;; CHECK-NEXT:     (i32.eqz
+  ;; CHECK-NEXT:      (struct.get $S 0
+  ;; CHECK-NEXT:       (ref.cast (ref null $S)
+  ;; CHECK-NEXT:        (local.get $a)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (return
+  ;; CHECK-NEXT:     (i32.const 0)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (if (result i32)
+  ;; CHECK-NEXT:   (if (result i32)
+  ;; CHECK-NEXT:    (i32.gt_s
+  ;; CHECK-NEXT:     (struct.get $S 0
+  ;; CHECK-NEXT:      (local.tee $1
+  ;; CHECK-NEXT:       (ref.cast (ref null $S)
+  ;; CHECK-NEXT:        (local.get $a)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.const 10)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (then
+  ;; CHECK-NEXT:     (i32.gt_s
+  ;; CHECK-NEXT:      (struct.get $S 1
+  ;; CHECK-NEXT:       (local.get $1)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (i32.const 20)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (else
+  ;; CHECK-NEXT:     (i32.const 0)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (struct.get $S 1
+  ;; CHECK-NEXT:     (ref.cast (ref null $S)
+  ;; CHECK-NEXT:      (local.get $a)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (else
+  ;; CHECK-NEXT:    (struct.get $S 0
+  ;; CHECK-NEXT:     (ref.cast (ref null $S)
+  ;; CHECK-NEXT:      (local.get $a)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $short-circuit-and-or (type $4) (param $a anyref) (result i32)
+  ;; SHRINK-NEXT:  (local $1 i32)
+  ;; SHRINK-NEXT:  (local $2 i32)
+  ;; SHRINK-NEXT:  (if
+  ;; SHRINK-NEXT:   (if (result i32)
+  ;; SHRINK-NEXT:    (ref.is_null
+  ;; SHRINK-NEXT:     (local.get $a)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (then
+  ;; SHRINK-NEXT:     (i32.const 1)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (else
+  ;; SHRINK-NEXT:     (i32.eqz
+  ;; SHRINK-NEXT:      (local.tee $1
+  ;; SHRINK-NEXT:       (struct.get $S 0
+  ;; SHRINK-NEXT:        (ref.cast (ref null $S)
+  ;; SHRINK-NEXT:         (local.get $a)
+  ;; SHRINK-NEXT:        )
+  ;; SHRINK-NEXT:       )
+  ;; SHRINK-NEXT:      )
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (then
+  ;; SHRINK-NEXT:    (return
+  ;; SHRINK-NEXT:     (i32.const 0)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (if (result i32)
+  ;; SHRINK-NEXT:   (if (result i32)
+  ;; SHRINK-NEXT:    (i32.gt_s
+  ;; SHRINK-NEXT:     (local.get $1)
+  ;; SHRINK-NEXT:     (i32.const 10)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (then
+  ;; SHRINK-NEXT:     (i32.gt_s
+  ;; SHRINK-NEXT:      (local.tee $2
+  ;; SHRINK-NEXT:       (struct.get $S 1
+  ;; SHRINK-NEXT:        (ref.cast (ref null $S)
+  ;; SHRINK-NEXT:         (local.get $a)
+  ;; SHRINK-NEXT:        )
+  ;; SHRINK-NEXT:       )
+  ;; SHRINK-NEXT:      )
+  ;; SHRINK-NEXT:      (i32.const 20)
+  ;; SHRINK-NEXT:     )
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (else
+  ;; SHRINK-NEXT:     (i32.const 0)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (then
+  ;; SHRINK-NEXT:    (local.get $2)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (else
+  ;; SHRINK-NEXT:    (local.get $1)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $short-circuit-and-or (param $a anyref) (result i32)
+    ;; Short-circuit || guard with non-returning then: the else arm of the
+    ;; condition dominates the code after the guard.
+    (if
+      (if (result i32)
+        (ref.is_null (local.get $a))
+        (then
+          (i32.const 1)
+        )
+        (else
+          (i32.eqz
+            (struct.get $S 0
+              (ref.cast (ref null $S) (local.get $a))
+            )
+          )
+        )
+      )
+      (then
+        (return (i32.const 0))
+      )
+    )
+    ;; Short-circuit && condition: the then arm of the condition dominates the
+    ;; outer then arm.
+    (if (result i32)
+      (if (result i32)
+        (i32.gt_s
+          (struct.get $S 0
+            (ref.cast (ref null $S) (local.get $a))
+          )
+          (i32.const 10)
+        )
+        (then
+          (i32.gt_s
+            (struct.get $S 1
+              (ref.cast (ref null $S) (local.get $a))
+            )
+            (i32.const 20)
+          )
+        )
+        (else
+          (i32.const 0)
+        )
+      )
+      (then
+        (struct.get $S 1
+          (ref.cast (ref null $S) (local.get $a))
+        )
+      )
+      (else
+        (struct.get $S 0
+          (ref.cast (ref null $S) (local.get $a))
+        )
+      )
+    )
+  )
+
+  ;; CHECK:      (func $pure-call-across-disjoint-struct-set (type $2) (param $s (ref $S)) (result i32)
+  ;; CHECK-NEXT:  (local $x i32)
+  ;; CHECK-NEXT:  (local.set $x
+  ;; CHECK-NEXT:   (call $pure_get_f0
+  ;; CHECK-NEXT:    (local.get $s)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (struct.set $S 1
+  ;; CHECK-NEXT:   (local.get $s)
+  ;; CHECK-NEXT:   (i32.const 42)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (call $pure_get_f0
+  ;; CHECK-NEXT:     (local.get $s)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (call $pure_get_f0
+  ;; CHECK-NEXT:     (local.get $s)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $pure-call-across-disjoint-struct-set (type $2) (param $s (ref $S)) (result i32)
+  ;; SHRINK-NEXT:  (local $x i32)
+  ;; SHRINK-NEXT:  (local.set $x
+  ;; SHRINK-NEXT:   (call $pure_get_f0
+  ;; SHRINK-NEXT:    (local.get $s)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (struct.set $S 1
+  ;; SHRINK-NEXT:   (local.get $s)
+  ;; SHRINK-NEXT:   (i32.const 42)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT:  (i32.add
+  ;; SHRINK-NEXT:   (local.get $x)
+  ;; SHRINK-NEXT:   (i32.add
+  ;; SHRINK-NEXT:    (local.get $x)
+  ;; SHRINK-NEXT:    (local.get $x)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $pure-call-across-disjoint-struct-set (param $s (ref $S)) (result i32)
+    (local $x i32)
+    (local.set $x
+      (call $pure_get_f0 (local.get $s))
+    )
+    (struct.set $S 1 (local.get $s) (i32.const 42))
+    (i32.add
+      (local.get $x)
+      (i32.add
+        (call $pure_get_f0 (local.get $s))
+        (call $pure_get_f0 (local.get $s))
       )
     )
   )

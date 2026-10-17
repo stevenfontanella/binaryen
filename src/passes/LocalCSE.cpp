@@ -1326,6 +1326,8 @@ struct ScopedDominatorCSE {
     bool readsMutableArray = false;
     bool readsMemory = false;
     bool readsTable = false;
+    bool exitedArmScope = false;
+    bool crossedScope = false;
   };
 
   struct NodeInfo {
@@ -1344,7 +1346,109 @@ struct ScopedDominatorCSE {
   // Maps normalized hash -> active original indices in the current scope.
   using ActiveMap = std::unordered_map<size_t, SmallVector<Index, 1>>;
   ActiveMap activeMap;
+  Expression* lastCondExpr = nullptr;
+  ActiveMap lastCondTrueMap;
+  ActiveMap lastCondFalseMap;
+  bool hasLastBrExitMap = false;
+  ActiveMap lastBrExitMap;
   std::unordered_set<Type> activeVarTypes;
+
+  static bool isConstZeroI32(Expression* e) {
+    while (e) {
+      if (auto* c = e->dynCast<Const>()) {
+        return c->type == Type::i32 && c->value.geti32() == 0;
+      }
+      if (auto* b = e->dynCast<Block>()) {
+        if (!b->list.empty() && !SubtreeTargetsName(b, b->name)) {
+          e = b->list.back();
+          continue;
+        }
+      }
+      break;
+    }
+    return false;
+  }
+
+  static bool isConstNonZeroI32(Expression* e) {
+    while (e) {
+      if (auto* c = e->dynCast<Const>()) {
+        return c->type == Type::i32 && c->value.geti32() != 0;
+      }
+      if (auto* b = e->dynCast<Block>()) {
+        if (!b->list.empty() && !SubtreeTargetsName(b, b->name)) {
+          e = b->list.back();
+          continue;
+        }
+      }
+      break;
+    }
+    return false;
+  }
+
+  bool doesNotReturn(Expression* e) const {
+    if (!e) {
+      return false;
+    }
+    if (e->type == Type::unreachable) {
+      return true;
+    }
+    if (auto* b = e->dynCast<Block>()) {
+      for (auto* elem : b->list) {
+        if (SubtreeTargetsName(elem, b->name)) {
+          return false;
+        }
+        if (doesNotReturn(elem)) {
+          return true;
+        }
+      }
+      return false;
+    }
+    if (auto* iff = e->dynCast<If>()) {
+      if (doesNotReturn(iff->condition)) {
+        return true;
+      }
+      return iff->ifFalse && doesNotReturn(iff->ifTrue) &&
+             doesNotReturn(iff->ifFalse);
+    }
+    if (auto* d = e->dynCast<Drop>()) {
+      return doesNotReturn(d->value);
+    }
+    if (auto* ls = e->dynCast<LocalSet>()) {
+      return doesNotReturn(ls->value);
+    }
+    if (auto* call = e->dynCast<Call>()) {
+      if (auto* target = wasm.getFunctionOrNull(call->target)) {
+        if (target->effects && target->effects->mustNotReturn) {
+          return true;
+        }
+      }
+      for (auto* op : call->operands) {
+        if (doesNotReturn(op)) {
+          return true;
+        }
+      }
+      return false;
+    }
+    return false;
+  }
+
+  bool collectPureCallStructFieldsRead(
+    Function* target,
+    SmallVector<std::pair<HeapType, Index>, 2>& fieldsOut) const {
+    if (!target || target->imported() || !target->effects ||
+        target->effects->readsSharedMutableStruct ||
+        target->effects->hasUnknownMutableStructRead ||
+        target->effects->calls) {
+      return false;
+    }
+    for (const auto& key : target->effects->mutableStructFieldsRead) {
+      if (std::find(fieldsOut.begin(), fieldsOut.end(), key) ==
+          fieldsOut.end()) {
+        fieldsOut.push_back(key);
+      }
+    }
+    return true;
+  }
 
   static Type getBinaryVarType(Type t) {
     if (t.isRef()) {
@@ -1466,6 +1570,14 @@ struct ScopedDominatorCSE {
                 rec.mutableStructFieldsRead.push_back(key);
               }
             } else {
+              rec.readsUnknownMutableStruct = true;
+            }
+          } else if (auto* call = e->dynCast<Call>()) {
+            if (eff.readsSharedMutableStruct ||
+                !isPureReadOnlyCall(call, wasm, options) ||
+                !collectPureCallStructFieldsRead(
+                  wasm.getFunctionOrNull(call->target),
+                  rec.mutableStructFieldsRead)) {
               rec.readsUnknownMutableStruct = true;
             }
           } else {
@@ -1650,6 +1762,7 @@ struct ScopedDominatorCSE {
   }
 
   NodeInfo walkExpr(Expression* curr) {
+    lastCondExpr = nullptr;
     if (!curr) {
       return {};
     }
@@ -1683,13 +1796,17 @@ struct ScopedDominatorCSE {
             capturedAfterDirectBr = true;
           }
         }
+        hasLastBrExitMap = false;
         walkExpr(block->list[i]);
         if (i == firstBranchIdx && capturedAfterDirectBr) {
-          savedExitMap = activeMap;
+          savedExitMap =
+            hasLastBrExitMap ? std::move(lastBrExitMap) : activeMap;
+          hasLastBrExitMap = false;
         }
       }
       if (block->type == Type::unreachable) {
         activeMap.clear();
+        lastCondExpr = nullptr;
       } else if (firstBranchIdx < block->list.size()) {
         activeMap = std::move(savedExitMap);
         for (Index i = firstBranchIdx; i < block->list.size(); i++) {
@@ -1700,19 +1817,71 @@ struct ScopedDominatorCSE {
           eff.trap = false;
           invalidateByEffects(eff, block->list[i]);
         }
+        lastCondExpr = nullptr;
+      } else if (!block->list.empty() && lastCondExpr == block->list.back()) {
+        lastCondExpr = block;
+      } else {
+        lastCondExpr = nullptr;
       }
       return {};
     }
     if (auto* iff = curr->dynCast<If>()) {
       walkExpr(iff->condition);
       ActiveMap afterCond = activeMap;
+      ActiveMap condTrueMap = (lastCondExpr == iff->condition)
+                                ? std::move(lastCondTrueMap)
+                                : afterCond;
+      ActiveMap condFalseMap = (lastCondExpr == iff->condition)
+                                 ? std::move(lastCondFalseMap)
+                                 : afterCond;
+      lastCondExpr = nullptr;
+
+      Index origStart = origRecords.size();
+      activeMap = std::move(condTrueMap);
       walkExpr(iff->ifTrue);
+      ActiveMap thenTrueMap =
+        (lastCondExpr == iff->ifTrue) ? std::move(lastCondTrueMap) : activeMap;
+      ActiveMap thenFalseMap =
+        (lastCondExpr == iff->ifTrue) ? std::move(lastCondFalseMap) : activeMap;
+      ActiveMap afterTrue = std::move(activeMap);
+      lastCondExpr = nullptr;
+
+      ActiveMap afterFalse;
+      ActiveMap elseTrueMap;
+      ActiveMap elseFalseMap;
       if (iff->ifFalse) {
-        activeMap = afterCond;
+        activeMap = std::move(condFalseMap);
         walkExpr(iff->ifFalse);
+        elseTrueMap = (lastCondExpr == iff->ifFalse)
+                        ? std::move(lastCondTrueMap)
+                        : activeMap;
+        elseFalseMap = (lastCondExpr == iff->ifFalse)
+                         ? std::move(lastCondFalseMap)
+                         : activeMap;
+        afterFalse = std::move(activeMap);
+        lastCondExpr = nullptr;
+      } else {
+        elseTrueMap = condFalseMap;
+        elseFalseMap = condFalseMap;
+        afterFalse = std::move(condFalseMap);
       }
-      if (iff->type == Type::unreachable) {
+
+      for (Index k = origStart; k < origRecords.size(); k++) {
+        origRecords[k].exitedArmScope = true;
+      }
+
+      bool thenNR = doesNotReturn(iff->ifTrue);
+      bool elseNR = iff->ifFalse && doesNotReturn(iff->ifFalse);
+
+      if (iff->type == Type::unreachable || (thenNR && elseNR)) {
         activeMap.clear();
+        return {};
+      }
+
+      if (thenNR && !elseNR) {
+        activeMap = std::move(afterFalse);
+      } else if (elseNR && !thenNR) {
+        activeMap = std::move(afterTrue);
       } else {
         activeMap = std::move(afterCond);
         EffectAnalyzer thenEff(options, wasm, iff->ifTrue);
@@ -1723,6 +1892,30 @@ struct ScopedDominatorCSE {
           elseEff.trap = false;
           invalidateByEffects(elseEff, iff->ifFalse);
         }
+      }
+
+      if (iff->type == Type::i32 && iff->ifFalse) {
+        bool thenAlwaysZero = thenNR || isConstZeroI32(iff->ifTrue);
+        bool elseAlwaysZero = elseNR || isConstZeroI32(iff->ifFalse);
+        bool thenAlwaysNonZero = thenNR || isConstNonZeroI32(iff->ifTrue);
+        bool elseAlwaysNonZero = elseNR || isConstNonZeroI32(iff->ifFalse);
+
+        if (elseAlwaysZero && !thenAlwaysZero) {
+          lastCondTrueMap = std::move(thenTrueMap);
+        } else if (thenAlwaysZero && !elseAlwaysZero) {
+          lastCondTrueMap = std::move(elseTrueMap);
+        } else {
+          lastCondTrueMap = activeMap;
+        }
+
+        if (thenAlwaysNonZero && !elseAlwaysNonZero) {
+          lastCondFalseMap = std::move(elseFalseMap);
+        } else if (elseAlwaysNonZero && !thenAlwaysNonZero) {
+          lastCondFalseMap = std::move(thenFalseMap);
+        } else {
+          lastCondFalseMap = activeMap;
+        }
+        lastCondExpr = iff;
       }
       return {};
     }
@@ -1778,10 +1971,17 @@ struct ScopedDominatorCSE {
       }
       if (br->condition) {
         walkExpr(br->condition);
+        if (lastCondExpr == br->condition) {
+          hasLastBrExitMap = true;
+          lastBrExitMap = activeMap;
+          activeMap = std::move(lastCondFalseMap);
+          lastCondExpr = nullptr;
+        }
       }
       if (!br->condition) {
         activeMap.clear();
       }
+      lastCondExpr = nullptr;
       return {};
     }
     if (auto* bron = curr->dynCast<BrOn>()) {
@@ -1789,6 +1989,7 @@ struct ScopedDominatorCSE {
       if (bron->desc) {
         walkExpr(bron->desc);
       }
+      lastCondExpr = nullptr;
       return {};
     }
     if (auto* sw = curr->dynCast<Switch>()) {
@@ -1797,6 +1998,7 @@ struct ScopedDominatorCSE {
       }
       walkExpr(sw->condition);
       activeMap.clear();
+      lastCondExpr = nullptr;
       return {};
     }
     if (auto* ret = curr->dynCast<Return>()) {
@@ -1804,6 +2006,7 @@ struct ScopedDominatorCSE {
         walkExpr(ret->value);
       }
       activeMap.clear();
+      lastCondExpr = nullptr;
       return {};
     }
     if (auto* th = curr->dynCast<Throw>()) {
@@ -1811,6 +2014,7 @@ struct ScopedDominatorCSE {
         walkExpr(op);
       }
       activeMap.clear();
+      lastCondExpr = nullptr;
       return {};
     }
     if (curr->is<Rethrow>() || curr->is<Unreachable>()) {
@@ -1828,6 +2032,7 @@ struct ScopedDominatorCSE {
         activeVarTypes.insert(getBinaryVarType(func->getLocalType(ls->index)));
       }
       NodeInfo valInfo = walkExpr(ls->value);
+      lastCondExpr = nullptr;
       invalidateByLocalWrite(ls->index);
       if (valInfo.possible && !origRecords.empty() &&
           origRecords.back().orig == ls->value &&
@@ -1862,6 +2067,16 @@ struct ScopedDominatorCSE {
         hasTee = hasTee || cInfo.hasTee;
       }
     }
+    if (auto* u = curr->dynCast<Unary>()) {
+      if (u->op == EqZInt32 && lastCondExpr == u->value) {
+        std::swap(lastCondTrueMap, lastCondFalseMap);
+        lastCondExpr = u;
+      } else {
+        lastCondExpr = nullptr;
+      }
+    } else {
+      lastCondExpr = nullptr;
+    }
 
     bool idempotentCall = isIdempotent(curr, wasm);
     bool pureReadOnlyCall = isPureReadOnlyCall(curr, wasm, options);
@@ -1879,7 +2094,8 @@ struct ScopedDominatorCSE {
     if (shallow.hasNonTrapSideEffects()) {
       invalidateByEffects(shallow, curr);
     }
-    if (shallow.branchesOut || curr->type == Type::unreachable) {
+    if (shallow.branchesOut || curr->type == Type::unreachable ||
+        (curr->is<Call>() && doesNotReturn(curr))) {
       activeMap.clear();
       return {};
     }
@@ -1905,6 +2121,9 @@ struct ScopedDominatorCSE {
         if (normEqual(origRecords[origIdx].orig, curr)) {
           repeatToOrigIdx[curr] = origIdx;
           origRecords[origIdx].reuses++;
+          if (origRecords[origIdx].exitedArmScope) {
+            origRecords[origIdx].crossedScope = true;
+          }
           for (auto* child : ChildIterator(curr)) {
             auto cIt = repeatToOrigIdx.find(child);
             if (cIt != repeatToOrigIdx.end()) {
@@ -1979,8 +2198,14 @@ struct ScopedDominatorCSE {
       if (rec.existingLocal != Index(-1)) {
         return effBytes >= 4;
       }
+      Index nonNullPenalty =
+        (rec.crossedScope && rec.orig->type.isNonNullable()) ? 1 : 0;
+      if (effBytes <= 2 + nonNullPenalty) {
+        return false;
+      }
       Index headerBytes = getHeaderBytes(rec.orig->type);
-      return rec.reuses * (effBytes - 2) >= 2 + headerBytes + 1;
+      return rec.reuses * (effBytes - 2 - nonNullPenalty) >=
+             2 + nonNullPenalty + headerBytes + 1;
     };
 
     // Evaluate originals in reverse postorder (parents before children).
@@ -2166,7 +2391,11 @@ static bool unCseSingleWriteTees(Function* func,
           }
           if (tEff.readsMutableStruct || tEff.readsSharedMutableStruct) {
             rec.readsMutableStruct = true;
-            rec.readsUnknownMutableStruct = true;
+            if (tEff.readsSharedMutableStruct ||
+                !helper.collectPureCallStructFieldsRead(
+                  target, rec.mutableStructFieldsRead)) {
+              rec.readsUnknownMutableStruct = true;
+            }
           }
           if (tEff.readsMutableArray || tEff.readsSharedMutableArray) {
             rec.readsMutableArray = true;
@@ -2382,7 +2611,13 @@ static bool unCseSingleWriteTees(Function* func,
       break;
     }
 
-    std::unordered_map<Index, Index> activeTees;
+    using TeeMap = std::unordered_map<Index, Index>;
+    TeeMap activeTees;
+    Expression* lastCondExpr = nullptr;
+    TeeMap lastCondTrueMap;
+    TeeMap lastCondFalseMap;
+    bool hasLastBrExitMap = false;
+    TeeMap lastBrExitMap;
     std::vector<Index> validReads(numLocals, 0);
     Index currentLoopDepth = 0;
 
@@ -2414,6 +2649,7 @@ static bool unCseSingleWriteTees(Function* func,
     };
 
     std::function<void(Expression*)> walkDom = [&](Expression* curr) {
+      lastCondExpr = nullptr;
       if (!curr) {
         return;
       }
@@ -2427,7 +2663,7 @@ static bool unCseSingleWriteTees(Function* func,
             }
           }
         }
-        std::unordered_map<Index, Index> savedExitMap;
+        TeeMap savedExitMap;
         bool capturedAfterDirectBr = false;
         for (Index i = 0; i < block->list.size(); i++) {
           if (i == firstBranchIdx) {
@@ -2447,13 +2683,17 @@ static bool unCseSingleWriteTees(Function* func,
               capturedAfterDirectBr = true;
             }
           }
+          hasLastBrExitMap = false;
           walkDom(block->list[i]);
           if (i == firstBranchIdx && capturedAfterDirectBr) {
-            savedExitMap = activeTees;
+            savedExitMap =
+              hasLastBrExitMap ? std::move(lastBrExitMap) : activeTees;
+            hasLastBrExitMap = false;
           }
         }
         if (block->type == Type::unreachable) {
           activeTees.clear();
+          lastCondExpr = nullptr;
         } else if (firstBranchIdx < block->list.size()) {
           activeTees = std::move(savedExitMap);
           for (Index i = firstBranchIdx; i < block->list.size(); i++) {
@@ -2464,43 +2704,105 @@ static bool unCseSingleWriteTees(Function* func,
             eff.trap = false;
             invalidateActiveByEffects(eff, block->list[i]);
           }
+          lastCondExpr = nullptr;
+        } else if (!block->list.empty() && lastCondExpr == block->list.back()) {
+          lastCondExpr = block;
+        } else {
+          lastCondExpr = nullptr;
         }
         return;
       }
       if (auto* iff = curr->dynCast<If>()) {
         walkDom(iff->condition);
         auto afterCond = activeTees;
+        TeeMap condTrueMap = (lastCondExpr == iff->condition)
+                               ? std::move(lastCondTrueMap)
+                               : afterCond;
+        TeeMap condFalseMap = (lastCondExpr == iff->condition)
+                                ? std::move(lastCondFalseMap)
+                                : afterCond;
+        lastCondExpr = nullptr;
+
+        activeTees = std::move(condTrueMap);
         walkDom(iff->ifTrue);
+        TeeMap thenTrueMap =
+          (lastCondExpr == iff->ifTrue) ? std::move(lastCondTrueMap) : activeTees;
+        TeeMap thenFalseMap = (lastCondExpr == iff->ifTrue)
+                                ? std::move(lastCondFalseMap)
+                                : activeTees;
+        TeeMap afterTrue = std::move(activeTees);
+        lastCondExpr = nullptr;
+
+        TeeMap afterFalse;
+        TeeMap elseTrueMap;
+        TeeMap elseFalseMap;
         if (iff->ifFalse) {
-          activeTees = afterCond;
+          activeTees = std::move(condFalseMap);
           walkDom(iff->ifFalse);
+          elseTrueMap = (lastCondExpr == iff->ifFalse)
+                          ? std::move(lastCondTrueMap)
+                          : activeTees;
+          elseFalseMap = (lastCondExpr == iff->ifFalse)
+                           ? std::move(lastCondFalseMap)
+                           : activeTees;
+          afterFalse = std::move(activeTees);
+          lastCondExpr = nullptr;
+        } else {
+          elseTrueMap = condFalseMap;
+          elseFalseMap = condFalseMap;
+          afterFalse = std::move(condFalseMap);
         }
-        if (iff->type == Type::unreachable) {
+
+        bool thenNR = helper.doesNotReturn(iff->ifTrue);
+        bool elseNR = iff->ifFalse && helper.doesNotReturn(iff->ifFalse);
+
+        if (iff->type == Type::unreachable || (thenNR && elseNR)) {
           activeTees.clear();
+          return;
+        }
+
+        if (thenNR && !elseNR) {
+          activeTees = std::move(afterFalse);
+        } else if (elseNR && !thenNR) {
+          activeTees = std::move(afterTrue);
         } else {
           activeTees = std::move(afterCond);
-          bool thenExitsFunc =
-            iff->ifTrue->type == Type::unreachable &&
-            FindAll<Break>(iff->ifTrue).list.empty() &&
-            FindAll<Switch>(iff->ifTrue).list.empty() &&
-            FindAll<BrOn>(iff->ifTrue).list.empty();
-          if (!thenExitsFunc) {
-            EffectAnalyzer thenEff(options, wasm, iff->ifTrue);
-            thenEff.trap = false;
-            invalidateActiveByEffects(thenEff, iff->ifTrue);
-          }
+          EffectAnalyzer thenEff(options, wasm, iff->ifTrue);
+          thenEff.trap = false;
+          invalidateActiveByEffects(thenEff, iff->ifTrue);
           if (iff->ifFalse) {
-            bool elseExitsFunc =
-              iff->ifFalse->type == Type::unreachable &&
-              FindAll<Break>(iff->ifFalse).list.empty() &&
-              FindAll<Switch>(iff->ifFalse).list.empty() &&
-              FindAll<BrOn>(iff->ifFalse).list.empty();
-            if (!elseExitsFunc) {
-              EffectAnalyzer elseEff(options, wasm, iff->ifFalse);
-              elseEff.trap = false;
-              invalidateActiveByEffects(elseEff, iff->ifFalse);
-            }
+            EffectAnalyzer elseEff(options, wasm, iff->ifFalse);
+            elseEff.trap = false;
+            invalidateActiveByEffects(elseEff, iff->ifFalse);
           }
+        }
+
+        if (iff->type == Type::i32 && iff->ifFalse) {
+          bool thenAlwaysZero =
+            thenNR || ScopedDominatorCSE::isConstZeroI32(iff->ifTrue);
+          bool elseAlwaysZero =
+            elseNR || ScopedDominatorCSE::isConstZeroI32(iff->ifFalse);
+          bool thenAlwaysNonZero =
+            thenNR || ScopedDominatorCSE::isConstNonZeroI32(iff->ifTrue);
+          bool elseAlwaysNonZero =
+            elseNR || ScopedDominatorCSE::isConstNonZeroI32(iff->ifFalse);
+
+          if (elseAlwaysZero && !thenAlwaysZero) {
+            lastCondTrueMap = std::move(thenTrueMap);
+          } else if (thenAlwaysZero && !elseAlwaysZero) {
+            lastCondTrueMap = std::move(elseTrueMap);
+          } else {
+            lastCondTrueMap = activeTees;
+          }
+
+          if (thenAlwaysNonZero && !elseAlwaysNonZero) {
+            lastCondFalseMap = std::move(elseFalseMap);
+          } else if (elseAlwaysNonZero && !thenAlwaysNonZero) {
+            lastCondFalseMap = std::move(thenFalseMap);
+          } else {
+            lastCondFalseMap = activeTees;
+          }
+          lastCondExpr = iff;
         }
         return;
       }
@@ -2517,6 +2819,7 @@ static bool unCseSingleWriteTees(Function* func,
         } else {
           activeTees = std::move(beforeLoop);
         }
+        lastCondExpr = nullptr;
         return;
       }
       if (auto* tryy = curr->dynCast<Try>()) {
@@ -2537,6 +2840,7 @@ static bool unCseSingleWriteTees(Function* func,
           tryEff.trap = false;
           invalidateActiveByEffects(tryEff, tryy);
         }
+        lastCondExpr = nullptr;
         return;
       }
       if (auto* tt = curr->dynCast<TryTable>()) {
@@ -2550,6 +2854,7 @@ static bool unCseSingleWriteTees(Function* func,
           ttEff.trap = false;
           invalidateActiveByEffects(ttEff, tt);
         }
+        lastCondExpr = nullptr;
         return;
       }
       if (auto* br = curr->dynCast<Break>()) {
@@ -2558,10 +2863,17 @@ static bool unCseSingleWriteTees(Function* func,
         }
         if (br->condition) {
           walkDom(br->condition);
+          if (lastCondExpr == br->condition) {
+            hasLastBrExitMap = true;
+            lastBrExitMap = activeTees;
+            activeTees = std::move(lastCondFalseMap);
+            lastCondExpr = nullptr;
+          }
         }
         if (!br->condition) {
           activeTees.clear();
         }
+        lastCondExpr = nullptr;
         return;
       }
       if (auto* bron = curr->dynCast<BrOn>()) {
@@ -2569,6 +2881,7 @@ static bool unCseSingleWriteTees(Function* func,
         if (bron->desc) {
           walkDom(bron->desc);
         }
+        lastCondExpr = nullptr;
         return;
       }
       if (auto* sw = curr->dynCast<Switch>()) {
@@ -2577,6 +2890,7 @@ static bool unCseSingleWriteTees(Function* func,
         }
         walkDom(sw->condition);
         activeTees.clear();
+        lastCondExpr = nullptr;
         return;
       }
       if (auto* ret = curr->dynCast<Return>()) {
@@ -2584,6 +2898,7 @@ static bool unCseSingleWriteTees(Function* func,
           walkDom(ret->value);
         }
         activeTees.clear();
+        lastCondExpr = nullptr;
         return;
       }
       if (auto* th = curr->dynCast<Throw>()) {
@@ -2591,6 +2906,7 @@ static bool unCseSingleWriteTees(Function* func,
           walkDom(op);
         }
         activeTees.clear();
+        lastCondExpr = nullptr;
         return;
       }
       if (curr->is<Rethrow>() || curr->is<Unreachable>()) {
@@ -2615,6 +2931,7 @@ static bool unCseSingleWriteTees(Function* func,
       }
       if (auto* ls = curr->dynCast<LocalSet>()) {
         walkDom(ls->value);
+        lastCondExpr = nullptr;
         invalidateActiveByLocalWrite(ls->index);
         activeTees.erase(ls->index);
         if (isCandidate[ls->index] && writes[ls->index].back() == ls) {
@@ -2625,6 +2942,16 @@ static bool unCseSingleWriteTees(Function* func,
 
       for (auto* child : ChildIterator(curr)) {
         walkDom(child);
+      }
+      if (auto* u = curr->dynCast<Unary>()) {
+        if (u->op == EqZInt32 && lastCondExpr == u->value) {
+          std::swap(lastCondTrueMap, lastCondFalseMap);
+          lastCondExpr = u;
+        } else {
+          lastCondExpr = nullptr;
+        }
+      } else {
+        lastCondExpr = nullptr;
       }
 
       bool idempotentCall = isIdempotent(curr, wasm);
@@ -2642,7 +2969,8 @@ static bool unCseSingleWriteTees(Function* func,
       if (shallow.hasNonTrapSideEffects()) {
         invalidateActiveByEffects(shallow, curr);
       }
-      if (shallow.branchesOut || curr->type == Type::unreachable) {
+      if (shallow.branchesOut || curr->type == Type::unreachable ||
+          (curr->is<Call>() && helper.doesNotReturn(curr))) {
         activeTees.clear();
       }
     };

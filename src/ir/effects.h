@@ -45,7 +45,8 @@ public:
       implicitTrap(false), throws_(false), danglingPop(false),
       mayNotReturn(false), hasReturnCallThrow(false), suspends(false),
       generative(false), isIdempotent(false), onlyTouchesInitGlobals(false),
-      module(module), features(module.features) {}
+      mustNotReturn(false), hasUnknownMutableStructRead(false), module(module),
+      features(module.features) {}
 
   EffectAnalyzer(const PassOptions& passOptions,
                  const Module& module,
@@ -150,6 +151,15 @@ public:
   // Whether this function's writes only touch lazy-init / once-init globals or
   // cache arrays.
   bool onlyTouchesInitGlobals : 1;
+
+  // Whether calling this function is guaranteed never to return normally.
+  bool mustNotReturn : 1;
+
+  // Whether this function reads a mutable struct field that could not be
+  // statically enumerated in mutableStructFieldsRead.
+  bool hasUnknownMutableStructRead : 1;
+
+  SmallVector<std::pair<HeapType, Index>, 2> mutableStructFieldsRead;
 
   const Module& module;
   FeatureSet features;
