@@ -6444,3 +6444,110 @@
     )
   )
 )
+
+;; Multi-read reuse when caller local is nullable and wrapped in ref.as_non_null.
+(module
+  ;; CHECK:      (type $S (struct (field i32) (field i32)))
+  ;; SHRINK:      (type $S (struct (field i32) (field i32)))
+  (type $S (struct (field i32) (field i32)))
+
+  ;; CHECK:      (type $1 (func (param i32) (result (ref null $S))))
+
+  ;; CHECK:      (type $2 (func (param (ref $S)) (result i32)))
+
+  ;; CHECK:      (type $3 (func (param i32) (result i32)))
+
+  ;; CHECK:      (import "env" "get_s" (func $get_s (type $1) (param i32) (result (ref null $S))))
+  ;; SHRINK:      (type $1 (func (param i32) (result (ref null $S))))
+
+  ;; SHRINK:      (type $2 (func (param (ref null $S)) (result i32)))
+
+  ;; SHRINK:      (type $3 (func (param i32) (result i32)))
+
+  ;; SHRINK:      (import "env" "get_s" (func $get_s (type $1) (param i32) (result (ref null $S))))
+  (import "env" "get_s" (func $get_s (param i32) (result (ref null $S))))
+
+  ;; CHECK:      (func $multi-read-ref-helper (type $2) (param $x (ref $S)) (result i32)
+  ;; CHECK-NEXT:  (i32.xor
+  ;; CHECK-NEXT:   (i32.mul
+  ;; CHECK-NEXT:    (struct.get $S 0
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.const 100000)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.sub
+  ;; CHECK-NEXT:    (struct.get $S 1
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.const 200000)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $multi-read-ref-helper (type $2) (param $x (ref null $S)) (result i32)
+  ;; SHRINK-NEXT:  (i32.xor
+  ;; SHRINK-NEXT:   (i32.mul
+  ;; SHRINK-NEXT:    (struct.get $S 0
+  ;; SHRINK-NEXT:     (local.get $x)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (i32.const 100000)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (i32.sub
+  ;; SHRINK-NEXT:    (struct.get $S 1
+  ;; SHRINK-NEXT:     (local.get $x)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:    (i32.const 200000)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $multi-read-ref-helper (param $x (ref $S)) (result i32)
+    (i32.xor
+      (i32.mul (struct.get $S 0 (local.get $x)) (i32.const 100000))
+      (i32.sub (struct.get $S 1 (local.get $x)) (i32.const 200000))
+    )
+  )
+
+  ;; CHECK:      (func $caller-nullable-tee (type $3) (param $a i32) (result i32)
+  ;; CHECK-NEXT:  (local $t (ref null $S))
+  ;; CHECK-NEXT:  (i32.xor
+  ;; CHECK-NEXT:   (i32.mul
+  ;; CHECK-NEXT:    (struct.get $S 0
+  ;; CHECK-NEXT:     (ref.as_non_null
+  ;; CHECK-NEXT:      (local.tee $t
+  ;; CHECK-NEXT:       (call $get_s
+  ;; CHECK-NEXT:        (local.get $a)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.const 100000)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.sub
+  ;; CHECK-NEXT:    (struct.get $S 1
+  ;; CHECK-NEXT:     (ref.as_non_null
+  ;; CHECK-NEXT:      (local.get $t)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.const 200000)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (func $caller-nullable-tee (type $3) (param $a i32) (result i32)
+  ;; SHRINK-NEXT:  (call $multi-read-ref-helper
+  ;; SHRINK-NEXT:   (call $get_s
+  ;; SHRINK-NEXT:    (local.get $a)
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $caller-nullable-tee (param $a i32) (result i32) (local $t (ref null $S))
+    (i32.xor
+      (i32.mul
+        (struct.get $S 0 (ref.as_non_null (local.tee $t (call $get_s (local.get $a)))))
+        (i32.const 100000)
+      )
+      (i32.sub
+        (struct.get $S 1 (ref.as_non_null (local.get $t)))
+        (i32.const 200000)
+      )
+    )
+  )
+)

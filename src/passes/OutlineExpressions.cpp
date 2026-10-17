@@ -11495,9 +11495,8 @@ struct OutlineExpressions : public Pass {
             forwardArgs[j] =
               ExpressionManipulator::copy(constAtPos[j], *wasm);
           } else {
-            Type pType = newParams[nextParamIdx];
-            forwardArgs[j] = builder.makeLocalGet(nextParamIdx, pType);
-            nextParamIdx++;
+            Index pIdx = nextParamIdx++;
+            forwardArgs[j] = builder.makeLocalGet(pIdx, newParams[pIdx]);
           }
         }
 
@@ -12881,6 +12880,12 @@ struct OutlineExpressions : public Pass {
           len == 0 && curr && curr->is<If>() && !h->ifOrderFirstReadGet.empty();
         const auto& activeFirstReadGet =
           matchSelectAsIf ? h->ifOrderFirstReadGet : h->firstReadGet;
+        auto stripRefAsNonNull = [](Expression* e) -> Expression* {
+          if (auto* ra = e->dynCast<RefAs>(); ra && ra->op == RefAsNonNull) {
+            return ra->value;
+          }
+          return e;
+        };
         std::vector<Expression*> firstReadArg(P, nullptr);
         std::vector<Expression*> otherReadArg(P, nullptr);
         bool mismatch = false;
@@ -12906,7 +12911,15 @@ struct OutlineExpressions : public Pass {
             } else if (!otherReadArg[p]) {
               otherReadArg[p] = right;
             } else if (!ExpressionAnalyzer::equal(otherReadArg[p], right)) {
-              mismatch = true;
+              if (allowSigAlign &&
+                  ExpressionAnalyzer::equal(stripRefAsNonNull(otherReadArg[p]),
+                                            stripRefAsNonNull(right))) {
+                if (right->type.isNonNullable()) {
+                  otherReadArg[p] = right;
+                }
+              } else {
+                mismatch = true;
+              }
             }
             return true;
           }
@@ -13059,9 +13072,31 @@ struct OutlineExpressions : public Pass {
             }
             if (ExpressionAnalyzer::equal(firstReadArg[p], otherReadArg[p])) {
               boundArgs[p] = firstReadArg[p];
-            } else if (auto* tee = firstReadArg[p]->dynCast<LocalSet>();
+            } else if (allowSigAlign &&
+                       ExpressionAnalyzer::equal(
+                         stripRefAsNonNull(firstReadArg[p]),
+                         stripRefAsNonNull(otherReadArg[p]))) {
+              Expression* stripped = stripRefAsNonNull(firstReadArg[p]);
+              Expression* nonNullVer = firstReadArg[p]->type.isNonNullable()
+                                         ? firstReadArg[p]
+                                         : otherReadArg[p];
+              if (Type::isSubType(stripped->type, h->demandedParams[p]) &&
+                  (Type::isSubType(stripped->type, h->currentParams[p]) ||
+                   !h->isEscaped)) {
+                boundArgs[p] = stripped;
+              } else if (getPassOptions().trapsNeverHappen) {
+                boundArgs[p] = nonNullVer;
+              } else {
+                return;
+              }
+            } else if (auto* tee = (allowSigAlign
+                                      ? stripRefAsNonNull(firstReadArg[p])
+                                      : firstReadArg[p])
+                                     ->dynCast<LocalSet>();
                        tee && tee->isTee()) {
-              auto* subGet = otherReadArg[p]->dynCast<LocalGet>();
+              auto* subGet = (allowSigAlign ? stripRefAsNonNull(otherReadArg[p])
+                                            : otherReadArg[p])
+                               ->dynCast<LocalGet>();
               if (!subGet || subGet->index != tee->index ||
                   tee->index >= numCallerLocals) {
                 return;
@@ -13108,8 +13143,11 @@ struct OutlineExpressions : public Pass {
                       unwrapped = rra->value;
                     }
                   }
-                  if (isPureReuseLeaf(unwrapped) ||
-                      compoundArgBytes.count(unwrapped)) {
+                  if ((isPureReuseLeaf(unwrapped) ||
+                       compoundArgBytes.count(unwrapped)) &&
+                      Type::isSubType(unwrapped->type, h->demandedParams[p]) &&
+                      (Type::isSubType(unwrapped->type, h->currentParams[p]) ||
+                       !h->isEscaped)) {
                     boundArgs[p] = unwrapped;
                     if (x >= caller->getVarIndexBase() &&
                         totalCallerGets[x] == totReads &&

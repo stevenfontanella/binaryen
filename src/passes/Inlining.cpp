@@ -181,7 +181,7 @@ struct FunctionInfo {
     }
     // If it's small enough that we always want to inline such things, do so.
     if ((!byteBudgetMode || options.shrinkLevel == 0 || refs <= 1 ||
-         usedGlobally) &&
+         (usedGlobally && nonParamBodyBytes <= 3)) &&
         size <= options.inlining.alwaysInlineMaxSize) {
       return true;
     }
@@ -193,7 +193,8 @@ struct FunctionInfo {
     }
     // If the function calls another one in a way that always shrinks when
     // inlined, inline it in all optimization and shrink modes.
-    if ((!byteBudgetMode || options.shrinkLevel == 0 || usedGlobally) &&
+    if ((!byteBudgetMode || options.shrinkLevel == 0 ||
+         (usedGlobally && nonParamBodyBytes <= 3)) &&
         trivialInstruction == TrivialInstruction::Shrinks) {
       return true;
     }
@@ -2596,7 +2597,7 @@ struct Inlining : public Pass {
       argEffects.emplace_back(options, *module, arg);
       if (argEffects[p].branchesOut ||
           argEffects[p].hasExternalBreakTargets() ||
-          argEffects[p].danglingPop || argEffects[p].mayNotReturn) {
+          argEffects[p].danglingPop) {
         return false;
       }
       if (options.trapsNeverHappen) {
