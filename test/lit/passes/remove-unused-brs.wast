@@ -5,7 +5,7 @@
 
 (module
   ;; Regression test in which we need to calculate a proper LUB.
-  ;; CHECK:      (func $selectify-fresh-lub (type $5) (param $x i32) (result anyref)
+  ;; CHECK:      (func $selectify-fresh-lub (type $6) (param $x i32) (result anyref)
   ;; CHECK-NEXT:  (select (result i31ref)
   ;; CHECK-NEXT:   (ref.null none)
   ;; CHECK-NEXT:   (ref.i31
@@ -948,7 +948,7 @@
     )
   )
 
-  ;; CHECK:      (func $fold-bool-if-neg (type $6) (param $x i32) (param $y i32) (result i32)
+  ;; CHECK:      (func $fold-bool-if-neg (type $5) (param $x i32) (param $y i32) (result i32)
   ;; CHECK-NEXT:  (local $t i32)
   ;; CHECK-NEXT:  (if (result i32)
   ;; CHECK-NEXT:   (local.get $x)
@@ -1058,6 +1058,47 @@
       (call $nothing)
       (br_if $out (local.get $t))
       (call $nothing)
+    )
+  )
+
+  ;; CHECK:      (func $fold-bool-drop-br-if-val (type $5) (param $x i32) (param $y i32) (result i32)
+  ;; CHECK-NEXT:  (local $t i32)
+  ;; CHECK-NEXT:  (block $out (result i32)
+  ;; CHECK-NEXT:   (if
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (then
+  ;; CHECK-NEXT:     (local.set $t
+  ;; CHECK-NEXT:      (local.get $y)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (br $out
+  ;; CHECK-NEXT:      (i32.const 42)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (call $nothing)
+  ;; CHECK-NEXT:   (local.get $t)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $fold-bool-drop-br-if-val (param $x i32) (param $y i32) (result i32)
+    (local $t i32)
+    (block $out (result i32)
+      (drop
+        (br_if $out
+          (i32.const 42)
+          (if (result i32)
+            (local.get $x)
+            (then
+              (local.set $t (local.get $y))
+              (i32.const 1)
+            )
+            (else
+              (i32.const 0)
+            )
+          )
+        )
+      )
+      (call $nothing)
+      (local.get $t)
     )
   )
 )

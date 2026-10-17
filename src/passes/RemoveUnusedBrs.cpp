@@ -374,15 +374,28 @@ static bool tryFoldBooleanIfCondition(If* curr,
   return false;
 }
 
-// Try to fold a boolean-producing `if (result i32)` condition in `br_if $L`.
-// Returns the replacement Expression* (either `curr` if modified in place, or
-// a new `If*`), or nullptr if not folded.
+// Try to fold a boolean-producing `if (result i32)` condition in `br_if $L`
+// (or `(drop (br_if $L val cond))` when `outerDrop` is non-null).
+// Returns the replacement Expression* (either `curr`/`outerDrop` if modified
+// in place, or a new `If*`), or nullptr if not folded.
 static Expression* tryFoldBooleanBreakCondition(Break* curr,
                                                 Function* func,
                                                 Module& wasm,
-                                                const PassOptions& passOptions) {
-  if (!curr->condition || curr->value || curr->type == Type::unreachable) {
+                                                const PassOptions& passOptions,
+                                                bool neverUnconditionalize,
+                                                Drop* outerDrop = nullptr) {
+  if (!curr->condition || curr->type == Type::unreachable) {
     return nullptr;
+  }
+  if (curr->value) {
+    if (!outerDrop) {
+      return nullptr;
+    }
+    if (EffectAnalyzer(passOptions, wasm, curr->value).hasSideEffects() ||
+        !EffectAnalyzer::canReorder(
+          passOptions, wasm, curr->value, curr->condition)) {
+      return nullptr;
+    }
   }
   bool negated = false;
   Expression* cond = curr->condition;
@@ -401,6 +414,42 @@ static Expression* tryFoldBooleanBreakCondition(Break* curr,
   }
 
   Builder builder(wasm);
+  auto finishInPlace = [&]() -> Expression* {
+    curr->finalize();
+    if (outerDrop) {
+      outerDrop->finalize();
+    }
+    if (auto* rec = tryFoldBooleanBreakCondition(
+          curr, func, wasm, passOptions, neverUnconditionalize, outerDrop)) {
+      return rec;
+    }
+    return outerDrop ? static_cast<Expression*>(outerDrop)
+                     : static_cast<Expression*>(curr);
+  };
+  auto finishConditionalArm = [&]() -> Expression* {
+    curr->finalize();
+    BranchHints::clear(curr, func);
+    if (outerDrop) {
+      outerDrop->finalize();
+    }
+    if (auto* rec = tryFoldBooleanBreakCondition(
+          curr, func, wasm, passOptions, neverUnconditionalize, outerDrop)) {
+      return rec;
+    }
+    return outerDrop ? static_cast<Expression*>(outerDrop)
+                     : static_cast<Expression*>(curr);
+  };
+  auto finishUnconditionalArm = [&]() -> Expression* {
+    curr->condition = nullptr;
+    curr->finalize();
+    BranchHints::clear(curr, func);
+    return curr;
+  };
+  auto isTrivialValueToCopy = [](Expression* v) {
+    return v->is<Const>() || v->is<RefNull>() || v->is<LocalGet>() ||
+           v->is<GlobalGet>();
+  };
+
   std::vector<Expression*> prefix;
   Expression* val = nullptr;
   int32_t falseConst = 0;
@@ -415,14 +464,11 @@ static Expression* tryFoldBooleanBreakCondition(Break* curr,
       if (prefix.empty()) {
         curr->condition = builder.makeUnary(EqZInt32, inner->condition);
         BranchHints::copyFlippedTo(inner, curr, func);
-        curr->finalize();
-        return curr;
+        return finishInPlace();
       }
-      curr->condition = nullptr;
-      curr->finalize();
-      BranchHints::clear(curr, func);
-      auto* newIf = builder.makeIf(
-        inner->condition, prependToArm(builder, prefix, nullptr), curr);
+      auto* newIf = builder.makeIf(inner->condition,
+                                   prependToArm(builder, prefix, nullptr),
+                                   finishUnconditionalArm());
       BranchHints::copyTo(inner, newIf, func);
       return newIf;
     }
@@ -432,14 +478,11 @@ static Expression* tryFoldBooleanBreakCondition(Break* curr,
       if (prefix.empty()) {
         curr->condition = inner->condition;
         BranchHints::copyTo(inner, curr, func);
-        curr->finalize();
-        return curr;
+        return finishInPlace();
       }
-      curr->condition = nullptr;
-      curr->finalize();
-      BranchHints::clear(curr, func);
-      auto* newIf =
-        builder.makeIf(inner->condition, prependToArm(builder, prefix, curr));
+      auto* newIf = builder.makeIf(
+        inner->condition,
+        prependToArm(builder, prefix, finishUnconditionalArm()));
       BranchHints::copyTo(inner, newIf, func);
       return newIf;
     }
@@ -449,12 +492,39 @@ static Expression* tryFoldBooleanBreakCondition(Break* curr,
         ((falseConst == 0 && !negated) || (falseConst != 0 && negated))) {
       curr->condition =
         negated ? builder.makeUnary(EqZInt32, val) : val;
-      curr->finalize();
-      BranchHints::clear(curr, func);
-      auto* newIf =
-        builder.makeIf(inner->condition, prependToArm(builder, prefix, curr));
+      auto* newIf = builder.makeIf(
+        inner->condition,
+        prependToArm(builder, prefix, finishConditionalArm()));
       BranchHints::copyTo(inner, newIf, func);
       return newIf;
+    }
+    // `br_if $L (if (result i32) c (then A E) (else 1))`
+    // or `br_if $L (i32.eqz (if (result i32) c (then A E) (else 0)))`
+    if (!valIsConst &&
+        ((falseConst != 0 && !negated) || (falseConst == 0 && negated))) {
+      Expression* rhs = negated ? builder.makeUnary(EqZInt32, val) : val;
+      if (prefix.empty() && !neverUnconditionalize &&
+          !EffectAnalyzer(passOptions, wasm, val).hasSideEffects() &&
+          !tooCostlyToRunUnconditionally(passOptions, val)) {
+        curr->condition = builder.makeBinary(
+          OrInt32, builder.makeUnary(EqZInt32, inner->condition), rhs);
+        BranchHints::clear(curr, func);
+        return finishInPlace();
+      }
+      if (!curr->value ||
+          (isTrivialValueToCopy(curr->value) && !negated)) {
+        Expression* valCopy =
+          curr->value ? ExpressionManipulator::copy(curr->value, wasm)
+                      : nullptr;
+        curr->condition = rhs;
+        auto* uncondBr = builder.makeBreak(curr->name, valCopy);
+        auto* newIf = builder.makeIf(
+          inner->condition,
+          prependToArm(builder, prefix, finishConditionalArm()),
+          uncondBr);
+        BranchHints::copyTo(inner, newIf, func);
+        return newIf;
+      }
     }
   }
 
@@ -468,15 +538,11 @@ static Expression* tryFoldBooleanBreakCondition(Break* curr,
       if (prefix.empty()) {
         curr->condition = builder.makeUnary(EqZInt32, inner->condition);
         BranchHints::copyFlippedTo(inner, curr, func);
-        curr->finalize();
-        return curr;
+        return finishInPlace();
       }
-      curr->condition = nullptr;
-      curr->finalize();
-      BranchHints::clear(curr, func);
       auto* newIf =
         builder.makeIf(builder.makeUnary(EqZInt32, inner->condition),
-                       prependToArm(builder, prefix, curr));
+                       prependToArm(builder, prefix, finishUnconditionalArm()));
       BranchHints::copyFlippedTo(inner, newIf, func);
       return newIf;
     }
@@ -485,14 +551,11 @@ static Expression* tryFoldBooleanBreakCondition(Break* curr,
       if (prefix.empty()) {
         curr->condition = inner->condition;
         BranchHints::copyTo(inner, curr, func);
-        curr->finalize();
-        return curr;
+        return finishInPlace();
       }
-      curr->condition = nullptr;
-      curr->finalize();
-      BranchHints::clear(curr, func);
-      auto* newIf = builder.makeIf(
-        inner->condition, curr, prependToArm(builder, prefix, nullptr));
+      auto* newIf = builder.makeIf(inner->condition,
+                                   finishUnconditionalArm(),
+                                   prependToArm(builder, prefix, nullptr));
       BranchHints::copyTo(inner, newIf, func);
       return newIf;
     }
@@ -500,13 +563,37 @@ static Expression* tryFoldBooleanBreakCondition(Break* curr,
         ((trueConst == 0 && !negated) || (trueConst != 0 && negated))) {
       curr->condition =
         negated ? builder.makeUnary(EqZInt32, val) : val;
-      curr->finalize();
-      BranchHints::clear(curr, func);
       auto* newIf =
         builder.makeIf(builder.makeUnary(EqZInt32, inner->condition),
-                       prependToArm(builder, prefix, curr));
+                       prependToArm(builder, prefix, finishConditionalArm()));
       BranchHints::copyFlippedTo(inner, newIf, func);
       return newIf;
+    }
+    // `br_if $L (if (result i32) c (then 1) (else A E))`
+    // or `br_if $L (i32.eqz (if (result i32) c (then 0) (else A E)))`
+    if (!valIsConst &&
+        ((trueConst != 0 && !negated) || (trueConst == 0 && negated))) {
+      Expression* rhs = negated ? builder.makeUnary(EqZInt32, val) : val;
+      if (prefix.empty() && !neverUnconditionalize &&
+          !EffectAnalyzer(passOptions, wasm, val).hasSideEffects() &&
+          !tooCostlyToRunUnconditionally(passOptions, val)) {
+        curr->condition = builder.makeBinary(OrInt32, inner->condition, rhs);
+        BranchHints::clear(curr, func);
+        return finishInPlace();
+      }
+      if (!curr->value || isTrivialValueToCopy(curr->value)) {
+        Expression* valCopy =
+          curr->value ? ExpressionManipulator::copy(curr->value, wasm)
+                      : nullptr;
+        curr->condition = rhs;
+        auto* uncondBr = builder.makeBreak(curr->name, valCopy);
+        auto* newIf = builder.makeIf(
+          inner->condition,
+          uncondBr,
+          prependToArm(builder, prefix, finishConditionalArm()));
+        BranchHints::copyTo(inner, newIf, func);
+        return newIf;
+      }
     }
   }
   return nullptr;
@@ -1637,9 +1724,12 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
   bool foldBooleanIfs(Function* func) {
     struct BoolIfFolder : public PostWalker<BoolIfFolder> {
       const PassOptions& passOptions;
+      bool neverUnconditionalize;
       bool worked = false;
 
-      BoolIfFolder(const PassOptions& passOptions) : passOptions(passOptions) {}
+      BoolIfFolder(const PassOptions& passOptions, bool neverUnconditionalize)
+        : passOptions(passOptions),
+          neverUnconditionalize(neverUnconditionalize) {}
 
       void visitIf(If* curr) {
         while (tryFoldBooleanIfCondition(
@@ -1649,8 +1739,11 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
       }
 
       void visitBreak(Break* curr) {
-        if (auto* rep = tryFoldBooleanBreakCondition(
-              curr, getFunction(), *getModule(), passOptions)) {
+        if (auto* rep = tryFoldBooleanBreakCondition(curr,
+                                                     getFunction(),
+                                                     *getModule(),
+                                                     passOptions,
+                                                     neverUnconditionalize)) {
           if (rep != curr) {
             replaceCurrent(rep);
             if (auto* iff = rep->dynCast<If>()) {
@@ -1660,7 +1753,26 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
           worked = true;
         }
       }
-    } folder(getPassOptions());
+
+      void visitDrop(Drop* curr) {
+        if (auto* br = curr->value->dynCast<Break>()) {
+          if (auto* rep = tryFoldBooleanBreakCondition(br,
+                                                       getFunction(),
+                                                       *getModule(),
+                                                       passOptions,
+                                                       neverUnconditionalize,
+                                                       curr)) {
+            if (rep != curr) {
+              replaceCurrent(rep);
+              if (auto* iff = rep->dynCast<If>()) {
+                visitIf(iff);
+              }
+            }
+            worked = true;
+          }
+        }
+      }
+    } folder(getPassOptions(), neverUnconditionalize);
 
     folder.walkFunctionInModule(func, getModule());
     if (folder.worked) {
@@ -1821,6 +1933,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
     struct JumpThreader
       : public PostWalker<JumpThreader,
                           UnifiedExpressionVisitor<JumpThreader>> {
+      const PassOptions& passOptions;
       // Map of all labels (branch targets) to the branches going to them. (We
       // only care about blocks here, and not loops, but for simplicity we
       // store all branch targets since blocks are 99% of that set anyhow. Any
@@ -1828,6 +1941,9 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
       std::unordered_map<Name, std::vector<Expression*>> labelToBranches;
 
       bool worked = false;
+      bool trappedSwitchWorked = false;
+
+      JumpThreader(const PassOptions& passOptions) : passOptions(passOptions) {}
 
       void visitExpression(Expression* curr) {
         // Find the relevant targets: targets that (as mentioned above) have no
@@ -1844,8 +1960,6 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         for (auto target : relevantTargets) {
           labelToBranches[target].push_back(curr);
         }
-        // TODO: If all but one target trap, in TNH we can unconditionally jump
-        //       to the non-trapping place.
       }
 
       void visitBlock(Block* curr) {
@@ -1858,38 +1972,86 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
               redirectBranches(child, curr->name);
             }
           }
-        } else if (list.size() == 2) {
-          // With two items, we look for this form:
+        } else if (list.size() >= 2) {
+          // With two or more items, we look at the last two items:
           //
           //  (block ;; curr
-          //    (block $child ;; child
+          //    ...
+          //    (block $child ;; child = list[list.size() - 2]
           //    )
-          //    after
+          //    after ;; list.back()
           //  )
           //
-          // Anything branching to the child will end up in that second
+          // Anything branching to the child will end up in that final
           // instruction |after|. That lets us optimize the cases where |after|
           // is a br or an unreachable.
-          if (auto* child = list[0]->dynCast<Block>()) {
-            if (child->name) {
-              if (auto* jump = list[1]->dynCast<Break>()) {
-                if (ExpressionAnalyzer::isSimple(jump)) {
-                  // Unconditional jumps to the child can skip ahead to where
-                  // the child jumps.
-                  redirectBranches(child, jump->name);
-                }
-              } else if (list[1]->dynCast<Unreachable>()) {
-                // Unconditional jumps to a trap can just trap.
-                for (auto* branch : labelToBranches[child->name]) {
-                  if (auto* br = branch->dynCast<Break>()) {
-                    if (ExpressionAnalyzer::isSimple(br)) {
-                      // It is safe to just modify the br in-place because it is
-                      // only jumping here, so this the last place that will
-                      // read it.
-                      ExpressionManipulator::unreachable(br);
+          auto* child = list[list.size() - 2]->dynCast<Block>();
+          auto* after = list.back();
+          if (child && child->name) {
+            if (auto* jump = after->dynCast<Break>()) {
+              if (ExpressionAnalyzer::isSimple(jump)) {
+                // Unconditional jumps to the child can skip ahead to where
+                // the child jumps.
+                redirectBranches(child, jump->name);
+              }
+            } else if (after->is<Unreachable>()) {
+              // Unconditional jumps to a trap can just trap.
+              for (auto* branch : labelToBranches[child->name]) {
+                if (auto* br = branch->dynCast<Break>()) {
+                  if (ExpressionAnalyzer::isSimple(br)) {
+                    // It is safe to just modify the br in-place because it is
+                    // only jumping here, so this the last place that will
+                    // read it.
+                    ExpressionManipulator::unreachable(br);
+                  }
+                } else if (auto* sw = branch->dynCast<Switch>();
+                           sw && !sw->value && passOptions.trapsNeverHappen) {
+                  if (sw->default_ == child->name) {
+                    while (!sw->targets.empty() &&
+                           sw->targets.back() == child->name) {
+                      sw->targets.pop_back();
+                      worked = true;
+                      trappedSwitchWorked = true;
+                    }
+                    if (!sw->targets.empty()) {
+                      Name newDefault = sw->targets.back();
+                      sw->default_ = newDefault;
+                      while (!sw->targets.empty() &&
+                             sw->targets.back() == newDefault) {
+                        sw->targets.pop_back();
+                      }
+                      for (auto& target : sw->targets) {
+                        if (target == child->name) {
+                          target = newDefault;
+                        }
+                      }
+                      labelToBranches[newDefault].push_back(sw);
+                      worked = true;
+                      trappedSwitchWorked = true;
+                    }
+                  } else {
+                    bool changedSw = false;
+                    for (auto& target : sw->targets) {
+                      if (target == child->name) {
+                        target = sw->default_;
+                        changedSw = true;
+                      }
+                    }
+                    if (changedSw) {
+                      while (!sw->targets.empty() &&
+                             sw->targets.back() == sw->default_) {
+                        sw->targets.pop_back();
+                      }
+                      worked = true;
+                      trappedSwitchWorked = true;
                     }
                   }
                 }
+              }
+              if (trappedSwitchWorked &&
+                  !BranchUtils::BranchSeeker::has(child, child->name)) {
+                child->name = Name();
+                worked = true;
               }
             }
           }
@@ -1917,10 +2079,51 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         }
       }
     };
-    JumpThreader jumpThreader;
-    jumpThreader.setModule(getModule());
-    jumpThreader.walkFunction(func);
-    jumpThreader.finish(func);
+    while (true) {
+      JumpThreader jumpThreader(getPassOptions());
+      jumpThreader.setModule(getModule());
+      jumpThreader.walkFunction(func);
+      jumpThreader.finish(func);
+      if (!jumpThreader.trappedSwitchWorked) {
+        break;
+      }
+      // A trapping Switch target was removed; run a cycle of RemoveUnusedBrs
+      // so 1-target Switches turn into Ifs and dead blocks are simplified.
+      do {
+        anotherCycle = false;
+        Super::doWalkFunction(func);
+        assert(ifStack.empty());
+        for (Index i = 0; i < flows.size(); i++) {
+          auto* flow = (*flows[i])->dynCast<Return>();
+          if (!flow) {
+            continue;
+          }
+          if (!flow->value) {
+            ExpressionManipulator::nop(flow);
+          } else {
+            *flows[i] = flow->value;
+          }
+          anotherCycle = true;
+        }
+        flows.clear();
+        for (auto* loop : loops) {
+          anotherCycle |= optimizeLoop(loop);
+        }
+        loops.clear();
+        if (anotherCycle) {
+          ReFinalize().walkFunctionInModule(func, getModule());
+        }
+        if (sinkBlocks(func)) {
+          anotherCycle = true;
+        }
+        if (optimizeGC(func)) {
+          anotherCycle = true;
+        }
+        if (foldBoolIf && foldBooleanIfs(func)) {
+          anotherCycle = true;
+        }
+      } while (anotherCycle);
+    }
 
     // perform some final optimizations
     struct FinalOptimizer : public PostWalker<FinalOptimizer> {
@@ -1932,6 +2135,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
 
       bool needUniqify = false;
       bool refinalize = false;
+      std::unordered_set<Block*> unnestedIfBlocks;
 
       FinalOptimizer(PassOptions& passOptions) : passOptions(passOptions) {}
 
@@ -1946,6 +2150,15 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         //   interfere with optimizeLoop()ing.
         auto& list = curr->list;
         for (Index i = 0; i < list.size(); i++) {
+          if (auto* sub = list[i]->dynCast<Block>();
+              sub && unnestedIfBlocks.contains(sub)) {
+            unnestedIfBlocks.erase(sub);
+            list[i] = sub->list[0];
+            for (Index j = 1; j < sub->list.size(); j++) {
+              list.insertAt(i + j, sub->list[j]);
+            }
+            curr->finalize(curr->type);
+          }
           auto* iff = list[i]->dynCast<If>();
           if (!iff || !iff->ifFalse) {
             // if it lacked an if-false, it would already be a br_if, as that's
@@ -1985,101 +2198,265 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         }
         if (list.size() >= 2) {
           // combine/optimize adjacent br_ifs + a br (maybe _if) right after it
+          bool mergedWithNop = false;
           for (Index i = 0; i < list.size() - 1; i++) {
-            auto* br1 = list[i]->dynCast<Break>();
-            // avoid unreachable brs, as they are dead code anyhow, and after
-            // merging them the outer scope could need type changes
-            if (!br1 || !br1->condition || br1->type == Type::unreachable) {
+            if (auto* br1 = list[i]->dynCast<Break>()) {
+              // avoid unreachable brs, as they are dead code anyhow, and after
+              // merging them the outer scope could need type changes
+              if (!br1->condition || br1->type == Type::unreachable) {
+                continue;
+              }
+              assert(!br1->value);
+              auto* br2 = list[i + 1]->dynCast<Break>();
+              if (!br2 || br1->name != br2->name) {
+                continue;
+              }
+              assert(!br2->value); // same target as previous, which has no value
+              // a br_if and then a br[_if] with the same target right after it
+              if (br2->condition) {
+                if (shrink && !neverUnconditionalize &&
+                    br2->type != Type::unreachable) {
+                  // Join adjacent br_ifs to the same target, making one br_if
+                  // with a "selectified" condition that executes both.
+                  if (!EffectAnalyzer(passOptions, *getModule(), br2->condition)
+                         .hasSideEffects() &&
+                      !tooCostlyToRunUnconditionally(passOptions,
+                                                     br2->condition)) {
+                    // it's ok to execute them both, do it
+                    Builder builder(*getModule());
+                    br1->condition = builder.makeBinary(
+                      OrInt32, br1->condition, br2->condition);
+                    BranchHints::applyOrTo(br1, br2, br1, getFunction());
+                    ExpressionManipulator::nop(br2);
+                    BranchHints::clear(br2, getFunction());
+                  }
+                }
+              } else {
+                // merge, we go there anyhow
+                Builder builder(*getModule());
+                list[i] = builder.makeDrop(br1->condition);
+              }
               continue;
             }
-            assert(!br1->value);
-            auto* br2 = list[i + 1]->dynCast<Break>();
-            if (!br2 || br1->name != br2->name) {
-              continue;
-            }
-            assert(!br2->value); // same target as previous, which has no value
-            // a br_if and then a br[_if] with the same target right after it
-            if (br2->condition) {
-              if (shrink && br2->type != Type::unreachable) {
-                // Join adjacent br_ifs to the same target, making one br_if
-                // with a "selectified" condition that executes both.
-                if (!EffectAnalyzer(passOptions, *getModule(), br2->condition)
-                       .hasSideEffects()) {
-                  // it's ok to execute them both, do it
-                  Builder builder(*getModule());
-                  br1->condition =
-                    builder.makeBinary(OrInt32, br1->condition, br2->condition);
-                  BranchHints::applyOrTo(br1, br2, br1, getFunction());
-                  ExpressionManipulator::nop(br2);
-                  BranchHints::clear(br2, getFunction());
+            if (shrink && !neverUnconditionalize) {
+              auto* drop1 = list[i]->dynCast<Drop>();
+              auto* drop2 = list[i + 1]->dynCast<Drop>();
+              if (!drop1 || !drop2) {
+                continue;
+              }
+              auto* br1 = drop1->value->dynCast<Break>();
+              auto* br2 = drop2->value->dynCast<Break>();
+              if (!br1 || !br2 || !br1->condition || !br2->condition ||
+                  !br1->value || !br2->value ||
+                  br1->type == Type::unreachable ||
+                  br2->type == Type::unreachable || br1->name != br2->name ||
+                  !ExpressionAnalyzer::equal(br1->value, br2->value)) {
+                continue;
+              }
+              if (!EffectAnalyzer(passOptions, *getModule(), br1->value)
+                     .hasSideEffects() &&
+                  !EffectAnalyzer(passOptions, *getModule(), br2->condition)
+                     .hasSideEffects() &&
+                  !tooCostlyToRunUnconditionally(passOptions, br2->condition) &&
+                  EffectAnalyzer::canReorder(
+                    passOptions, *getModule(), br1->condition, br2->value)) {
+                Builder builder(*getModule());
+                br1->condition =
+                  builder.makeBinary(OrInt32, br1->condition, br2->condition);
+                BranchHints::applyOrTo(br1, br2, br1, getFunction());
+                ExpressionManipulator::nop(drop2);
+                BranchHints::clear(br2, getFunction());
+                mergedWithNop = true;
+                // Look ahead to merge runs of >= 3 adjacent same-value
+                // Drop(br_if)s (e.g. 13 in $2855).
+                while (i + 2 < list.size()) {
+                  auto* dropNext = list[i + 2]->dynCast<Drop>();
+                  if (!dropNext) {
+                    break;
+                  }
+                  auto* brNext = dropNext->value->dynCast<Break>();
+                  if (!brNext || !brNext->condition || !brNext->value ||
+                      brNext->type == Type::unreachable ||
+                      brNext->name != br1->name ||
+                      !ExpressionAnalyzer::equal(br1->value, brNext->value) ||
+                      EffectAnalyzer(passOptions, *getModule(), brNext->condition)
+                        .hasSideEffects() ||
+                      tooCostlyToRunUnconditionally(passOptions,
+                                                    brNext->condition) ||
+                      !EffectAnalyzer::canReorder(passOptions,
+                                                  *getModule(),
+                                                  br1->condition,
+                                                  brNext->value)) {
+                    break;
+                  }
+                  br1->condition = builder.makeBinary(
+                    OrInt32, br1->condition, brNext->condition);
+                  BranchHints::applyOrTo(br1, brNext, br1, getFunction());
+                  ExpressionManipulator::nop(dropNext);
+                  BranchHints::clear(brNext, getFunction());
+                  i++;
                 }
               }
-            } else {
-              // merge, we go there anyhow
-              Builder builder(*getModule());
-              list[i] = builder.makeDrop(br1->condition);
             }
+          }
+          if (shrink && mergedWithNop) {
+            Index writeIdx = 0;
+            for (Index readIdx = 0; readIdx < list.size(); readIdx++) {
+              if (!list[readIdx]->is<Nop>()) {
+                list[writeIdx++] = list[readIdx];
+              }
+            }
+            list.resize(writeIdx);
+          }
+          if (list.size() < 2) {
+            return;
           }
           // Combine adjacent br_ifs that test the same value into a br_table,
           // when that makes sense.
           tablify(curr);
-          // Pattern-patch ifs, recreating them when it makes sense.
-          restructureIf(curr);
 
-          // Optimize block tails where a dropped `br_if`'s value is redundant
-          // when the br_if targets the block itself:
-          //
-          // (block $block (result i32)
-          // ..
-          //   (drop
-          //     (br_if $block ;; <- MUST target parent $block
-          //       (value)
-          //       (condition)
-          //     )
-          //   )
-          //   (value) ;; <- MUST be same as br_if's value
-          // )
-          // =>
-          // (block $block (result i32)
-          // ..
-          //   (drop
-          //     (condition)
-          //   )
-          //   (value)
-          // )
-          size_t size = curr->list.size();
-          auto* secondLast = curr->list[size - 2];
-          auto* last = curr->list[size - 1];
-          if (auto* drop = secondLast->dynCast<Drop>()) {
-            if (auto* br = drop->value->dynCast<Break>();
-                br && br->value && br->condition && br->name == curr->name &&
-                ExpressionAnalyzer::equal(br->value, last)) {
-              // The value must have no effects, as we are removing one copy
-              // of it. Also, the condition must not interfere with that
-              // value, or it might change, e.g.
-              //
-              //   (drop
-              //     (br_if $block
-              //       (read a value)     ;; this original value is returned,
-              //       (write that value) ;; if we branch
-              //     )
-              //   )
-              //   (read a value)
-              // =>
-              //   (drop
-              //     (write that value)
-              //   )
-              //   (read a value)         ;; now the written value is used
-              auto valueEffects =
-                EffectAnalyzer(passOptions, *getModule(), br->value);
-              if (!valueEffects.hasUnremovableSideEffects()) {
-                auto conditionEffects =
-                  EffectAnalyzer(passOptions, *getModule(), br->condition);
-                if (!conditionEffects.invalidates(valueEffects)) {
-                  // All conditions met, perform the update.
-                  drop->value = br->condition;
+          if (!shrink) {
+            // Pattern-patch ifs, recreating them when it makes sense.
+            restructureIf(curr);
+
+            size_t size = curr->list.size();
+            auto* secondLast = curr->list[size - 2];
+            auto* last = curr->list[size - 1];
+            if (auto* drop = secondLast->dynCast<Drop>()) {
+              if (auto* br = drop->value->dynCast<Break>();
+                  br && br->value && br->condition && br->name == curr->name &&
+                  ExpressionAnalyzer::equal(br->value, last)) {
+                auto valueEffects =
+                  EffectAnalyzer(passOptions, *getModule(), br->value);
+                if (!valueEffects.hasUnremovableSideEffects()) {
+                  auto conditionEffects =
+                    EffectAnalyzer(passOptions, *getModule(), br->condition);
+                  if (!conditionEffects.invalidates(valueEffects)) {
+                    drop->value = br->condition;
+                  }
                 }
               }
+            }
+          } else {
+            // Under shrink, loop backward over block-tail
+            // `(drop (br_if $curr (val) (cond)))` + `last` chains before
+            // `restructureIf` so 2+-branch blocks (and 2-element boolean/select
+            // blocks) fold completely.
+            Builder builder(*getModule());
+            bool tailChanged = false;
+            while (curr->list.size() >= 2 && curr->name.is()) {
+              size_t size = curr->list.size();
+              auto* secondLast = curr->list[size - 2];
+              auto* last = curr->list[size - 1];
+              auto* drop = secondLast->dynCast<Drop>();
+              if (!drop) {
+                break;
+              }
+              auto* br = drop->value->dynCast<Break>();
+              if (!br || !br->value || !br->condition ||
+                  br->name != curr->name || br->type == Type::unreachable ||
+                  last->type == Type::unreachable) {
+                break;
+              }
+              // (a) Equal values: `br->value == last`.
+              if (ExpressionAnalyzer::equal(br->value, last)) {
+                EffectAnalyzer valEff(passOptions, *getModule(), br->value);
+                if (!valEff.hasUnremovableSideEffects()) {
+                  EffectAnalyzer condEff(
+                    passOptions, *getModule(), br->condition);
+                  if (!condEff.invalidates(valEff)) {
+                    BranchHints::clear(br, getFunction());
+                    if (!condEff.hasUnremovableSideEffects()) {
+                      curr->list[size - 2] = last;
+                      curr->list.pop_back();
+                      tailChanged = true;
+                      continue;
+                    }
+                    drop->value = br->condition;
+                    tailChanged = true;
+                  }
+                }
+                break;
+              }
+              // (b) Opposite boolean constants: `{br->value, last} == {0, 1}`.
+              int32_t brConst = 0, lastConst = 0;
+              if (isI32Const(br->value, brConst) &&
+                  isI32Const(last, lastConst) &&
+                  ((brConst == 0 && lastConst == 1) ||
+                   (brConst == 1 && lastConst == 0))) {
+                Expression* rep = nullptr;
+                if (brConst == 0 && lastConst == 1) {
+                  if (auto* u = br->condition->dynCast<Unary>();
+                      u && u->op == EqZInt32 &&
+                      Properties::emitsBoolean(u->value)) {
+                    rep = u->value;
+                  } else {
+                    rep = builder.makeUnary(EqZInt32, br->condition);
+                  }
+                } else {
+                  if (Properties::emitsBoolean(br->condition)) {
+                    rep = br->condition;
+                  } else {
+                    rep = builder.makeBinary(
+                      NeInt32, br->condition, builder.makeConst(int32_t(0)));
+                  }
+                }
+                BranchHints::clear(br, getFunction());
+                curr->list[size - 2] = rep;
+                curr->list.pop_back();
+                tailChanged = true;
+                continue;
+              }
+              // (c) General `select` fold:
+              // - For non-reference types, untyped `select` (1 B) is always
+              //   smaller than `br_if + drop` (3 B), even for intermediate
+              //   steps in a multi-branch block.
+              // - For reference types, `SelectWithType` (`0x1c 0x01 <type>`) is
+              //   smaller than `if <type> .. else .. end` by 1 B only when the
+              //   enclosing block is eliminated (`size == 2` and single branch)
+              //   and `sel->type` does not have a larger encoding than
+              //   `curr->type`.
+              if (!neverUnconditionalize &&
+                  (!curr->type.isRef() ||
+                   (size == 2 &&
+                    BranchUtils::BranchSeeker::count(curr, curr->name) == 1)) &&
+                  Properties::canEmitSelectWithArms(br->value, last) &&
+                  !tooCostlyToRunUnconditionally(
+                    passOptions, br->value, last)) {
+                EffectAnalyzer valEff(passOptions, *getModule(), br->value);
+                EffectAnalyzer lastEff(passOptions, *getModule(), last);
+                if (!valEff.hasSideEffects() && !lastEff.hasSideEffects()) {
+                  EffectAnalyzer condEff(
+                    passOptions, *getModule(), br->condition);
+                  if (!condEff.invalidates(valEff) &&
+                      EffectAnalyzer::canReorder(
+                        passOptions, *getModule(), br->condition, last)) {
+                    auto* sel =
+                      builder.makeSelect(br->condition, br->value, last);
+                    if (!sel->type.isRef() || sel->type == curr->type ||
+                        sel->type.getHeapType().isBasic()) {
+                      if (sel->type != curr->type) {
+                        refinalize = true;
+                      }
+                      BranchHints::clear(br, getFunction());
+                      curr->list[size - 2] = sel;
+                      curr->list.pop_back();
+                      tailChanged = true;
+                      continue;
+                    }
+                  }
+                }
+              }
+              break;
+            }
+            if (tailChanged && curr->name.is() &&
+                !BranchUtils::BranchSeeker::has(curr, curr->name)) {
+              curr->name = Name();
+              curr->finalize(curr->type);
+              refinalize = true;
+            }
+            if (curr->list.size() >= 2) {
+              restructureIf(curr);
             }
           }
         }
@@ -2243,6 +2620,101 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         // we may have simplified ifs enough to turn them into selects
         if (auto* select = selectify(curr)) {
           replaceCurrent(select);
+          return;
+        }
+        if (shrink && curr->ifFalse &&
+            curr->condition->type != Type::unreachable &&
+            curr->ifTrue->type == Type::unreachable &&
+            curr->ifFalse->type == Type::unreachable) {
+          Builder builder(*getModule());
+          auto makeUnnestedSeq = [&](Expression* first,
+                                     Expression* second) -> Block* {
+            auto* seq = builder.makeBlock(first);
+            if (auto* secondBlock = second->dynCast<Block>();
+                secondBlock && !secondBlock->name.is()) {
+              for (auto* item : secondBlock->list) {
+                seq->list.push_back(item);
+              }
+            } else {
+              seq->list.push_back(second);
+            }
+            seq->finalize();
+            unnestedIfBlocks.insert(seq);
+            return seq;
+          };
+          auto* ifTrueBreak = curr->ifTrue->dynCast<Break>();
+          if (ifTrueBreak && !ifTrueBreak->condition &&
+              canTurnIfIntoBrIf(curr->condition,
+                                ifTrueBreak->value,
+                                passOptions,
+                                *getModule())) {
+            ifTrueBreak->condition = curr->condition;
+            BranchHints::copyTo(curr, ifTrueBreak, getFunction());
+            ifTrueBreak->finalize();
+            Expression* first = builder.dropIfConcretelyTyped(ifTrueBreak);
+            if (foldBoolIf) {
+              if (auto* rep =
+                    tryFoldBooleanBreakCondition(ifTrueBreak,
+                                                 getFunction(),
+                                                 *getModule(),
+                                                 passOptions,
+                                                 neverUnconditionalize,
+                                                 first->dynCast<Drop>())) {
+                first = rep;
+                if (auto* iff = first->dynCast<If>()) {
+                  while (tryFoldBooleanIfCondition(
+                    iff, getFunction(), *getModule(), passOptions)) {
+                  }
+                }
+              }
+            }
+            replaceCurrent(makeUnnestedSeq(first, curr->ifFalse));
+            return;
+          }
+          auto* ifFalseBreak = curr->ifFalse->dynCast<Break>();
+          if (ifFalseBreak && !ifFalseBreak->condition &&
+              canTurnIfIntoBrIf(curr->condition,
+                                ifFalseBreak->value,
+                                passOptions,
+                                *getModule())) {
+            ifFalseBreak->condition =
+              builder.makeUnary(EqZInt32, curr->condition);
+            BranchHints::copyFlippedTo(curr, ifFalseBreak, getFunction());
+            ifFalseBreak->finalize();
+            Expression* first = builder.dropIfConcretelyTyped(ifFalseBreak);
+            if (foldBoolIf) {
+              if (auto* rep =
+                    tryFoldBooleanBreakCondition(ifFalseBreak,
+                                                 getFunction(),
+                                                 *getModule(),
+                                                 passOptions,
+                                                 neverUnconditionalize,
+                                                 first->dynCast<Drop>())) {
+                first = rep;
+                if (auto* iff = first->dynCast<If>()) {
+                  while (tryFoldBooleanIfCondition(
+                    iff, getFunction(), *getModule(), passOptions)) {
+                  }
+                }
+              }
+            }
+            replaceCurrent(makeUnnestedSeq(first, curr->ifTrue));
+            return;
+          }
+          if (auto* u = curr->condition->dynCast<Unary>();
+              u && u->op == EqZInt32) {
+            curr->condition = u->value;
+            std::swap(curr->ifTrue, curr->ifFalse);
+            BranchHints::flip(curr, getFunction());
+          }
+          Expression* after = curr->ifFalse;
+          curr->ifFalse = nullptr;
+          curr->finalize();
+          while (foldBoolIf &&
+                 tryFoldBooleanIfCondition(
+                   curr, getFunction(), *getModule(), passOptions)) {
+          }
+          replaceCurrent(makeUnnestedSeq(curr, after));
         }
       }
 
@@ -2677,8 +3149,11 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
           return;
         }
         if (foldBoolIf) {
-          if (auto* rep = tryFoldBooleanBreakCondition(
-                curr, getFunction(), *getModule(), passOptions)) {
+          if (auto* rep = tryFoldBooleanBreakCondition(curr,
+                                                       getFunction(),
+                                                       *getModule(),
+                                                       passOptions,
+                                                       neverUnconditionalize)) {
             if (rep != curr) {
               replaceCurrent(rep);
               if (auto* iff = rep->dynCast<If>()) {
@@ -2715,6 +3190,27 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
           // not taken, as then the target block may have no more breaks, and
           // become unreachable. Either way, refinalize.
           refinalize = true;
+        }
+      }
+
+      void visitDrop(Drop* curr) {
+        if (!foldBoolIf) {
+          return;
+        }
+        if (auto* br = curr->value->dynCast<Break>()) {
+          if (auto* rep = tryFoldBooleanBreakCondition(br,
+                                                       getFunction(),
+                                                       *getModule(),
+                                                       passOptions,
+                                                       neverUnconditionalize,
+                                                       curr)) {
+            if (rep != curr) {
+              replaceCurrent(rep);
+              if (auto* iff = rep->dynCast<If>()) {
+                visitIf(iff);
+              }
+            }
+          }
         }
       }
     };

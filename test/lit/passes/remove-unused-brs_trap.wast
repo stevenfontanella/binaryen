@@ -3,11 +3,11 @@
 ;; RUN: wasm-opt %s --remove-unused-brs --traps-never-happen -all -S -o - | filecheck %s --check-prefix=TNH
 
 (module
-  ;; CHECK:      (import "a" "b" (func $import (type $1)))
-  ;; TNH:      (import "a" "b" (func $import (type $1)))
+  ;; CHECK:      (import "a" "b" (func $import (type $2)))
+  ;; TNH:      (import "a" "b" (func $import (type $2)))
   (import "a" "b" (func $import))
 
-  ;; CHECK:      (func $jump-to-trap (type $2) (param $x i32) (result i32)
+  ;; CHECK:      (func $jump-to-trap (type $0) (param $x i32) (result i32)
   ;; CHECK-NEXT:  (block $trap
   ;; CHECK-NEXT:   (call $import)
   ;; CHECK-NEXT:   (br_if $trap
@@ -34,7 +34,7 @@
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT:  (unreachable)
   ;; CHECK-NEXT: )
-  ;; TNH:      (func $jump-to-trap (type $2) (param $x i32) (result i32)
+  ;; TNH:      (func $jump-to-trap (type $0) (param $x i32) (result i32)
   ;; TNH-NEXT:  (block $trap
   ;; TNH-NEXT:   (call $import)
   ;; TNH-NEXT:   (br_if $trap
@@ -87,7 +87,7 @@
     (unreachable)
   )
 
-  ;; CHECK:      (func $dispatch (type $0) (param $x i32)
+  ;; CHECK:      (func $dispatch (type $1) (param $x i32)
   ;; CHECK-NEXT:  (block $trap
   ;; CHECK-NEXT:   (block $mid
   ;; CHECK-NEXT:    (block $top
@@ -102,15 +102,20 @@
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT:  (unreachable)
   ;; CHECK-NEXT: )
-  ;; TNH:      (func $dispatch (type $0) (param $x i32)
-  ;; TNH-NEXT:  (block $trap
-  ;; TNH-NEXT:   (block $mid
-  ;; TNH-NEXT:    (block $top
-  ;; TNH-NEXT:     (br_table $top $mid $trap
-  ;; TNH-NEXT:      (local.get $x)
+  ;; TNH:      (func $dispatch (type $1) (param $x i32)
+  ;; TNH-NEXT:  (block
+  ;; TNH-NEXT:   (if
+  ;; TNH-NEXT:    (i32.eqz
+  ;; TNH-NEXT:     (local.get $x)
+  ;; TNH-NEXT:    )
+  ;; TNH-NEXT:    (then
+  ;; TNH-NEXT:     (block $mid
+  ;; TNH-NEXT:      (nop)
+  ;; TNH-NEXT:      (block $top
+  ;; TNH-NEXT:      )
+  ;; TNH-NEXT:      (call $import)
   ;; TNH-NEXT:     )
   ;; TNH-NEXT:    )
-  ;; TNH-NEXT:    (call $import)
   ;; TNH-NEXT:   )
   ;; TNH-NEXT:   (call $import)
   ;; TNH-NEXT:  )
@@ -132,7 +137,7 @@
     (unreachable)
   )
 
-  ;; CHECK:      (func $strip-void-trailing-unreachable (type $0) (param $x i32)
+  ;; CHECK:      (func $strip-void-trailing-unreachable (type $1) (param $x i32)
   ;; CHECK-NEXT:  (if
   ;; CHECK-NEXT:   (local.get $x)
   ;; CHECK-NEXT:   (then
@@ -143,7 +148,7 @@
   ;; CHECK-NEXT:  (call $import)
   ;; CHECK-NEXT:  (unreachable)
   ;; CHECK-NEXT: )
-  ;; TNH:      (func $strip-void-trailing-unreachable (type $0) (param $x i32)
+  ;; TNH:      (func $strip-void-trailing-unreachable (type $1) (param $x i32)
   ;; TNH-NEXT:  (if
   ;; TNH-NEXT:   (local.get $x)
   ;; TNH-NEXT:   (then
@@ -161,6 +166,68 @@
       )
     )
     (call $import)
+    (unreachable)
+  )
+
+  ;; CHECK:      (func $dispatch-multi-stmt-block (type $0) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (call $import)
+  ;; CHECK-NEXT:  (block $trap
+  ;; CHECK-NEXT:   (block $a
+  ;; CHECK-NEXT:    (block $b
+  ;; CHECK-NEXT:     (br_table $a $trap $b $trap
+  ;; CHECK-NEXT:      (local.get $x)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (call $import)
+  ;; CHECK-NEXT:    (return
+  ;; CHECK-NEXT:     (i32.const 10)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (return
+  ;; CHECK-NEXT:    (i32.const 20)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (unreachable)
+  ;; CHECK-NEXT: )
+  ;; TNH:      (func $dispatch-multi-stmt-block (type $0) (param $x i32) (result i32)
+  ;; TNH-NEXT:  (call $import)
+  ;; TNH-NEXT:  (block
+  ;; TNH-NEXT:   (if
+  ;; TNH-NEXT:    (i32.eqz
+  ;; TNH-NEXT:     (i32.eqz
+  ;; TNH-NEXT:      (local.get $x)
+  ;; TNH-NEXT:     )
+  ;; TNH-NEXT:    )
+  ;; TNH-NEXT:    (then
+  ;; TNH-NEXT:     (block $a
+  ;; TNH-NEXT:      (nop)
+  ;; TNH-NEXT:      (block $b
+  ;; TNH-NEXT:      )
+  ;; TNH-NEXT:      (call $import)
+  ;; TNH-NEXT:      (return
+  ;; TNH-NEXT:       (i32.const 10)
+  ;; TNH-NEXT:      )
+  ;; TNH-NEXT:     )
+  ;; TNH-NEXT:    )
+  ;; TNH-NEXT:   )
+  ;; TNH-NEXT:   (return
+  ;; TNH-NEXT:    (i32.const 20)
+  ;; TNH-NEXT:   )
+  ;; TNH-NEXT:  )
+  ;; TNH-NEXT:  (unreachable)
+  ;; TNH-NEXT: )
+  (func $dispatch-multi-stmt-block (param $x i32) (result i32)
+    (call $import)
+    (block $trap
+      (block $a
+        (block $b
+          (br_table $a $trap $b $trap (local.get $x))
+        )
+        (call $import)
+        (return (i32.const 10))
+      )
+      (return (i32.const 20))
+    )
     (unreachable)
   )
 )

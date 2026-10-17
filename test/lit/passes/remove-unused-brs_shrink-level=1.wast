@@ -11,6 +11,10 @@
   ;; CHECK:      (type $1 (func))
   (type $1 (func))
   (type $2 (func (result i32)))
+  ;; CHECK:      (type $3 (func (param i32 i32) (result i32)))
+
+  ;; CHECK:      (type $4 (func (param i32 i32 i32) (result i32)))
+
   ;; CHECK:      (memory $0 256 256)
 
   ;; CHECK:      (func $b14 (result i32)
@@ -479,5 +483,101 @@
       (return (i32.const 2))
     )
     (return (i32.const 3))
+  )
+  ;; CHECK:      (func $merge-drop-br_ifs-and-tail-select (param $x i32) (param $y i32) (param $z i32) (result i32)
+  ;; CHECK-NEXT:  (select
+  ;; CHECK-NEXT:   (i32.const 10)
+  ;; CHECK-NEXT:   (select
+  ;; CHECK-NEXT:    (i32.const 20)
+  ;; CHECK-NEXT:    (i32.const 30)
+  ;; CHECK-NEXT:    (local.get $z)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.or
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (local.get $y)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $merge-drop-br_ifs-and-tail-select (param $x i32) (param $y i32) (param $z i32) (result i32)
+    (block $out (result i32)
+      (drop
+        (br_if $out
+          (i32.const 10)
+          (local.get $x)
+        )
+      )
+      (drop
+        (br_if $out
+          (i32.const 10)
+          (local.get $y)
+        )
+      )
+      (drop
+        (br_if $out
+          (i32.const 20)
+          (local.get $z)
+        )
+      )
+      (i32.const 30)
+    )
+  )
+  ;; CHECK:      (func $tail-br_if-opposite-bools (param $x i32) (param $y i32) (result i32)
+  ;; CHECK-NEXT:  (i32.eqz
+  ;; CHECK-NEXT:   (i32.or
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (local.get $y)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $tail-br_if-opposite-bools (param $x i32) (param $y i32) (result i32)
+    (block $out (result i32)
+      (drop
+        (br_if $out
+          (i32.const 0)
+          (local.get $x)
+        )
+      )
+      (drop
+        (br_if $out
+          (i32.const 0)
+          (local.get $y)
+        )
+      )
+      (i32.const 1)
+    )
+  )
+  ;; CHECK:      (func $unnest-unreachable-if (param $x i32) (param $y i32) (result i32)
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (drop
+  ;; CHECK-NEXT:     (i32.const 2)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (return
+  ;; CHECK-NEXT:     (i32.const 20)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (i32.const 1)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (return
+  ;; CHECK-NEXT:   (i32.const 10)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (i32.const 30)
+  ;; CHECK-NEXT: )
+  (func $unnest-unreachable-if (param $x i32) (param $y i32) (result i32)
+    (if
+      (i32.eqz (local.get $x))
+      (then
+        (drop (i32.const 1))
+        (return (i32.const 10))
+      )
+      (else
+        (drop (i32.const 2))
+        (return (i32.const 20))
+      )
+    )
+    (i32.const 30)
   )
 )
