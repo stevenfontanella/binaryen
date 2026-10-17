@@ -710,20 +710,17 @@
   ;; ALWAYS-NEXT:   (local.get $x)
   ;; ALWAYS-NEXT:  )
   ;; ALWAYS-NEXT: )
-  ;; CAREFUL:      (type $1 (func (param f64)))
+  ;; CAREFUL:      (type $1 (func (param f32) (result anyref)))
 
-  ;; CAREFUL:      (type $2 (func (param f32) (result anyref)))
+  ;; CAREFUL:      (type $2 (func (param f64) (result anyref)))
 
-  ;; CAREFUL:      (type $3 (func (param f64) (result anyref)))
+  ;; CAREFUL:      (type $3 (func (param f64)))
 
   ;; CAREFUL:      (type $4 (func (param (ref $struct)) (result anyref)))
 
-  ;; CAREFUL:      (func $caller (type $2) (param $x f32) (result anyref)
-  ;; CAREFUL-NEXT:  (call $target
-  ;; CAREFUL-NEXT:   (struct.new $struct
-  ;; CAREFUL-NEXT:    (local.get $x)
-  ;; CAREFUL-NEXT:    (f64.const 4.2)
-  ;; CAREFUL-NEXT:   )
+  ;; CAREFUL:      (func $caller (type $1) (param $x f32) (result anyref)
+  ;; CAREFUL-NEXT:  (call $target_4
+  ;; CAREFUL-NEXT:   (local.get $x)
   ;; CAREFUL-NEXT:  )
   ;; CAREFUL-NEXT: )
   (func $caller (param $x f32) (result anyref)
@@ -743,12 +740,9 @@
   ;; ALWAYS-NEXT:   (local.get $x)
   ;; ALWAYS-NEXT:  )
   ;; ALWAYS-NEXT: )
-  ;; CAREFUL:      (func $caller-flip (type $3) (param $x f64) (result anyref)
-  ;; CAREFUL-NEXT:  (call $target
-  ;; CAREFUL-NEXT:   (struct.new $struct
-  ;; CAREFUL-NEXT:    (f32.const 13.369999885559082)
-  ;; CAREFUL-NEXT:    (local.get $x)
-  ;; CAREFUL-NEXT:   )
+  ;; CAREFUL:      (func $caller-flip (type $2) (param $x f64) (result anyref)
+  ;; CAREFUL-NEXT:  (call $target_5
+  ;; CAREFUL-NEXT:   (local.get $x)
   ;; CAREFUL-NEXT:  )
   ;; CAREFUL-NEXT: )
   (func $caller-flip (param $x f64) (result anyref)
@@ -767,8 +761,8 @@
   ;; ALWAYS-NEXT:   (local.get $x)
   ;; ALWAYS-NEXT:  )
   ;; ALWAYS-NEXT: )
-  ;; CAREFUL:      (func $dropped-caller (type $1) (param $x f64)
-  ;; CAREFUL-NEXT:  (call $target_4
+  ;; CAREFUL:      (func $dropped-caller (type $3) (param $x f64)
+  ;; CAREFUL-NEXT:  (call $target_6
   ;; CAREFUL-NEXT:   (local.get $x)
   ;; CAREFUL-NEXT:  )
   ;; CAREFUL-NEXT: )
@@ -949,7 +943,41 @@
 ;; ALWAYS-NEXT:  )
 ;; ALWAYS-NEXT: )
 
-;; CAREFUL:      (func $target_4 (type $1) (param $0 f64)
+;; CAREFUL:      (func $target_4 (type $1) (param $0 f32) (result anyref)
+;; CAREFUL-NEXT:  (local $1 (ref (exact $struct)))
+;; CAREFUL-NEXT:  (local.set $1
+;; CAREFUL-NEXT:   (struct.new $struct
+;; CAREFUL-NEXT:    (f32.add
+;; CAREFUL-NEXT:     (local.get $0)
+;; CAREFUL-NEXT:     (f32.const 1.100000023841858)
+;; CAREFUL-NEXT:    )
+;; CAREFUL-NEXT:    (f64.max
+;; CAREFUL-NEXT:     (f64.const 4.2)
+;; CAREFUL-NEXT:     (f64.const -1.2)
+;; CAREFUL-NEXT:    )
+;; CAREFUL-NEXT:   )
+;; CAREFUL-NEXT:  )
+;; CAREFUL-NEXT:  (local.get $1)
+;; CAREFUL-NEXT: )
+
+;; CAREFUL:      (func $target_5 (type $2) (param $0 f64) (result anyref)
+;; CAREFUL-NEXT:  (local $1 (ref (exact $struct)))
+;; CAREFUL-NEXT:  (local.set $1
+;; CAREFUL-NEXT:   (struct.new $struct
+;; CAREFUL-NEXT:    (f32.add
+;; CAREFUL-NEXT:     (f32.const 13.369999885559082)
+;; CAREFUL-NEXT:     (f32.const 1.100000023841858)
+;; CAREFUL-NEXT:    )
+;; CAREFUL-NEXT:    (f64.max
+;; CAREFUL-NEXT:     (local.get $0)
+;; CAREFUL-NEXT:     (f64.const -1.2)
+;; CAREFUL-NEXT:    )
+;; CAREFUL-NEXT:   )
+;; CAREFUL-NEXT:  )
+;; CAREFUL-NEXT:  (local.get $1)
+;; CAREFUL-NEXT: )
+
+;; CAREFUL:      (func $target_6 (type $3) (param $0 f64)
 ;; CAREFUL-NEXT:  (nop)
 ;; CAREFUL-NEXT: )
 (module

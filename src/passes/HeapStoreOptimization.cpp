@@ -23,6 +23,9 @@
 #include "cfg/cfg-traversal.h"
 #include "ir/effects.h"
 #include "ir/local-graph.h"
+#include "ir/manipulation.h"
+#include "ir/properties.h"
+#include "ir/utils.h"
 #include "pass.h"
 #include "wasm-builder.h"
 #include "wasm.h"
@@ -53,6 +56,8 @@ struct HeapStoreOptimization
   // state in the function. (This may need to change if we do more general dead
   // store elimination.)
   bool ignoreBranchesOutsideOfFunc = true;
+  bool needsRefinalize = false;
+  bool funcHasCatch = false;
 
   // Store struct.sets and blocks, as we can find patterns among those.
   void addAction() {
@@ -62,6 +67,12 @@ struct HeapStoreOptimization
   }
   void visitStructSet(StructSet* curr) { addAction(); }
   void visitBlock(Block* curr) { addAction(); }
+  void visitTry(Try* curr) { funcHasCatch = true; }
+  void visitTryTable(TryTable* curr) { funcHasCatch = true; }
+
+  bool hasInFuncControlFlow(const EffectAnalyzer& eff) const {
+    return eff.hasExternalBreakTargets() || (eff.throws() && funcHasCatch);
+  }
 
   void visitFunction(Function* curr) {
     // Now that the walk is complete and we have a CFG, find things to optimize.
@@ -77,6 +88,23 @@ struct HeapStoreOptimization
         }
       }
     }
+    if (getPassOptions().shrinkLevel > 0) {
+      struct BlockStoreLoadOptimizer
+        : public PostWalker<BlockStoreLoadOptimizer> {
+        HeapStoreOptimization& parent;
+        BlockStoreLoadOptimizer(HeapStoreOptimization& parent)
+          : parent(parent) {}
+        void visitBlock(Block* curr) {
+          parent.optimizeBlockStoresAndLoads(curr);
+        }
+      };
+      BlockStoreLoadOptimizer(*this).walk(curr->body);
+    }
+    if (needsRefinalize) {
+      ReFinalize().walkFunctionInModule(curr, getModule());
+    }
+    needsRefinalize = false;
+    funcHasCatch = false;
   }
 
   // Optimize a struct.set. Receives also a pointer to where it is referred to,
@@ -101,6 +129,46 @@ struct HeapStoreOptimization
     }
   }
 
+  // Check whether every LocalGet of `refLocal` inside `expr` is the `ref`
+  // operand of a `StructGet` on `expectedHT`, and collect the set of fields
+  // read on `refLocal`.
+  bool checkOnlyStructGetsOnRef(Expression* expr,
+                                Index refLocal,
+                                HeapType expectedHT,
+                                SmallSet<Index, 4>& fieldsRead,
+                                std::vector<Expression**>& selfGetPtrs) {
+    struct Scanner : public PostWalker<Scanner> {
+      Index refLocal;
+      HeapType expectedHT;
+      Index totalGets = 0;
+      SmallSet<Index, 4>& fieldsRead;
+      std::vector<Expression**>& selfGetPtrs;
+      Scanner(Index refLocal,
+              HeapType expectedHT,
+              SmallSet<Index, 4>& fieldsRead,
+              std::vector<Expression**>& selfGetPtrs)
+        : refLocal(refLocal), expectedHT(expectedHT), fieldsRead(fieldsRead),
+          selfGetPtrs(selfGetPtrs) {}
+      void visitLocalGet(LocalGet* curr) {
+        if (curr->index == refLocal) {
+          totalGets++;
+        }
+      }
+      void visitStructGet(StructGet* curr) {
+        if (auto* lg = curr->ref->dynCast<LocalGet>()) {
+          if (lg->index == refLocal && curr->ref->type.isRef() &&
+              curr->ref->type.getHeapType() == expectedHT) {
+            fieldsRead.insert(curr->index);
+            selfGetPtrs.push_back(getCurrentPointer());
+          }
+        }
+      }
+    };
+    Scanner scanner(refLocal, expectedHT, fieldsRead, selfGetPtrs);
+    scanner.walk(expr);
+    return scanner.totalGets == selfGetPtrs.size();
+  }
+
   // Similar to the above with struct.set whose reference is a tee of a new, we
   // can do the same for subsequent sets in a list:
   //
@@ -116,19 +184,51 @@ struct HeapStoreOptimization
     auto& list = curr->list;
 
     for (Index i = 0; i < list.size(); i++) {
-      auto* localSet = list[i]->dynCast<LocalSet>();
+      LocalSet* localSet = list[i]->dynCast<LocalSet>();
+      StructSet* firstSet = nullptr;
+      if (!localSet) {
+        firstSet = list[i]->dynCast<StructSet>();
+        if (firstSet) {
+          localSet = firstSet->ref->dynCast<LocalSet>();
+        }
+      }
       if (!localSet) {
         continue;
       }
       auto* new_ = localSet->value->dynCast<StructNew>();
-      if (!new_) {
+      if (!new_ || new_->type == Type::unreachable) {
         continue;
       }
 
-      // This local.set of a struct.new looks good. Find struct.sets after it to
-      // optimize.
+      HeapType newHT = new_->type.getHeapType();
+      struct InterveningSet {
+        StructSet* set;
+        EffectAnalyzer valEffects;
+        SmallSet<Index, 4> selfFieldsRead;
+      };
+      std::vector<InterveningSet> intervening;
+
+      if (firstSet) {
+        auto valEff = effects(firstSet->value);
+        SmallSet<Index, 4> fieldsRead;
+        std::vector<Expression**> selfGetPtrs;
+        if (hasInFuncControlFlow(valEff) ||
+            valEff.localsWritten.contains(localSet->index) ||
+            !checkOnlyStructGetsOnRef(
+              firstSet->value, localSet->index, newHT, fieldsRead, selfGetPtrs)) {
+          continue;
+        }
+        intervening.push_back(
+          {firstSet, std::move(valEff), std::move(fieldsRead)});
+      }
+
+      // This local.set (or struct.set with local.tee) of a struct.new looks
+      // good. Find struct.sets after it to optimize.
       Index localSetIndex = i;
       for (Index j = localSetIndex + 1; j < list.size(); j++) {
+        if (!intervening.empty() && list[j]->is<Nop>()) {
+          continue;
+        }
 
         // Check that the next instruction is a struct.set on the same local as
         // the struct.new.
@@ -139,7 +239,7 @@ struct HeapStoreOptimization
           // Any time the pattern no longer matches, we try to push the
           // struct.new further down but if it is not possible we stop
           // optimizing possible struct.sets for this struct.new.
-          if (trySwap(list, localSetIndex, j)) {
+          if (intervening.empty() && trySwap(list, localSetIndex, j)) {
             // Update the index and continue to try again.
             localSetIndex = j;
             continue;
@@ -147,13 +247,50 @@ struct HeapStoreOptimization
           break;
         }
 
+        // Check if we can fold structSet past any intervening un-folded sets.
+        bool canPassIntervening = true;
+        auto setValEff = effects(structSet->value);
+        SmallSet<Index, 4> currSelfFieldsRead;
+        std::vector<Expression**> currSelfGetPtrs;
+        bool onlySelfGets = checkOnlyStructGetsOnRef(structSet->value,
+                                                     localSet->index,
+                                                     newHT,
+                                                     currSelfFieldsRead,
+                                                     currSelfGetPtrs);
+        if (!intervening.empty()) {
+          if (hasInFuncControlFlow(setValEff) || !onlySelfGets ||
+              setValEff.localsWritten.contains(localSet->index)) {
+            canPassIntervening = false;
+          } else {
+            for (auto& prev : intervening) {
+              if (prev.set->index == structSet->index ||
+                  prev.selfFieldsRead.contains(structSet->index) ||
+                  currSelfFieldsRead.contains(prev.set->index) ||
+                  prev.valEffects.orderedBefore(setValEff)) {
+                canPassIntervening = false;
+                break;
+              }
+            }
+          }
+        }
+
         // The pattern matches, try to optimize.
-        if (!optimizeSubsequentStructSet(new_, structSet, localSet)) {
-          break;
-        } else {
+        if (canPassIntervening &&
+            optimizeSubsequentStructSet(new_, structSet, localSet)) {
           // Success. Replace the set with a nop, and continue to perhaps
           // optimize more.
           ExpressionManipulator::nop(structSet);
+        } else {
+          // If we could not fold this structSet, see if subsequent struct.sets
+          // on the same fresh allocation can still fold past it.
+          if (!hasInFuncControlFlow(setValEff) && onlySelfGets &&
+              !setValEff.localsWritten.contains(localSet->index)) {
+            intervening.push_back({structSet,
+                                   std::move(setValEff),
+                                   std::move(currSelfFieldsRead)});
+            continue;
+          }
+          break;
         }
       }
     }
@@ -219,6 +356,20 @@ struct HeapStoreOptimization
     auto index = set->index;
     auto& operands = new_->operands;
     auto refLocalIndex = localSet->index;
+    auto newHT = new_->type.getHeapType();
+    auto& fields = newHT.getStruct().fields;
+
+    bool isRedundantDefaultStore = false;
+    if (new_->isWithDefault() && getPassOptions().shrinkLevel > 0) {
+      if (Properties::isConstantExpression(set->value) &&
+          Properties::getLiteral(set->value) ==
+            Literal::makeZero(fields[index].type)) {
+        isRedundantDefaultStore = true;
+      } else if (fields.size() > 3) {
+        // Materializing > 3 default operands in struct.new bloats code size.
+        return false;
+      }
+    }
 
     // Check for effects that prevent us moving the struct.set's value (X' in
     // the function comment) into its new position in the struct.new. First, it
@@ -227,9 +378,87 @@ struct HeapStoreOptimization
     // occurred; or, if it writes to that local, then it would cross another
     // write).
     auto setValueEffects = effects(set->value);
-    if (setValueEffects.localsRead.contains(refLocalIndex) ||
-        setValueEffects.localsWritten.contains(refLocalIndex)) {
+    if (setValueEffects.localsWritten.contains(refLocalIndex)) {
       return false;
+    }
+
+    std::vector<Expression**> selfGetPtrs;
+    if (setValueEffects.localsRead.contains(refLocalIndex)) {
+      SmallSet<Index, 4> fieldsRead;
+      if (!checkOnlyStructGetsOnRef(
+            set->value, refLocalIndex, newHT, fieldsRead, selfGetPtrs) ||
+          selfGetPtrs.empty()) {
+        return false;
+      }
+      // Verify every self-get reads a field whose initial value in `new_` can
+      // be substituted into `set->value`.
+      for (auto** getp : selfGetPtrs) {
+        auto* get = (*getp)->cast<StructGet>();
+        Index f2 = get->index;
+        if (new_->isWithDefault()) {
+          continue;
+        }
+        Expression* op2 = operands[f2];
+        if (op2->is<Const>() || op2->is<RefNull>() || op2->is<RefFunc>()) {
+          continue;
+        }
+        if (auto* lg = op2->dynCast<LocalGet>()) {
+          if (lg->index == refLocalIndex ||
+              setValueEffects.localsWritten.contains(lg->index)) {
+            return false;
+          }
+          bool writtenInNew = false;
+          for (Index k = 0; k < operands.size(); k++) {
+            if (k != f2 &&
+                effects(operands[k]).localsWritten.contains(lg->index)) {
+              writtenInNew = true;
+              break;
+            }
+          }
+          if (writtenInNew ||
+              (new_->desc &&
+               effects(new_->desc).localsWritten.contains(lg->index))) {
+            return false;
+          }
+          continue;
+        }
+        if (auto* gg = op2->dynCast<GlobalGet>()) {
+          if (setValueEffects.globalsWritten.contains(gg->name)) {
+            return false;
+          }
+          bool writtenInNew = false;
+          for (Index k = 0; k < operands.size(); k++) {
+            if (k != f2 &&
+                effects(operands[k]).globalsWritten.contains(gg->name)) {
+              writtenInNew = true;
+              break;
+            }
+          }
+          if (writtenInNew ||
+              (new_->desc &&
+               effects(new_->desc).globalsWritten.contains(gg->name))) {
+            return false;
+          }
+          continue;
+        }
+        if (auto* tee2 = op2->dynCast<LocalSet>()) {
+          if (tee2->isTee() && f2 < index && tee2->index != refLocalIndex &&
+              !setValueEffects.localsWritten.contains(tee2->index)) {
+            bool writtenAfter = false;
+            for (Index k = f2 + 1; k < operands.size(); k++) {
+              if (effects(operands[k]).localsWritten.contains(tee2->index)) {
+                writtenAfter = true;
+                break;
+              }
+            }
+            if (!writtenAfter) {
+              continue;
+            }
+          }
+        }
+        return false;
+      }
+      setValueEffects.localsRead.erase(refLocalIndex);
     }
 
     // We must move the set's value past indexes greater than it (Y and Z in
@@ -274,14 +503,62 @@ struct HeapStoreOptimization
       return false;
     }
 
+    if (isRedundantDefaultStore) {
+      return true;
+    }
+
     // We can optimize here!
     Builder builder(*getModule());
+
+    // Perform any self-get substitutions in set->value before overwriting
+    // operands[index].
+    if (!selfGetPtrs.empty()) {
+      for (auto** getp : selfGetPtrs) {
+        auto* get = (*getp)->cast<StructGet>();
+        Index f2 = get->index;
+        auto& field = fields[f2];
+        Expression* rep = nullptr;
+        if (new_->isWithDefault()) {
+          rep = builder.makeConstantExpression(Literal::makeZero(field.type));
+        } else if (auto* tee2 = operands[f2]->dynCast<LocalSet>()) {
+          rep = builder.makeLocalGet(tee2->index, tee2->type);
+        } else {
+          rep = ExpressionManipulator::copy(operands[f2], *getModule());
+        }
+        if (field.type == Type::i32 && field.packedType != Field::NotPacked) {
+          if (auto* c = rep->dynCast<Const>()) {
+            int32_t v = c->value.geti32();
+            if (field.packedType == Field::i8) {
+              v = get->signed_ ? int32_t(int8_t(v)) : int32_t(uint8_t(v));
+            } else {
+              v = get->signed_ ? int32_t(int16_t(v)) : int32_t(uint16_t(v));
+            }
+            c->value = Literal(v);
+          } else if (field.packedType == Field::i8) {
+            rep = get->signed_
+                    ? static_cast<Expression*>(
+                        builder.makeUnary(ExtendS8Int32, rep))
+                    : static_cast<Expression*>(builder.makeBinary(
+                        AndInt32, rep, builder.makeConst(int32_t(0xff))));
+          } else {
+            rep = get->signed_
+                    ? static_cast<Expression*>(
+                        builder.makeUnary(ExtendS16Int32, rep))
+                    : static_cast<Expression*>(builder.makeBinary(
+                        AndInt32, rep, builder.makeConst(int32_t(0xffff))));
+          }
+        }
+        if (rep->type != get->type) {
+          needsRefinalize = true;
+        }
+        *getp = rep;
+      }
+    }
 
     // If this was with_default then we add default values now. That does
     // increase code size in some cases (if there are many values, and few sets
     // that get removed), but in general this optimization is worth it.
     if (new_->isWithDefault()) {
-      auto& fields = new_->type.getHeapType().getStruct().fields;
       for (auto& field : fields) {
         auto zero = Literal::makeZero(field.type);
         operands.push_back(builder.makeConstantExpression(zero));
@@ -297,6 +574,763 @@ struct HeapStoreOptimization
     }
 
     return true;
+  }
+
+  bool exprReadsStructField(Expression* root,
+                            HeapType targetHT,
+                            Index targetField,
+                            int depth = 0) {
+    struct Checker : public PostWalker<Checker> {
+      HeapStoreOptimization& parent;
+      HeapType targetHT;
+      Index targetField;
+      int depth;
+      bool found = false;
+      Checker(HeapStoreOptimization& parent,
+              HeapType targetHT,
+              Index targetField,
+              int d)
+        : parent(parent), targetHT(targetHT), targetField(targetField),
+          depth(d) {}
+      void visitStructGet(StructGet* curr) {
+        if (found || curr->ref->type == Type::unreachable ||
+            curr->ref->type.isNull()) {
+          return;
+        }
+        if (curr->index == targetField &&
+            (HeapType::isSubType(curr->ref->type.getHeapType(), targetHT) ||
+             HeapType::isSubType(targetHT, curr->ref->type.getHeapType()))) {
+          found = true;
+        }
+      }
+      void visitCall(Call* curr) {
+        if (found) {
+          return;
+        }
+        ShallowEffectAnalyzer eff(
+          parent.getPassOptions(), *parent.getModule(), curr);
+        if (eff.readsMutableStruct) {
+          found = true;
+        }
+      }
+      void visitCallIndirect(CallIndirect* curr) { found = true; }
+      void visitCallRef(CallRef* curr) { found = true; }
+    };
+    Checker checker(*this, targetHT, targetField, depth);
+    checker.walk(root);
+    return checker.found;
+  }
+
+  bool exprWritesStructField(Expression* root,
+                             HeapType targetHT,
+                             Index targetField,
+                             int depth = 0) {
+    struct Checker : public PostWalker<Checker> {
+      HeapStoreOptimization& parent;
+      HeapType targetHT;
+      Index targetField;
+      int depth;
+      bool found = false;
+      Checker(HeapStoreOptimization& parent,
+              HeapType targetHT,
+              Index targetField,
+              int d)
+        : parent(parent), targetHT(targetHT), targetField(targetField),
+          depth(d) {}
+      void visitStructSet(StructSet* curr) {
+        if (found || curr->ref->type == Type::unreachable ||
+            curr->ref->type.isNull()) {
+          return;
+        }
+        if (curr->index == targetField &&
+            (HeapType::isSubType(curr->ref->type.getHeapType(), targetHT) ||
+             HeapType::isSubType(targetHT, curr->ref->type.getHeapType()))) {
+          found = true;
+        }
+      }
+      void visitCall(Call* curr) {
+        if (found) {
+          return;
+        }
+        ShallowEffectAnalyzer eff(
+          parent.getPassOptions(), *parent.getModule(), curr);
+        if (eff.writesStruct) {
+          found = true;
+        }
+      }
+      void visitCallIndirect(CallIndirect* curr) { found = true; }
+      void visitCallRef(CallRef* curr) { found = true; }
+    };
+    Checker checker(*this, targetHT, targetField, depth);
+    checker.walk(root);
+    return checker.found;
+  }
+
+  bool isProvablyNonNull(Expression* expr,
+                         const SmallSet<Index, 8>& nonNullLocals) {
+    while (auto* blk = expr->dynCast<Block>()) {
+      if (blk->name.is() || blk->list.empty()) {
+        break;
+      }
+      expr = blk->list.back();
+    }
+    if (expr->type.isNonNullable()) {
+      return true;
+    }
+    if (expr->is<StructNew>() || expr->is<ArrayNew>() ||
+        expr->is<ArrayNewFixed>() || expr->is<ArrayNewData>() ||
+        expr->is<RefFunc>() || expr->is<StringConst>()) {
+      return true;
+    }
+    if (auto* ls = expr->dynCast<LocalSet>()) {
+      if (ls->isTee()) {
+        return isProvablyNonNull(ls->value, nonNullLocals);
+      }
+    }
+    if (auto* lg = expr->dynCast<LocalGet>()) {
+      return nonNullLocals.contains(lg->index);
+    }
+    return false;
+  }
+
+  Expression* getForwardableValue(Expression* val,
+                                  const Field& field,
+                                  Index& depLocal,
+                                  Name& depGlobal) {
+    depLocal = Index(-1);
+    depGlobal = Name();
+    if (field.packedType != Field::NotPacked) {
+      if (auto* c = val->dynCast<Const>()) {
+        return c;
+      }
+      return nullptr;
+    }
+    if (auto* lg = val->dynCast<LocalGet>()) {
+      depLocal = lg->index;
+      return lg;
+    }
+    if (auto* ls = val->dynCast<LocalSet>()) {
+      if (ls->isTee()) {
+        depLocal = ls->index;
+        return ls;
+      }
+    }
+    if (auto* gg = val->dynCast<GlobalGet>()) {
+      depGlobal = gg->name;
+      return gg;
+    }
+    if (val->is<RefNull>() || val->is<RefFunc>()) {
+      return val;
+    }
+    if (auto* c = val->dynCast<Const>()) {
+      if (c->type == Type::i32) {
+        int32_t v = c->value.geti32();
+        if (v >= -8192 && v <= 8191) {
+          return c;
+        }
+      }
+    }
+    return nullptr;
+  }
+
+  Expression* makeForwardedReplacement(Expression* fwdSource,
+                                       StructGet* get,
+                                       const Field& field) {
+    Builder builder(*getModule());
+    Expression* rep = nullptr;
+    if (auto* ls = fwdSource->dynCast<LocalSet>()) {
+      rep = builder.makeLocalGet(ls->index, ls->type);
+    } else {
+      rep = ExpressionManipulator::copy(fwdSource, *getModule());
+    }
+    if (field.type == Type::i32 && field.packedType != Field::NotPacked) {
+      auto* c = rep->cast<Const>();
+      int32_t v = c->value.geti32();
+      if (field.packedType == Field::i8) {
+        v = get->signed_ ? int32_t(int8_t(v)) : int32_t(uint8_t(v));
+      } else {
+        v = get->signed_ ? int32_t(int16_t(v)) : int32_t(uint16_t(v));
+      }
+      c->value = Literal(v);
+    }
+    if (rep->type != get->type) {
+      needsRefinalize = true;
+    }
+    return rep;
+  }
+
+  // Walk `exprp` in WebAssembly evaluation order, forwarding `fwdSource` (if
+  // non-null) to matching `(struct.get $T f (local.get $refLocal))` and folding
+  // `(ref.is_null (struct.get $T f (local.get $refLocal)))` when `valIsNonNull`
+  // is true. Returns false as soon as an instruction might clobber `(ht, f)`,
+  // `refLocal`, `depLocal`, `depGlobal`, or transfer control flow.
+  bool forwardStoreInExpr(Expression** exprp,
+                          Index refLocal,
+                          HeapType ht,
+                          Index fieldIdx,
+                          const Field& field,
+                          Expression* fwdSource,
+                          Index depLocal,
+                          Name depGlobal,
+                          bool valIsNonNull) {
+    Expression* expr = *exprp;
+    if (!expr || expr->type == Type::unreachable) {
+      return false;
+    }
+    if (expr->is<Nop>() || expr->is<LocalGet>() || expr->is<Const>() ||
+        expr->is<RefNull>() || expr->is<RefFunc>() || expr->is<GlobalGet>() ||
+        expr->is<StringConst>()) {
+      return true;
+    }
+    if (auto* get = expr->dynCast<StructGet>()) {
+      if (!forwardStoreInExpr(&get->ref,
+                              refLocal,
+                              ht,
+                              fieldIdx,
+                              field,
+                              fwdSource,
+                              depLocal,
+                              depGlobal,
+                              valIsNonNull)) {
+        return false;
+      }
+      if (fwdSource && get->index == fieldIdx &&
+          get->ref->is<LocalGet>() &&
+          get->ref->cast<LocalGet>()->index == refLocal &&
+          get->ref->type.isRef() && get->ref->type.getHeapType() == ht) {
+        *exprp = makeForwardedReplacement(fwdSource, get, field);
+      }
+      return true;
+    }
+    if (auto* rn = expr->dynCast<RefIsNull>()) {
+      if (valIsNonNull) {
+        if (auto* get = rn->value->dynCast<StructGet>()) {
+          if (get->index == fieldIdx && get->ref->is<LocalGet>() &&
+              get->ref->cast<LocalGet>()->index == refLocal &&
+              get->ref->type.isRef() && get->ref->type.getHeapType() == ht) {
+            Builder builder(*getModule());
+            *exprp = builder.makeConst(int32_t(0));
+            return true;
+          }
+        }
+      }
+      return forwardStoreInExpr(&rn->value,
+                                refLocal,
+                                ht,
+                                fieldIdx,
+                                field,
+                                fwdSource,
+                                depLocal,
+                                depGlobal,
+                                valIsNonNull);
+    }
+    if (auto* u = expr->dynCast<Unary>()) {
+      return forwardStoreInExpr(&u->value,
+                                refLocal,
+                                ht,
+                                fieldIdx,
+                                field,
+                                fwdSource,
+                                depLocal,
+                                depGlobal,
+                                valIsNonNull);
+    }
+    if (auto* b = expr->dynCast<Binary>()) {
+      return forwardStoreInExpr(&b->left,
+                                refLocal,
+                                ht,
+                                fieldIdx,
+                                field,
+                                fwdSource,
+                                depLocal,
+                                depGlobal,
+                                valIsNonNull) &&
+             forwardStoreInExpr(&b->right,
+                                refLocal,
+                                ht,
+                                fieldIdx,
+                                field,
+                                fwdSource,
+                                depLocal,
+                                depGlobal,
+                                valIsNonNull);
+    }
+    if (auto* re = expr->dynCast<RefEq>()) {
+      return forwardStoreInExpr(&re->left,
+                                refLocal,
+                                ht,
+                                fieldIdx,
+                                field,
+                                fwdSource,
+                                depLocal,
+                                depGlobal,
+                                valIsNonNull) &&
+             forwardStoreInExpr(&re->right,
+                                refLocal,
+                                ht,
+                                fieldIdx,
+                                field,
+                                fwdSource,
+                                depLocal,
+                                depGlobal,
+                                valIsNonNull);
+    }
+    if (auto* rc = expr->dynCast<RefCast>()) {
+      return forwardStoreInExpr(&rc->ref,
+                                refLocal,
+                                ht,
+                                fieldIdx,
+                                field,
+                                fwdSource,
+                                depLocal,
+                                depGlobal,
+                                valIsNonNull);
+    }
+    if (auto* rt = expr->dynCast<RefTest>()) {
+      return forwardStoreInExpr(&rt->ref,
+                                refLocal,
+                                ht,
+                                fieldIdx,
+                                field,
+                                fwdSource,
+                                depLocal,
+                                depGlobal,
+                                valIsNonNull);
+    }
+    if (auto* ra = expr->dynCast<RefAs>()) {
+      return forwardStoreInExpr(&ra->value,
+                                refLocal,
+                                ht,
+                                fieldIdx,
+                                field,
+                                fwdSource,
+                                depLocal,
+                                depGlobal,
+                                valIsNonNull);
+    }
+    if (auto* al = expr->dynCast<ArrayLen>()) {
+      return forwardStoreInExpr(&al->ref,
+                                refLocal,
+                                ht,
+                                fieldIdx,
+                                field,
+                                fwdSource,
+                                depLocal,
+                                depGlobal,
+                                valIsNonNull);
+    }
+    if (auto* sel = expr->dynCast<Select>()) {
+      return forwardStoreInExpr(&sel->ifTrue,
+                                refLocal,
+                                ht,
+                                fieldIdx,
+                                field,
+                                fwdSource,
+                                depLocal,
+                                depGlobal,
+                                valIsNonNull) &&
+             forwardStoreInExpr(&sel->ifFalse,
+                                refLocal,
+                                ht,
+                                fieldIdx,
+                                field,
+                                fwdSource,
+                                depLocal,
+                                depGlobal,
+                                valIsNonNull) &&
+             forwardStoreInExpr(&sel->condition,
+                                refLocal,
+                                ht,
+                                fieldIdx,
+                                field,
+                                fwdSource,
+                                depLocal,
+                                depGlobal,
+                                valIsNonNull);
+    }
+    if (auto* drop = expr->dynCast<Drop>()) {
+      return forwardStoreInExpr(&drop->value,
+                                refLocal,
+                                ht,
+                                fieldIdx,
+                                field,
+                                fwdSource,
+                                depLocal,
+                                depGlobal,
+                                valIsNonNull);
+    }
+    if (auto* ret = expr->dynCast<Return>()) {
+      if (ret->value) {
+        forwardStoreInExpr(&ret->value,
+                           refLocal,
+                           ht,
+                           fieldIdx,
+                           field,
+                           fwdSource,
+                           depLocal,
+                           depGlobal,
+                           valIsNonNull);
+      }
+      return false;
+    }
+    if (auto* ls = expr->dynCast<LocalSet>()) {
+      if (!forwardStoreInExpr(&ls->value,
+                              refLocal,
+                              ht,
+                              fieldIdx,
+                              field,
+                              fwdSource,
+                              depLocal,
+                              depGlobal,
+                              valIsNonNull)) {
+        return false;
+      }
+      if (ls->index == refLocal || ls->index == depLocal) {
+        return false;
+      }
+      return true;
+    }
+    if (auto* gs = expr->dynCast<GlobalSet>()) {
+      if (!forwardStoreInExpr(&gs->value,
+                              refLocal,
+                              ht,
+                              fieldIdx,
+                              field,
+                              fwdSource,
+                              depLocal,
+                              depGlobal,
+                              valIsNonNull)) {
+        return false;
+      }
+      if (depGlobal.is() && gs->name == depGlobal) {
+        return false;
+      }
+      return true;
+    }
+    if (auto* ss = expr->dynCast<StructSet>()) {
+      if (!forwardStoreInExpr(&ss->ref,
+                              refLocal,
+                              ht,
+                              fieldIdx,
+                              field,
+                              fwdSource,
+                              depLocal,
+                              depGlobal,
+                              valIsNonNull) ||
+          !forwardStoreInExpr(&ss->value,
+                              refLocal,
+                              ht,
+                              fieldIdx,
+                              field,
+                              fwdSource,
+                              depLocal,
+                              depGlobal,
+                              valIsNonNull)) {
+        return false;
+      }
+      if (ss->ref->type == Type::unreachable || ss->ref->type.isNull()) {
+        return false;
+      }
+      if (ss->index == fieldIdx &&
+          (HeapType::isSubType(ss->ref->type.getHeapType(), ht) ||
+           HeapType::isSubType(ht, ss->ref->type.getHeapType()))) {
+        return false;
+      }
+      return true;
+    }
+    if (auto* sn = expr->dynCast<StructNew>()) {
+      for (auto*& op : sn->operands) {
+        if (!forwardStoreInExpr(&op,
+                                refLocal,
+                                ht,
+                                fieldIdx,
+                                field,
+                                fwdSource,
+                                depLocal,
+                                depGlobal,
+                                valIsNonNull)) {
+          return false;
+        }
+      }
+      if (sn->desc && !forwardStoreInExpr(&sn->desc,
+                                          refLocal,
+                                          ht,
+                                          fieldIdx,
+                                          field,
+                                          fwdSource,
+                                          depLocal,
+                                          depGlobal,
+                                          valIsNonNull)) {
+        return false;
+      }
+      return true;
+    }
+    if (auto* call = expr->dynCast<Call>()) {
+      for (auto*& op : call->operands) {
+        if (!forwardStoreInExpr(&op,
+                                refLocal,
+                                ht,
+                                fieldIdx,
+                                field,
+                                fwdSource,
+                                depLocal,
+                                depGlobal,
+                                valIsNonNull)) {
+          return false;
+        }
+      }
+      ShallowEffectAnalyzer callEff(getPassOptions(), *getModule(), call);
+      if (hasInFuncControlFlow(callEff)) {
+        return false;
+      }
+      if (depGlobal.is() && callEff.globalsWritten.contains(depGlobal)) {
+        return false;
+      }
+      if (callEff.writesStruct && exprWritesStructField(call, ht, fieldIdx)) {
+        return false;
+      }
+      return true;
+    }
+    if (auto* iff = expr->dynCast<If>()) {
+      if (!forwardStoreInExpr(&iff->condition,
+                              refLocal,
+                              ht,
+                              fieldIdx,
+                              field,
+                              fwdSource,
+                              depLocal,
+                              depGlobal,
+                              valIsNonNull)) {
+        return false;
+      }
+      if (auto* c = iff->condition->dynCast<Const>()) {
+        if (c->value.geti32() == 0 && !iff->ifFalse) {
+          ExpressionManipulator::nop(iff);
+          return true;
+        }
+      }
+      bool okTrue = forwardStoreInExpr(&iff->ifTrue,
+                                       refLocal,
+                                       ht,
+                                       fieldIdx,
+                                       field,
+                                       fwdSource,
+                                       depLocal,
+                                       depGlobal,
+                                       valIsNonNull);
+      bool okFalse = !iff->ifFalse ||
+                     forwardStoreInExpr(&iff->ifFalse,
+                                        refLocal,
+                                        ht,
+                                        fieldIdx,
+                                        field,
+                                        fwdSource,
+                                        depLocal,
+                                        depGlobal,
+                                        valIsNonNull);
+      return okTrue && okFalse;
+    }
+    if (auto* blk = expr->dynCast<Block>()) {
+      if (blk->name.is()) {
+        return false;
+      }
+      for (auto*& item : blk->list) {
+        if (!forwardStoreInExpr(&item,
+                                refLocal,
+                                ht,
+                                fieldIdx,
+                                field,
+                                fwdSource,
+                                depLocal,
+                                depGlobal,
+                                valIsNonNull)) {
+          return false;
+        }
+      }
+      return true;
+    }
+    return false;
+  }
+
+  Expression** findLeftmostSelfGet(Expression** exprp,
+                                   Index refLocal,
+                                   HeapType ht,
+                                   Index fieldIdx) {
+    Expression* expr = *exprp;
+    if (!expr || expr->type == Type::unreachable) {
+      return nullptr;
+    }
+    if (auto* get = expr->dynCast<StructGet>()) {
+      if (get->index == fieldIdx && get->ref->is<LocalGet>() &&
+          get->ref->cast<LocalGet>()->index == refLocal &&
+          get->ref->type.isRef() && get->ref->type.getHeapType() == ht) {
+        return exprp;
+      }
+      return findLeftmostSelfGet(&get->ref, refLocal, ht, fieldIdx);
+    }
+    if (auto* u = expr->dynCast<Unary>()) {
+      return findLeftmostSelfGet(&u->value, refLocal, ht, fieldIdx);
+    }
+    if (auto* b = expr->dynCast<Binary>()) {
+      return findLeftmostSelfGet(&b->left, refLocal, ht, fieldIdx);
+    }
+    if (auto* s = expr->dynCast<Select>()) {
+      return findLeftmostSelfGet(&s->ifTrue, refLocal, ht, fieldIdx);
+    }
+    if (auto* c = expr->dynCast<Call>()) {
+      if (!c->operands.empty()) {
+        return findLeftmostSelfGet(&c->operands[0], refLocal, ht, fieldIdx);
+      }
+    }
+    return nullptr;
+  }
+
+  void optimizeBlockStoresAndLoads(Block* curr) {
+    auto& list = curr->list;
+    SmallSet<Index, 8> nonNullLocals;
+
+    for (Index i = 0; i < list.size(); i++) {
+      Expression* stmt = list[i];
+      if (stmt->is<Nop>()) {
+        continue;
+      }
+      if (auto* ls = stmt->dynCast<LocalSet>()) {
+        if (isProvablyNonNull(ls->value, nonNullLocals)) {
+          nonNullLocals.insert(ls->index);
+        } else {
+          nonNullLocals.erase(ls->index);
+        }
+        continue;
+      }
+
+      auto* set = stmt->dynCast<StructSet>();
+      if (!set || set->type == Type::unreachable ||
+          set->ref->type == Type::unreachable || set->ref->type.isNull()) {
+        auto eff = effects(stmt);
+        for (Index w : eff.localsWritten) {
+          nonNullLocals.erase(w);
+        }
+        continue;
+      }
+
+      Index refLocal = Index(-1);
+      if (auto* lg = set->ref->dynCast<LocalGet>()) {
+        refLocal = lg->index;
+      } else if (auto* tee = set->ref->dynCast<LocalSet>()) {
+        refLocal = tee->index;
+      }
+      if (refLocal == Index(-1)) {
+        auto eff = effects(stmt);
+        for (Index w : eff.localsWritten) {
+          nonNullLocals.erase(w);
+        }
+        continue;
+      }
+
+      if (getPassOptions().trapsNeverHappen) {
+        nonNullLocals.insert(refLocal);
+      }
+      auto setValEff = effects(set->value);
+      for (Index w : setValEff.localsWritten) {
+        nonNullLocals.erase(w);
+      }
+      if (auto* tee = set->value->dynCast<LocalSet>()) {
+        if (isProvablyNonNull(tee->value, nonNullLocals)) {
+          nonNullLocals.insert(tee->index);
+        }
+      }
+
+      HeapType ht = set->ref->type.getHeapType();
+      Index fieldIdx = set->index;
+      auto& field = ht.getStruct().fields[fieldIdx];
+
+      // 1. Check for adjacent dead overwritten struct.set $T f (local.get $x)
+      if (set->ref->is<LocalGet>()) {
+        Index nextIdx = i + 1;
+        while (nextIdx < list.size() && list[nextIdx]->is<Nop>()) {
+          nextIdx++;
+        }
+        if (nextIdx < list.size()) {
+          if (auto* nextSet = list[nextIdx]->dynCast<StructSet>()) {
+            auto* nextLg = nextSet->ref->dynCast<LocalGet>();
+            if (nextLg && nextLg->index == refLocal &&
+                nextSet->index == fieldIdx &&
+                nextSet->type != Type::unreachable &&
+                nextSet->ref->type.isRef() &&
+                nextSet->ref->type.getHeapType() == ht) {
+              auto val2Eff = effects(nextSet->value);
+              if (!setValEff.transfersControlFlow() &&
+                  !val2Eff.localsWritten.contains(refLocal) &&
+                  !val2Eff.transfersControlFlow() &&
+                  (getPassOptions().trapsNeverHappen ||
+                   set->ref->type.isNonNullable() ||
+                   !val2Eff.hasUnremovableSideEffects()) &&
+                  !exprWritesStructField(nextSet->value, ht, fieldIdx)) {
+                if (!exprReadsStructField(nextSet->value, ht, fieldIdx)) {
+                  if (!setValEff.hasUnremovableSideEffects()) {
+                    ExpressionManipulator::nop(set);
+                  } else {
+                    Builder builder(*getModule());
+                    list[i] = builder.makeDrop(set->value);
+                  }
+                  continue;
+                } else if (field.packedType == Field::NotPacked &&
+                           !setValEff.localsWritten.contains(refLocal) &&
+                           !setValEff.transfersControlFlow()) {
+                  if (auto** slot = findLeftmostSelfGet(
+                        &nextSet->value, refLocal, ht, fieldIdx)) {
+                    Expression* origGet = *slot;
+                    *slot = set->ref;
+                    if (!exprReadsStructField(nextSet->value, ht, fieldIdx)) {
+                      if (set->value->type != origGet->type) {
+                        needsRefinalize = true;
+                      }
+                      *slot = set->value;
+                      ExpressionManipulator::nop(set);
+                      continue;
+                    }
+                    *slot = origGet;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // 2. Intra-block store-to-load forwarding & non-null guard folding.
+      Index depLocal = Index(-1);
+      Name depGlobal;
+      Expression* fwdSource =
+        getForwardableValue(set->value, field, depLocal, depGlobal);
+      bool valIsNonNull = isProvablyNonNull(set->value, nonNullLocals);
+      if ((depLocal != Index(-1) && setValEff.localsWritten.contains(depLocal) &&
+           !set->value->is<LocalSet>()) ||
+          depLocal == refLocal) {
+        fwdSource = nullptr;
+      }
+
+      if (!fwdSource && !valIsNonNull) {
+        continue;
+      }
+
+      for (Index j = i + 1; j < list.size(); j++) {
+        if (list[j]->is<Nop>()) {
+          continue;
+        }
+        if (!forwardStoreInExpr(&list[j],
+                                refLocal,
+                                ht,
+                                fieldIdx,
+                                field,
+                                fwdSource,
+                                depLocal,
+                                depGlobal,
+                                valIsNonNull)) {
+          break;
+        }
+      }
+    }
   }
 
   // We must be careful of branches that skip the local.set. For example:

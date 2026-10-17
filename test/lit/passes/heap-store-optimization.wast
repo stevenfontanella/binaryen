@@ -8,9 +8,9 @@
 (module
   ;; CHECK:      (type $struct (struct (field (mut i32))))
 
-  ;; CHECK:      (type $struct2 (struct (field (mut i32)) (field (mut i32))))
-
   ;; CHECK:      (type $struct3 (struct (field (mut i32)) (field (mut i32)) (field (mut i32))))
+
+  ;; CHECK:      (type $struct2 (struct (field (mut i32)) (field (mut i32))))
 
   ;; CHECK:      (tag $tag (type $1))
   (tag $tag)
@@ -1680,5 +1680,71 @@
       )
     )
     (local.get $ref)
+  )
+
+  ;; CHECK:      (func $self-get-in-set-value (type $1)
+  ;; CHECK-NEXT:  (local $ref (ref null $struct2))
+  ;; CHECK-NEXT:  (local.set $ref
+  ;; CHECK-NEXT:   (struct.new $struct2
+  ;; CHECK-NEXT:    (i32.const 10)
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (i32.const 10)
+  ;; CHECK-NEXT:     (i32.const 5)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $self-get-in-set-value
+    (local $ref (ref null $struct2))
+    (struct.set $struct2 1
+      (local.tee $ref
+        (struct.new $struct2
+          (i32.const 10)
+          (i32.const 20)
+        )
+      )
+      (i32.add
+        (struct.get $struct2 0
+          (local.get $ref)
+        )
+        (i32.const 5)
+      )
+    )
+  )
+
+  ;; CHECK:      (func $fold-past-intervening-unfolded-set (type $1)
+  ;; CHECK-NEXT:  (local $ref (ref null $struct3))
+  ;; CHECK-NEXT:  (struct.set $struct3 0
+  ;; CHECK-NEXT:   (local.tee $ref
+  ;; CHECK-NEXT:    (struct.new $struct3
+  ;; CHECK-NEXT:     (i32.const 10)
+  ;; CHECK-NEXT:     (call $helper-i32
+  ;; CHECK-NEXT:      (i32.const 0)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.const 99)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (call $helper-i32
+  ;; CHECK-NEXT:    (i32.const 1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (nop)
+  ;; CHECK-NEXT: )
+  (func $fold-past-intervening-unfolded-set
+    (local $ref (ref null $struct3))
+    (struct.set $struct3 0
+      (local.tee $ref
+        (struct.new $struct3
+          (i32.const 10)
+          (call $helper-i32 (i32.const 0))
+          (i32.const 30)
+        )
+      )
+      (call $helper-i32 (i32.const 1))
+    )
+    (struct.set $struct3 2
+      (local.get $ref)
+      (i32.const 99)
+    )
   )
 )
