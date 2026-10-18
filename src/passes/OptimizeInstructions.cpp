@@ -1070,6 +1070,11 @@ struct OptimizeInstructions
       if (auto* ret = conditionalizeExpensiveOnBitwise(curr)) {
         return replaceCurrent(ret);
       }
+      if (getPassOptions().shrinkLevel >= 2) {
+        if (auto* ret = tryPushBitwiseIntoIf(curr)) {
+          return replaceCurrent(ret);
+        }
+      }
     }
     if (curr->op == AndInt64) {
       if (auto* ret = optimizeAndNoOverlappingBits(curr)) {
@@ -1304,10 +1309,11 @@ struct OptimizeInstructions
           return replaceCurrent(ret);
         }
       }
-      if (canNegateForFree(curr->value) &&
+      if ((canNegateForFree(curr->value) ||
+           canPushNegationIntoIfFree(curr->value)) &&
           (curr->value->is<Call>() || curr->value->is<If>() ||
            curr->value->is<Select>() || curr->value->is<Block>())) {
-        return replaceCurrent(makeNegatedOneBit(curr->value));
+        return replaceCurrent(pushNegationIntoIfFree(curr->value));
       }
       if (auto* inner = curr->value->dynCast<Binary>()) {
         // Try to invert a relational operation using De Morgan's law
@@ -1434,6 +1440,15 @@ struct OptimizeInstructions
             BranchHints::flip(curr, getFunction());
           }
         }
+      } else if (getPassOptions().shrinkLevel >= 2 &&
+                 (curr->condition->is<If>() || curr->condition->is<Block>()) &&
+                 canNegateForFree(curr->condition, 0, /*mustBeOneBit=*/false) &&
+                 hasRemovableEqZInNegatable(
+                   curr->condition, 0, /*mustBeOneBit=*/false)) {
+        curr->condition =
+          makeNegatedOneBit(curr->condition, /*mustBeOneBit=*/false);
+        std::swap(curr->ifTrue, curr->ifFalse);
+        BranchHints::flip(curr, getFunction());
       }
       // Note that we do not consider metadata here. Like LLVM, we ignore
       // metadata when trying to fold code together, preferring certain
@@ -1627,6 +1642,19 @@ struct OptimizeInstructions
     assert(getModule()->features.hasBulkMemoryOpt());
     if (auto* ret = optimizeMemoryFill(curr)) {
       return replaceCurrent(ret);
+    }
+  }
+
+  void visitCall(Call* curr) {
+    if (!moduleOneBitInfo) {
+      return;
+    }
+    for (Index i = 0; i < curr->operands.size(); i++) {
+      if (curr->operands[i]->type == Type::i32 &&
+          moduleOneBitInfo->isBoolOnlyParam(curr->target, i)) {
+        curr->operands[i] =
+          optimizeBoolean(curr->operands[i], /*mustBeOneBit=*/false);
+      }
     }
   }
 
@@ -3729,10 +3757,11 @@ private:
               return ret;
             }
           }
-          if (canNegateForFree(unary->value, 0, mustBeOneBit) &&
+          if ((canNegateForFree(unary->value, 0, mustBeOneBit) ||
+               canPushNegationIntoIfFree(unary->value, 0, mustBeOneBit)) &&
               (unary->value->is<Call>() || unary->value->is<If>() ||
                unary->value->is<Select>() || unary->value->is<Block>())) {
-            return makeNegatedOneBit(unary->value, mustBeOneBit);
+            return pushNegationIntoIfFree(unary->value, 0, mustBeOneBit);
           }
           unary->value = optimizeBoolean(unary->value, /*mustBeOneBit=*/false);
           unary2 = unary->value->dynCast<Unary>();
@@ -3745,10 +3774,11 @@ private:
               return ret;
             }
           }
-          if (canNegateForFree(unary->value, 0, mustBeOneBit) &&
+          if ((canNegateForFree(unary->value, 0, mustBeOneBit) ||
+               canPushNegationIntoIfFree(unary->value, 0, mustBeOneBit)) &&
               (unary->value->is<Call>() || unary->value->is<If>() ||
                unary->value->is<Select>() || unary->value->is<Block>())) {
-            return makeNegatedOneBit(unary->value, mustBeOneBit);
+            return pushNegationIntoIfFree(unary->value, 0, mustBeOneBit);
           }
         }
         if (unary->op == EqZInt32 || unary->op == EqZInt64) {
@@ -3771,6 +3801,15 @@ private:
         // boolean
         binary->left = optimizeBoolean(binary->left, mustBeOneBit);
         binary->right = optimizeBoolean(binary->right, mustBeOneBit);
+        if (getPassOptions().shrinkLevel >= 2) {
+          if (auto* pushed = tryPushBitwiseIntoIf(binary, !mustBeOneBit)) {
+            return pushed;
+          }
+        }
+      } else if (binary->op == AndInt32 && getPassOptions().shrinkLevel >= 2) {
+        if (auto* pushed = tryPushBitwiseIntoIf(binary, !mustBeOneBit)) {
+          return pushed;
+        }
       } else if (binary->op == NeInt32) {
         if (auto* c = binary->right->dynCast<Const>()) {
           // x != 0 is just x if it's used as a bool
@@ -3979,8 +4018,185 @@ private:
     if (Bits::getMaxBits(expr, this) <= 1) {
       return expr;
     }
+    if (getPassOptions().shrinkLevel >= 2) {
+      if (auto* blk = expr->dynCast<Block>();
+          blk && !blk->name.is() && !blk->list.empty() &&
+          blk->type == Type::i32 && blk->list.back()->type == Type::i32) {
+        blk->list.back() = makeOneBit(blk->list.back());
+        return blk;
+      }
+      if (auto* iff = expr->dynCast<If>();
+          iff && iff->ifFalse && iff->type == Type::i32 &&
+          iff->condition->type != Type::unreachable &&
+          iff->ifTrue->type == Type::i32 && iff->ifFalse->type == Type::i32) {
+        bool trueOneBit = Bits::getMaxBits(iff->ifTrue, this) <= 1;
+        bool falseOneBit = Bits::getMaxBits(iff->ifFalse, this) <= 1;
+        if (trueOneBit && !falseOneBit) {
+          iff->ifFalse = makeOneBit(iff->ifFalse);
+          return iff;
+        }
+        if (falseOneBit && !trueOneBit) {
+          iff->ifTrue = makeOneBit(iff->ifTrue);
+          return iff;
+        }
+      }
+    }
     Builder builder(*getModule());
     return builder.makeUnary(EqZInt32, makeNegatedOneBit(expr));
+  }
+
+  bool hasRemovableEqZInNegatable(Expression* expr,
+                                  Index depth = 0,
+                                  bool mustBeOneBit = false) {
+    if (!expr || depth > 6) {
+      return false;
+    }
+    if (isRemovableOneBitEqZ(expr, mustBeOneBit)) {
+      return true;
+    }
+    if (auto* blk = expr->dynCast<Block>();
+        blk && !blk->name.is() && !blk->list.empty()) {
+      return hasRemovableEqZInNegatable(
+        blk->list.back(), depth + 1, mustBeOneBit);
+    }
+    if (auto* iff = expr->dynCast<If>(); iff && iff->ifFalse) {
+      return hasRemovableEqZInNegatable(
+               iff->ifTrue, depth + 1, mustBeOneBit) ||
+             hasRemovableEqZInNegatable(
+               iff->ifFalse, depth + 1, mustBeOneBit);
+    }
+    if (auto* sel = expr->dynCast<Select>()) {
+      return hasRemovableEqZInNegatable(
+               sel->ifTrue, depth + 1, mustBeOneBit) ||
+             hasRemovableEqZInNegatable(
+               sel->ifFalse, depth + 1, mustBeOneBit);
+    }
+    return false;
+  }
+
+  bool canPushNegationIntoIfFree(Expression* expr,
+                                 Index depth = 0,
+                                 bool mustBeOneBit = true) {
+    if (getPassOptions().shrinkLevel < 2 || !expr || expr->type != Type::i32 ||
+        depth > 6) {
+      return false;
+    }
+    if (canNegateForFree(expr, depth, mustBeOneBit)) {
+      return true;
+    }
+    if (auto* blk = expr->dynCast<Block>()) {
+      return !blk->name.is() && !blk->list.empty() &&
+             canPushNegationIntoIfFree(
+               blk->list.back(), depth + 1, mustBeOneBit);
+    }
+    if (auto* iff = expr->dynCast<If>()) {
+      if (!iff->ifFalse || iff->condition->type == Type::unreachable ||
+          iff->ifTrue->type != Type::i32 || iff->ifFalse->type != Type::i32) {
+        return false;
+      }
+      return canNegateForFree(iff->ifTrue, depth + 1, mustBeOneBit) ||
+             canNegateForFree(iff->ifFalse, depth + 1, mustBeOneBit);
+    }
+    return false;
+  }
+
+  Expression* pushNegationIntoIfFree(Expression* expr,
+                                     Index depth = 0,
+                                     bool mustBeOneBit = true) {
+    if (canNegateForFree(expr, depth, mustBeOneBit)) {
+      return makeNegatedOneBit(expr, mustBeOneBit);
+    }
+    if (auto* blk = expr->dynCast<Block>();
+        blk && !blk->name.is() && !blk->list.empty() &&
+        canPushNegationIntoIfFree(blk->list.back(), depth + 1, mustBeOneBit)) {
+      blk->list.back() =
+        pushNegationIntoIfFree(blk->list.back(), depth + 1, mustBeOneBit);
+      return blk;
+    }
+    if (auto* iff = expr->dynCast<If>();
+        iff && iff->ifFalse && iff->condition->type != Type::unreachable &&
+        iff->ifTrue->type == Type::i32 && iff->ifFalse->type == Type::i32 &&
+        (canNegateForFree(iff->ifTrue, depth + 1, mustBeOneBit) ||
+         canNegateForFree(iff->ifFalse, depth + 1, mustBeOneBit))) {
+      iff->ifTrue =
+        pushNegationIntoIfFree(iff->ifTrue, depth + 1, mustBeOneBit);
+      iff->ifFalse =
+        pushNegationIntoIfFree(iff->ifFalse, depth + 1, mustBeOneBit);
+      return iff;
+    }
+    return makeNegatedOneBit(expr, mustBeOneBit);
+  }
+
+  Expression* tryPushBitwiseIntoIf(Binary* curr,
+                                   bool inBooleanContext = false,
+                                   Index depth = 0) {
+    if (!curr || curr->type != Type::i32 || depth > 6 ||
+        (curr->op != AndInt32 && curr->op != OrInt32)) {
+      return nullptr;
+    }
+    auto matchTargetConst = [&](Expression* arm, int32_t& valOut) {
+      auto* c = arm->dynCast<Const>();
+      if (!c || c->type != Type::i32) {
+        return false;
+      }
+      valOut = c->value.geti32();
+      if (curr->op == AndInt32) {
+        return valOut == 0;
+      }
+      return inBooleanContext ? (valOut != 0) : (valOut == 1 || valOut == -1);
+    };
+    Builder builder(*getModule());
+
+    if (auto* iff = curr->left->dynCast<If>();
+        iff && iff->ifFalse && iff->type == Type::i32 &&
+        iff->condition->type != Type::unreachable &&
+        iff->ifTrue->type == Type::i32 && iff->ifFalse->type == Type::i32) {
+      int32_t cVal = 0;
+      bool trueMatches = matchTargetConst(iff->ifTrue, cVal);
+      bool falseMatches = !trueMatches && matchTargetConst(iff->ifFalse, cVal);
+      if ((trueMatches || falseMatches) &&
+          (curr->op == AndInt32 || inBooleanContext || cVal == -1 ||
+           Bits::getMaxBits(curr->right, this) <= 1) &&
+          !effects(curr->right).hasSideEffects()) {
+        Expression*& otherArm = trueMatches ? iff->ifFalse : iff->ifTrue;
+        auto* newBin = builder.makeBinary(curr->op, otherArm, curr->right);
+        if (auto* pushed =
+              tryPushBitwiseIntoIf(newBin, inBooleanContext, depth + 1)) {
+          otherArm = pushed;
+        } else {
+          otherArm = newBin;
+        }
+        return iff;
+      }
+    }
+
+    if (auto* iff = curr->right->dynCast<If>();
+        iff && iff->ifFalse && iff->type == Type::i32 &&
+        iff->condition->type != Type::unreachable &&
+        iff->ifTrue->type == Type::i32 && iff->ifFalse->type == Type::i32) {
+      int32_t cVal = 0;
+      bool trueMatches = matchTargetConst(iff->ifTrue, cVal);
+      bool falseMatches = !trueMatches && matchTargetConst(iff->ifFalse, cVal);
+      if ((trueMatches || falseMatches) &&
+          (curr->op == AndInt32 || inBooleanContext || cVal == -1 ||
+           Bits::getMaxBits(curr->left, this) <= 1)) {
+        auto leftEffects = effects(curr->left);
+        if (!leftEffects.hasSideEffects() &&
+            !leftEffects.invalidates(effects(iff->condition))) {
+          Expression*& otherArm = trueMatches ? iff->ifFalse : iff->ifTrue;
+          auto* newBin = builder.makeBinary(curr->op, curr->left, otherArm);
+          if (auto* pushed =
+                tryPushBitwiseIntoIf(newBin, inBooleanContext, depth + 1)) {
+            otherArm = pushed;
+          } else {
+            otherArm = newBin;
+          }
+          return iff;
+        }
+      }
+    }
+
+    return nullptr;
   }
 
   Expression* optimizeEqZSelect(Select* select, bool inBooleanContext = false) {
@@ -4265,6 +4481,15 @@ private:
           std::swap(curr->ifTrue, curr->ifFalse);
         }
       }
+    } else if (getPassOptions().shrinkLevel >= 2 &&
+               (curr->condition->is<If>() || curr->condition->is<Block>()) &&
+               canReorder(curr->ifTrue, curr->ifFalse) &&
+               canNegateForFree(curr->condition, 0, /*mustBeOneBit=*/false) &&
+               hasRemovableEqZInNegatable(
+                 curr->condition, 0, /*mustBeOneBit=*/false)) {
+      curr->condition =
+        makeNegatedOneBit(curr->condition, /*mustBeOneBit=*/false);
+      std::swap(curr->ifTrue, curr->ifFalse);
     }
     if (curr->type == Type::i32 && curr->ifTrue->type == Type::i32 &&
         curr->ifFalse->type == Type::i32 &&
@@ -5727,6 +5952,24 @@ private:
         matches(curr, binary(NeInt32, any(&left), i32(0))) &&
         canNegateForFree(left)) {
       return builder.makeUnary(EqZInt32, makeNegatedOneBit(left));
+    }
+    if (getPassOptions().shrinkLevel >= 2 &&
+        matches(curr, binary(NeInt32, any(&left), i32(0)))) {
+      if (auto* iff = left->dynCast<If>();
+          iff && iff->ifFalse && iff->type == Type::i32 &&
+          iff->condition->type != Type::unreachable &&
+          iff->ifTrue->type == Type::i32 && iff->ifFalse->type == Type::i32) {
+        bool trueOneBit = Bits::getMaxBits(iff->ifTrue, this) <= 1;
+        bool falseOneBit = Bits::getMaxBits(iff->ifFalse, this) <= 1;
+        if (trueOneBit && !falseOneBit) {
+          iff->ifFalse = makeOneBit(iff->ifFalse);
+          return iff;
+        }
+        if (falseOneBit && !trueOneBit) {
+          iff->ifTrue = makeOneBit(iff->ifTrue);
+          return iff;
+        }
+      }
     }
     // i64(bool(x)) == 1  ==>  i32(bool(x))
     // i64(bool(x)) != 0  ==>  i32(bool(x))
@@ -7231,7 +7474,9 @@ private:
       Unary* un;
       Const* c;
       auto check = [&](Expression* a, Expression* b) {
-        return matches(b, bval(&c)) && matches(a, unary(&un, EqZ, any()));
+        return matches(b, bval(&c)) && matches(a, unary(&un, EqZ, any())) &&
+               !(std::is_same_v<T, If> && getPassOptions().shrinkLevel >= 2 &&
+                 un->op == EqZInt32);
       };
       if (check(curr->ifTrue, curr->ifFalse) ||
           check(curr->ifFalse, curr->ifTrue)) {

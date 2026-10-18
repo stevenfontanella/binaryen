@@ -4171,9 +4171,13 @@
   ;; CHECK:      (type $vtable (struct (field (ref $pred))))
   (type $vtable (struct (field (ref $pred))))
 
-  ;; CHECK:      (type $4 (func (param (ref null $item)) (result i32)))
+  ;; CHECK:      (type $4 (func (param i32) (result i32)))
 
-  ;; CHECK:      (type $5 (func (param (ref $vtable) (ref null $item) i32) (result i32)))
+  ;; CHECK:      (type $5 (func (param i32 i32) (result i32)))
+
+  ;; CHECK:      (type $6 (func (param (ref null $item)) (result i32)))
+
+  ;; CHECK:      (type $7 (func (param (ref $vtable) (ref null $item) i32) (result i32)))
 
   ;; CHECK:      (global $col (ref $pred_arr) (array.new_fixed $pred_arr 2
   ;; CHECK-NEXT:  (ref.func $pred-eq)
@@ -4202,7 +4206,7 @@
     (unreachable)
   )
 
-  ;; CHECK:      (func $not-pred-sub (type $4) (param $s (ref null $item)) (result i32)
+  ;; CHECK:      (func $not-pred-sub (type $6) (param $s (ref null $item)) (result i32)
   ;; CHECK-NEXT:  (i32.eqz
   ;; CHECK-NEXT:   (call $pred-eq
   ;; CHECK-NEXT:    (local.get $s)
@@ -4213,7 +4217,7 @@
     (i32.eqz (call $pred-eq (local.get $s)))
   )
 
-  ;; CHECK:      (func $one-bit-array-global-and-twin (type $5) (param $vt (ref $vtable)) (param $s (ref null $item)) (param $idx i32) (result i32)
+  ;; CHECK:      (func $one-bit-array-global-and-twin (type $7) (param $vt (ref $vtable)) (param $s (ref null $item)) (param $idx i32) (result i32)
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (struct.new $vtable
   ;; CHECK-NEXT:    (array.get $pred_arr
@@ -4268,6 +4272,90 @@
       )
       (i32.eqz
         (call $not-pred-sub (local.get $s))
+      )
+    )
+  )
+
+  ;; CHECK:      (func $raw-val (type $4) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (local.get $x)
+  ;; CHECK-NEXT: )
+  (func $raw-val (param $x i32) (result i32)
+    (local.get $x)
+  )
+
+  ;; CHECK:      (func $not-raw-val (type $4) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (i32.eqz
+  ;; CHECK-NEXT:   (call $raw-val
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $not-raw-val (param $x i32) (result i32)
+    (i32.eqz (call $raw-val (local.get $x)))
+  )
+
+  ;; CHECK:      (func $take-bool-param (type $5) (param $b i32) (param $y i32) (result i32)
+  ;; CHECK-NEXT:  (if (result i32)
+  ;; CHECK-NEXT:   (local.get $b)
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (local.get $y)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (else
+  ;; CHECK-NEXT:    (i32.const 0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $take-bool-param (param $b i32) (param $y i32) (result i32)
+    (if (result i32)
+      (local.get $b)
+      (then (local.get $y))
+      (else (i32.const 0))
+    )
+  )
+
+  ;; CHECK:      (func $bool-param-and-if-push (type $5) (param $x i32) (param $y i32) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (call $take-bool-param
+  ;; CHECK-NEXT:    (call $raw-val
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (local.get $y)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.ne
+  ;; CHECK-NEXT:    (if (result i32)
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:     (then
+  ;; CHECK-NEXT:      (i32.const 0)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (else
+  ;; CHECK-NEXT:      (drop
+  ;; CHECK-NEXT:       (call $raw-val
+  ;; CHECK-NEXT:        (local.get $x)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (local.get $y)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.const 0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $bool-param-and-if-push (param $x i32) (param $y i32) (result i32)
+    (i32.add
+      (call $take-bool-param
+        (i32.eqz (call $not-raw-val (local.get $x)))
+        (local.get $y)
+      )
+      (i32.ne
+        (if (result i32)
+          (local.get $x)
+          (then (i32.const 0))
+          (else
+            (drop (call $raw-val (local.get $x)))
+            (local.get $y)
+          )
+        )
+        (i32.const 0)
       )
     )
   )

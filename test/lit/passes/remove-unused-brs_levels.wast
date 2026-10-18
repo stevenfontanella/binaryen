@@ -2425,4 +2425,189 @@
       )
     )
   )
+
+  ;; SHRINK_0:      (func $not-selectify-division (type $1) (param $x i32) (result i32)
+  ;; SHRINK_0-NEXT:  (i32.eqz
+  ;; SHRINK_0-NEXT:   (call $selectify-division
+  ;; SHRINK_0-NEXT:    (local.get $x)
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:  )
+  ;; SHRINK_0-NEXT: )
+  ;; SHRINK_1:      (func $not-selectify-division (type $1) (param $x i32) (result i32)
+  ;; SHRINK_1-NEXT:  (i32.eqz
+  ;; SHRINK_1-NEXT:   (call $selectify-division
+  ;; SHRINK_1-NEXT:    (local.get $x)
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:  )
+  ;; SHRINK_1-NEXT: )
+  ;; SHRINK_2:      (func $not-selectify-division (type $1) (param $x i32) (result i32)
+  ;; SHRINK_2-NEXT:  (i32.eqz
+  ;; SHRINK_2-NEXT:   (call $selectify-division
+  ;; SHRINK_2-NEXT:    (local.get $x)
+  ;; SHRINK_2-NEXT:   )
+  ;; SHRINK_2-NEXT:  )
+  ;; SHRINK_2-NEXT: )
+  (func $not-selectify-division (param $x i32) (result i32)
+    (i32.eqz (call $selectify-division (local.get $x)))
+  )
+
+  ;; SHRINK_0:      (func $take-bool-param (type $5) (param $b i32)
+  ;; SHRINK_0-NEXT:  (if
+  ;; SHRINK_0-NEXT:   (local.get $b)
+  ;; SHRINK_0-NEXT:   (then
+  ;; SHRINK_0-NEXT:    (unreachable)
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:  )
+  ;; SHRINK_0-NEXT: )
+  ;; SHRINK_1:      (func $take-bool-param (type $5) (param $b i32)
+  ;; SHRINK_1-NEXT:  (if
+  ;; SHRINK_1-NEXT:   (local.get $b)
+  ;; SHRINK_1-NEXT:   (then
+  ;; SHRINK_1-NEXT:    (unreachable)
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:  )
+  ;; SHRINK_1-NEXT: )
+  ;; SHRINK_2:      (func $take-bool-param (type $5) (param $b i32)
+  ;; SHRINK_2-NEXT:  (if
+  ;; SHRINK_2-NEXT:   (local.get $b)
+  ;; SHRINK_2-NEXT:   (then
+  ;; SHRINK_2-NEXT:    (unreachable)
+  ;; SHRINK_2-NEXT:   )
+  ;; SHRINK_2-NEXT:  )
+  ;; SHRINK_2-NEXT: )
+  (func $take-bool-param (param $b i32)
+    (if
+      (local.get $b)
+      (then
+        (unreachable)
+      )
+    )
+  )
+
+  ;; SHRINK_0:      (func $bool-param-and-push-bitwise-if (type $6) (param $x i32) (param $y i32)
+  ;; SHRINK_0-NEXT:  (call $take-bool-param
+  ;; SHRINK_0-NEXT:   (i32.eqz
+  ;; SHRINK_0-NEXT:    (call $not-selectify-division
+  ;; SHRINK_0-NEXT:     (local.get $x)
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:  )
+  ;; SHRINK_0-NEXT:  (if
+  ;; SHRINK_0-NEXT:   (i32.and
+  ;; SHRINK_0-NEXT:    (if (result i32)
+  ;; SHRINK_0-NEXT:     (local.get $x)
+  ;; SHRINK_0-NEXT:     (then
+  ;; SHRINK_0-NEXT:      (i32.const 0)
+  ;; SHRINK_0-NEXT:     )
+  ;; SHRINK_0-NEXT:     (else
+  ;; SHRINK_0-NEXT:      (drop
+  ;; SHRINK_0-NEXT:       (call $selectify-division
+  ;; SHRINK_0-NEXT:        (local.get $x)
+  ;; SHRINK_0-NEXT:       )
+  ;; SHRINK_0-NEXT:      )
+  ;; SHRINK_0-NEXT:      (local.get $y)
+  ;; SHRINK_0-NEXT:     )
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:    (i32.eq
+  ;; SHRINK_0-NEXT:     (local.get $x)
+  ;; SHRINK_0-NEXT:     (i32.const 5)
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:   (then
+  ;; SHRINK_0-NEXT:    (unreachable)
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:  )
+  ;; SHRINK_0-NEXT: )
+  ;; SHRINK_1:      (func $bool-param-and-push-bitwise-if (type $6) (param $x i32) (param $y i32)
+  ;; SHRINK_1-NEXT:  (call $take-bool-param
+  ;; SHRINK_1-NEXT:   (i32.eqz
+  ;; SHRINK_1-NEXT:    (call $not-selectify-division
+  ;; SHRINK_1-NEXT:     (local.get $x)
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:  )
+  ;; SHRINK_1-NEXT:  (if
+  ;; SHRINK_1-NEXT:   (i32.and
+  ;; SHRINK_1-NEXT:    (if (result i32)
+  ;; SHRINK_1-NEXT:     (local.get $x)
+  ;; SHRINK_1-NEXT:     (then
+  ;; SHRINK_1-NEXT:      (i32.const 0)
+  ;; SHRINK_1-NEXT:     )
+  ;; SHRINK_1-NEXT:     (else
+  ;; SHRINK_1-NEXT:      (drop
+  ;; SHRINK_1-NEXT:       (call $selectify-division
+  ;; SHRINK_1-NEXT:        (local.get $x)
+  ;; SHRINK_1-NEXT:       )
+  ;; SHRINK_1-NEXT:      )
+  ;; SHRINK_1-NEXT:      (local.get $y)
+  ;; SHRINK_1-NEXT:     )
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:    (i32.eq
+  ;; SHRINK_1-NEXT:     (local.get $x)
+  ;; SHRINK_1-NEXT:     (i32.const 5)
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:   (then
+  ;; SHRINK_1-NEXT:    (unreachable)
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:  )
+  ;; SHRINK_1-NEXT: )
+  ;; SHRINK_2:      (func $bool-param-and-push-bitwise-if (type $6) (param $x i32) (param $y i32)
+  ;; SHRINK_2-NEXT:  (call $take-bool-param
+  ;; SHRINK_2-NEXT:   (i32.eqz
+  ;; SHRINK_2-NEXT:    (call $not-selectify-division
+  ;; SHRINK_2-NEXT:     (local.get $x)
+  ;; SHRINK_2-NEXT:    )
+  ;; SHRINK_2-NEXT:   )
+  ;; SHRINK_2-NEXT:  )
+  ;; SHRINK_2-NEXT:  (block $tail_if$0
+  ;; SHRINK_2-NEXT:   (br_if $tail_if$0
+  ;; SHRINK_2-NEXT:    (local.get $x)
+  ;; SHRINK_2-NEXT:   )
+  ;; SHRINK_2-NEXT:   (if
+  ;; SHRINK_2-NEXT:    (i32.and
+  ;; SHRINK_2-NEXT:     (block (result i32)
+  ;; SHRINK_2-NEXT:      (drop
+  ;; SHRINK_2-NEXT:       (call $selectify-division
+  ;; SHRINK_2-NEXT:        (local.get $x)
+  ;; SHRINK_2-NEXT:       )
+  ;; SHRINK_2-NEXT:      )
+  ;; SHRINK_2-NEXT:      (local.get $y)
+  ;; SHRINK_2-NEXT:     )
+  ;; SHRINK_2-NEXT:     (i32.eq
+  ;; SHRINK_2-NEXT:      (local.get $x)
+  ;; SHRINK_2-NEXT:      (i32.const 5)
+  ;; SHRINK_2-NEXT:     )
+  ;; SHRINK_2-NEXT:    )
+  ;; SHRINK_2-NEXT:    (then
+  ;; SHRINK_2-NEXT:     (unreachable)
+  ;; SHRINK_2-NEXT:    )
+  ;; SHRINK_2-NEXT:   )
+  ;; SHRINK_2-NEXT:  )
+  ;; SHRINK_2-NEXT: )
+  (func $bool-param-and-push-bitwise-if (param $x i32) (param $y i32)
+    (call $take-bool-param
+      (i32.eqz
+        (call $not-selectify-division (local.get $x))
+      )
+    )
+    (if
+      (i32.and
+        (if (result i32)
+          (local.get $x)
+          (then
+            (i32.const 0)
+          )
+          (else
+            (drop (call $selectify-division (local.get $x)))
+            (local.get $y)
+          )
+        )
+        (i32.eq (local.get $x) (i32.const 5))
+      )
+      (then
+        (unreachable)
+      )
+    )
+  )
 )

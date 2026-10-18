@@ -352,6 +352,7 @@ struct ModuleOneBitInfo {
   std::unordered_set<Name> oneBitArrayGlobals;
   std::unordered_set<Name> oneBitReturns;
   std::unordered_map<Name, std::vector<bool>> oneBitParams;
+  std::unordered_map<Name, std::vector<bool>> boolOnlyParams;
   std::unordered_map<Name, std::vector<bool>> oneBitLocals;
   std::unordered_set<LocalGet*> oneBitLocalGets;
   std::unordered_set<Block*> oneBitBlocks;
@@ -436,6 +437,12 @@ struct ModuleOneBitInfo {
   bool isOneBitParam(Name funcName, Index paramIdx) const {
     auto it = oneBitParams.find(funcName);
     return it != oneBitParams.end() && paramIdx < it->second.size() &&
+           it->second[paramIdx];
+  }
+
+  bool isBoolOnlyParam(Name funcName, Index paramIdx) const {
+    auto it = boolOnlyParams.find(funcName);
+    return it != boolOnlyParams.end() && paramIdx < it->second.size() &&
            it->second[paramIdx];
   }
 
@@ -544,6 +551,7 @@ struct ModuleOneBitInfo {
     oneBitArrayGlobals.clear();
     oneBitReturns.clear();
     oneBitParams.clear();
+    boolOnlyParams.clear();
     oneBitLocals.clear();
     oneBitLocalGets.clear();
     oneBitBlocks.clear();
@@ -618,6 +626,9 @@ struct ModuleOneBitInfo {
       std::vector<Call*> directCalls;
       std::vector<CallRef*> callRefs;
       std::vector<Name> refFuncs;
+      std::vector<Index> paramGetCount;
+      std::vector<Index> paramStrictBoolGetCount;
+      std::vector<Index> paramAnyBoolGetCount;
     };
 
     struct SummaryScanner
@@ -739,6 +750,39 @@ struct ModuleOneBitInfo {
             summary.structDisqualifiedFields.push_back(
               {cmpx->ref->type.getHeapType(), cmpx->index});
           }
+        } else if (auto* lg = curr->dynCast<LocalGet>()) {
+          if (func && lg->index < func->getNumParams() &&
+              func->getLocalType(lg->index) == Type::i32) {
+            summary.paramGetCount[lg->index]++;
+            if (expressionStack.size() >= 2) {
+              Expression* parent = expressionStack[expressionStack.size() - 2];
+              bool isStrictBool = false;
+              bool isAnyBool = false;
+              if (auto* br = parent->dynCast<Break>();
+                  br && br->condition == lg) {
+                isStrictBool = true;
+                isAnyBool = true;
+              } else if (auto* iff = parent->dynCast<If>();
+                         iff && iff->condition == lg) {
+                isAnyBool = true;
+                if (iff->type == Type::none) {
+                  isStrictBool = true;
+                }
+              } else if (auto* sel = parent->dynCast<Select>();
+                         sel && sel->condition == lg) {
+                isAnyBool = true;
+              } else if (auto* u = parent->dynCast<Unary>();
+                         u && u->op == EqZInt32) {
+                isAnyBool = true;
+              }
+              if (isStrictBool) {
+                summary.paramStrictBoolGetCount[lg->index]++;
+              }
+              if (isAnyBool) {
+                summary.paramAnyBoolGetCount[lg->index]++;
+              }
+            }
+          }
         }
       }
     };
@@ -749,6 +793,9 @@ struct ModuleOneBitInfo {
           return;
         }
         summary.localWrites.resize(func->getNumLocals());
+        summary.paramGetCount.assign(func->getNumParams(), 0);
+        summary.paramStrictBoolGetCount.assign(func->getNumParams(), 0);
+        summary.paramAnyBoolGetCount.assign(func->getNumParams(), 0);
         SummaryScanner scanner(summary, func);
         scanner.walk(func->body);
         if (isTrackedOneBitType(func->getResults()) &&
@@ -905,6 +952,15 @@ struct ModuleOneBitInfo {
       }
       auto& params = oneBitParams[f->name];
       params.resize(f->getNumParams(), false);
+      auto& bParams = boolOnlyParams[f->name];
+      bParams.resize(f->getNumParams(), false);
+      for (Index p = 0; p < f->getNumParams(); p++) {
+        if (f->getLocalType(p) == Type::i32 && fs.localWrites[p].empty() &&
+            fs.paramGetCount[p] > 0 &&
+            fs.paramGetCount[p] == fs.paramStrictBoolGetCount[p]) {
+          bParams[p] = true;
+        }
+      }
       auto& locals = oneBitLocals[f->name];
       locals.resize(f->getNumLocals(), false);
       if (!isClosedWorld) {
@@ -927,13 +983,14 @@ struct ModuleOneBitInfo {
         }
       }
       for (Index p = 0; p < f->getNumParams(); p++) {
-        if (canInferParams && isTrackedOneBitType(f->getLocalType(p))) {
+        if (canInferParams && !bParams[p] &&
+            isTrackedOneBitType(f->getLocalType(p))) {
           params[p] = true;
         }
       }
       for (Index i = 0; i < f->getNumLocals(); i++) {
         if (isTrackedOneBitType(f->getLocalType(i)) &&
-            (!f->isParam(i) || canInferParams)) {
+            (!f->isParam(i) || (canInferParams && !bParams[i]))) {
           locals[i] = true;
         }
       }
@@ -1283,6 +1340,24 @@ struct ModuleOneBitInfo {
               }
             }
           }
+        }
+      }
+    }
+
+    for (auto& f : wasm.functions) {
+      if (f->imported() || !f->body) {
+        continue;
+      }
+      auto& fs = analysis.map[f.get()];
+      auto& params = oneBitParams[f->name];
+      auto& locals = oneBitLocals[f->name];
+      auto& bParams = boolOnlyParams[f->name];
+      for (Index p = 0; p < f->getNumParams(); p++) {
+        if (!bParams[p] && !params[p] && !locals[p] &&
+            f->getLocalType(p) == Type::i32 && fs.localWrites[p].empty() &&
+            fs.paramGetCount[p] > 0 &&
+            fs.paramGetCount[p] == fs.paramAnyBoolGetCount[p]) {
+          bParams[p] = true;
         }
       }
     }

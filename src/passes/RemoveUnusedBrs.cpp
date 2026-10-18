@@ -607,12 +607,125 @@ static Expression* makeOneBitCond(Builder& builder, Expression* expr) {
   if (isOneBitI32(expr)) {
     return expr;
   }
+  if (auto* blk = expr->dynCast<Block>();
+      blk && !blk->name.is() && !blk->list.empty() && blk->type == Type::i32 &&
+      blk->list.back()->type == Type::i32) {
+    blk->list.back() = makeOneBitCond(builder, blk->list.back());
+    return blk;
+  }
+  if (auto* iff = expr->dynCast<If>();
+      iff && iff->ifFalse && iff->type == Type::i32 &&
+      iff->condition->type != Type::unreachable &&
+      iff->ifTrue->type == Type::i32 && iff->ifFalse->type == Type::i32) {
+    bool trueOneBit = isOneBitI32(iff->ifTrue);
+    bool falseOneBit = isOneBitI32(iff->ifFalse);
+    if (trueOneBit && !falseOneBit) {
+      iff->ifFalse = makeOneBitCond(builder, iff->ifFalse);
+      return iff;
+    }
+    if (falseOneBit && !trueOneBit) {
+      iff->ifTrue = makeOneBitCond(builder, iff->ifTrue);
+      return iff;
+    }
+  }
   if (currentOneBitInfo && !expr->is<Const>() &&
       canInvertBoolExprFree(expr, 0, /*mustBeOneBit=*/true)) {
     invertBoolExprFree(expr, builder, /*mustBeOneBit=*/true);
     return builder.makeUnary(EqZInt32, expr);
   }
   return builder.makeBinary(NeInt32, expr, builder.makeConst(int32_t(0)));
+}
+
+static Expression* tryPushBitwiseIntoIf(Binary* curr,
+                                        const PassOptions& passOptions,
+                                        Module& wasm,
+                                        bool inBooleanContext = false,
+                                        Index depth = 0) {
+  if (!curr || curr->type != Type::i32 || depth > 6 ||
+      (curr->op != AndInt32 && curr->op != OrInt32)) {
+    return nullptr;
+  }
+  auto matchTargetConst = [&](Expression* arm, int32_t& valOut) {
+    if (!isI32Const(arm, valOut)) {
+      return false;
+    }
+    if (curr->op == AndInt32) {
+      return valOut == 0;
+    }
+    return inBooleanContext ? (valOut != 0) : (valOut == 1 || valOut == -1);
+  };
+  Builder builder(wasm);
+
+  if (auto* iff = curr->left->dynCast<If>();
+      iff && iff->ifFalse && iff->type == Type::i32 &&
+      iff->condition->type != Type::unreachable &&
+      iff->ifTrue->type == Type::i32 && iff->ifFalse->type == Type::i32) {
+    int32_t cVal = 0;
+    bool trueMatches = matchTargetConst(iff->ifTrue, cVal);
+    bool falseMatches = !trueMatches && matchTargetConst(iff->ifFalse, cVal);
+    if ((trueMatches || falseMatches) &&
+        (curr->op == AndInt32 || inBooleanContext || cVal == -1 ||
+         isOneBitI32(curr->right)) &&
+        !EffectAnalyzer(passOptions, wasm, curr->right).hasSideEffects()) {
+      Expression*& otherArm = trueMatches ? iff->ifFalse : iff->ifTrue;
+      auto* newBin = builder.makeBinary(curr->op, otherArm, curr->right);
+      if (auto* pushed = tryPushBitwiseIntoIf(
+            newBin, passOptions, wasm, inBooleanContext, depth + 1)) {
+        otherArm = pushed;
+      } else {
+        otherArm = newBin;
+      }
+      iff->finalize(Type::i32);
+      return iff;
+    }
+  }
+
+  if (auto* iff = curr->right->dynCast<If>();
+      iff && iff->ifFalse && iff->type == Type::i32 &&
+      iff->condition->type != Type::unreachable &&
+      iff->ifTrue->type == Type::i32 && iff->ifFalse->type == Type::i32) {
+    int32_t cVal = 0;
+    bool trueMatches = matchTargetConst(iff->ifTrue, cVal);
+    bool falseMatches = !trueMatches && matchTargetConst(iff->ifFalse, cVal);
+    if ((trueMatches || falseMatches) &&
+        (curr->op == AndInt32 || inBooleanContext || cVal == -1 ||
+         isOneBitI32(curr->left))) {
+      EffectAnalyzer leftEffects(passOptions, wasm, curr->left);
+      if (!leftEffects.hasSideEffects() &&
+          !leftEffects.invalidates(
+            EffectAnalyzer(passOptions, wasm, iff->condition))) {
+        Expression*& otherArm = trueMatches ? iff->ifFalse : iff->ifTrue;
+        auto* newBin = builder.makeBinary(curr->op, curr->left, otherArm);
+        if (auto* pushed = tryPushBitwiseIntoIf(
+              newBin, passOptions, wasm, inBooleanContext, depth + 1)) {
+          otherArm = pushed;
+        } else {
+          otherArm = newBin;
+        }
+        iff->finalize(Type::i32);
+        return iff;
+      }
+    }
+  }
+
+  return nullptr;
+}
+
+static Expression* makeBitwiseAndTryPush(Builder& builder,
+                                         BinaryOp op,
+                                         Expression* left,
+                                         Expression* right,
+                                         const PassOptions& passOptions,
+                                         Module& wasm,
+                                         bool inBooleanContext = false) {
+  auto* bin = builder.makeBinary(op, left, right);
+  if (isV4Enabled(passOptions)) {
+    if (auto* pushed =
+          tryPushBitwiseIntoIf(bin, passOptions, wasm, inBooleanContext)) {
+      return pushed;
+    }
+  }
+  return bin;
 }
 
 static Expression*
@@ -947,9 +1060,13 @@ static bool tryFoldBooleanIfCondition(If* curr,
           !tooCostlyToRunUnconditionally(passOptions, val) &&
           (isOneBitI32(inner->condition) || isOneBitI32(innerCond))) {
         curr->condition =
-          builder.makeBinary(AndInt32,
-                             makeOneBitCond(builder, inner->condition),
-                             makeOneBitCond(builder, innerCond));
+          makeBitwiseAndTryPush(builder,
+                                AndInt32,
+                                makeOneBitCond(builder, inner->condition),
+                                makeOneBitCond(builder, innerCond),
+                                passOptions,
+                                wasm,
+                                /*inBooleanContext=*/true);
         BranchHints::clear(curr, func);
         curr->finalize();
         return true;
@@ -974,8 +1091,14 @@ static bool tryFoldBooleanIfCondition(If* curr,
         !tooCostlyToRunUnconditionally(passOptions, val)) {
       Expression* innerCond =
         negated ? makeNegatedBool(builder, val, true) : val;
-      curr->condition = builder.makeBinary(
-        OrInt32, makeNegatedBool(builder, inner->condition, true), innerCond);
+      curr->condition = makeBitwiseAndTryPush(
+        builder,
+        OrInt32,
+        makeNegatedBool(builder, inner->condition, true),
+        innerCond,
+        passOptions,
+        wasm,
+        /*inBooleanContext=*/true);
       BranchHints::clear(curr, func);
       curr->finalize();
       return true;
@@ -1029,10 +1152,14 @@ static bool tryFoldBooleanIfCondition(If* curr,
           prefix.empty() &&
           !EffectAnalyzer(passOptions, wasm, val).hasSideEffects() &&
           !tooCostlyToRunUnconditionally(passOptions, val)) {
-        curr->condition = builder.makeBinary(
+        curr->condition = makeBitwiseAndTryPush(
+          builder,
           AndInt32,
           makeNegOneBitCond(builder, inner->condition, true),
-          makeOneBitCond(builder, innerCond));
+          makeOneBitCond(builder, innerCond),
+          passOptions,
+          wasm,
+          /*inBooleanContext=*/true);
         BranchHints::clear(curr, func);
         curr->finalize();
         return true;
@@ -1059,7 +1186,13 @@ static bool tryFoldBooleanIfCondition(If* curr,
       Expression* innerCond =
         negated ? makeNegatedBool(builder, val, true) : val;
       curr->condition =
-        builder.makeBinary(OrInt32, inner->condition, innerCond);
+        makeBitwiseAndTryPush(builder,
+                              OrInt32,
+                              inner->condition,
+                              innerCond,
+                              passOptions,
+                              wasm,
+                              /*inBooleanContext=*/true);
       BranchHints::clear(curr, func);
       curr->finalize();
       return true;
@@ -1248,9 +1381,13 @@ static Expression* tryFoldBooleanBreakCondition(Break* curr,
           !tooCostlyToRunUnconditionally(passOptions, val) &&
           (isOneBitI32(inner->condition) || isOneBitI32(rhs))) {
         curr->condition =
-          builder.makeBinary(AndInt32,
-                             makeOneBitCond(builder, inner->condition),
-                             makeOneBitCond(builder, rhs));
+          makeBitwiseAndTryPush(builder,
+                                AndInt32,
+                                makeOneBitCond(builder, inner->condition),
+                                makeOneBitCond(builder, rhs),
+                                passOptions,
+                                wasm,
+                                /*inBooleanContext=*/true);
         BranchHints::clear(curr, func);
         return finishInPlace();
       }
@@ -1272,10 +1409,14 @@ static Expression* tryFoldBooleanBreakCondition(Break* curr,
       if (prefix.empty() && !neverUnconditionalize &&
           !EffectAnalyzer(passOptions, wasm, val).hasSideEffects() &&
           !tooCostlyToRunUnconditionally(passOptions, val)) {
-        curr->condition = builder.makeBinary(
+        curr->condition = makeBitwiseAndTryPush(
+          builder,
           OrInt32,
           makeNegatedBool(builder, inner->condition, isV4Enabled(passOptions)),
-          rhs);
+          rhs,
+          passOptions,
+          wasm,
+          /*inBooleanContext=*/true);
         BranchHints::clear(curr, func);
         return finishInPlace();
       }
@@ -1357,10 +1498,14 @@ static Expression* tryFoldBooleanBreakCondition(Break* curr,
           !neverUnconditionalize &&
           !EffectAnalyzer(passOptions, wasm, val).hasSideEffects() &&
           !tooCostlyToRunUnconditionally(passOptions, val)) {
-        curr->condition = builder.makeBinary(
+        curr->condition = makeBitwiseAndTryPush(
+          builder,
           AndInt32,
           makeNegOneBitCond(builder, inner->condition, true),
-          makeOneBitCond(builder, rhs));
+          makeOneBitCond(builder, rhs),
+          passOptions,
+          wasm,
+          /*inBooleanContext=*/true);
         BranchHints::clear(curr, func);
         return finishInPlace();
       }
@@ -1382,7 +1527,13 @@ static Expression* tryFoldBooleanBreakCondition(Break* curr,
       if (prefix.empty() && !neverUnconditionalize &&
           !EffectAnalyzer(passOptions, wasm, val).hasSideEffects() &&
           !tooCostlyToRunUnconditionally(passOptions, val)) {
-        curr->condition = builder.makeBinary(OrInt32, inner->condition, rhs);
+        curr->condition = makeBitwiseAndTryPush(builder,
+                                                OrInt32,
+                                                inner->condition,
+                                                rhs,
+                                                passOptions,
+                                                wasm,
+                                                /*inBooleanContext=*/true);
         BranchHints::clear(curr, func);
         return finishInPlace();
       }
@@ -2786,6 +2937,74 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
           pushEqzIntoIfOrExprFree(curr->value, builder);
           replaceCurrent(curr->value);
           worked = true;
+        }
+      }
+
+      void visitBinary(Binary* curr) {
+        if (!isV4Enabled(passOptions) || curr->type != Type::i32) {
+          return;
+        }
+        if (auto* rep = tryPushBitwiseIntoIf(curr, passOptions, *getModule())) {
+          replaceCurrent(rep);
+          worked = true;
+          return;
+        }
+        int32_t rightConst = 0;
+        if (curr->op == NeInt32 && isI32Const(curr->right, rightConst) &&
+            rightConst == 0) {
+          if (isOneBitI32(curr->left)) {
+            replaceCurrent(curr->left);
+            worked = true;
+            return;
+          }
+          if (auto* iff = curr->left->dynCast<If>();
+              iff && iff->ifFalse && iff->type == Type::i32 &&
+              iff->condition->type != Type::unreachable &&
+              iff->ifTrue->type == Type::i32 &&
+              iff->ifFalse->type == Type::i32) {
+            bool trueOneBit = isOneBitI32(iff->ifTrue);
+            bool falseOneBit = isOneBitI32(iff->ifFalse);
+            if (trueOneBit != falseOneBit) {
+              Builder builder(*getModule());
+              if (trueOneBit) {
+                iff->ifFalse = makeOneBitCond(builder, iff->ifFalse);
+              } else {
+                iff->ifTrue = makeOneBitCond(builder, iff->ifTrue);
+              }
+              replaceCurrent(iff);
+              worked = true;
+              return;
+            }
+          }
+        }
+      }
+
+      void visitCall(Call* curr) {
+        if (!isV4Enabled(passOptions) || !currentOneBitInfo) {
+          return;
+        }
+        Builder builder(*getModule());
+        for (Index i = 0; i < curr->operands.size(); i++) {
+          Expression*& arg = curr->operands[i];
+          if (arg->type != Type::i32 ||
+              !currentOneBitInfo->isBoolOnlyParam(curr->target, i)) {
+            continue;
+          }
+          if (auto* u = arg->dynCast<Unary>();
+              u && u->op == EqZInt32 &&
+              canPushEqzIntoIfOrExprFree(
+                u->value, 0, /*mustBeOneBit=*/false)) {
+            pushEqzIntoIfOrExprFree(
+              u->value, builder, 0, /*mustBeOneBit=*/false);
+            arg = u->value;
+            worked = true;
+          } else if (auto* b = arg->dynCast<Binary>(); b && b->op == NeInt32) {
+            int32_t c = 0;
+            if (isI32Const(b->right, c) && c == 0) {
+              arg = b->left;
+              worked = true;
+            }
+          }
         }
       }
 
@@ -9283,25 +9502,41 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         if (v4 && iff->type == Type::i32) {
           if (falseIsConst && falseConst == 0 && isOneBitI32(iff->ifTrue) &&
               (condInvalidates || isOneBitI32(iff->condition))) {
-            return builder.makeBinary(
-              AndInt32, makeOneBitCond(builder, iff->condition), iff->ifTrue);
+            return makeBitwiseAndTryPush(
+              builder,
+              AndInt32,
+              makeOneBitCond(builder, iff->condition),
+              iff->ifTrue,
+              passOptions,
+              *getModule());
           }
           if (trueIsConst && trueConst == 0 && isOneBitI32(iff->ifFalse)) {
-            return builder.makeBinary(
+            return makeBitwiseAndTryPush(
+              builder,
               AndInt32,
               makeNegOneBitCond(builder, iff->condition, true),
-              iff->ifFalse);
+              iff->ifFalse,
+              passOptions,
+              *getModule());
           }
           if (trueIsConst && trueConst == 1 && isOneBitI32(iff->ifFalse) &&
               (condInvalidates || isOneBitI32(iff->condition))) {
-            return builder.makeBinary(
-              OrInt32, makeOneBitCond(builder, iff->condition), iff->ifFalse);
+            return makeBitwiseAndTryPush(
+              builder,
+              OrInt32,
+              makeOneBitCond(builder, iff->condition),
+              iff->ifFalse,
+              passOptions,
+              *getModule());
           }
           if (falseIsConst && falseConst == 1 && isOneBitI32(iff->ifTrue)) {
-            return builder.makeBinary(
+            return makeBitwiseAndTryPush(
+              builder,
               OrInt32,
               makeNegOneBitCond(builder, iff->condition, true),
-              iff->ifTrue);
+              iff->ifTrue,
+              passOptions,
+              *getModule());
           }
         }
         if (condInvalidates) {
