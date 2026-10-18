@@ -284,3 +284,92 @@
   )
  )
 )
+
+(module
+ ;; CHECK:      (type $pred (func (param eqref) (result i32)))
+ (type $pred (func (param eqref) (result i32)))
+ ;; CHECK:      (type $item (struct (field i32)))
+ (type $item (struct (field i32)))
+ ;; CHECK:      (type $pred_arr (array (ref $pred)))
+ (type $pred_arr (array (ref $pred)))
+
+ ;; CHECK:      (type $3 (func (param (ref null $item)) (result i32)))
+
+ ;; CHECK:      (type $4 (func (param (ref null $item))))
+
+ ;; CHECK:      (global $col (ref $pred_arr) (array.new_fixed $pred_arr 2
+ ;; CHECK-NEXT:  (ref.func $pred-eq)
+ ;; CHECK-NEXT:  (ref.func $pred-trap)
+ ;; CHECK-NEXT: ))
+ (global $col (ref $pred_arr)
+  (array.new_fixed $pred_arr 2
+   (ref.func $pred-eq)
+   (ref.func $pred-trap)
+  )
+ )
+
+ ;; CHECK:      (func $pred-eq (type $pred) (param $x eqref) (result i32)
+ ;; CHECK-NEXT:  (ref.test (ref $item)
+ ;; CHECK-NEXT:   (local.get $x)
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT: )
+ (func $pred-eq (type $pred) (param $x eqref) (result i32)
+  (ref.test (ref $item) (local.get $x))
+ )
+
+ ;; CHECK:      (func $pred-trap (type $pred) (param $x eqref) (result i32)
+ ;; CHECK-NEXT:  (unreachable)
+ ;; CHECK-NEXT: )
+ (func $pred-trap (type $pred) (param $x eqref) (result i32)
+  (unreachable)
+ )
+
+ ;; CHECK:      (func $not-pred-sub (type $3) (param $s (ref null $item)) (result i32)
+ ;; CHECK-NEXT:  (i32.eqz
+ ;; CHECK-NEXT:   (call $pred-eq
+ ;; CHECK-NEXT:    (local.get $s)
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT: )
+ (func $not-pred-sub (param $s (ref null $item)) (result i32)
+  (i32.eqz (call $pred-eq (local.get $s)))
+ )
+
+ ;; CHECK:      (func $br-if-negated-call-twin (type $4) (param $s (ref null $item))
+ ;; CHECK-NEXT:  (block $out
+ ;; CHECK-NEXT:   (nop)
+ ;; CHECK-NEXT:   (br_if $out
+ ;; CHECK-NEXT:    (call $pred-eq
+ ;; CHECK-NEXT:     (local.get $s)
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (if
+ ;; CHECK-NEXT:    (call $pred-eq
+ ;; CHECK-NEXT:     (local.get $s)
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:    (then
+ ;; CHECK-NEXT:     (unreachable)
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT: )
+ (func $br-if-negated-call-twin (param $s (ref null $item))
+  (block $out
+   (nop)
+   (br_if $out
+    (i32.eqz
+     (call $not-pred-sub (local.get $s))
+    )
+   )
+   (if
+    (i32.eqz
+     (call $not-pred-sub (local.get $s))
+    )
+    (then
+     (unreachable)
+    )
+   )
+  )
+ )
+)
+

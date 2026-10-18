@@ -3729,10 +3729,10 @@ private:
               return ret;
             }
           }
-          if (canNegateForFree(unary->value) &&
+          if (canNegateForFree(unary->value, 0, mustBeOneBit) &&
               (unary->value->is<Call>() || unary->value->is<If>() ||
                unary->value->is<Select>() || unary->value->is<Block>())) {
-            return makeNegatedOneBit(unary->value);
+            return makeNegatedOneBit(unary->value, mustBeOneBit);
           }
           unary->value = optimizeBoolean(unary->value, /*mustBeOneBit=*/false);
           unary2 = unary->value->dynCast<Unary>();
@@ -3745,10 +3745,10 @@ private:
               return ret;
             }
           }
-          if (canNegateForFree(unary->value) &&
+          if (canNegateForFree(unary->value, 0, mustBeOneBit) &&
               (unary->value->is<Call>() || unary->value->is<If>() ||
                unary->value->is<Select>() || unary->value->is<Block>())) {
-            return makeNegatedOneBit(unary->value);
+            return makeNegatedOneBit(unary->value, mustBeOneBit);
           }
         }
         if (unary->op == EqZInt32 || unary->op == EqZInt64) {
@@ -3885,29 +3885,35 @@ private:
     return boolean;
   }
 
-  Name getNegatedCallTwin(Expression* expr) {
+  Name getNegatedCallTwin(Expression* expr, bool mustBeOneBit = true) {
     if (moduleOneBitInfo) {
       if (auto* call = expr->dynCast<Call>();
           call && !call->isReturn && call->type == Type::i32) {
         return moduleOneBitInfo->getNegatedOneBitCallTwin(
-          call->target, getFunction() ? getFunction()->name : Name());
+          call,
+          *getModule(),
+          getFunction() ? getFunction()->name : Name(),
+          mustBeOneBit);
       }
     }
     return Name();
   }
 
-  bool isRemovableOneBitEqZ(Expression* expr) {
+  bool isRemovableOneBitEqZ(Expression* expr, bool mustBeOneBit = true) {
     auto* u = expr->dynCast<Unary>();
-    return u && u->op == EqZInt32 && Bits::getMaxBits(u->value, this) <= 1 &&
+    return u && u->op == EqZInt32 &&
+           (!mustBeOneBit || Bits::getMaxBits(u->value, this) <= 1) &&
            !(u->value->is<Unary>() && u->value->cast<Unary>()->op == EqZInt32);
   }
 
-  bool canNegateForFree(Expression* expr, Index depth = 0) {
+  bool canNegateForFree(Expression* expr,
+                        Index depth = 0,
+                        bool mustBeOneBit = true) {
     if (!expr || expr->type != Type::i32 || depth > 6) {
       return false;
     }
-    if (isRemovableOneBitEqZ(expr) || expr->is<Const>() ||
-        getNegatedCallTwin(expr).is()) {
+    if (isRemovableOneBitEqZ(expr, mustBeOneBit) || expr->is<Const>() ||
+        getNegatedCallTwin(expr, mustBeOneBit).is()) {
       return true;
     }
     if (auto* b = expr->dynCast<Binary>()) {
@@ -3916,55 +3922,56 @@ private:
     if (getPassOptions().shrinkLevel > 0) {
       if (auto* blk = expr->dynCast<Block>()) {
         return !blk->name.is() && !blk->list.empty() &&
-               canNegateForFree(blk->list.back(), depth + 1);
+               canNegateForFree(blk->list.back(), depth + 1, mustBeOneBit);
       }
       if (auto* iff = expr->dynCast<If>()) {
-        return iff->ifFalse && canNegateForFree(iff->ifTrue, depth + 1) &&
-               canNegateForFree(iff->ifFalse, depth + 1);
+        return iff->ifFalse &&
+               canNegateForFree(iff->ifTrue, depth + 1, mustBeOneBit) &&
+               canNegateForFree(iff->ifFalse, depth + 1, mustBeOneBit);
       }
       if (auto* sel = expr->dynCast<Select>()) {
-        return canNegateForFree(sel->ifTrue, depth + 1) &&
-               canNegateForFree(sel->ifFalse, depth + 1);
+        return canNegateForFree(sel->ifTrue, depth + 1, mustBeOneBit) &&
+               canNegateForFree(sel->ifFalse, depth + 1, mustBeOneBit);
       }
     }
     return false;
   }
 
-  Expression* makeNegatedOneBit(Expression* expr) {
+  Expression* makeNegatedOneBit(Expression* expr, bool mustBeOneBit = true) {
     Builder builder(*getModule());
     if (auto* u = expr->dynCast<Unary>(); u && u->op == EqZInt32) {
-      if (Bits::getMaxBits(u->value, this) <= 1) {
+      if (!mustBeOneBit || Bits::getMaxBits(u->value, this) <= 1) {
         return u->value;
       }
       return builder.makeUnary(EqZInt32, expr);
     }
-    if (Name twin = getNegatedCallTwin(expr); twin.is()) {
+    if (Name twin = getNegatedCallTwin(expr, mustBeOneBit); twin.is()) {
       auto* call = expr->cast<Call>();
       call->target = twin;
       return call;
     }
     if (auto* blk = expr->dynCast<Block>();
         blk && !blk->name.is() && !blk->list.empty() &&
-        canNegateForFree(blk->list.back())) {
-      blk->list.back() = makeNegatedOneBit(blk->list.back());
+        canNegateForFree(blk->list.back(), 0, mustBeOneBit)) {
+      blk->list.back() = makeNegatedOneBit(blk->list.back(), mustBeOneBit);
       return blk;
     }
     if (auto* iff = expr->dynCast<If>();
-        iff && iff->ifFalse && canNegateForFree(iff->ifTrue) &&
-        canNegateForFree(iff->ifFalse)) {
-      iff->ifTrue = makeNegatedOneBit(iff->ifTrue);
-      iff->ifFalse = makeNegatedOneBit(iff->ifFalse);
+        iff && iff->ifFalse &&
+        canNegateForFree(iff->ifTrue, 0, mustBeOneBit) &&
+        canNegateForFree(iff->ifFalse, 0, mustBeOneBit)) {
+      iff->ifTrue = makeNegatedOneBit(iff->ifTrue, mustBeOneBit);
+      iff->ifFalse = makeNegatedOneBit(iff->ifFalse, mustBeOneBit);
       return iff;
     }
     if (auto* sel = expr->dynCast<Select>();
-        sel && canNegateForFree(sel->ifTrue) &&
-        canNegateForFree(sel->ifFalse)) {
-      sel->ifTrue = makeNegatedOneBit(sel->ifTrue);
-      sel->ifFalse = makeNegatedOneBit(sel->ifFalse);
+        sel && canNegateForFree(sel->ifTrue, 0, mustBeOneBit) &&
+        canNegateForFree(sel->ifFalse, 0, mustBeOneBit)) {
+      sel->ifTrue = makeNegatedOneBit(sel->ifTrue, mustBeOneBit);
+      sel->ifFalse = makeNegatedOneBit(sel->ifFalse, mustBeOneBit);
       return sel;
     }
-    return optimizeBoolean(builder.makeUnary(EqZInt32, expr),
-                           /*mustBeOneBit=*/true);
+    return optimizeBoolean(builder.makeUnary(EqZInt32, expr), mustBeOneBit);
   }
 
   Expression* makeOneBit(Expression* expr) {
@@ -5715,6 +5722,11 @@ private:
          matches(curr, binary(And, any(&left), ival(1)))) &&
         Bits::getMaxBits(left, this) == 1) {
       return left;
+    }
+    if (getPassOptions().shrinkLevel > 0 &&
+        matches(curr, binary(NeInt32, any(&left), i32(0))) &&
+        canNegateForFree(left)) {
+      return builder.makeUnary(EqZInt32, makeNegatedOneBit(left));
     }
     // i64(bool(x)) == 1  ==>  i32(bool(x))
     // i64(bool(x)) != 0  ==>  i32(bool(x))

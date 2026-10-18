@@ -415,8 +415,12 @@ static bool tryInvertRelationalBinaryOp(BinaryOp op, BinaryOp& out) {
 }
 
 // Check whether `i32.eqz(curr)` can be pushed into `curr` with 0 net added
-// `i32.eqz` instructions, producing a 1-bit boolean result (0 or 1).
-static bool canInvertBoolExprFree(Expression* curr, Index depth = 0) {
+// `i32.eqz` instructions, producing a 1-bit boolean result (0 or 1) when
+// `mustBeOneBit` is true, or preserving boolean truthiness (`!= 0`) when
+// `mustBeOneBit` is false.
+static bool canInvertBoolExprFree(Expression* curr,
+                                  Index depth = 0,
+                                  bool mustBeOneBit = true) {
   if (!curr || curr->type != Type::i32 || depth > 6) {
     return false;
   }
@@ -426,7 +430,7 @@ static bool canInvertBoolExprFree(Expression* curr, Index depth = 0) {
   }
   if (auto* u = curr->dynCast<Unary>()) {
     if (u->op == EqZInt32) {
-      return isOneBitI32(u->value);
+      return !mustBeOneBit || isOneBitI32(u->value);
     }
     return false;
   }
@@ -436,23 +440,26 @@ static bool canInvertBoolExprFree(Expression* curr, Index depth = 0) {
   }
   if (auto* block = curr->dynCast<Block>()) {
     if (!block->name.is() && !block->list.empty()) {
-      return canInvertBoolExprFree(block->list.back(), depth + 1);
+      return canInvertBoolExprFree(block->list.back(), depth + 1, mustBeOneBit);
     }
     return false;
   }
   if (auto* iff = curr->dynCast<If>()) {
-    return iff->ifFalse && canInvertBoolExprFree(iff->ifTrue, depth + 1) &&
-           canInvertBoolExprFree(iff->ifFalse, depth + 1);
+    return iff->ifFalse &&
+           canInvertBoolExprFree(iff->ifTrue, depth + 1, mustBeOneBit) &&
+           canInvertBoolExprFree(iff->ifFalse, depth + 1, mustBeOneBit);
   }
   if (auto* sel = curr->dynCast<Select>()) {
-    return canInvertBoolExprFree(sel->ifTrue, depth + 1) &&
-           canInvertBoolExprFree(sel->ifFalse, depth + 1);
+    return canInvertBoolExprFree(sel->ifTrue, depth + 1, mustBeOneBit) &&
+           canInvertBoolExprFree(sel->ifFalse, depth + 1, mustBeOneBit);
   }
-  if (currentOneBitInfo) {
+  if (currentOneBitInfo && currentOneBitModule) {
     if (auto* call = curr->dynCast<Call>();
         call && !call->isReturn && call->type == Type::i32) {
       Name caller = currentOneBitFunc ? currentOneBitFunc->name : Name();
-      if (currentOneBitInfo->getNegatedOneBitCallTwin(call->target, caller)
+      if (currentOneBitInfo
+            ->getNegatedOneBitCallTwin(
+              call, *currentOneBitModule, caller, mustBeOneBit)
             .is()) {
         return true;
       }
@@ -461,14 +468,16 @@ static bool canInvertBoolExprFree(Expression* curr, Index depth = 0) {
   return false;
 }
 
-static void invertBoolExprFree(Expression*& curr, Builder& builder) {
+static void invertBoolExprFree(Expression*& curr,
+                               Builder& builder,
+                               bool mustBeOneBit = true) {
   int32_t c = 0;
   if (isI32Const(curr, c)) {
     curr->cast<Const>()->value = Literal(int32_t(c == 0 ? 1 : 0));
     return;
   }
   if (auto* u = curr->dynCast<Unary>()) {
-    assert(u->op == EqZInt32 && isOneBitI32(u->value));
+    assert(u->op == EqZInt32 && (!mustBeOneBit || isOneBitI32(u->value)));
     curr = u->value;
     return;
   }
@@ -482,26 +491,26 @@ static void invertBoolExprFree(Expression*& curr, Builder& builder) {
   }
   if (auto* block = curr->dynCast<Block>()) {
     assert(!block->name.is() && !block->list.empty());
-    invertBoolExprFree(block->list.back(), builder);
+    invertBoolExprFree(block->list.back(), builder, mustBeOneBit);
     return;
   }
   if (auto* iff = curr->dynCast<If>()) {
     assert(iff->ifFalse);
-    invertBoolExprFree(iff->ifTrue, builder);
-    invertBoolExprFree(iff->ifFalse, builder);
+    invertBoolExprFree(iff->ifTrue, builder, mustBeOneBit);
+    invertBoolExprFree(iff->ifFalse, builder, mustBeOneBit);
     return;
   }
   if (auto* sel = curr->dynCast<Select>()) {
-    invertBoolExprFree(sel->ifTrue, builder);
-    invertBoolExprFree(sel->ifFalse, builder);
+    invertBoolExprFree(sel->ifTrue, builder, mustBeOneBit);
+    invertBoolExprFree(sel->ifFalse, builder, mustBeOneBit);
     return;
   }
-  if (currentOneBitInfo) {
+  if (currentOneBitInfo && currentOneBitModule) {
     if (auto* call = curr->dynCast<Call>();
         call && !call->isReturn && call->type == Type::i32) {
       Name caller = currentOneBitFunc ? currentOneBitFunc->name : Name();
-      if (Name twin =
-            currentOneBitInfo->getNegatedOneBitCallTwin(call->target, caller);
+      if (Name twin = currentOneBitInfo->getNegatedOneBitCallTwin(
+            call, *currentOneBitModule, caller, mustBeOneBit);
           twin.is()) {
         call->target = twin;
         return;
@@ -515,16 +524,19 @@ static void invertBoolExprFree(Expression*& curr, Builder& builder) {
 // `i32.eqz` instructions (either 0 added `i32.eqz` via `canInvertBoolExprFree`,
 // or pushing `i32.eqz` through a 2-arm `If (result i32)` where at least one arm
 // is `canInvertBoolExprFree`).
-static bool canPushEqzIntoIfOrExprFree(Expression* curr, Index depth = 0) {
+static bool canPushEqzIntoIfOrExprFree(Expression* curr,
+                                       Index depth = 0,
+                                       bool mustBeOneBit = true) {
   if (!curr || curr->type != Type::i32 || depth > 8) {
     return false;
   }
-  if (canInvertBoolExprFree(curr, depth)) {
+  if (canInvertBoolExprFree(curr, depth, mustBeOneBit)) {
     return true;
   }
   if (auto* block = curr->dynCast<Block>()) {
     if (!block->name.is() && !block->list.empty()) {
-      return canPushEqzIntoIfOrExprFree(block->list.back(), depth + 1);
+      return canPushEqzIntoIfOrExprFree(
+        block->list.back(), depth + 1, mustBeOneBit);
     }
     return false;
   }
@@ -533,28 +545,31 @@ static bool canPushEqzIntoIfOrExprFree(Expression* curr, Index depth = 0) {
         iff->ifTrue->type != Type::i32 || iff->ifFalse->type != Type::i32) {
       return false;
     }
-    return canInvertBoolExprFree(iff->ifTrue, depth + 1) ||
-           canInvertBoolExprFree(iff->ifFalse, depth + 1);
+    return canInvertBoolExprFree(iff->ifTrue, depth + 1, mustBeOneBit) ||
+           canInvertBoolExprFree(iff->ifFalse, depth + 1, mustBeOneBit);
   }
   return false;
 }
 
 static void pushEqzIntoIfOrExprFree(Expression*& curr,
                                     Builder& builder,
-                                    Index depth = 0) {
-  if (canInvertBoolExprFree(curr, depth)) {
-    invertBoolExprFree(curr, builder);
+                                    Index depth = 0,
+                                    bool mustBeOneBit = true) {
+  if (canInvertBoolExprFree(curr, depth, mustBeOneBit)) {
+    invertBoolExprFree(curr, builder, mustBeOneBit);
     return;
   }
   if (auto* u = curr->dynCast<Unary>();
-      u && u->op == EqZInt32 && isOneBitI32(u->value)) {
+      u && u->op == EqZInt32 && (!mustBeOneBit || isOneBitI32(u->value))) {
     curr = u->value;
     return;
   }
   if (auto* block = curr->dynCast<Block>()) {
     if (!block->name.is() && !block->list.empty() &&
-        canPushEqzIntoIfOrExprFree(block->list.back(), depth + 1)) {
-      pushEqzIntoIfOrExprFree(block->list.back(), builder, depth + 1);
+        canPushEqzIntoIfOrExprFree(
+          block->list.back(), depth + 1, mustBeOneBit)) {
+      pushEqzIntoIfOrExprFree(
+        block->list.back(), builder, depth + 1, mustBeOneBit);
       block->finalize(Type::i32);
       return;
     }
@@ -562,10 +577,10 @@ static void pushEqzIntoIfOrExprFree(Expression*& curr,
   if (auto* iff = curr->dynCast<If>()) {
     if (iff->ifFalse && iff->condition->type != Type::unreachable &&
         iff->ifTrue->type == Type::i32 && iff->ifFalse->type == Type::i32 &&
-        (canInvertBoolExprFree(iff->ifTrue, depth + 1) ||
-         canInvertBoolExprFree(iff->ifFalse, depth + 1))) {
-      pushEqzIntoIfOrExprFree(iff->ifTrue, builder, depth + 1);
-      pushEqzIntoIfOrExprFree(iff->ifFalse, builder, depth + 1);
+        (canInvertBoolExprFree(iff->ifTrue, depth + 1, mustBeOneBit) ||
+         canInvertBoolExprFree(iff->ifFalse, depth + 1, mustBeOneBit))) {
+      pushEqzIntoIfOrExprFree(iff->ifTrue, builder, depth + 1, mustBeOneBit);
+      pushEqzIntoIfOrExprFree(iff->ifFalse, builder, depth + 1, mustBeOneBit);
       iff->finalize(Type::i32);
       return;
     }
@@ -581,8 +596,8 @@ makeNegatedBool(Builder& builder, Expression* expr, bool shrink2) {
   if (auto* u = expr->dynCast<Unary>(); u && u->op == EqZInt32) {
     return u->value;
   }
-  if (shrink2 && canInvertBoolExprFree(expr)) {
-    invertBoolExprFree(expr, builder);
+  if (shrink2 && canInvertBoolExprFree(expr, 0, /*mustBeOneBit=*/false)) {
+    invertBoolExprFree(expr, builder, /*mustBeOneBit=*/false);
     return expr;
   }
   return builder.makeUnary(EqZInt32, expr);
@@ -591,6 +606,11 @@ makeNegatedBool(Builder& builder, Expression* expr, bool shrink2) {
 static Expression* makeOneBitCond(Builder& builder, Expression* expr) {
   if (isOneBitI32(expr)) {
     return expr;
+  }
+  if (currentOneBitInfo && !expr->is<Const>() &&
+      canInvertBoolExprFree(expr, 0, /*mustBeOneBit=*/true)) {
+    invertBoolExprFree(expr, builder, /*mustBeOneBit=*/true);
+    return builder.makeUnary(EqZInt32, expr);
   }
   return builder.makeBinary(NeInt32, expr, builder.makeConst(int32_t(0)));
 }
@@ -857,6 +877,14 @@ static bool tryFoldBooleanIfCondition(If* curr,
   auto* inner = cond->dynCast<If>();
   if (!inner || !inner->ifFalse || inner->type != Type::i32 ||
       inner->condition->type == Type::unreachable) {
+    if (negated && (isV4Enabled(passOptions) || cond->is<Call>()) &&
+        canInvertBoolExprFree(cond, 0, /*mustBeOneBit=*/false)) {
+      Builder builder(wasm);
+      invertBoolExprFree(cond, builder, /*mustBeOneBit=*/false);
+      curr->condition = cond;
+      curr->finalize();
+      return true;
+    }
     return false;
   }
 
@@ -1070,6 +1098,14 @@ static bool tryFoldBooleanIfCondition(If* curr,
     return true;
   }
 
+  if (negated && isV4Enabled(passOptions) &&
+      canInvertBoolExprFree(cond, 0, /*mustBeOneBit=*/false)) {
+    invertBoolExprFree(cond, builder, /*mustBeOneBit=*/false);
+    curr->condition = cond;
+    curr->finalize();
+    return true;
+  }
+
   return false;
 }
 
@@ -1109,6 +1145,18 @@ static Expression* tryFoldBooleanBreakCondition(Break* curr,
   auto* inner = cond->dynCast<If>();
   if (!inner || !inner->ifFalse || inner->type != Type::i32 ||
       inner->condition->type == Type::unreachable) {
+    if (negated && (isV4Enabled(passOptions) || cond->is<Call>()) &&
+        canInvertBoolExprFree(cond, 0, /*mustBeOneBit=*/false)) {
+      Builder builder(wasm);
+      invertBoolExprFree(cond, builder, /*mustBeOneBit=*/false);
+      curr->condition = cond;
+      curr->finalize();
+      if (outerDrop) {
+        outerDrop->finalize();
+      }
+      return outerDrop ? static_cast<Expression*>(outerDrop)
+                       : static_cast<Expression*>(curr);
+    }
     return nullptr;
   }
 
@@ -1396,8 +1444,8 @@ static Expression* tryFoldBooleanBreakCondition(Break* curr,
     return newIf;
   }
 
-  if (negated && canInvertBoolExprFree(cond)) {
-    invertBoolExprFree(cond, builder);
+  if (negated && canInvertBoolExprFree(cond, 0, /*mustBeOneBit=*/false)) {
+    invertBoolExprFree(cond, builder, /*mustBeOneBit=*/false);
     curr->condition = cond;
     return finishInPlace();
   }
@@ -1658,12 +1706,8 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
   bool hasPrepareToRun() override { return true; }
 
   void prepareToRun(Module* module) override {
-    if (getPassOptions().worldMode == WorldMode::Closed) {
-      moduleOneBitInfo = std::make_shared<ModuleOneBitInfo>();
-      moduleOneBitInfo->compute(*module, getPassOptions());
-    } else {
-      moduleOneBitInfo.reset();
-    }
+    moduleOneBitInfo = std::make_shared<ModuleOneBitInfo>();
+    moduleOneBitInfo->compute(*module, getPassOptions());
   }
 
   std::unique_ptr<Pass> create() override {
@@ -4695,41 +4739,57 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         }
         return 1;
       };
-      auto canNegateFree = [](Expression* expr) -> bool {
-        return canInvertBoolExprFree(expr) || canPushEqzIntoIfOrExprFree(expr);
+      auto canNegateFree = [](Expression* expr,
+                              bool mustBeOneBit = false) -> bool {
+        return canInvertBoolExprFree(expr, 0, mustBeOneBit) ||
+               canPushEqzIntoIfOrExprFree(expr, 0, mustBeOneBit);
       };
-      auto posEqzCost = [&](const ShortCircuitStep& s) -> int {
-        return (s.negated && !canNegateFree(s.cond)) ? 1 : 0;
+      auto posEqzCost = [&](const ShortCircuitStep& s,
+                            bool mustBeOneBit = false) -> int {
+        return (s.negated && !canNegateFree(s.cond, mustBeOneBit)) ? 1 : 0;
       };
-      auto negEqzCost = [&](const ShortCircuitStep& s) -> int {
-        return (!s.negated && !canNegateFree(s.cond)) ? 1 : 0;
+      auto negEqzCost = [&](const ShortCircuitStep& s,
+                            bool mustBeOneBit = false) -> int {
+        return (!s.negated && !canNegateFree(s.cond, mustBeOneBit)) ? 1 : 0;
       };
-      auto makeNegated = [&](Expression* expr) -> Expression* {
-        if (canInvertBoolExprFree(expr)) {
-          invertBoolExprFree(expr, builder);
+      auto oneBitConvCost = [&](Expression* expr) -> int {
+        if (isOneBitI32(expr)) {
+          return 0;
+        }
+        if (currentOneBitInfo && !expr->is<Const>() &&
+            canInvertBoolExprFree(expr, 0, /*mustBeOneBit=*/true)) {
+          return 1;
+        }
+        return 3;
+      };
+      auto makeNegated = [&](Expression* expr,
+                             bool mustBeOneBit = false) -> Expression* {
+        if (canInvertBoolExprFree(expr, 0, mustBeOneBit)) {
+          invertBoolExprFree(expr, builder, mustBeOneBit);
           return expr;
         }
-        if (canPushEqzIntoIfOrExprFree(expr)) {
-          pushEqzIntoIfOrExprFree(expr, builder);
+        if (canPushEqzIntoIfOrExprFree(expr, 0, mustBeOneBit)) {
+          pushEqzIntoIfOrExprFree(expr, builder, 0, mustBeOneBit);
           return expr;
         }
-        return makeNegatedBool(builder, expr, true);
+        return mustBeOneBit ? makeNegOneBitCond(builder, expr, true)
+                            : makeNegatedBool(builder, expr, true);
       };
       auto materializePosCond = [&](const ShortCircuitStep& s) -> Expression* {
-        return s.negated ? makeNegated(s.cond) : s.cond;
+        return s.negated ? makeNegated(s.cond, /*mustBeOneBit=*/false) : s.cond;
       };
       auto materializeNegCond = [&](const ShortCircuitStep& s) -> Expression* {
-        return s.negated ? s.cond : makeNegated(s.cond);
+        return s.negated ? s.cond : makeNegated(s.cond, /*mustBeOneBit=*/false);
       };
       auto materializePosOneBit =
         [&](const ShortCircuitStep& s) -> Expression* {
-        return s.negated ? makeNegated(s.cond)
+        return s.negated ? makeNegated(s.cond, /*mustBeOneBit=*/true)
                          : makeOneBitCond(builder, s.cond);
       };
       auto materializeNegOneBit =
         [&](const ShortCircuitStep& s) -> Expression* {
         return s.negated ? makeOneBitCond(builder, s.cond)
-                         : makeNegated(s.cond);
+                         : makeNegated(s.cond, /*mustBeOneBit=*/true);
       };
       auto appendPrefixAndStmt = [&](Block* dst,
                                      const std::vector<Expression*>& prefix,
@@ -4842,11 +4902,13 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
             const ShortCircuitStep& sLast = plan.steps[remN - 1];
             int convCost = 0;
             if (shortConst == 0) {
-              convCost = !sLast.negated ? (isOneBitI32(sLast.cond) ? 0 : 3)
-                                        : posEqzCost(sLast);
+              convCost = !sLast.negated
+                           ? oneBitConvCost(sLast.cond)
+                           : posEqzCost(sLast, /*mustBeOneBit=*/true);
             } else {
-              convCost = sLast.negated ? (isOneBitI32(sLast.cond) ? 0 : 3)
-                                       : negEqzCost(sLast);
+              convCost = sLast.negated
+                           ? oneBitConvCost(sLast.cond)
+                           : negEqzCost(sLast, /*mustBeOneBit=*/true);
             }
             plan.foldLastConstIntoPass = true;
             remN--;
@@ -4876,8 +4938,9 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
             if (!canOneBit) {
               break;
             }
-            int eqzC =
-              (shortConst == 0) ? posEqzCost(sPrev) : negEqzCost(sPrev);
+            int eqzC = (shortConst == 0)
+                         ? posEqzCost(sPrev, /*mustBeOneBit=*/true)
+                         : negEqzCost(sPrev, /*mustBeOneBit=*/true);
             plan.numTrailingAndOrFolds++;
             remN--;
             extraPassBytes += 1 + eqzC;
@@ -4917,7 +4980,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
               allRemPureOneBit = false;
               break;
             }
-            condFoldExtra += 1 + posEqzCost(si);
+            condFoldExtra += 1 + posEqzCost(si, /*mustBeOneBit=*/true);
           }
           if (allRemPureOneBit) {
             plan.numCondAndFolds = Index(remN - 1);
@@ -4929,14 +4992,17 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         int newBytes = 0;
         if (plan.foldAllToAndOr) {
           assert(remN == 1);
-          int eqz0 = (shortConst == 0) ? posEqzCost(plan.steps[0])
-                                       : negEqzCost(plan.steps[0]);
+          int eqz0 = (shortConst == 0)
+                       ? posEqzCost(plan.steps[0], /*mustBeOneBit=*/true)
+                       : negEqzCost(plan.steps[0], /*mustBeOneBit=*/true);
           // Eliminates the outer If (3 + bt) AND the remaining shortArm (2 B),
           // replacing them with 1-byte i32.and/i32.or + eqz0.
           newBytes = (isReturnNode ? 1 : 0) + 1 + eqz0 + extraPassBytes - 2;
         } else if (remN == 1) {
-          newBytes = (isReturnNode ? 1 : 0) + (3 + bt) +
-                     posEqzCost(plan.steps[0]) + extraPassBytes;
+          newBytes =
+            (isReturnNode ? 1 : 0) + (3 + bt) +
+            posEqzCost(plan.steps[0], plan.numCondAndFolds > 0) +
+            extraPassBytes;
         } else {
           int exitBytes = 0;
           if (isReturnNode) {
@@ -5583,12 +5649,15 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
               if (auto* u = iff->condition->dynCast<Unary>();
                   u && u->op == EqZInt32 && u->value->type == Type::i32) {
                 negCond = u->value;
-              } else if (canInvertBoolExprFree(iff->condition)) {
+              } else if (canInvertBoolExprFree(
+                           iff->condition, 0, /*mustBeOneBit=*/false)) {
                 negCond = iff->condition;
-                invertBoolExprFree(negCond, builder);
-              } else if (canPushEqzIntoIfOrExprFree(iff->condition)) {
+                invertBoolExprFree(negCond, builder, /*mustBeOneBit=*/false);
+              } else if (canPushEqzIntoIfOrExprFree(
+                           iff->condition, 0, /*mustBeOneBit=*/false)) {
                 negCond = iff->condition;
-                pushEqzIntoIfOrExprFree(negCond, builder);
+                pushEqzIntoIfOrExprFree(
+                  negCond, builder, 0, /*mustBeOneBit=*/false);
               }
               if (negCond) {
                 bool reuseLabel = enclosingTailLabel.is();
