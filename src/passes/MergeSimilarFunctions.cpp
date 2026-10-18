@@ -312,16 +312,18 @@ struct EquivalentClass {
     const std::vector<ParamInfo>& params,
     const ModuleCallStats& stats,
     const std::unordered_map<Function*, FuncNormalizationState>* normStates,
-    bool shrinkMode) const;
+    bool shrinkMode,
+    bool earlyMode = false) const;
 
   bool hasMergeBenefit(
     Module* module,
     const std::vector<ParamInfo>& params,
     const ModuleCallStats& stats,
     const std::unordered_map<Function*, FuncNormalizationState>* normStates,
-    bool shrinkMode) const {
+    bool shrinkMode,
+    bool earlyMode = false) const {
     return evaluateMergeSavings(
-             module, params, stats, normStates, shrinkMode) > 0;
+             module, params, stats, normStates, shrinkMode, earlyMode) > 0;
   }
 
   Function* createShared(
@@ -338,7 +340,8 @@ struct EquivalentClass {
 
   bool deriveParams(Module* module,
                     std::vector<ParamInfo>& params,
-                    bool isIndirectionEnabled) const;
+                    bool isIndirectionEnabled,
+                    bool earlyMode = false) const;
 };
 
 struct MergeSimilarFunctions : public Pass {
@@ -348,9 +351,13 @@ struct MergeSimilarFunctions : public Pass {
   std::unordered_set<Name> activeConstThunks;
   std::unordered_map<Function*, FuncNormalizationState> normStates;
   ModuleCallStats stats;
+  bool earlyMode = false;
 
   void run(Module* module) override {
-    for (int round = 0; round < 2; ++round) {
+    earlyMode =
+      getArgumentOrDefault("merge-similar-functions", "") == "early";
+    int numRounds = earlyMode ? 2 : 3;
+    for (int round = 0; round < numRounds; ++round) {
       constThunks.clear();
       activeConstThunks.clear();
       normStates.clear();
@@ -358,6 +365,9 @@ struct MergeSimilarFunctions : public Pass {
 
       collectModuleStats(module);
       identifyConstThunks(module);
+      if (round == 2) {
+        activeConstThunks.clear();
+      }
       normalizeModuleFunctions(module);
 
       std::vector<EquivalentClass> rawClasses;
@@ -397,7 +407,7 @@ struct MergeSimilarFunctions : public Pass {
             continue;
           }
           std::vector<ParamInfo> params;
-          if (!clazz.deriveParams(module, params, callIndirection)) {
+          if (!clazz.deriveParams(module, params, callIndirection, earlyMode)) {
             continue;
           }
           if (params.empty()) {
@@ -407,7 +417,7 @@ struct MergeSimilarFunctions : public Pass {
             continue;
           }
           if (!clazz.hasMergeBenefit(
-                module, params, stats, &normStates, shrinkMode)) {
+                module, params, stats, &normStates, shrinkMode, earlyMode)) {
             continue;
           }
           for (auto* f : clazz.functions) {
@@ -429,7 +439,13 @@ struct MergeSimilarFunctions : public Pass {
       }
 
       if (mergedThunkPairs.empty()) {
-        break;
+        if (earlyMode || activeConstThunks.empty()) {
+          break;
+        }
+        if (round == 0) {
+          round = 1;
+        }
+        continue;
       }
 
       // Forward non-escaped 1..2 caller merged thunks directly to their shared
@@ -556,8 +572,15 @@ void MergeSimilarFunctions::identifyConstThunks(Module* module) {
     for (Index j = 0; j < numArgs; ++j) {
       Expression* op = call->operands[j];
       if (auto* lg = op->dynCast<LocalGet>()) {
-        if (lg->index != expectedParam ||
-            lg->type != func->getLocalType(expectedParam)) {
+        if (expectedParam >= numParams || lg->index != expectedParam) {
+          valid = false;
+          break;
+        }
+        bool typeOk =
+          earlyMode
+            ? (lg->type == func->getLocalType(expectedParam))
+            : Type::isSubType(lg->type, func->getLocalType(expectedParam));
+        if (!typeOk) {
           valid = false;
           break;
         }
@@ -665,7 +688,16 @@ void MergeSimilarFunctions::identifyConstThunks(Module* module) {
   });
 
   for (const auto& [thunkName, info] : constThunks) {
-    if (baseCallerFuncCount[info.baseTarget] >= 2) {
+    bool hasRefFuncConst = false;
+    if (!earlyMode) {
+      for (Expression* ce : info.constExpr) {
+        if (ce && ce->is<RefFunc>()) {
+          hasRefFuncConst = true;
+          break;
+        }
+      }
+    }
+    if (!hasRefFuncConst && baseCallerFuncCount[info.baseTarget] >= 2) {
       activeConstThunks.insert(thunkName);
     }
   }
@@ -970,6 +1002,12 @@ bool MergeSimilarFunctions::areInEquvalentClass(Function* lhs,
       if (lhsCallee->type != rhsCallee->type) {
         return false;
       }
+      if (lhsCast->type.getHeapType() != lhsCallee->type.getHeapType() ||
+          rhsCast->type.getHeapType() != rhsCallee->type.getHeapType() ||
+          ((lhsCast->type.isExact() || rhsCast->type.isExact()) &&
+           module->features.hasCustomDescriptors())) {
+        return false;
+      }
       if (getPassOptions().worldMode == WorldMode::Open &&
           !PublicTypeValidator(module->features)
              .isValidPublicType(lhsCallee->type.getHeapType())) {
@@ -1064,7 +1102,8 @@ void MergeSimilarFunctions::collectEquivalentClasses(
 
 bool EquivalentClass::deriveParams(Module* module,
                                    std::vector<ParamInfo>& params,
-                                   bool isCallIndirectionEnabled) const {
+                                   bool isCallIndirectionEnabled,
+                                   bool earlyMode) const {
   struct DeepValueIterator {
     SmallVector<Expression**, 10> tasks;
 
@@ -1111,7 +1150,12 @@ bool EquivalentClass::deriveParams(Module* module,
       if (auto* rf = expr->dynCast<RefFunc>()) {
         auto* callee = module->getFunction(rf->func);
         Type paramType(callee->type.getHeapType(), NonNullable);
-        if (paramType == rf->type) {
+        bool match =
+          earlyMode
+            ? (paramType == rf->type)
+            : (rf->type.getHeapType() == callee->type.getHeapType() &&
+               (!rf->type.isExact() || !module->features.hasCustomDescriptors()));
+        if (match) {
           out = LeafValue{LeafValue::FuncVal, paramType, Literal(), rf->func};
           return true;
         }
@@ -1187,7 +1231,8 @@ int EquivalentClass::evaluateMergeSavings(
   const std::vector<ParamInfo>& params,
   const ModuleCallStats& stats,
   const std::unordered_map<Function*, FuncNormalizationState>* normStates,
-  bool shrinkMode) const {
+  bool shrinkMode,
+  bool earlyMode) const {
   if (params.empty()) {
     return -1;
   }
@@ -1211,7 +1256,7 @@ int EquivalentClass::evaluateMergeSavings(
         paramUseDeltas += 2 - int(getShallowBytes(use));
       }
     }
-    if (shrinkMode && !param.values.empty() &&
+    if (!param.values.empty() &&
         param.values[0].kind == LeafValue::FuncVal) {
       for (const auto& v : param.values) {
         auto it = stats.refFuncCounts.find(v.name);
@@ -1251,7 +1296,8 @@ int EquivalentClass::evaluateMergeSavings(
 
   int sharedBodyBytes = origPrimaryBodyBytes + paramUseDeltas;
   int sharedLocalDeclBytes = int(getExtraLocalDeclBytes(primaryFunction));
-  int sharedOverhead = 4 + int(newlyReferencedFuncs.size()) * 2;
+  int sharedOverhead =
+    4 + (shrinkMode ? int(newlyReferencedFuncs.size()) * 2 : 0);
   std::vector<Type> sigParams;
   for (const auto& p : primaryFunction->getParams()) {
     sigParams.push_back(p);
@@ -1292,9 +1338,14 @@ int EquivalentClass::evaluateMergeSavings(
     auto rfIt = stats.refFuncCounts.find(f->name);
     Index rfCount = (rfIt != stats.refFuncCounts.end()) ? rfIt->second : 0;
     bool canForward =
-      (callCount >= 1 && rfCount == 0 && !stats.exportedFuncs.count(f->name));
+      (callCount >= 1 && rfCount == 0 &&
+       (earlyMode || !newlyReferencedFuncs.count(f->name)) &&
+       !stats.exportedFuncs.count(f->name));
+    bool forwardSavingsOk =
+      earlyMode ? (int(callCount) * extraArgBytes < thunkInstrBytes + 5)
+                : (int(callCount) * extraArgBytes <= thunkInstrBytes + 5);
 
-    if (canForward && int(callCount) * extraArgBytes < thunkInstrBytes + 5) {
+    if (canForward && forwardSavingsOk) {
       oldBytes += fOldBytes + 5;
       newBytes += int(callCount) * extraArgBytes;
       numForwarded++;
@@ -1324,7 +1375,8 @@ void MergeSimilarFunctions::splitIntoSubClusters(
   }
 
   std::vector<ParamInfo> allParams;
-  bool allValid = rawClass.deriveParams(module, allParams, callIndirection);
+  bool allValid =
+    rawClass.deriveParams(module, allParams, callIndirection, earlyMode);
   if (allValid && allParams.empty()) {
     for (auto* f : rawClass.functions) {
       canonicalizedIdenticalFuncs.insert(f);
@@ -1333,7 +1385,7 @@ void MergeSimilarFunctions::splitIntoSubClusters(
   }
   int allSavings =
     allValid ? rawClass.evaluateMergeSavings(
-                 module, allParams, stats, &normStates, shrinkMode)
+                 module, allParams, stats, &normStates, shrinkMode, earlyMode)
              : -1;
 
   // If the entire group already needs <= 1 parameter and is profitable, no
@@ -1424,7 +1476,7 @@ void MergeSimilarFunctions::splitIntoSubClusters(
     }
     EquivalentClass subClass(rawClass.primaryFunction, std::move(subFuncs));
     int sav = subClass.evaluateMergeSavings(
-      module, subParams, stats, &normStates, shrinkMode);
+      module, subParams, stats, &normStates, shrinkMode, earlyMode);
     return {sav, int(subParams.size())};
   };
 
@@ -1642,9 +1694,110 @@ Function* EquivalentClass::createShared(
   };
   Expression* body =
     ExpressionManipulator::flexibleCopy(primaryFunction->body, *module, copier);
+
+  bool anyUpgraded = false;
+  if (module->features.hasCustomDescriptors()) {
+    std::unordered_set<Type> demandedExactTypes;
+    for (const auto& t : primaryFunction->getResults()) {
+      if (t.isExact()) {
+        demandedExactTypes.insert(t);
+      }
+    }
+    for (const auto& t : primaryFunction->vars) {
+      if (t.isExact()) {
+        demandedExactTypes.insert(t);
+      }
+    }
+    for (const auto& t : primaryFunction->getParams()) {
+      if (t.isExact()) {
+        demandedExactTypes.insert(t);
+      }
+    }
+    SmallVector<Expression*, 32> exactWorklist;
+    exactWorklist.push_back(body);
+    while (!exactWorklist.empty()) {
+      Expression* curr = exactWorklist.back();
+      exactWorklist.pop_back();
+      if (auto* call = curr->dynCast<Call>()) {
+        for (const auto& t : module->getFunction(call->target)->getParams()) {
+          if (t.isExact()) {
+            demandedExactTypes.insert(t);
+          }
+        }
+      } else if (auto* cr = curr->dynCast<CallRef>()) {
+        if (cr->target->type.isSignature()) {
+          for (const auto& t :
+               cr->target->type.getHeapType().getSignature().params) {
+            if (t.isExact()) {
+              demandedExactTypes.insert(t);
+            }
+          }
+        }
+      } else if (auto* gs = curr->dynCast<GlobalSet>()) {
+        Type gt = module->getGlobal(gs->name)->type;
+        if (gt.isExact()) {
+          demandedExactTypes.insert(gt);
+        }
+      } else if (auto* sn = curr->dynCast<StructNew>()) {
+        if (sn->type.isStruct()) {
+          for (const auto& field : sn->type.getHeapType().getStruct().fields) {
+            if (field.type.isExact()) {
+              demandedExactTypes.insert(field.type);
+            }
+          }
+        }
+      } else if (auto* ss = curr->dynCast<StructSet>()) {
+        if (ss->ref->type.isStruct()) {
+          Type ft =
+            ss->ref->type.getHeapType().getStruct().fields[ss->index].type;
+          if (ft.isExact()) {
+            demandedExactTypes.insert(ft);
+          }
+        }
+      }
+      for (auto* child : ChildIterator(curr)) {
+        exactWorklist.push_back(child);
+      }
+    }
+
+    if (!demandedExactTypes.empty()) {
+      for (Index paramIdx = 0; paramIdx < params.size(); ++paramIdx) {
+        if (params[paramIdx].values.empty() ||
+            params[paramIdx].values[0].kind != LeafValue::FuncVal) {
+          continue;
+        }
+        Type curType = sigParams[extraParamBase + paramIdx];
+        Type exactType(curType.getHeapType(), NonNullable, Exact);
+        if (demandedExactTypes.count(exactType)) {
+          sigParams[extraParamBase + paramIdx] = exactType;
+          anyUpgraded = true;
+        }
+      }
+      if (anyUpgraded) {
+        sig = Signature(Type(sigParams), primaryFunction->getResults());
+        exactWorklist.push_back(body);
+        while (!exactWorklist.empty()) {
+          Expression* curr = exactWorklist.back();
+          exactWorklist.pop_back();
+          if (auto* lg = curr->dynCast<LocalGet>()) {
+            if (lg->index >= extraParamBase && lg->index < newVarBase) {
+              lg->type = sigParams[lg->index];
+            }
+          }
+          for (auto* child : ChildIterator(curr)) {
+            exactWorklist.push_back(child);
+          }
+        }
+      }
+    }
+  }
+
   auto vars = primaryFunction->vars;
   std::unique_ptr<Function> f = builder.makeFunction(
     fnName, Type(sig, NonNullable, Exact), std::move(vars), body);
+  if (anyUpgraded) {
+    ReFinalize().walkFunctionInModule(f.get(), module);
+  }
   return module->addFunction(std::move(f));
 }
 
@@ -1753,7 +1906,10 @@ void MergeSimilarFunctions::forwardDirectCallers(
       extraArgBytes += int(getShallowBytes(thunkCall->operands[k]));
     }
     int thunkTotalBytes = 8 + 2 * int(numOrigParams) + extraArgBytes;
-    if (int(sites.size()) * extraArgBytes >= thunkTotalBytes) {
+    bool skipForward =
+      earlyMode ? (int(sites.size()) * extraArgBytes >= thunkTotalBytes)
+                : (int(sites.size()) * extraArgBytes > thunkTotalBytes);
+    if (skipForward) {
       continue;
     }
     bool allSitesValid = true;

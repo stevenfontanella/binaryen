@@ -577,6 +577,7 @@
     (call $merged-callee-2 (local.get $x))
   )
 )
+
 ;; CHECK:      (func $byn$mgfn-shared$merged-callee-1 (type $1) (param $0 i32) (param $1 (ref $0)) (param $2 i32) (result i32)
 ;; CHECK-NEXT:  (local $3 i32)
 ;; CHECK-NEXT:  (local $4 i32)
@@ -608,6 +609,213 @@
 ;; CHECK-NEXT:     (local.get $4)
 ;; CHECK-NEXT:     (local.get $1)
 ;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:  )
+;; CHECK-NEXT: )
+(module
+  ;; CHECK:      (type $fn (func (param i32) (result i32)))
+  (type $fn (func (param i32) (result i32)))
+
+  ;; CHECK:      (type $1 (func (param i32 (ref $fn)) (result i32)))
+
+  ;; CHECK:      (type $2 (func (param (ref $fn) i32) (result i32)))
+
+  ;; CHECK:      (type $3 (func (param i32 i32) (result i32)))
+
+  ;; CHECK:      (elem declare func $const-thunk-a $non-thunk-b $target-a $target-b)
+
+  ;; CHECK:      (export "rf1" (func $ref-func-and-call-1))
+
+  ;; CHECK:      (export "rf2" (func $ref-func-and-call-2))
+
+  ;; CHECK:      (export "obc" (func $other-base-caller))
+
+  ;; CHECK:      (export "asym1" (func $asym-1))
+
+  ;; CHECK:      (export "asym2" (func $asym-2))
+
+  ;; CHECK:      (func $target-a (type $fn) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (i32.const 10)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $target-a (type $fn) (param $x i32) (result i32)
+    (i32.add (local.get $x) (i32.const 10))
+  )
+  ;; CHECK:      (func $target-b (type $fn) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (i32.sub
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (i32.const 10)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $target-b (type $fn) (param $x i32) (result i32)
+    (i32.sub (local.get $x) (i32.const 10))
+  )
+  ;; CHECK:      (func $consume-fn (type $2) (param $0 (ref $fn)) (param $1 i32) (result i32)
+  ;; CHECK-NEXT:  (call_ref $fn
+  ;; CHECK-NEXT:   (local.get $1)
+  ;; CHECK-NEXT:   (local.get $0)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $consume-fn (param (ref $fn) i32) (result i32)
+    (call_ref $fn (local.get 1) (local.get 0))
+  )
+
+  ;; Differ in both (ref.func $target-{a,b}) and (call $target-{a,b} ...):
+  ;; both uses should share a single (ref $fn) parameter on the merged helper.
+  ;; CHECK:      (func $ref-func-and-call-1 (type $fn) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (call $byn$mgfn-shared$ref-func-and-call-1
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (ref.func $target-a)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $ref-func-and-call-1 (export "rf1") (param $x i32) (result i32)
+    (i32.add
+      (i32.add
+        (call $consume-fn (ref.func $target-a) (local.get $x))
+        (call $consume-fn (ref.func $target-a) (i32.add (local.get $x) (i32.const 1)))
+      )
+      (call $target-a (i32.mul (local.get $x) (i32.const 3)))
+    )
+  )
+  ;; CHECK:      (func $ref-func-and-call-2 (type $fn) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (call $byn$mgfn-shared$ref-func-and-call-1
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (ref.func $target-b)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $ref-func-and-call-2 (export "rf2") (param $x i32) (result i32)
+    (i32.add
+      (i32.add
+        (call $consume-fn (ref.func $target-b) (local.get $x))
+        (call $consume-fn (ref.func $target-b) (i32.add (local.get $x) (i32.const 1)))
+      )
+      (call $target-b (i32.mul (local.get $x) (i32.const 3)))
+    )
+  )
+
+  ;; Asymmetric constThunk fallback: $const-thunk-a is an active constThunk
+  ;; (its base $base-two-arg has >= 2 callers), whereas $non-thunk-b is not a
+  ;; constThunk. Unwrapping $const-thunk-a in rounds 0..1 changes $asym-1's call
+  ;; arity from 1 to 2, so round 2 (without unwrapping) merges $asym-1 and
+  ;; $asym-2 via their 1-arg targets.
+  ;; CHECK:      (func $base-two-arg (type $3) (param $x i32) (param $k i32) (result i32)
+  ;; CHECK-NEXT:  (i32.xor
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (local.get $k)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $base-two-arg (param $x i32) (param $k i32) (result i32)
+    (i32.xor (local.get $x) (local.get $k))
+  )
+  ;; CHECK:      (func $const-thunk-a (type $fn) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (call $base-two-arg
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (i32.const 99)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $const-thunk-a (type $fn) (param $x i32) (result i32)
+    (call $base-two-arg (local.get $x) (i32.const 99))
+  )
+  ;; CHECK:      (func $other-base-caller (type $fn) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (call $base-two-arg
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (i32.const 77)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $other-base-caller (export "obc") (param $x i32) (result i32)
+    (call $base-two-arg (local.get $x) (i32.const 77))
+  )
+  ;; CHECK:      (func $non-thunk-b (type $fn) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (i32.mul
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $non-thunk-b (type $fn) (param $x i32) (result i32)
+    (i32.mul (local.get $x) (local.get $x))
+  )
+  ;; CHECK:      (func $asym-1 (type $fn) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (call $byn$mgfn-shared$asym-1
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (ref.func $const-thunk-a)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $asym-1 (export "asym1") (param $x i32) (result i32)
+    (i32.add
+      (i32.add
+        (call $const-thunk-a (i32.add (local.get $x) (i32.const 1)))
+        (call $const-thunk-a (i32.add (local.get $x) (i32.const 2)))
+      )
+      (call $const-thunk-a (i32.add (local.get $x) (i32.const 3)))
+    )
+  )
+  ;; CHECK:      (func $asym-2 (type $fn) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (call $byn$mgfn-shared$asym-1
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (ref.func $non-thunk-b)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $asym-2 (export "asym2") (param $x i32) (result i32)
+    (i32.add
+      (i32.add
+        (call $non-thunk-b (i32.add (local.get $x) (i32.const 1)))
+        (call $non-thunk-b (i32.add (local.get $x) (i32.const 2)))
+      )
+      (call $non-thunk-b (i32.add (local.get $x) (i32.const 3)))
+    )
+  )
+)
+;; CHECK:      (func $byn$mgfn-shared$asym-1 (type $1) (param $0 i32) (param $1 (ref $fn)) (result i32)
+;; CHECK-NEXT:  (i32.add
+;; CHECK-NEXT:   (i32.add
+;; CHECK-NEXT:    (call_ref $fn
+;; CHECK-NEXT:     (i32.add
+;; CHECK-NEXT:      (local.get $0)
+;; CHECK-NEXT:      (i32.const 1)
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:     (local.get $1)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:    (call_ref $fn
+;; CHECK-NEXT:     (i32.add
+;; CHECK-NEXT:      (local.get $0)
+;; CHECK-NEXT:      (i32.const 2)
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:     (local.get $1)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (call_ref $fn
+;; CHECK-NEXT:    (i32.add
+;; CHECK-NEXT:     (local.get $0)
+;; CHECK-NEXT:     (i32.const 3)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:    (local.get $1)
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:  )
+;; CHECK-NEXT: )
+
+;; CHECK:      (func $byn$mgfn-shared$ref-func-and-call-1 (type $1) (param $0 i32) (param $1 (ref $fn)) (result i32)
+;; CHECK-NEXT:  (i32.add
+;; CHECK-NEXT:   (i32.add
+;; CHECK-NEXT:    (call $consume-fn
+;; CHECK-NEXT:     (local.get $1)
+;; CHECK-NEXT:     (local.get $0)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:    (call $consume-fn
+;; CHECK-NEXT:     (local.get $1)
+;; CHECK-NEXT:     (i32.add
+;; CHECK-NEXT:      (local.get $0)
+;; CHECK-NEXT:      (i32.const 1)
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (call_ref $fn
+;; CHECK-NEXT:    (i32.mul
+;; CHECK-NEXT:     (local.get $0)
+;; CHECK-NEXT:     (i32.const 3)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:    (local.get $1)
 ;; CHECK-NEXT:   )
 ;; CHECK-NEXT:  )
 ;; CHECK-NEXT: )
