@@ -398,4 +398,47 @@
       )
     )
   )
+
+  ;; CHECK:      (func $try-sibling-does-not-block-folding (type $2) (param $x i32)
+  ;; CHECK-NEXT:  (block $out
+  ;; CHECK-NEXT:   (if
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (then
+  ;; CHECK-NEXT:     (try
+  ;; CHECK-NEXT:      (do
+  ;; CHECK-NEXT:       (call $foo)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (catch_all
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (br $out)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (call $foo)
+  ;; CHECK-NEXT:  (call $foo)
+  ;; CHECK-NEXT:  (call $foo)
+  ;; CHECK-NEXT: )
+  (func $try-sibling-does-not-block-folding (param $x i32)
+    (block $out
+      (if
+        (local.get $x)
+        (then
+          (try
+            (do
+              (call $foo)
+            )
+            (catch_all)
+          )
+          (call $foo)
+          (call $foo)
+          (call $foo)
+          (br $out)
+        )
+      )
+      (call $foo)
+      (call $foo)
+      (call $foo)
+    )
+  )
 )

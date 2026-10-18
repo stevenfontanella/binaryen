@@ -340,7 +340,7 @@
     )
   )
 
-  ;; CHECK:      (func $restructure-br_if-constant-branch-1 (type $4) (param $x i32)
+  ;; CHECK:      (func $restructure-br_if-constant-branch-1 (type $5) (param $x i32)
   ;; CHECK-NEXT:  (local $1 i32)
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (block $x (result i32)
@@ -398,7 +398,7 @@
       )
     )
   )
-  ;; CHECK:      (func $restructure-br_if-constant-branch-2 (type $4) (param $x i32)
+  ;; CHECK:      (func $restructure-br_if-constant-branch-2 (type $5) (param $x i32)
   ;; CHECK-NEXT:  (local $1 i32)
   ;; CHECK-NEXT:  (local $2 i32)
   ;; CHECK-NEXT:  (block $x
@@ -948,7 +948,7 @@
     )
   )
 
-  ;; CHECK:      (func $fold-bool-if-neg (type $5) (param $x i32) (param $y i32) (result i32)
+  ;; CHECK:      (func $fold-bool-if-neg (type $4) (param $x i32) (param $y i32) (result i32)
   ;; CHECK-NEXT:  (local $t i32)
   ;; CHECK-NEXT:  (if (result i32)
   ;; CHECK-NEXT:   (local.get $x)
@@ -1061,7 +1061,7 @@
     )
   )
 
-  ;; CHECK:      (func $fold-bool-drop-br-if-val (type $5) (param $x i32) (param $y i32) (result i32)
+  ;; CHECK:      (func $fold-bool-drop-br-if-val (type $4) (param $x i32) (param $y i32) (result i32)
   ;; CHECK-NEXT:  (local $t i32)
   ;; CHECK-NEXT:  (block $out (result i32)
   ;; CHECK-NEXT:   (if
@@ -1100,5 +1100,177 @@
       (call $nothing)
       (local.get $t)
     )
+  )
+
+  ;; CHECK:      (func $switch-arm-exact-dedup (type $0) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (local $r i32)
+  ;; CHECK-NEXT:  (block $out
+  ;; CHECK-NEXT:   (block $b3
+  ;; CHECK-NEXT:    (block $b2
+  ;; CHECK-NEXT:     (br_table $b2 $b3 $b2 $b3
+  ;; CHECK-NEXT:      (local.get $x)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (local.set $r
+  ;; CHECK-NEXT:     (i32.const 10)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (br $out)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.set $r
+  ;; CHECK-NEXT:    (i32.const 20)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.get $r)
+  ;; CHECK-NEXT: )
+  (func $switch-arm-exact-dedup (param $x i32) (result i32)
+    (local $r i32)
+    (block $out
+      (block $b3
+        (block $b2
+          (block $b1
+            (block $b0
+              (br_table $b0 $b1 $b2 $b3 (local.get $x))
+            )
+            (local.set $r (i32.const 10))
+            (br $out)
+          )
+          (local.set $r (i32.const 20))
+          (br $out)
+        )
+        (local.set $r (i32.const 10))
+        (br $out)
+      )
+      (local.set $r (i32.const 20))
+    )
+    (local.get $r)
+  )
+
+  ;; CHECK:      (func $switch-arm-shared-suffix (type $0) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (local $a i32)
+  ;; CHECK-NEXT:  (local $b i32)
+  ;; CHECK-NEXT:  (block $out
+  ;; CHECK-NEXT:   (block $b2
+  ;; CHECK-NEXT:    (block $rub_tail$0
+  ;; CHECK-NEXT:     (block $b1
+  ;; CHECK-NEXT:      (block $b0
+  ;; CHECK-NEXT:       (br_table $b0 $b1 $b2
+  ;; CHECK-NEXT:        (local.get $x)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (local.set $a
+  ;; CHECK-NEXT:       (i32.const 1)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (br $rub_tail$0)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (local.set $a
+  ;; CHECK-NEXT:      (i32.const 2)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (local.set $b
+  ;; CHECK-NEXT:     (i32.const 99)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (br $out)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.set $a
+  ;; CHECK-NEXT:    (i32.const 3)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (local.get $a)
+  ;; CHECK-NEXT:   (local.get $b)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $switch-arm-shared-suffix (param $x i32) (result i32)
+    (local $a i32)
+    (local $b i32)
+    (block $out
+      (block $b2
+        (block $b1
+          (block $b0
+            (br_table $b0 $b1 $b2 (local.get $x))
+          )
+          (local.set $a (i32.const 1))
+          (local.set $b (i32.const 99))
+          (br $out)
+        )
+        (local.set $a (i32.const 2))
+        (local.set $b (i32.const 99))
+        (br $out)
+      )
+      (local.set $a (i32.const 3))
+      (br $out)
+    )
+    (i32.add (local.get $a) (local.get $b))
+  )
+
+  ;; CHECK:      (func $push-switch-into-const-leaf-if (type $4) (param $x i32) (param $y i32) (result i32)
+  ;; CHECK-NEXT:  (local $r i32)
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (block $out
+  ;; CHECK-NEXT:     (block
+  ;; CHECK-NEXT:      (local.set $r
+  ;; CHECK-NEXT:       (i32.const 100)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (return
+  ;; CHECK-NEXT:       (local.get $r)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (else
+  ;; CHECK-NEXT:    (if
+  ;; CHECK-NEXT:     (local.get $y)
+  ;; CHECK-NEXT:     (then
+  ;; CHECK-NEXT:      (return
+  ;; CHECK-NEXT:       (i32.const 200)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (else
+  ;; CHECK-NEXT:      (unreachable)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (i32.const 0)
+  ;; CHECK-NEXT: )
+  (func $push-switch-into-const-leaf-if (param $x i32) (param $y i32) (result i32)
+    (local $r i32)
+    (block $out
+      (block $b2
+        (block $b1
+          (block $b0
+            (br_table $b0 $b1 $b2
+              (if (result i32)
+                (local.get $x)
+                (then
+                  (local.set $r (i32.const 100))
+                  (i32.const 0)
+                )
+                (else
+                  (i32.sub
+                    (i32.const 2)
+                    (if (result i32)
+                      (local.get $y)
+                      (then
+                        (i32.const 1)
+                      )
+                      (else
+                        (i32.const 0)
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+          (return (local.get $r))
+        )
+        (return (i32.const 200))
+      )
+      (unreachable)
+    )
+    (i32.const 0)
   )
 )

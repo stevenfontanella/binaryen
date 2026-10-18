@@ -401,11 +401,47 @@ private:
     return canMove(items, outOf, BranchUtils::getBranchTargets(outOf));
   }
 
+  static bool isEnclosedByTry(Expression* target, Expression* root) {
+    struct Finder : public PostWalker<Finder> {
+      Expression* target;
+      Index tryDepth = 0;
+      bool foundTarget = false;
+      bool enclosed = false;
+      void visitTry(Try* curr) {
+        assert(tryDepth > 0);
+        --tryDepth;
+      }
+      void visitTryTable(TryTable* curr) {
+        assert(tryDepth > 0);
+        --tryDepth;
+      }
+      static void scan(Finder* self, Expression** currp) {
+        if (self->foundTarget) {
+          return;
+        }
+        auto* curr = *currp;
+        if (curr == self->target) {
+          self->foundTarget = true;
+          self->enclosed = (self->tryDepth > 0);
+          return;
+        }
+        if (curr->is<Try>() || curr->is<TryTable>()) {
+          ++self->tryDepth;
+        }
+        PostWalker<Finder>::scan(self, currp);
+      }
+    } finder;
+    finder.target = target;
+    finder.walk(root);
+    return finder.enclosed;
+  }
+
   // Overload that accepts pre-computed branch targets to avoid redundant
   // O(N) getBranchTargets calls.
   bool canMove(const std::vector<Expression*>& items,
                Expression* outOf,
                const BranchUtils::NameSet& allTargets) {
+    std::optional<bool> enclosedByTry;
     for (auto* item : items) {
       auto exiting = BranchUtils::getExitingBranches(item);
       std::vector<Name> intersection;
@@ -427,19 +463,18 @@ private:
         if (effects.danglingPop) {
           return false;
         }
-        // When an expression can throw and it is within a try/try_table scope,
-        // taking it out of the try/try_table scope changes the program's
+        // When an expression can throw and it is within a try/try_table scope
+        // inside 'outOf', taking it out of 'outOf' changes the program's
         // behavior, because the expression that would otherwise have been
         // caught by the try/try_table now throws up to the next try/try_table
-        // scope or even up to the caller. We restrict the move if 'outOf'
-        // contains a 'try' or 'try_table' anywhere in it. This is a
-        // conservative approximation because there can be cases that
-        // 'try'/'try_table' is within the expression that may throw so it is
-        // safe to take the expression out.
-        // TODO: optimize this check to avoid two FindAlls.
-        if (effects.throws() &&
-            (FindAll<Try>(outOf).has() || FindAll<TryTable>(outOf).has())) {
-          return false;
+        // scope or even up to the caller.
+        if (effects.throws()) {
+          if (!enclosedByTry) {
+            enclosedByTry = isEnclosedByTry(items[0], outOf);
+          }
+          if (*enclosedByTry) {
+            return false;
+          }
         }
       }
     }

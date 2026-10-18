@@ -26,6 +26,7 @@
 #include "ir/find_all.h"
 #include "ir/gc-type-utils.h"
 #include "ir/iteration.h"
+#include "ir/label-utils.h"
 #include "ir/literal-utils.h"
 #include "ir/local-graph.h"
 #include "ir/localize.h"
@@ -5961,6 +5962,607 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
     }
   }
 
+  static void
+  replaceBranchTargetsInSubtree(Expression* root, Name from, Name to) {
+    if (!from.is() || !to.is() || from == to) {
+      return;
+    }
+    struct Replacer
+      : public PostWalker<Replacer, UnifiedExpressionVisitor<Replacer>> {
+      Name from;
+      Name to;
+      void visitExpression(Expression* curr) {
+        if (!curr->is<Try>() && !curr->is<Rethrow>()) {
+          BranchUtils::replacePossibleTarget(curr, from, to);
+        }
+      }
+    } replacer;
+    replacer.from = from;
+    replacer.to = to;
+    replacer.walk(root);
+  }
+
+  static int32_t estimateByteLen(Expression* root) {
+    struct ByteMeasurer
+      : public PostWalker<ByteMeasurer,
+                          UnifiedExpressionVisitor<ByteMeasurer>> {
+      int32_t bytes = 0;
+      void visitExpression(Expression* curr) {
+        switch (curr->_id) {
+          case Expression::Id::ConstId: {
+            auto t = curr->type;
+            bytes += (t == Type::f64 || t == Type::i64) ? 5 : 2;
+            break;
+          }
+          case Expression::Id::LocalGetId:
+          case Expression::Id::LocalSetId:
+          case Expression::Id::GlobalGetId:
+          case Expression::Id::GlobalSetId:
+          case Expression::Id::BreakId:
+          case Expression::Id::CallId:
+          case Expression::Id::RefNullId:
+          case Expression::Id::RefFuncId:
+          case Expression::Id::LoadId:
+          case Expression::Id::StoreId:
+          case Expression::Id::BlockId:
+          case Expression::Id::LoopId:
+            bytes += 2;
+            break;
+          case Expression::Id::CallRefId:
+          case Expression::Id::CallIndirectId:
+          case Expression::Id::StructGetId:
+          case Expression::Id::StructSetId:
+          case Expression::Id::StructNewId:
+          case Expression::Id::ArrayGetId:
+          case Expression::Id::ArraySetId:
+          case Expression::Id::ArrayNewId:
+          case Expression::Id::ArrayNewFixedId:
+          case Expression::Id::ArrayCopyId:
+          case Expression::Id::RefCastId:
+          case Expression::Id::RefTestId:
+          case Expression::Id::BrOnId:
+          case Expression::Id::IfId:
+            bytes += 3;
+            break;
+          default:
+            bytes += 1;
+            break;
+        }
+      }
+    } measurer;
+    measurer.walk(root);
+    return measurer.bytes;
+  }
+
+  static bool isSwitchChainChild(Block* child, Block* parent) {
+    return parent->list.size() >= 2 && parent->list[0] == child &&
+           child->type == Type::none && !child->list.empty() &&
+           child->list.back()->type == Type::unreachable;
+  }
+
+  bool checkConstLeafTree(Expression* expr,
+                          bool& hasIfOrSelect,
+                          Index& leafCount) {
+    if (leafCount > 64) {
+      return false;
+    }
+    if (auto* c = expr->dynCast<Const>()) {
+      if (c->type != Type::i32) {
+        return false;
+      }
+      ++leafCount;
+      return leafCount <= 64;
+    }
+    if (auto* iff = expr->dynCast<If>()) {
+      if (!iff->ifFalse || iff->type != Type::i32 ||
+          iff->condition->type != Type::i32) {
+        return false;
+      }
+      if (!BranchUtils::getExitingBranches(iff->condition).empty()) {
+        return false;
+      }
+      hasIfOrSelect = true;
+      return checkConstLeafTree(iff->ifTrue, hasIfOrSelect, leafCount) &&
+             checkConstLeafTree(iff->ifFalse, hasIfOrSelect, leafCount);
+    }
+    if (auto* sel = expr->dynCast<Select>()) {
+      if (sel->type != Type::i32 || sel->condition->type != Type::i32) {
+        return false;
+      }
+      if (EffectAnalyzer(getPassOptions(), *getModule(), sel)
+            .hasSideEffects()) {
+        return false;
+      }
+      hasIfOrSelect = true;
+      return checkConstLeafTree(sel->ifTrue, hasIfOrSelect, leafCount) &&
+             checkConstLeafTree(sel->ifFalse, hasIfOrSelect, leafCount);
+    }
+    if (auto* blk = expr->dynCast<Block>()) {
+      if (blk->name.is() || blk->list.empty() || blk->type != Type::i32) {
+        return false;
+      }
+      for (Index i = 0; i + 1 < blk->list.size(); ++i) {
+        if (blk->list[i]->type != Type::none ||
+            !BranchUtils::getExitingBranches(blk->list[i]).empty()) {
+          return false;
+        }
+      }
+      return checkConstLeafTree(blk->list.back(), hasIfOrSelect, leafCount);
+    }
+    if (auto* bin = expr->dynCast<Binary>()) {
+      if (bin->op == SubInt32 || bin->op == AddInt32) {
+        if (bin->left->is<Const>()) {
+          return checkConstLeafTree(bin->right, hasIfOrSelect, leafCount);
+        }
+        if (bin->right->is<Const>()) {
+          return checkConstLeafTree(bin->left, hasIfOrSelect, leafCount);
+        }
+      }
+    }
+    if (expr->type == Type::i32 && isOneBitI32(expr) &&
+        BranchUtils::getExitingBranches(expr).empty()) {
+      leafCount += 2;
+      return leafCount <= 64;
+    }
+    return false;
+  }
+
+  Expression* pushSwitchIntoTree(Expression* expr,
+                                 uint32_t offset,
+                                 uint32_t sign,
+                                 Switch* sw,
+                                 Builder& builder) {
+    auto targetForIndex = [&](uint32_t k) -> Name {
+      return (k < sw->targets.size()) ? sw->targets[k] : sw->default_;
+    };
+    if (auto* c = expr->dynCast<Const>()) {
+      uint32_t k = offset + sign * uint32_t(c->value.geti32());
+      return builder.makeBreak(targetForIndex(k));
+    }
+    if (auto* iff = expr->dynCast<If>()) {
+      iff->ifTrue =
+        pushSwitchIntoTree(iff->ifTrue, offset, sign, sw, builder);
+      iff->ifFalse =
+        pushSwitchIntoTree(iff->ifFalse, offset, sign, sw, builder);
+      iff->type = Type::unreachable;
+      return iff;
+    }
+    if (auto* sel = expr->dynCast<Select>()) {
+      auto* t = pushSwitchIntoTree(sel->ifTrue, offset, sign, sw, builder);
+      auto* f = pushSwitchIntoTree(sel->ifFalse, offset, sign, sw, builder);
+      return builder.makeIf(sel->condition, t, f, Type::unreachable);
+    }
+    if (auto* blk = expr->dynCast<Block>()) {
+      blk->list.back() =
+        pushSwitchIntoTree(blk->list.back(), offset, sign, sw, builder);
+      blk->type = Type::unreachable;
+      return blk;
+    }
+    if (auto* bin = expr->dynCast<Binary>()) {
+      if (bin->op == SubInt32) {
+        if (auto* c = bin->left->dynCast<Const>()) {
+          uint32_t cVal = uint32_t(c->value.geti32());
+          return pushSwitchIntoTree(
+            bin->right, offset + sign * cVal, uint32_t(0) - sign, sw, builder);
+        }
+        if (auto* c = bin->right->dynCast<Const>()) {
+          uint32_t cVal = uint32_t(c->value.geti32());
+          return pushSwitchIntoTree(
+            bin->left, offset - sign * cVal, sign, sw, builder);
+        }
+      } else if (bin->op == AddInt32) {
+        if (auto* c = bin->left->dynCast<Const>()) {
+          uint32_t cVal = uint32_t(c->value.geti32());
+          return pushSwitchIntoTree(
+            bin->right, offset + sign * cVal, sign, sw, builder);
+        }
+        if (auto* c = bin->right->dynCast<Const>()) {
+          uint32_t cVal = uint32_t(c->value.geti32());
+          return pushSwitchIntoTree(
+            bin->left, offset + sign * cVal, sign, sw, builder);
+        }
+      }
+    }
+    // 1-bit i32 expression (produces 0 or 1).
+    Name t1 = targetForIndex(offset + sign);
+    Name t0 = targetForIndex(offset);
+    return builder.makeIf(
+      expr, builder.makeBreak(t1), builder.makeBreak(t0), Type::unreachable);
+  }
+
+  static Index inlineArmOnSpine(Expression*& node,
+                                Name targetName,
+                                Block* bMParent,
+                                bool cloneStmts,
+                                Module* wasm,
+                                Builder& builder) {
+    if (auto* br = node->dynCast<Break>()) {
+      if (!br->condition && !br->value && br->name == targetName) {
+        if (bMParent->list.size() == 2) {
+          node = cloneStmts
+                   ? ExpressionManipulator::copy(bMParent->list[1], *wasm)
+                   : bMParent->list[1];
+        } else {
+          auto* armBlk = builder.makeBlock();
+          for (Index k = 1; k < bMParent->list.size(); ++k) {
+            armBlk->list.push_back(
+              cloneStmts ? ExpressionManipulator::copy(bMParent->list[k], *wasm)
+                         : bMParent->list[k]);
+          }
+          armBlk->type = Type::unreachable;
+          node = armBlk;
+        }
+        return 1;
+      }
+      return 0;
+    }
+    if (auto* iff = node->dynCast<If>()) {
+      if (iff->type != Type::unreachable || !iff->ifFalse) {
+        return 0;
+      }
+      Index c = inlineArmOnSpine(
+        iff->ifTrue, targetName, bMParent, cloneStmts, wasm, builder);
+      c += inlineArmOnSpine(
+        iff->ifFalse, targetName, bMParent, cloneStmts, wasm, builder);
+      return c;
+    }
+    if (auto* blk = node->dynCast<Block>()) {
+      if (!blk->name.is() && !blk->list.empty()) {
+        if (auto* br = blk->list.back()->dynCast<Break>()) {
+          if (!br->condition && !br->value && br->name == targetName) {
+            blk->list.pop_back();
+            for (Index k = 1; k < bMParent->list.size(); ++k) {
+              blk->list.push_back(
+                cloneStmts
+                  ? ExpressionManipulator::copy(bMParent->list[k], *wasm)
+                  : bMParent->list[k]);
+            }
+            blk->type = Type::unreachable;
+            return 1;
+          }
+        }
+        return inlineArmOnSpine(
+          blk->list.back(), targetName, bMParent, cloneStmts, wasm, builder);
+      }
+    }
+    return 0;
+  }
+
+  bool optimizeSwitchArms(Function* func) {
+    if (!func->body) {
+      return false;
+    }
+    struct BlockCollector : public PostWalker<BlockCollector> {
+      std::vector<Block*> postOrderBlocks;
+      std::unordered_set<Block*> isChainChild;
+      void visitBlock(Block* curr) {
+        postOrderBlocks.push_back(curr);
+        if (curr->list.size() >= 2) {
+          if (auto* first = curr->list[0]->dynCast<Block>()) {
+            if (isSwitchChainChild(first, curr)) {
+              isChainChild.insert(first);
+            }
+          }
+        }
+      }
+    } collector;
+    collector.walk(func->body);
+
+    Builder builder(*getModule());
+    std::unique_ptr<LabelUtils::LabelManager> labelManager;
+    auto getFreshLabel = [&](const char* prefix) -> Name {
+      if (!labelManager) {
+        labelManager = std::make_unique<LabelUtils::LabelManager>(func);
+      }
+      return labelManager->getUnique(prefix);
+    };
+
+    bool changed = false;
+
+    for (Block* bTop : collector.postOrderBlocks) {
+      if (collector.isChainChild.count(bTop)) {
+        continue;
+      }
+      std::vector<Block*> chain;
+      Block* curr = bTop;
+      while (true) {
+        chain.push_back(curr);
+        if (curr->list.size() >= 2) {
+          if (auto* child = curr->list[0]->dynCast<Block>()) {
+            if (isSwitchChainChild(child, curr)) {
+              curr = child;
+              continue;
+            }
+          }
+        }
+        break;
+      }
+      if (chain.size() < 2) {
+        continue;
+      }
+      std::reverse(chain.begin(), chain.end());
+      if (!FindAll<Switch>(chain[0]).has()) {
+        continue;
+      }
+      const Index n = chain.size() - 1;
+      std::vector<bool> eliminated(n, false);
+      bool chainChanged = false;
+
+      // 1. Exact Duplicate Switch-Arm Elimination (Inner-to-Outer + Fallthrough)
+      for (Index last = n - 1; last >= 1; --last) {
+        if (eliminated[last]) {
+          continue;
+        }
+        Block* bLast = chain[last];
+        Block* bLastParent = chain[last + 1];
+        if (bLastParent->list.size() < 2) {
+          continue;
+        }
+        Index armLastLen = bLastParent->list.size() - 1;
+        if (bLastParent->list.back()->type == Type::unreachable) {
+          for (Index i = 0; i < last; ++i) {
+            if (eliminated[i] || !chain[i]->name.is()) {
+              continue;
+            }
+            Block* bIParent = chain[i + 1];
+            if (bIParent->list.size() - 1 != armLastLen) {
+              continue;
+            }
+            bool allEqual = true;
+            for (Index k = 0; k < armLastLen; ++k) {
+              if (!ExpressionAnalyzer::equal(bIParent->list[1 + k],
+                                             bLastParent->list[1 + k])) {
+                allEqual = false;
+                break;
+              }
+            }
+            if (allEqual) {
+              if (!bLast->name.is()) {
+                bLast->name = getFreshLabel("rub_dedup$");
+              }
+              replaceBranchTargetsInSubtree(
+                chain[i], chain[i]->name, bLast->name);
+              chain[i]->name = Name();
+              bIParent->list.resize(1);
+              eliminated[i] = true;
+              chainChanged = true;
+            }
+          }
+        } else if (last == n - 1 && bLastParent->type == Type::none &&
+                   bLastParent->name.is()) {
+          // Outermost fallthrough exact duplicate: Arm_i == Arm_{n-1} + (br $b_n)
+          for (Index i = 0; i < last; ++i) {
+            if (eliminated[i] || !chain[i]->name.is()) {
+              continue;
+            }
+            Block* bIParent = chain[i + 1];
+            if (bIParent->list.size() - 1 != armLastLen + 1) {
+              continue;
+            }
+            auto* br = bIParent->list.back()->dynCast<Break>();
+            if (!br || br->condition || br->value ||
+                br->name != bLastParent->name) {
+              continue;
+            }
+            bool allEqual = true;
+            for (Index k = 0; k < armLastLen; ++k) {
+              if (!ExpressionAnalyzer::equal(bIParent->list[1 + k],
+                                             bLastParent->list[1 + k])) {
+                allEqual = false;
+                break;
+              }
+            }
+            if (allEqual) {
+              if (!bLast->name.is()) {
+                bLast->name = getFreshLabel("rub_dedup$");
+              }
+              replaceBranchTargetsInSubtree(
+                chain[i], chain[i]->name, bLast->name);
+              chain[i]->name = Name();
+              bIParent->list.resize(1);
+              eliminated[i] = true;
+              chainChanged = true;
+            }
+          }
+        }
+      }
+
+      // 3. Push br_table (Switch) into All-Constant-Leaf If/Select/i32.sub
+      //    Condition Ladders + Inline Single-Target Arms
+      Block* b0 = chain[0];
+      if (!b0->list.empty()) {
+        if (auto* sw = b0->list.back()->dynCast<Switch>()) {
+          if (!sw->value && sw->condition->type == Type::i32) {
+            bool hasIfOrSelect = false;
+            Index leafCount = 0;
+            if (checkConstLeafTree(sw->condition, hasIfOrSelect, leafCount) &&
+                hasIfOrSelect && leafCount >= 2 && leafCount <= 64) {
+              b0->list.back() =
+                pushSwitchIntoTree(sw->condition, 0, 1, sw, builder);
+              chainChanged = true;
+
+              for (Index m = 0; m < n; ++m) {
+                if (eliminated[m]) {
+                  continue;
+                }
+                Block* bM = chain[m];
+                Block* bMParent = chain[m + 1];
+                Index count = bM->name.is()
+                                ? BranchUtils::BranchSeeker::count(bM, bM->name)
+                                : 0;
+                if (count == 0) {
+                  if (m < n - 1 ||
+                      bMParent->list.back()->type == Type::unreachable ||
+                      bMParent->type == Type::none) {
+                    bM->name = Name();
+                    bMParent->list.resize(1);
+                    eliminated[m] = true;
+                  }
+                  continue;
+                }
+                if (bMParent->list.back()->type != Type::unreachable) {
+                  continue;
+                }
+                bool isOneByteTerminator =
+                  bMParent->list.size() == 2 &&
+                  (bMParent->list[1]->is<Unreachable>() ||
+                   (bMParent->list[1]->is<Return>() &&
+                    !bMParent->list[1]->cast<Return>()->value));
+                if (count == 1 || isOneByteTerminator) {
+                  Index replaced = inlineArmOnSpine(b0->list.back(),
+                                                    bM->name,
+                                                    bMParent,
+                                                    /*cloneStmts=*/count > 1,
+                                                    getModule(),
+                                                    builder);
+                  if (replaced == count) {
+                    bM->name = Name();
+                    bMParent->list.resize(1);
+                    eliminated[m] = true;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // 2. Switch-Arm Shared-Suffix Tail Merging on surviving arms
+      std::vector<bool> usedInPart2(n, false);
+      for (Index last = n - 1; last >= 1; --last) {
+        if (eliminated[last] || usedInPart2[last]) {
+          continue;
+        }
+        Block* bLast = chain[last];
+        Block* bLastParent = chain[last + 1];
+        if (bLastParent->list.size() < 3 ||
+            bLastParent->list.back()->type != Type::unreachable) {
+          continue;
+        }
+        Index armLastLen = bLastParent->list.size() - 1;
+        std::vector<Index> lcp(last, 0);
+        Index maxS = 0;
+        for (Index i = 0; i < last; ++i) {
+          if (eliminated[i] || usedInPart2[i] || !chain[i]->name.is()) {
+            continue;
+          }
+          Block* bIParent = chain[i + 1];
+          if (bIParent->list.size() < 3 ||
+              bIParent->list.back()->type != Type::unreachable) {
+            continue;
+          }
+          Index armILen = bIParent->list.size() - 1;
+          Index limit = std::min(armILen, armLastLen);
+          Index match = 0;
+          while (match < limit &&
+                 ExpressionAnalyzer::equal(
+                   bIParent->list[bIParent->list.size() - 1 - match],
+                   bLastParent->list[bLastParent->list.size() - 1 - match])) {
+            ++match;
+          }
+          if (match >= 2) {
+            lcp[i] = match;
+            maxS = std::max(maxS, match);
+          }
+        }
+        if (maxS < 2) {
+          continue;
+        }
+        std::vector<int32_t> suffixByteLen(maxS + 1, 0);
+        for (Index s = 1; s <= maxS; ++s) {
+          Expression* stmt = bLastParent->list[bLastParent->list.size() - s];
+          suffixByteLen[s] = suffixByteLen[s - 1] + estimateByteLen(stmt);
+        }
+        Index bestS = 0;
+        int32_t bestSavings = 0;
+        for (Index s = 2; s <= maxS; ++s) {
+          int32_t k = 1;
+          for (Index i = 0; i < last; ++i) {
+            if (lcp[i] >= s) {
+              ++k;
+            }
+          }
+          if (k < 2) {
+            continue;
+          }
+          bool prefixLastEmpty = (s == armLastLen);
+          int32_t savings =
+            (k - 1) * (suffixByteLen[s] - 2) - (prefixLastEmpty ? 0 : 3);
+          if (savings > bestSavings) {
+            bestSavings = savings;
+            bestS = s;
+          }
+        }
+        if (bestS < 2 || bestSavings <= 0) {
+          continue;
+        }
+        bool prefixLastEmpty = (bestS == armLastLen);
+        Name target;
+        if (prefixLastEmpty) {
+          if (!bLast->name.is()) {
+            bLast->name = getFreshLabel("rub_tail$");
+          }
+          target = bLast->name;
+        } else {
+          target = getFreshLabel("rub_tail$");
+        }
+        for (Index i = 0; i < last; ++i) {
+          if (lcp[i] < bestS) {
+            continue;
+          }
+          Block* bIParent = chain[i + 1];
+          Index armILen = bIParent->list.size() - 1;
+          if (bestS == armILen) {
+            replaceBranchTargetsInSubtree(chain[i], chain[i]->name, target);
+            chain[i]->name = Name();
+            bIParent->list.resize(1);
+            eliminated[i] = true;
+          } else {
+            bIParent->list.resize(bIParent->list.size() - bestS);
+            bIParent->list.push_back(builder.makeBreak(target));
+          }
+          usedInPart2[i] = true;
+        }
+        if (!prefixLastEmpty) {
+          Index splitIdx = bLastParent->list.size() - bestS;
+          Block* bShared = builder.makeBlock();
+          bShared->name = target;
+          for (Index idx = 0; idx < splitIdx; ++idx) {
+            bShared->list.push_back(bLastParent->list[idx]);
+          }
+          bShared->type = Type::none;
+          ExpressionList newList(getModule()->allocator);
+          newList.push_back(bShared);
+          for (Index idx = splitIdx; idx < bLastParent->list.size(); ++idx) {
+            newList.push_back(bLastParent->list[idx]);
+          }
+          bLastParent->list = std::move(newList);
+        }
+        usedInPart2[last] = true;
+        chainChanged = true;
+      }
+
+      if (chainChanged) {
+        for (Index m = 0; m < n; ++m) {
+          Block* outer = chain[m + 1];
+          if (outer->list.size() == 1) {
+            if (auto* inner = outer->list[0]->dynCast<Block>()) {
+              if (!inner->name.is()) {
+                outer->list = std::move(inner->list);
+              }
+            }
+          }
+        }
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      ReFinalize().walkFunctionInModule(func, getModule());
+    }
+    return changed;
+  }
+
   void doWalkFunction(Function* func) {
     struct OneBitScope {
       OneBitScope(const ModuleOneBitInfo* info, Function* f, Module* m) {
@@ -6187,7 +6789,8 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
       jumpThreader.setModule(getModule());
       jumpThreader.walkFunction(func);
       jumpThreader.finish(func);
-      if (!jumpThreader.trappedSwitchWorked) {
+      bool switchArmsWorked = optimizeSwitchArms(func);
+      if (!jumpThreader.trappedSwitchWorked && !switchArmsWorked) {
         break;
       }
       // A trapping Switch target was removed; run a cycle of RemoveUnusedBrs
