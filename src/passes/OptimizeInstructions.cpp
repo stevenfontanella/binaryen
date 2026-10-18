@@ -324,6 +324,13 @@ struct LocalScanner : ExpressionStackWalker<LocalScanner> {
     }
     return getBitsForType(get->type);
   }
+
+  Index getMaxBitsForArrayGet(ArrayGet* get) {
+    if (moduleOneBitInfo && moduleOneBitInfo->isOneBitArrayGet(get)) {
+      return 1;
+    }
+    return getBitsForType(get->type);
+  }
 };
 
 namespace {
@@ -1296,6 +1303,11 @@ struct OptimizeInstructions
         if (auto* ret = optimizeEqZSelect(select)) {
           return replaceCurrent(ret);
         }
+      }
+      if (canNegateForFree(curr->value) &&
+          (curr->value->is<Call>() || curr->value->is<If>() ||
+           curr->value->is<Select>() || curr->value->is<Block>())) {
+        return replaceCurrent(makeNegatedOneBit(curr->value));
       }
       if (auto* inner = curr->value->dynCast<Binary>()) {
         // Try to invert a relational operation using De Morgan's law
@@ -3273,6 +3285,13 @@ struct OptimizeInstructions
     return getBitsForType(get->type);
   }
 
+  Index getMaxBitsForArrayGet(ArrayGet* get) {
+    if (moduleOneBitInfo && moduleOneBitInfo->isOneBitArrayGet(get)) {
+      return 1;
+    }
+    return getBitsForType(get->type);
+  }
+
 private:
   // Information about our locals and named integer blocks
   std::vector<LocalInfo> localInfo;
@@ -3710,6 +3729,11 @@ private:
               return ret;
             }
           }
+          if (canNegateForFree(unary->value) &&
+              (unary->value->is<Call>() || unary->value->is<If>() ||
+               unary->value->is<Select>() || unary->value->is<Block>())) {
+            return makeNegatedOneBit(unary->value);
+          }
           unary->value = optimizeBoolean(unary->value, /*mustBeOneBit=*/false);
           unary2 = unary->value->dynCast<Unary>();
           if (unary2 && unary2->op == EqZInt32 &&
@@ -3720,6 +3744,11 @@ private:
             if (auto* ret = tryFoldEqZBinary(binary)) {
               return ret;
             }
+          }
+          if (canNegateForFree(unary->value) &&
+              (unary->value->is<Call>() || unary->value->is<If>() ||
+               unary->value->is<Select>() || unary->value->is<Block>())) {
+            return makeNegatedOneBit(unary->value);
           }
         }
         if (unary->op == EqZInt32 || unary->op == EqZInt64) {
@@ -3856,18 +3885,47 @@ private:
     return boolean;
   }
 
+  Name getNegatedCallTwin(Expression* expr) {
+    if (moduleOneBitInfo) {
+      if (auto* call = expr->dynCast<Call>();
+          call && !call->isReturn && call->type == Type::i32) {
+        return moduleOneBitInfo->getNegatedOneBitCallTwin(
+          call->target, getFunction() ? getFunction()->name : Name());
+      }
+    }
+    return Name();
+  }
+
   bool isRemovableOneBitEqZ(Expression* expr) {
     auto* u = expr->dynCast<Unary>();
     return u && u->op == EqZInt32 && Bits::getMaxBits(u->value, this) <= 1 &&
            !(u->value->is<Unary>() && u->value->cast<Unary>()->op == EqZInt32);
   }
 
-  bool canNegateForFree(Expression* expr) {
-    if (isRemovableOneBitEqZ(expr) || expr->is<Const>()) {
+  bool canNegateForFree(Expression* expr, Index depth = 0) {
+    if (!expr || expr->type != Type::i32 || depth > 6) {
+      return false;
+    }
+    if (isRemovableOneBitEqZ(expr) || expr->is<Const>() ||
+        getNegatedCallTwin(expr).is()) {
       return true;
     }
     if (auto* b = expr->dynCast<Binary>()) {
       return invertBinaryOp(b->op) != InvalidBinary;
+    }
+    if (getPassOptions().shrinkLevel > 0) {
+      if (auto* blk = expr->dynCast<Block>()) {
+        return !blk->name.is() && !blk->list.empty() &&
+               canNegateForFree(blk->list.back(), depth + 1);
+      }
+      if (auto* iff = expr->dynCast<If>()) {
+        return iff->ifFalse && canNegateForFree(iff->ifTrue, depth + 1) &&
+               canNegateForFree(iff->ifFalse, depth + 1);
+      }
+      if (auto* sel = expr->dynCast<Select>()) {
+        return canNegateForFree(sel->ifTrue, depth + 1) &&
+               canNegateForFree(sel->ifFalse, depth + 1);
+      }
     }
     return false;
   }
@@ -3879,6 +3937,31 @@ private:
         return u->value;
       }
       return builder.makeUnary(EqZInt32, expr);
+    }
+    if (Name twin = getNegatedCallTwin(expr); twin.is()) {
+      auto* call = expr->cast<Call>();
+      call->target = twin;
+      return call;
+    }
+    if (auto* blk = expr->dynCast<Block>();
+        blk && !blk->name.is() && !blk->list.empty() &&
+        canNegateForFree(blk->list.back())) {
+      blk->list.back() = makeNegatedOneBit(blk->list.back());
+      return blk;
+    }
+    if (auto* iff = expr->dynCast<If>();
+        iff && iff->ifFalse && canNegateForFree(iff->ifTrue) &&
+        canNegateForFree(iff->ifFalse)) {
+      iff->ifTrue = makeNegatedOneBit(iff->ifTrue);
+      iff->ifFalse = makeNegatedOneBit(iff->ifFalse);
+      return iff;
+    }
+    if (auto* sel = expr->dynCast<Select>();
+        sel && canNegateForFree(sel->ifTrue) &&
+        canNegateForFree(sel->ifFalse)) {
+      sel->ifTrue = makeNegatedOneBit(sel->ifTrue);
+      sel->ifFalse = makeNegatedOneBit(sel->ifFalse);
+      return sel;
     }
     return optimizeBoolean(builder.makeUnary(EqZInt32, expr),
                            /*mustBeOneBit=*/true);
@@ -4249,7 +4332,8 @@ private:
         int32_t k = cFalse->value.geti32();
         if ((k == 1 || k == -1) &&
             (curr->ifTrue->is<LocalSet>() ||
-             canNegateForFree(curr->condition)) &&
+             canNegateForFree(curr->condition) ||
+             getPassOptions().shrinkLevel > 0) &&
             areConsecutiveInputsEqual(curr->ifTrue, curr->condition)) {
           return builder.makeBinary(k == 1 ? OrInt32 : SubInt32,
                                     curr->ifTrue,
@@ -4257,52 +4341,206 @@ private:
         }
       }
 
-      // Increment/decrement select:
-      //   c ? (x +/- 1) : x  ==>  x +/- makeOneBit(c)
-      //   c ? x : (x +/- 1)  ==>  x +/- makeNegatedOneBit(c)
-      auto matchIncDec = [](Expression* arm,
-                            Expression*& base,
-                            int32_t& delta) -> bool {
+      // Increment/decrement and single-bit update select:
+      //   c ? (x +|-|||^ (1 << sh)) : x  ==>  x +|-|||^ (makeOneBit(c) << sh)
+      //   c ? x : (x +|-|||^ (1 << sh))  ==>  x +|-|||^ (makeNegatedOneBit(c) << sh)
+      auto matchOneBitUpdate = [](Expression* arm,
+                                  Expression*& base,
+                                  BinaryOp& updateOp,
+                                  int32_t& shift) -> bool {
         auto* bin = arm->dynCast<Binary>();
-        if (!bin || (bin->op != AddInt32 && bin->op != SubInt32)) {
+        if (!bin || (bin->op != AddInt32 && bin->op != SubInt32 &&
+                     bin->op != OrInt32 && bin->op != XorInt32)) {
           return false;
         }
-        if (auto* c = bin->right->dynCast<Const>()) {
-          int32_t v = c->value.geti32();
-          if (v == 1 || v == -1) {
-            base = bin->left;
-            delta = (bin->op == AddInt32) ? v : -v;
-            return true;
+        auto tryConst = [&](Const* c, Expression* other, bool isRight) -> bool {
+          if (!c || c->type != Type::i32) {
+            return false;
           }
-        }
-        if (bin->op == AddInt32) {
-          if (auto* c = bin->left->dynCast<Const>()) {
-            int32_t v = c->value.geti32();
-            if (v == 1 || v == -1) {
-              base = bin->right;
-              delta = v;
+          int32_t v = c->value.geti32();
+          if (bin->op == AddInt32 || (bin->op == SubInt32 && isRight)) {
+            if (v > 0 && Bits::isPowerOf2(uint32_t(v))) {
+              base = other;
+              updateOp = bin->op;
+              shift = Bits::countTrailingZeroes(v);
               return true;
             }
+            if (v < 0 && v != std::numeric_limits<int32_t>::min() &&
+                Bits::isPowerOf2(uint32_t(-v))) {
+              base = other;
+              updateOp = (bin->op == AddInt32) ? SubInt32 : AddInt32;
+              shift = Bits::countTrailingZeroes(-v);
+              return true;
+            }
+          } else if (bin->op == OrInt32 || bin->op == XorInt32) {
+            if (v > 0 && Bits::isPowerOf2(uint32_t(v))) {
+              base = other;
+              updateOp = bin->op;
+              shift = Bits::countTrailingZeroes(v);
+              return true;
+            }
+          }
+          return false;
+        };
+        return tryConst(bin->right->dynCast<Const>(), bin->left, true) ||
+               tryConst(bin->left->dynCast<Const>(), bin->right, false);
+      };
+      Expression* base = nullptr;
+      BinaryOp updateOp = InvalidBinary;
+      int32_t shift = 0;
+      bool condOneBit = Bits::getMaxBits(curr->condition, this) <= 1;
+      bool condFreeNeg = canNegateForFree(curr->condition);
+      if (matchOneBitUpdate(curr->ifTrue, base, updateOp, shift) &&
+          areConsecutiveInputsEqualAndFoldable(base, curr->ifFalse)) {
+        if (shift == 0) {
+          return builder.makeBinary(
+            updateOp, base, makeOneBit(curr->condition));
+        }
+        if (condOneBit || condFreeNeg ||
+            (getPassOptions().shrinkLevel > 0 && shift >= 6)) {
+          return builder.makeBinary(
+            updateOp,
+            base,
+            builder.makeBinary(ShlInt32,
+                               makeOneBit(curr->condition),
+                               builder.makeConst(shift)));
+        }
+      }
+      if (matchOneBitUpdate(curr->ifFalse, base, updateOp, shift) &&
+          areConsecutiveInputsEqualAndFoldable(curr->ifTrue, base)) {
+        if (shift == 0) {
+          return builder.makeBinary(
+            updateOp, curr->ifTrue, makeNegatedOneBit(curr->condition));
+        }
+        if (condOneBit || condFreeNeg || getPassOptions().shrinkLevel > 0) {
+          return builder.makeBinary(
+            updateOp,
+            curr->ifTrue,
+            builder.makeBinary(ShlInt32,
+                               makeNegatedOneBit(curr->condition),
+                               builder.makeConst(shift)));
+        }
+      }
+
+      // Negation / bitwise-not selects:
+      //   c ? -x : ~x        ==>  ~x + makeOneBit(c)
+      //   c ? ~x : -x        ==>  ~x + makeNegatedOneBit(c)
+      //   (x < 0) ? ~x : x   ==>  x ^ (x >>_s 31)
+      //   (x >= 0) ? x : ~x  ==>  x ^ (x >>_s 31)
+      //   c_1bit ? ~x : x    ==>  x ^ (0 - c_1bit) / x ^ (makeNegatedOneBit(c) - 1)
+      //   c_1bit ? x : ~x    ==>  x ^ (c_1bit - 1) / x ^ (0 - makeNegatedOneBit(c))
+      auto matchBitNot = [](Expression* arm, Expression*& notBase) -> bool {
+        auto* bin = arm->dynCast<Binary>();
+        if (!bin) {
+          return false;
+        }
+        if (bin->op == SubInt32) {
+          if (auto* c = bin->left->dynCast<Const>();
+              c && c->value.geti32() == -1) {
+            notBase = bin->right;
+            return true;
+          }
+        } else if (bin->op == XorInt32) {
+          if (auto* c = bin->right->dynCast<Const>();
+              c && c->value.geti32() == -1) {
+            notBase = bin->left;
+            return true;
+          }
+          if (auto* c = bin->left->dynCast<Const>();
+              c && c->value.geti32() == -1) {
+            notBase = bin->right;
+            return true;
           }
         }
         return false;
       };
-      Expression* base = nullptr;
-      int32_t delta = 0;
-      if (matchIncDec(curr->ifTrue, base, delta) &&
-          areConsecutiveInputsEqualAndFoldable(base, curr->ifFalse)) {
-        bool useNeg = isRemovableOneBitEqZ(curr->condition);
-        if (!useNeg) {
-          return builder.makeBinary(delta == 1 ? AddInt32 : SubInt32,
-                                    base,
-                                    makeOneBit(curr->condition));
+      auto matchNeg = [](Expression* arm, Expression*& negBase) -> bool {
+        auto* bin = arm->dynCast<Binary>();
+        if (bin && bin->op == SubInt32) {
+          if (auto* c = bin->left->dynCast<Const>();
+              c && c->value.geti32() == 0) {
+            negBase = bin->right;
+            return true;
+          }
+        }
+        return false;
+      };
+      Expression *negBase = nullptr, *notBase = nullptr;
+      if (matchNeg(curr->ifTrue, negBase) &&
+          matchBitNot(curr->ifFalse, notBase) &&
+          areConsecutiveInputsEqualAndFoldable(negBase, notBase)) {
+        return builder.makeBinary(
+          AddInt32,
+          builder.makeBinary(XorInt32, negBase, builder.makeConst(int32_t(-1))),
+          makeOneBit(curr->condition));
+      }
+      if (matchBitNot(curr->ifTrue, notBase) &&
+          matchNeg(curr->ifFalse, negBase) &&
+          areConsecutiveInputsEqualAndFoldable(notBase, negBase)) {
+        return builder.makeBinary(
+          AddInt32,
+          builder.makeBinary(XorInt32, notBase, builder.makeConst(int32_t(-1))),
+          makeNegatedOneBit(curr->condition));
+      }
+      if (matchBitNot(curr->ifTrue, notBase) &&
+          areConsecutiveInputsEqualAndFoldable(notBase, curr->ifFalse)) {
+        if (auto* bC = curr->condition->dynCast<Binary>();
+            bC && bC->op == LtSInt32 && curr->ifFalse->is<LocalGet>() &&
+            ExpressionAnalyzer::equal(curr->ifFalse, bC->left)) {
+          if (auto* cZero = bC->right->dynCast<Const>();
+              cZero && cZero->value.geti32() == 0) {
+            return builder.makeBinary(
+              XorInt32,
+              notBase,
+              builder.makeBinary(
+                ShrSInt32, bC->left, builder.makeConst(int32_t(31))));
+          }
+        }
+        if (condFreeNeg) {
+          return builder.makeBinary(
+            XorInt32,
+            notBase,
+            builder.makeBinary(SubInt32,
+                               makeNegatedOneBit(curr->condition),
+                               builder.makeConst(int32_t(1))));
+        }
+        if (condOneBit) {
+          return builder.makeBinary(
+            XorInt32,
+            notBase,
+            builder.makeBinary(
+              SubInt32, builder.makeConst(int32_t(0)), curr->condition));
         }
       }
-      if (matchIncDec(curr->ifFalse, base, delta) &&
-          areConsecutiveInputsEqualAndFoldable(curr->ifTrue, base)) {
-        return builder.makeBinary(delta == 1 ? AddInt32 : SubInt32,
-                                  curr->ifTrue,
-                                  makeNegatedOneBit(curr->condition));
+      if (matchBitNot(curr->ifFalse, notBase) &&
+          areConsecutiveInputsEqualAndFoldable(curr->ifTrue, notBase)) {
+        if (auto* bC = curr->condition->dynCast<Binary>();
+            bC && bC->op == GeSInt32 && notBase->is<LocalGet>() &&
+            ExpressionAnalyzer::equal(notBase, bC->left)) {
+          if (auto* cZero = bC->right->dynCast<Const>();
+              cZero && cZero->value.geti32() == 0) {
+            return builder.makeBinary(
+              XorInt32,
+              curr->ifTrue,
+              builder.makeBinary(
+                ShrSInt32, bC->left, builder.makeConst(int32_t(31))));
+          }
+        }
+        if (condOneBit && !isRemovableOneBitEqZ(curr->condition)) {
+          return builder.makeBinary(
+            XorInt32,
+            curr->ifTrue,
+            builder.makeBinary(
+              SubInt32, curr->condition, builder.makeConst(int32_t(1))));
+        }
+        if (condFreeNeg) {
+          return builder.makeBinary(
+            XorInt32,
+            curr->ifTrue,
+            builder.makeBinary(SubInt32,
+                               builder.makeConst(int32_t(0)),
+                               makeNegatedOneBit(curr->condition)));
+        }
       }
 
       // Three-way comparison select:
@@ -4410,10 +4648,12 @@ private:
             curr->condition->is<Unary>() &&
             curr->condition->cast<Unary>()->op == EqZInt32 &&
             !isRemovableOneBitEqZ(curr->condition);
-          bool condOneBit =
-            Bits::getMaxBits(curr->condition, this) <= 1 && !isNonOneBitEqz;
+          bool condOneBit = Bits::getMaxBits(curr->condition, this) <= 1;
           bool condFreeNeg = canNegateForFree(curr->condition);
           bool allowNonOneBit = getPassOptions().shrinkLevel > 0;
+          if (isNonOneBitEqz && !allowNonOneBit) {
+            condOneBit = false;
+          }
           // c ? (k2 + 1) : k2
           if (int64_t(k1) - int64_t(k2) == 1 &&
               (condOneBit || condFreeNeg || allowNonOneBit)) {
@@ -4471,6 +4711,89 @@ private:
             if (k1 > 0 && k1 <= 0x3fffffff && k2 == 2 * k1) {
               return builder.makeBinary(
                 ShrUInt32, builder.makeConst(k2), curr->condition);
+            }
+          }
+        }
+      }
+    }
+    if (curr->type == Type::i64 && curr->ifTrue->type == Type::i64 &&
+        curr->ifFalse->type == Type::i64 &&
+        curr->condition->type == Type::i32) {
+      auto matchIncDec64 = [](Expression* arm,
+                              Expression*& base,
+                              BinaryOp& updateOp) -> bool {
+        auto* bin = arm->dynCast<Binary>();
+        if (!bin || (bin->op != AddInt64 && bin->op != SubInt64)) {
+          return false;
+        }
+        if (auto* c = bin->right->dynCast<Const>()) {
+          int64_t v = c->value.geti64();
+          if (v == 1 || v == -1) {
+            base = bin->left;
+            updateOp = ((bin->op == AddInt64) == (v == 1)) ? AddInt64 : SubInt64;
+            return true;
+          }
+        }
+        if (bin->op == AddInt64) {
+          if (auto* c = bin->left->dynCast<Const>()) {
+            int64_t v = c->value.geti64();
+            if (v == 1 || v == -1) {
+              base = bin->right;
+              updateOp = (v == 1) ? AddInt64 : SubInt64;
+              return true;
+            }
+          }
+        }
+        return false;
+      };
+      Expression* base64 = nullptr;
+      BinaryOp updateOp64 = InvalidBinary;
+      if (matchIncDec64(curr->ifTrue, base64, updateOp64) &&
+          areConsecutiveInputsEqualAndFoldable(base64, curr->ifFalse)) {
+        return builder.makeBinary(
+          updateOp64,
+          base64,
+          builder.makeUnary(ExtendUInt32, makeOneBit(curr->condition)));
+      }
+      if (matchIncDec64(curr->ifFalse, base64, updateOp64) &&
+          areConsecutiveInputsEqualAndFoldable(curr->ifTrue, base64)) {
+        return builder.makeBinary(
+          updateOp64,
+          curr->ifTrue,
+          builder.makeUnary(ExtendUInt32, makeNegatedOneBit(curr->condition)));
+      }
+      if (auto* c1 = curr->ifTrue->dynCast<Const>()) {
+        if (auto* c2 = curr->ifFalse->dynCast<Const>()) {
+          int64_t k1 = c1->value.geti64();
+          int64_t k2 = c2->value.geti64();
+          bool condOneBit = Bits::getMaxBits(curr->condition, this) <= 1;
+          bool condFreeNeg = canNegateForFree(curr->condition);
+          if ((condOneBit || condFreeNeg) && k1 != 0 && k2 != 0) {
+            if (k1 > k2 && uint64_t(k1) - uint64_t(k2) == 1) {
+              if (isRemovableOneBitEqZ(curr->condition) || !condOneBit) {
+                return builder.makeBinary(
+                  SubInt64,
+                  builder.makeConst(k1),
+                  builder.makeUnary(ExtendUInt32,
+                                    makeNegatedOneBit(curr->condition)));
+              }
+              return builder.makeBinary(
+                AddInt64,
+                builder.makeUnary(ExtendUInt32, curr->condition),
+                builder.makeConst(k2));
+            }
+            if (k2 > k1 && uint64_t(k2) - uint64_t(k1) == 1) {
+              if (condFreeNeg || !condOneBit) {
+                return builder.makeBinary(
+                  AddInt64,
+                  builder.makeUnary(ExtendUInt32,
+                                    makeNegatedOneBit(curr->condition)),
+                  builder.makeConst(k1));
+              }
+              return builder.makeBinary(
+                SubInt64,
+                builder.makeConst(k2),
+                builder.makeUnary(ExtendUInt32, curr->condition));
             }
           }
         }

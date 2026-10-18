@@ -156,6 +156,9 @@ struct DummyLocalInfoProvider {
   Index getMaxBitsForBlock(Block* block) {
     return block->type == Type::i64 ? 64 : 32;
   }
+  Index getMaxBitsForArrayGet(ArrayGet* get) {
+    return get->type == Type::i64 ? 64 : 32;
+  }
 };
 
 // Returns the maximum amount of bits used in an integer expression
@@ -541,6 +544,12 @@ Index getMaxBits(Expression* curr,
       }
     }
   } else if (auto* get = curr->dynCast<ArrayGet>()) {
+    if (localInfoProvider) {
+      auto bits = localInfoProvider->getMaxBitsForArrayGet(get);
+      if (bits < (get->type == Type::i64 ? Index(64) : Index(32))) {
+        return bits;
+      }
+    }
     if (!get->signed_ && get->ref->type.isArray()) {
       const auto& field = get->ref->type.getHeapType().getArray().element;
       if (field.isPacked()) {

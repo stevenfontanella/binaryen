@@ -246,6 +246,41 @@ static bool isOneBitI32(Expression* curr, Index depth = 0) {
     if (currentOneBitInfo && currentOneBitInfo->isOneBitBlock(block)) {
       return true;
     }
+    if (!block->list.empty() &&
+        (block->list.back()->type == Type::unreachable ||
+         isOneBitI32(block->list.back(), depth + 1))) {
+      struct CheckBlockBranches
+        : public PostWalker<CheckBlockBranches,
+                            UnifiedExpressionVisitor<CheckBlockBranches>> {
+        Name targetName;
+        Index depth;
+        Index count = 0;
+        bool ok = true;
+        CheckBlockBranches(Name targetName, Index depth)
+          : targetName(targetName), depth(depth) {}
+        void visitExpression(Expression* expr) {
+          if (!ok || ++count > 32) {
+            ok = false;
+            return;
+          }
+          if ((expr->is<Break>() || expr->is<Switch>() || expr->is<BrOn>() ||
+               expr->is<TryTable>()) &&
+              BranchUtils::isBranchReachable(expr)) {
+            BranchUtils::operateOnScopeNameUsesAndSentValues(
+              expr, [&](Name& name, Expression* val) {
+                if (name == targetName) {
+                  if (!val || (val->type != Type::unreachable &&
+                               !isOneBitI32(val, depth + 1))) {
+                    ok = false;
+                  }
+                }
+              });
+          }
+        }
+      } checker(block->name, depth);
+      checker.walk(curr);
+      return checker.ok;
+    }
   }
   if (auto* loop = curr->dynCast<Loop>()) {
     return isOneBitI32(loop->body, depth + 1);
@@ -273,6 +308,9 @@ static bool isOneBitI32(Expression* curr, Index depth = 0) {
     return currentOneBitInfo && sg->ref->type.isStruct() &&
            currentOneBitInfo->isOneBitStructField(sg->ref->type.getHeapType(),
                                                   sg->index);
+  }
+  if (auto* ag = curr->dynCast<ArrayGet>()) {
+    return currentOneBitInfo && currentOneBitInfo->isOneBitArrayGet(ag);
   }
   if (auto* call = curr->dynCast<Call>()) {
     if (currentOneBitInfo && currentOneBitInfo->isOneBitReturn(call->target)) {
@@ -410,6 +448,16 @@ static bool canInvertBoolExprFree(Expression* curr, Index depth = 0) {
     return canInvertBoolExprFree(sel->ifTrue, depth + 1) &&
            canInvertBoolExprFree(sel->ifFalse, depth + 1);
   }
+  if (currentOneBitInfo) {
+    if (auto* call = curr->dynCast<Call>();
+        call && !call->isReturn && call->type == Type::i32) {
+      Name caller = currentOneBitFunc ? currentOneBitFunc->name : Name();
+      if (currentOneBitInfo->getNegatedOneBitCallTwin(call->target, caller)
+            .is()) {
+        return true;
+      }
+    }
+  }
   return false;
 }
 
@@ -447,6 +495,18 @@ static void invertBoolExprFree(Expression*& curr, Builder& builder) {
     invertBoolExprFree(sel->ifTrue, builder);
     invertBoolExprFree(sel->ifFalse, builder);
     return;
+  }
+  if (currentOneBitInfo) {
+    if (auto* call = curr->dynCast<Call>();
+        call && !call->isReturn && call->type == Type::i32) {
+      Name caller = currentOneBitFunc ? currentOneBitFunc->name : Name();
+      if (Name twin =
+            currentOneBitInfo->getNegatedOneBitCallTwin(call->target, caller);
+          twin.is()) {
+        call->target = twin;
+        return;
+      }
+    }
   }
   WASM_UNREACHABLE("unexpected expression in invertBoolExprFree");
 }
@@ -1334,6 +1394,12 @@ static Expression* tryFoldBooleanBreakCondition(Break* curr,
                          prependToArm(builder, prefixFalse, uncondArm));
     BranchHints::copyTo(inner, newIf, func);
     return newIf;
+  }
+
+  if (negated && canInvertBoolExprFree(cond)) {
+    invertBoolExprFree(cond, builder);
+    curr->condition = cond;
+    return finishInPlace();
   }
 
   return nullptr;
@@ -4698,6 +4764,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         Expression* shortArm = nullptr;
         bool foldLastConstIntoPass = false;
         Index numTrailingAndOrFolds = 0;
+        Index numCondAndFolds = 0;
         bool foldAllToAndOr = false;
       };
 
@@ -4835,6 +4902,29 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
             }
           }
         }
+        if (!plan.foldAllToAndOr && !neverUnconditionalize && remN >= 2 &&
+            (plan.steps[0].negated || isOneBitI32(plan.steps[0].cond))) {
+          bool allRemPureOneBit = true;
+          int condFoldExtra = 0;
+          for (size_t i = 1; i < remN; i++) {
+            const ShortCircuitStep& si = plan.steps[i];
+            if (!si.prefix.empty() ||
+                !(si.negated || isOneBitI32(si.cond)) ||
+                EffectAnalyzer(getPassOptions(), *getModule(), si.cond)
+                  .hasSideEffects() ||
+                tooCostlyToRunUnconditionally(getPassOptions(), si.cond) ||
+                estimateMinBinaryBytes(si.cond) > 6) {
+              allRemPureOneBit = false;
+              break;
+            }
+            condFoldExtra += 1 + posEqzCost(si);
+          }
+          if (allRemPureOneBit) {
+            plan.numCondAndFolds = Index(remN - 1);
+            remN = 1;
+            extraPassBytes += condFoldExtra;
+          }
+        }
 
         int newBytes = 0;
         if (plan.foldAllToAndOr) {
@@ -4949,7 +5039,14 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         }
         if (remN == 1) {
           const ShortCircuitStep& s0 = plan.steps[0];
-          Expression* cond0 = materializePosCond(s0);
+          Expression* cond0 = (plan.numCondAndFolds > 0)
+                                ? materializePosOneBit(s0)
+                                : materializePosCond(s0);
+          for (Index f = 0; f < plan.numCondAndFolds; f++) {
+            const ShortCircuitStep& sNext = plan.steps[1 + f];
+            cond0 = builder.makeBinary(
+              AndInt32, cond0, materializePosOneBit(sNext));
+          }
           auto* singleIf =
             builder.makeIf(cond0, newPassArm, plan.shortArm, rootIf->type);
           Expression* res = prependToArm(builder, s0.prefix, singleIf);
@@ -5236,8 +5333,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
               &iff->condition, false, false, Type::unreachable, tryDepth);
             bool armVoidTail = (iff->type == Type::none);
             bool armFuncReturnTail =
-              isFuncReturnTail &&
-              (iff->type == funcResults || iff->type == Type::unreachable);
+              isFuncReturnTail && Type::isSubType(iff->type, funcResults);
             Type armElidableType = iff->type;
             walkShortCircuitChains(&iff->ifTrue,
                                    armVoidTail &&
@@ -5314,10 +5410,21 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                       }
                       if (ret1 && ret1->value &&
                           ret1->value->type != Type::unreachable &&
-                          Type::isSubType(ret1->value->type, blk->type) &&
                           Type::isSubType(ret1->value->type, funcResults)) {
-                        isModeR = true;
-                        thenRetVal = ret1->value;
+                        bool blkIsTargeted =
+                          blk->name.is() &&
+                          BranchUtils::BranchSeeker::has(blk, blk->name);
+                        Type newBlkType =
+                          Type::getLeastUpperBound(blk->type, ret1->value->type);
+                        if (newBlkType != Type::unreachable &&
+                            Type::isSubType(newBlkType, funcResults) &&
+                            (!blkIsTargeted ||
+                             Type::isSubType(ret1->value->type, blk->type)) &&
+                            (elidableTailType == Type::unreachable ||
+                             Type::isSubType(newBlkType, elidableTailType))) {
+                          isModeR = true;
+                          thenRetVal = ret1->value;
+                        }
                       }
                     }
                     if (isModeU || isModeR) {
@@ -5391,10 +5498,13 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                           appendPrefixAndStmt(blk, d0.prefix, outerVoidIf);
                           if (isModeR) {
                             appendPrefixAndStmt(blk, thenRetPrefix, thenRetVal);
+                            blk->finalize(
+                              Type::getLeastUpperBound(blk->type,
+                                                       thenRetVal->type));
                           } else {
                             appendPrefixAndStmt(blk, {}, iff->ifTrue);
+                            blk->finalize(blk->type);
                           }
-                          blk->finalize(blk->type);
                           lowerer.changed = true;
                           walkShortCircuitChains(currp,
                                                  isVoidTail,
@@ -5428,8 +5538,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
               blk->type == Type::none && blk->list.back()->type == Type::none &&
               (isVoidTail || isTargeted);
             bool backIsFuncReturnTail =
-              isFuncReturnTail &&
-              (blk->type == funcResults || blk->type == Type::unreachable);
+              isFuncReturnTail && Type::isSubType(blk->type, funcResults);
             Type backElidableType = isTargeted ? blk->type : elidableTailType;
             walkShortCircuitChains(&blk->list.back(),
                                    backIsVoidTail,
@@ -5455,8 +5564,8 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
     // at StackIR-elidable void tail positions (1(a) void function body,
     // 1(b.1/b.2) void If arm, 1(c) targeted void Block tail).
     if (allowFuncExit && func->body) {
-      std::function<void(Expression**, bool)> walkVoidTails =
-        [&](Expression** currp, bool isVoidTail) {
+      std::function<void(Expression**, bool, Name)> walkVoidTails =
+        [&](Expression** currp, bool isVoidTail, Name enclosingTailLabel) {
           Expression* curr = *currp;
           if (!curr) {
             return;
@@ -5482,11 +5591,15 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                 pushEqzIntoIfOrExprFree(negCond, builder);
               }
               if (negCond) {
-                Name bName = makeFreshBlockName("tail_if$");
-                auto* brIf = builder.makeBreak(bName, nullptr, negCond);
+                bool reuseLabel = enclosingTailLabel.is();
+                Name targetName = reuseLabel
+                                    ? enclosingTailLabel
+                                    : makeFreshBlockName("tail_if$");
+                auto* brIf = builder.makeBreak(targetName, nullptr, negCond);
                 BranchHints::copyFlippedTo(iff, brIf, func);
                 BranchHints::clear(iff, func);
-                auto* blk = builder.makeBlock(bName, {brIf}, Type::none);
+                auto* blk = builder.makeBlock(
+                  reuseLabel ? Name() : targetName, {brIf}, Type::none);
                 if (auto* tb = iff->ifTrue->dynCast<Block>();
                     tb && !tb->name.is()) {
                   for (auto* item : tb->list) {
@@ -5496,19 +5609,25 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                   blk->list.push_back(iff->ifTrue);
                 }
                 blk->finalize(Type::none);
-                nameToBlock[bName] = blk;
+                if (!reuseLabel) {
+                  nameToBlock[targetName] = blk;
+                }
                 *currp = blk;
                 lowerer.changed = true;
-                walkVoidTails(currp, true);
+                walkVoidTails(currp, true, targetName);
                 return;
               }
             }
             bool armVoidTail = (iff->type == Type::none);
+            bool trueTail = armVoidTail && iff->ifTrue->type == Type::none;
             walkVoidTails(&iff->ifTrue,
-                          armVoidTail && iff->ifTrue->type == Type::none);
+                          trueTail,
+                          trueTail ? enclosingTailLabel : Name());
             if (iff->ifFalse) {
+              bool falseTail = armVoidTail && iff->ifFalse->type == Type::none;
               walkVoidTails(&iff->ifFalse,
-                            armVoidTail && iff->ifFalse->type == Type::none);
+                            falseTail,
+                            falseTail ? enclosingTailLabel : Name());
             }
             return;
           }
@@ -5521,22 +5640,25 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
               if (blk->list[i]->type == Type::unreachable) {
                 hasEarlierUnreachable = true;
               }
-              walkVoidTails(&blk->list[i], false);
+              walkVoidTails(&blk->list[i], false, Name());
             }
+            bool isTargeted =
+              blk->name.is() && BranchUtils::BranchSeeker::has(blk, blk->name);
             bool backIsVoidTail =
               !hasEarlierUnreachable && blk->type == Type::none &&
               blk->list.back()->type == Type::none &&
-              (isVoidTail ||
-               (blk->name.is() &&
-                BranchUtils::BranchSeeker::has(blk, blk->name)));
-            walkVoidTails(&blk->list.back(), backIsVoidTail);
+              (isVoidTail || isTargeted);
+            Name backLabel = !backIsVoidTail
+                               ? Name()
+                               : (isTargeted ? blk->name : enclosingTailLabel);
+            walkVoidTails(&blk->list.back(), backIsVoidTail, backLabel);
             return;
           }
           for (auto*& child : ChildIterator(curr)) {
-            walkVoidTails(&child, false);
+            walkVoidTails(&child, false, Name());
           }
         };
-      walkVoidTails(&func->body, funcResults == Type::none);
+      walkVoidTails(&func->body, funcResults == Type::none, Name());
     }
 
     if (lowerer.changed) {

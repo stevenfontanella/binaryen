@@ -349,11 +349,13 @@ computeReachingDefs(Function* func,
 struct ModuleOneBitInfo {
   std::unordered_map<HeapType, std::vector<bool>> oneBitStructFields;
   std::unordered_set<Name> oneBitGlobals;
+  std::unordered_set<Name> oneBitArrayGlobals;
   std::unordered_set<Name> oneBitReturns;
   std::unordered_map<Name, std::vector<bool>> oneBitParams;
   std::unordered_map<Name, std::vector<bool>> oneBitLocals;
   std::unordered_set<LocalGet*> oneBitLocalGets;
   std::unordered_set<Block*> oneBitBlocks;
+  std::unordered_map<Name, Name> negatedOneBitCallTwin;
 
   bool isOneBitStructField(HeapType ht, Index idx) const {
     auto it = oneBitStructFields.find(ht);
@@ -362,6 +364,38 @@ struct ModuleOneBitInfo {
   }
 
   bool isOneBitGlobal(Name name) const { return oneBitGlobals.contains(name); }
+
+  bool isOneBitArrayGlobal(Name name) const {
+    return oneBitArrayGlobals.contains(name);
+  }
+
+  bool isOneBitArrayGet(ArrayGet* ag) const {
+    if (!ag) {
+      return false;
+    }
+    Expression* ref = ag->ref;
+    while (ref) {
+      if (auto* ra = ref->dynCast<RefAs>(); ra && ra->op == RefAsNonNull) {
+        ref = ra->value;
+      } else if (auto* rc = ref->dynCast<RefCast>()) {
+        ref = rc->ref;
+      } else {
+        break;
+      }
+    }
+    if (auto* gg = ref ? ref->dynCast<GlobalGet>() : nullptr) {
+      return oneBitArrayGlobals.contains(gg->name);
+    }
+    return false;
+  }
+
+  Name getNegatedOneBitCallTwin(Name target, Name callerFunc = Name()) const {
+    auto it = negatedOneBitCallTwin.find(target);
+    if (it != negatedOneBitCallTwin.end() && it->second != callerFunc) {
+      return it->second;
+    }
+    return Name();
+  }
 
   bool isOneBitReturn(Name funcName) const {
     return oneBitReturns.contains(funcName);
@@ -424,6 +458,9 @@ struct ModuleOneBitInfo {
       return sg->ref->type.isStruct() &&
              isOneBitStructField(sg->ref->type.getHeapType(), sg->index);
     }
+    if (auto* ag = curr->dynCast<ArrayGet>()) {
+      return isOneBitArrayGet(ag);
+    }
     if (auto* call = curr->dynCast<Call>()) {
       return isOneBitReturn(call->target);
     }
@@ -472,11 +509,13 @@ struct ModuleOneBitInfo {
   void compute(Module& wasm, const PassOptions& options) {
     oneBitStructFields.clear();
     oneBitGlobals.clear();
+    oneBitArrayGlobals.clear();
     oneBitReturns.clear();
     oneBitParams.clear();
     oneBitLocals.clear();
     oneBitLocalGets.clear();
     oneBitBlocks.clear();
+    negatedOneBitCallTwin.clear();
 
     if (options.worldMode != WorldMode::Closed) {
       for (auto& f : wasm.functions) {
@@ -764,9 +803,17 @@ struct ModuleOneBitInfo {
     }
 
     for (auto& g : wasm.globals) {
-      if (!g->imported() && g->init && isTrackedOneBitType(g->type) &&
-          (!g->mutable_ || !exportedGlobals.contains(g->name))) {
-        oneBitGlobals.insert(g->name);
+      if (!g->imported() && g->init) {
+        if (isTrackedOneBitType(g->type) &&
+            (!g->mutable_ || !exportedGlobals.contains(g->name))) {
+          oneBitGlobals.insert(g->name);
+        } else if (!g->mutable_ && g->type.isArray()) {
+          auto elem = g->type.getHeapType().getArray().element;
+          if (elem.mutable_ == Immutable && isTrackedOneBitType(elem.type) &&
+              (g->init->is<ArrayNewFixed>() || g->init->is<ArrayNew>())) {
+            oneBitArrayGlobals.insert(g->name);
+          }
+        }
       }
     }
 
@@ -798,9 +845,7 @@ struct ModuleOneBitInfo {
         continue;
       }
       auto& fs = analysis.map[f.get()];
-      if (isTrackedOneBitType(f->getResults()) && !fs.hasIndirectTailCall &&
-          (!fs.returnValues.empty() || !fs.tailCallTargets.empty() ||
-           !fs.tailCallRefs.empty())) {
+      if (isTrackedOneBitType(f->getResults()) && !fs.hasIndirectTailCall) {
         oneBitReturns.insert(f->name);
       }
       auto& params = oneBitParams[f->name];
@@ -966,6 +1011,12 @@ struct ModuleOneBitInfo {
         }
         return get->type == Type::i64 ? 64 : 32;
       }
+      Index getMaxBitsForArrayGet(ArrayGet* get) {
+        if (info.isOneBitArrayGet(get)) {
+          return 1;
+        }
+        return get->type == Type::i64 ? 64 : 32;
+      }
     } provider(*this);
 
     auto isOneBitExpr = [&](Expression* val) -> bool {
@@ -984,6 +1035,28 @@ struct ModuleOneBitInfo {
         if (oneBitGlobals.contains(g->name) && !isOneBitExpr(g->init)) {
           oneBitGlobals.erase(g->name);
           changed = true;
+        }
+        if (oneBitArrayGlobals.contains(g->name)) {
+          bool ok = true;
+          if (auto* anf = g->init->dynCast<ArrayNewFixed>()) {
+            for (auto* val : anf->values) {
+              if (!val->type.isNull() && !isOneBitExpr(val)) {
+                ok = false;
+                break;
+              }
+            }
+          } else if (auto* an = g->init->dynCast<ArrayNew>()) {
+            if (!an->isWithDefault() && !an->init->type.isNull() &&
+                !isOneBitExpr(an->init)) {
+              ok = false;
+            }
+          } else {
+            ok = false;
+          }
+          if (!ok) {
+            oneBitArrayGlobals.erase(g->name);
+            changed = true;
+          }
         }
       }
       for (auto& [field, val] : moduleSummary.structNewWrites) {
@@ -1153,6 +1226,48 @@ struct ModuleOneBitInfo {
             }
           }
         }
+      }
+    }
+
+    for (auto& f : wasm.functions) {
+      if (f->imported() || !f->body || f->getResults() != Type::i32 ||
+          f->getNumVars() != 0 || !oneBitReturns.contains(f->name)) {
+        continue;
+      }
+      Expression* body = f->body;
+      if (auto* ret = body->dynCast<Return>(); ret && ret->value) {
+        body = ret->value;
+      }
+      auto* u = body->dynCast<Unary>();
+      if (!u || u->op != EqZInt32) {
+        continue;
+      }
+      auto* call = u->value->dynCast<Call>();
+      if (!call || call->isReturn ||
+          call->operands.size() != f->getNumParams()) {
+        continue;
+      }
+      auto* targetFunc = wasm.getFunctionOrNull(call->target);
+      if (!targetFunc || targetFunc->getParams() != f->getParams() ||
+          targetFunc->getResults() != Type::i32 ||
+          !oneBitReturns.contains(call->target) || call->target == f->name) {
+        continue;
+      }
+      bool argsMatch = true;
+      for (Index i = 0; i < call->operands.size(); i++) {
+        auto* lg = call->operands[i]->dynCast<LocalGet>();
+        if (!lg || lg->index != i) {
+          argsMatch = false;
+          break;
+        }
+      }
+      if (!argsMatch) {
+        continue;
+      }
+      negatedOneBitCallTwin[f->name] = call->target;
+      if (directCallCount[f->name] >= 2 &&
+          !negatedOneBitCallTwin.contains(call->target)) {
+        negatedOneBitCallTwin[call->target] = f->name;
       }
     }
 

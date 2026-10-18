@@ -140,6 +140,8 @@
 
   ;; CHECK:      (type $54 (func (param (ref $B) (ref $C) i32) (result i32)))
 
+  ;; CHECK:      (type $55 (func (param i32 i64) (result i32)))
+
   ;; CHECK:      (import "env" "get-i32" (func $get-i32 (type $8) (result i32)))
   (import "env" "get-i32" (func $get-i32 (result i32)))
 
@@ -4076,6 +4078,83 @@
           (i32.eq (local.get $x) (i32.const 2))
           (then (local.get $b))
           (else (ref.null none))
+        )
+      )
+    )
+  )
+
+  ;; CHECK:      (func $select-one-bit-updates-and-neg (type $55) (param $x i32) (param $y i64) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (i32.xor
+  ;; CHECK-NEXT:      (local.get $x)
+  ;; CHECK-NEXT:      (i32.const -1)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.eq
+  ;; CHECK-NEXT:      (local.get $x)
+  ;; CHECK-NEXT:      (i32.const 7)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (i32.wrap_i64
+  ;; CHECK-NEXT:      (i64.add
+  ;; CHECK-NEXT:       (i64.extend_i32_u
+  ;; CHECK-NEXT:        (i32.eq
+  ;; CHECK-NEXT:         (local.get $x)
+  ;; CHECK-NEXT:         (i32.const 9)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:       (local.get $y)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.xor
+  ;; CHECK-NEXT:      (i32.shr_s
+  ;; CHECK-NEXT:       (local.get $x)
+  ;; CHECK-NEXT:       (i32.const 31)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (local.get $x)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.or
+  ;; CHECK-NEXT:    (i32.shl
+  ;; CHECK-NEXT:     (i32.eq
+  ;; CHECK-NEXT:      (local.get $x)
+  ;; CHECK-NEXT:      (i32.const 5)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.const 1)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $select-one-bit-updates-and-neg (param $x i32) (param $y i64) (result i32)
+    (i32.add
+      (select
+        (i32.or (local.get $x) (i32.const 2))
+        (local.get $x)
+        (i32.eq (local.get $x) (i32.const 5))
+      )
+      (i32.add
+        (select
+          (i32.sub (i32.const 0) (local.get $x))
+          (i32.xor (local.get $x) (i32.const -1))
+          (i32.eq (local.get $x) (i32.const 7))
+        )
+        (i32.add
+          (select
+            (i32.xor (local.get $x) (i32.const -1))
+            (local.get $x)
+            (i32.lt_s (local.get $x) (i32.const 0))
+          )
+          (i32.wrap_i64
+            (select (result i64)
+              (i64.add (local.get $y) (i64.const 1))
+              (local.get $y)
+              (i32.eq (local.get $x) (i32.const 9))
+            )
+          )
         )
       )
     )

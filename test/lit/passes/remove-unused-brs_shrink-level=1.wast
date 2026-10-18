@@ -15,6 +15,8 @@
 
   ;; CHECK:      (type $4 (func (param i32 i32 i32) (result i32)))
 
+  ;; CHECK:      (type $5 (func (param i32 i32)))
+
   ;; CHECK:      (memory $0 256 256)
 
   ;; CHECK:      (func $b14 (result i32)
@@ -579,5 +581,63 @@
       )
     )
     (i32.const 30)
+  )
+  ;; CHECK:      (func $br-if-neg-free-invert (param $x i32) (param $y i32)
+  ;; CHECK-NEXT:  (block $out
+  ;; CHECK-NEXT:   (br_if $out
+  ;; CHECK-NEXT:    (select
+  ;; CHECK-NEXT:     (block (result i32)
+  ;; CHECK-NEXT:      (drop
+  ;; CHECK-NEXT:       (i32.const 1)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (i32.ge_s
+  ;; CHECK-NEXT:       (local.get $x)
+  ;; CHECK-NEXT:       (i32.const 10)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (block (result i32)
+  ;; CHECK-NEXT:      (drop
+  ;; CHECK-NEXT:       (i32.const 2)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (i32.ne
+  ;; CHECK-NEXT:       (local.get $y)
+  ;; CHECK-NEXT:       (i32.const 20)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (drop
+  ;; CHECK-NEXT:    (i32.const 3)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (br_if $out
+  ;; CHECK-NEXT:    (local.get $y)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (drop
+  ;; CHECK-NEXT:    (i32.const 4)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $br-if-neg-free-invert (param $x i32) (param $y i32)
+    (block $out
+      (br_if $out
+        (i32.eqz
+          (if (result i32)
+            (local.get $x)
+            (then
+              (drop (i32.const 1))
+              (i32.lt_s (local.get $x) (i32.const 10))
+            )
+            (else
+              (drop (i32.const 2))
+              (i32.eq (local.get $y) (i32.const 20))
+            )
+          )
+        )
+      )
+      (drop (i32.const 3))
+      (br_if $out (local.get $y))
+      (drop (i32.const 4))
+    )
   )
 )
