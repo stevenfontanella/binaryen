@@ -1009,9 +1009,17 @@ void StackIROptimizer::removeUnneededBlocks() {
       continue;
     }
     if (elideBlock(b)) {
-      bindLabel(insts.ifTrueLabels[iff], b->name);
+      auto bindOuterToArm = [&](Name& armLabel) {
+        if (!armLabel.is()) {
+          armLabel = b->name;
+        } else if (armLabel != b->name) {
+          insts.labelAliases[armLabel] = b->name;
+          armLabel = b->name;
+        }
+      };
+      bindOuterToArm(insts.ifTrueLabels[iff]);
       if (ifElseIdx.contains(iff)) {
-        bindLabel(insts.ifFalseLabels[iff], b->name);
+        bindOuterToArm(insts.ifFalseLabels[iff]);
       }
     }
   }

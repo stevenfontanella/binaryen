@@ -155,7 +155,7 @@
     )
   )
 
-  ;; SHRINK_0:      (func $if-tests (type $5) (param $x (ref $struct)) (param $y (ref $struct)) (result i32)
+  ;; SHRINK_0:      (func $if-tests (type $6) (param $x (ref $struct)) (param $y (ref $struct)) (result i32)
   ;; SHRINK_0-NEXT:  (if (result i32)
   ;; SHRINK_0-NEXT:   (ref.test (ref $substruct)
   ;; SHRINK_0-NEXT:    (local.get $x)
@@ -170,7 +170,7 @@
   ;; SHRINK_0-NEXT:   )
   ;; SHRINK_0-NEXT:  )
   ;; SHRINK_0-NEXT: )
-  ;; SHRINK_1:      (func $if-tests (type $5) (param $x (ref $struct)) (param $y (ref $struct)) (result i32)
+  ;; SHRINK_1:      (func $if-tests (type $6) (param $x (ref $struct)) (param $y (ref $struct)) (result i32)
   ;; SHRINK_1-NEXT:  (select
   ;; SHRINK_1-NEXT:   (ref.test (ref $substruct)
   ;; SHRINK_1-NEXT:    (local.get $y)
@@ -181,7 +181,7 @@
   ;; SHRINK_1-NEXT:   )
   ;; SHRINK_1-NEXT:  )
   ;; SHRINK_1-NEXT: )
-  ;; SHRINK_2:      (func $if-tests (type $5) (param $x (ref $struct)) (param $y (ref $struct)) (result i32)
+  ;; SHRINK_2:      (func $if-tests (type $6) (param $x (ref $struct)) (param $y (ref $struct)) (result i32)
   ;; SHRINK_2-NEXT:  (i32.and
   ;; SHRINK_2-NEXT:   (ref.test (ref $substruct)
   ;; SHRINK_2-NEXT:    (local.get $x)
@@ -213,7 +213,7 @@
     )
   )
 
-  ;; SHRINK_0:      (func $if-tests-arms (type $6) (param $x (ref $struct)) (param $y (ref $struct)) (param $z (ref $struct)) (result i32)
+  ;; SHRINK_0:      (func $if-tests-arms (type $7) (param $x (ref $struct)) (param $y (ref $struct)) (param $z (ref $struct)) (result i32)
   ;; SHRINK_0-NEXT:  (if (result i32)
   ;; SHRINK_0-NEXT:   (ref.test (ref $substruct)
   ;; SHRINK_0-NEXT:    (local.get $x)
@@ -230,7 +230,7 @@
   ;; SHRINK_0-NEXT:   )
   ;; SHRINK_0-NEXT:  )
   ;; SHRINK_0-NEXT: )
-  ;; SHRINK_1:      (func $if-tests-arms (type $6) (param $x (ref $struct)) (param $y (ref $struct)) (param $z (ref $struct)) (result i32)
+  ;; SHRINK_1:      (func $if-tests-arms (type $7) (param $x (ref $struct)) (param $y (ref $struct)) (param $z (ref $struct)) (result i32)
   ;; SHRINK_1-NEXT:  (select
   ;; SHRINK_1-NEXT:   (ref.test (ref $substruct)
   ;; SHRINK_1-NEXT:    (local.get $y)
@@ -243,7 +243,7 @@
   ;; SHRINK_1-NEXT:   )
   ;; SHRINK_1-NEXT:  )
   ;; SHRINK_1-NEXT: )
-  ;; SHRINK_2:      (func $if-tests-arms (type $6) (param $x (ref $struct)) (param $y (ref $struct)) (param $z (ref $struct)) (result i32)
+  ;; SHRINK_2:      (func $if-tests-arms (type $7) (param $x (ref $struct)) (param $y (ref $struct)) (param $z (ref $struct)) (result i32)
   ;; SHRINK_2-NEXT:  (select
   ;; SHRINK_2-NEXT:   (ref.test (ref $substruct)
   ;; SHRINK_2-NEXT:    (local.get $y)
@@ -1045,7 +1045,7 @@
     )
   )
 
-  ;; SHRINK_0:      (func $lower-void-conditional-return (type $7) (param $x i32)
+  ;; SHRINK_0:      (func $lower-void-conditional-return (type $5) (param $x i32)
   ;; SHRINK_0-NEXT:  (if
   ;; SHRINK_0-NEXT:   (local.get $x)
   ;; SHRINK_0-NEXT:   (then
@@ -1061,7 +1061,7 @@
   ;; SHRINK_0-NEXT:   )
   ;; SHRINK_0-NEXT:  )
   ;; SHRINK_0-NEXT: )
-  ;; SHRINK_1:      (func $lower-void-conditional-return (type $7) (param $x i32)
+  ;; SHRINK_1:      (func $lower-void-conditional-return (type $5) (param $x i32)
   ;; SHRINK_1-NEXT:  (if
   ;; SHRINK_1-NEXT:   (local.get $x)
   ;; SHRINK_1-NEXT:   (then
@@ -1077,7 +1077,7 @@
   ;; SHRINK_1-NEXT:   )
   ;; SHRINK_1-NEXT:  )
   ;; SHRINK_1-NEXT: )
-  ;; SHRINK_2:      (func $lower-void-conditional-return (type $7) (param $x i32)
+  ;; SHRINK_2:      (func $lower-void-conditional-return (type $5) (param $x i32)
   ;; SHRINK_2-NEXT:  (block $func_exit$0
   ;; SHRINK_2-NEXT:   (br_if $func_exit$0
   ;; SHRINK_2-NEXT:    (local.get $x)
@@ -1378,5 +1378,278 @@
         )
       )
     )
+  )
+
+  ;; SHRINK_0:      (func $lower-tail-void-if-eqz (type $5) (param $x i32)
+  ;; SHRINK_0-NEXT:  (local $tmp i32)
+  ;; SHRINK_0-NEXT:  (if
+  ;; SHRINK_0-NEXT:   (i32.eqz
+  ;; SHRINK_0-NEXT:    (local.get $x)
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:   (then
+  ;; SHRINK_0-NEXT:    (local.set $tmp
+  ;; SHRINK_0-NEXT:     (i32.const 1)
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:  )
+  ;; SHRINK_0-NEXT: )
+  ;; SHRINK_1:      (func $lower-tail-void-if-eqz (type $5) (param $x i32)
+  ;; SHRINK_1-NEXT:  (local $tmp i32)
+  ;; SHRINK_1-NEXT:  (if
+  ;; SHRINK_1-NEXT:   (i32.eqz
+  ;; SHRINK_1-NEXT:    (local.get $x)
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:   (then
+  ;; SHRINK_1-NEXT:    (local.set $tmp
+  ;; SHRINK_1-NEXT:     (i32.const 1)
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:  )
+  ;; SHRINK_1-NEXT: )
+  ;; SHRINK_2:      (func $lower-tail-void-if-eqz (type $5) (param $x i32)
+  ;; SHRINK_2-NEXT:  (local $tmp i32)
+  ;; SHRINK_2-NEXT:  (block $tail_if$0
+  ;; SHRINK_2-NEXT:   (br_if $tail_if$0
+  ;; SHRINK_2-NEXT:    (local.get $x)
+  ;; SHRINK_2-NEXT:   )
+  ;; SHRINK_2-NEXT:   (local.set $tmp
+  ;; SHRINK_2-NEXT:    (i32.const 1)
+  ;; SHRINK_2-NEXT:   )
+  ;; SHRINK_2-NEXT:  )
+  ;; SHRINK_2-NEXT: )
+  (func $lower-tail-void-if-eqz (param $x i32)
+    (local $tmp i32)
+    (if
+      (i32.eqz (local.get $x))
+      (then
+        (local.set $tmp (i32.const 1))
+      )
+    )
+  )
+
+  ;; SHRINK_0:      (func $lower-tail-void-if-cmp (type $5) (param $x i32)
+  ;; SHRINK_0-NEXT:  (local $tmp i32)
+  ;; SHRINK_0-NEXT:  (if
+  ;; SHRINK_0-NEXT:   (i32.gt_s
+  ;; SHRINK_0-NEXT:    (local.get $x)
+  ;; SHRINK_0-NEXT:    (i32.const 0)
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:   (then
+  ;; SHRINK_0-NEXT:    (local.set $tmp
+  ;; SHRINK_0-NEXT:     (i32.const 1)
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:  )
+  ;; SHRINK_0-NEXT: )
+  ;; SHRINK_1:      (func $lower-tail-void-if-cmp (type $5) (param $x i32)
+  ;; SHRINK_1-NEXT:  (local $tmp i32)
+  ;; SHRINK_1-NEXT:  (if
+  ;; SHRINK_1-NEXT:   (i32.gt_s
+  ;; SHRINK_1-NEXT:    (local.get $x)
+  ;; SHRINK_1-NEXT:    (i32.const 0)
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:   (then
+  ;; SHRINK_1-NEXT:    (local.set $tmp
+  ;; SHRINK_1-NEXT:     (i32.const 1)
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:  )
+  ;; SHRINK_1-NEXT: )
+  ;; SHRINK_2:      (func $lower-tail-void-if-cmp (type $5) (param $x i32)
+  ;; SHRINK_2-NEXT:  (local $tmp i32)
+  ;; SHRINK_2-NEXT:  (block $tail_if$0
+  ;; SHRINK_2-NEXT:   (br_if $tail_if$0
+  ;; SHRINK_2-NEXT:    (i32.le_s
+  ;; SHRINK_2-NEXT:     (local.get $x)
+  ;; SHRINK_2-NEXT:     (i32.const 0)
+  ;; SHRINK_2-NEXT:    )
+  ;; SHRINK_2-NEXT:   )
+  ;; SHRINK_2-NEXT:   (local.set $tmp
+  ;; SHRINK_2-NEXT:    (i32.const 1)
+  ;; SHRINK_2-NEXT:   )
+  ;; SHRINK_2-NEXT:  )
+  ;; SHRINK_2-NEXT: )
+  (func $lower-tail-void-if-cmp (param $x i32)
+    (local $tmp i32)
+    (if
+      (i32.gt_s (local.get $x) (i32.const 0))
+      (then
+        (local.set $tmp (i32.const 1))
+      )
+    )
+  )
+
+  ;; SHRINK_0:      (func $lower-br-on-null-spine (type $9) (param $x (ref null $struct))
+  ;; SHRINK_0-NEXT:  (local $tmp (ref null $struct))
+  ;; SHRINK_0-NEXT:  (if
+  ;; SHRINK_0-NEXT:   (i32.eqz
+  ;; SHRINK_0-NEXT:    (ref.is_null
+  ;; SHRINK_0-NEXT:     (local.tee $tmp
+  ;; SHRINK_0-NEXT:      (local.get $x)
+  ;; SHRINK_0-NEXT:     )
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:   (then
+  ;; SHRINK_0-NEXT:    (drop
+  ;; SHRINK_0-NEXT:     (ref.as_non_null
+  ;; SHRINK_0-NEXT:      (local.get $tmp)
+  ;; SHRINK_0-NEXT:     )
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:  )
+  ;; SHRINK_0-NEXT: )
+  ;; SHRINK_1:      (func $lower-br-on-null-spine (type $9) (param $x (ref null $struct))
+  ;; SHRINK_1-NEXT:  (local $tmp (ref null $struct))
+  ;; SHRINK_1-NEXT:  (if
+  ;; SHRINK_1-NEXT:   (i32.eqz
+  ;; SHRINK_1-NEXT:    (ref.is_null
+  ;; SHRINK_1-NEXT:     (local.tee $tmp
+  ;; SHRINK_1-NEXT:      (local.get $x)
+  ;; SHRINK_1-NEXT:     )
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:   (then
+  ;; SHRINK_1-NEXT:    (drop
+  ;; SHRINK_1-NEXT:     (ref.as_non_null
+  ;; SHRINK_1-NEXT:      (local.get $tmp)
+  ;; SHRINK_1-NEXT:     )
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:  )
+  ;; SHRINK_1-NEXT: )
+  ;; SHRINK_2:      (func $lower-br-on-null-spine (type $9) (param $x (ref null $struct))
+  ;; SHRINK_2-NEXT:  (local $tmp (ref null $struct))
+  ;; SHRINK_2-NEXT:  (block $br_on_null$0
+  ;; SHRINK_2-NEXT:   (drop
+  ;; SHRINK_2-NEXT:    (br_on_null $br_on_null$0
+  ;; SHRINK_2-NEXT:     (local.get $x)
+  ;; SHRINK_2-NEXT:    )
+  ;; SHRINK_2-NEXT:   )
+  ;; SHRINK_2-NEXT:  )
+  ;; SHRINK_2-NEXT: )
+  (func $lower-br-on-null-spine (param $x (ref null $struct))
+    (local $tmp (ref null $struct))
+    (if
+      (i32.eqz
+        (ref.is_null
+          (local.tee $tmp (local.get $x))
+        )
+      )
+      (then
+        (drop
+          (ref.as_non_null (local.get $tmp))
+        )
+      )
+    )
+  )
+
+  ;; SHRINK_0:      (func $lower-null-coalesce-if (type $4) (param $x (ref null $struct)) (result (ref null $struct))
+  ;; SHRINK_0-NEXT:  (local $tmp (ref null $struct))
+  ;; SHRINK_0-NEXT:  (if (result (ref null $struct))
+  ;; SHRINK_0-NEXT:   (ref.is_null
+  ;; SHRINK_0-NEXT:    (local.tee $tmp
+  ;; SHRINK_0-NEXT:     (local.get $x)
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:   (then
+  ;; SHRINK_0-NEXT:    (struct.new_default $struct)
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:   (else
+  ;; SHRINK_0-NEXT:    (local.get $tmp)
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:  )
+  ;; SHRINK_0-NEXT: )
+  ;; SHRINK_1:      (func $lower-null-coalesce-if (type $4) (param $x (ref null $struct)) (result (ref null $struct))
+  ;; SHRINK_1-NEXT:  (local $tmp (ref null $struct))
+  ;; SHRINK_1-NEXT:  (if (result (ref null $struct))
+  ;; SHRINK_1-NEXT:   (ref.is_null
+  ;; SHRINK_1-NEXT:    (local.tee $tmp
+  ;; SHRINK_1-NEXT:     (local.get $x)
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:   (then
+  ;; SHRINK_1-NEXT:    (struct.new_default $struct)
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:   (else
+  ;; SHRINK_1-NEXT:    (local.get $tmp)
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:  )
+  ;; SHRINK_1-NEXT: )
+  ;; SHRINK_2:      (func $lower-null-coalesce-if (type $4) (param $x (ref null $struct)) (result (ref null $struct))
+  ;; SHRINK_2-NEXT:  (local $tmp (ref null $struct))
+  ;; SHRINK_2-NEXT:  (block $coalesce$0 (result (ref $struct))
+  ;; SHRINK_2-NEXT:   (br_on_non_null $coalesce$0
+  ;; SHRINK_2-NEXT:    (local.get $x)
+  ;; SHRINK_2-NEXT:   )
+  ;; SHRINK_2-NEXT:   (struct.new_default $struct)
+  ;; SHRINK_2-NEXT:  )
+  ;; SHRINK_2-NEXT: )
+  (func $lower-null-coalesce-if (param $x (ref null $struct)) (result (ref null $struct))
+    (local $tmp (ref null $struct))
+    (if (result (ref null $struct))
+      (ref.is_null
+        (local.tee $tmp (local.get $x))
+      )
+      (then
+        (struct.new $struct)
+      )
+      (else
+        (local.get $tmp)
+      )
+    )
+  )
+
+  ;; SHRINK_0:      (func $lower-lazy-init-tail-if (type $4) (param $x (ref null $struct)) (result (ref null $struct))
+  ;; SHRINK_0-NEXT:  (local $tmp (ref null $struct))
+  ;; SHRINK_0-NEXT:  (if
+  ;; SHRINK_0-NEXT:   (ref.is_null
+  ;; SHRINK_0-NEXT:    (local.tee $tmp
+  ;; SHRINK_0-NEXT:     (local.get $x)
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:   (then
+  ;; SHRINK_0-NEXT:    (local.set $tmp
+  ;; SHRINK_0-NEXT:     (struct.new_default $struct)
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:  )
+  ;; SHRINK_0-NEXT:  (local.get $tmp)
+  ;; SHRINK_0-NEXT: )
+  ;; SHRINK_1:      (func $lower-lazy-init-tail-if (type $4) (param $x (ref null $struct)) (result (ref null $struct))
+  ;; SHRINK_1-NEXT:  (local $tmp (ref null $struct))
+  ;; SHRINK_1-NEXT:  (if
+  ;; SHRINK_1-NEXT:   (ref.is_null
+  ;; SHRINK_1-NEXT:    (local.tee $tmp
+  ;; SHRINK_1-NEXT:     (local.get $x)
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:   (then
+  ;; SHRINK_1-NEXT:    (local.set $tmp
+  ;; SHRINK_1-NEXT:     (struct.new_default $struct)
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:  )
+  ;; SHRINK_1-NEXT:  (local.get $tmp)
+  ;; SHRINK_1-NEXT: )
+  ;; SHRINK_2:      (func $lower-lazy-init-tail-if (type $4) (param $x (ref null $struct)) (result (ref null $struct))
+  ;; SHRINK_2-NEXT:  (local $tmp (ref null $struct))
+  ;; SHRINK_2-NEXT:  (block $lazy$0 (result (ref $struct))
+  ;; SHRINK_2-NEXT:   (br_on_non_null $lazy$0
+  ;; SHRINK_2-NEXT:    (local.get $x)
+  ;; SHRINK_2-NEXT:   )
+  ;; SHRINK_2-NEXT:   (struct.new_default $struct)
+  ;; SHRINK_2-NEXT:  )
+  ;; SHRINK_2-NEXT: )
+  (func $lower-lazy-init-tail-if (param $x (ref null $struct)) (result (ref null $struct))
+    (local $tmp (ref null $struct))
+    (if
+      (ref.is_null
+        (local.tee $tmp (local.get $x))
+      )
+      (then
+        (local.set $tmp (struct.new $struct))
+      )
+    )
+    (local.get $tmp)
   )
 )
