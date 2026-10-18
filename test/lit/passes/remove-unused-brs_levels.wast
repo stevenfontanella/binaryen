@@ -1999,4 +1999,430 @@
       )
     )
   )
+
+  ;; SHRINK_0:      (func $unnest-one-unreachable-arm-if (type $1) (param $x i32) (result i32)
+  ;; SHRINK_0-NEXT:  (if (result i32)
+  ;; SHRINK_0-NEXT:   (local.get $x)
+  ;; SHRINK_0-NEXT:   (then
+  ;; SHRINK_0-NEXT:    (drop
+  ;; SHRINK_0-NEXT:     (call $selectify-division
+  ;; SHRINK_0-NEXT:      (i32.const 1)
+  ;; SHRINK_0-NEXT:     )
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:    (unreachable)
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:   (else
+  ;; SHRINK_0-NEXT:    (call $selectify-division
+  ;; SHRINK_0-NEXT:     (i32.const 2)
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:  )
+  ;; SHRINK_0-NEXT: )
+  ;; SHRINK_1:      (func $unnest-one-unreachable-arm-if (type $1) (param $x i32) (result i32)
+  ;; SHRINK_1-NEXT:  (if (result i32)
+  ;; SHRINK_1-NEXT:   (local.get $x)
+  ;; SHRINK_1-NEXT:   (then
+  ;; SHRINK_1-NEXT:    (drop
+  ;; SHRINK_1-NEXT:     (call $selectify-division
+  ;; SHRINK_1-NEXT:      (i32.const 1)
+  ;; SHRINK_1-NEXT:     )
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:    (unreachable)
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:   (else
+  ;; SHRINK_1-NEXT:    (call $selectify-division
+  ;; SHRINK_1-NEXT:     (i32.const 2)
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:  )
+  ;; SHRINK_1-NEXT: )
+  ;; SHRINK_2:      (func $unnest-one-unreachable-arm-if (type $1) (param $x i32) (result i32)
+  ;; SHRINK_2-NEXT:  (if
+  ;; SHRINK_2-NEXT:   (local.get $x)
+  ;; SHRINK_2-NEXT:   (then
+  ;; SHRINK_2-NEXT:    (drop
+  ;; SHRINK_2-NEXT:     (call $selectify-division
+  ;; SHRINK_2-NEXT:      (i32.const 1)
+  ;; SHRINK_2-NEXT:     )
+  ;; SHRINK_2-NEXT:    )
+  ;; SHRINK_2-NEXT:    (unreachable)
+  ;; SHRINK_2-NEXT:   )
+  ;; SHRINK_2-NEXT:  )
+  ;; SHRINK_2-NEXT:  (call $selectify-division
+  ;; SHRINK_2-NEXT:   (i32.const 2)
+  ;; SHRINK_2-NEXT:  )
+  ;; SHRINK_2-NEXT: )
+  (func $unnest-one-unreachable-arm-if (param $x i32) (result i32)
+    (if (result i32)
+      (local.get $x)
+      (then
+        (drop (call $selectify-division (i32.const 1)))
+        (unreachable)
+      )
+      (else
+        (call $selectify-division (i32.const 2))
+      )
+    )
+  )
+
+  ;; SHRINK_0:      (func $lower-void-or-guard-unreachable-tail (type $2) (param $x i32) (param $y i32) (result i32)
+  ;; SHRINK_0-NEXT:  (if
+  ;; SHRINK_0-NEXT:   (if (result i32)
+  ;; SHRINK_0-NEXT:    (i32.eq
+  ;; SHRINK_0-NEXT:     (local.get $x)
+  ;; SHRINK_0-NEXT:     (i32.const 1)
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:    (then
+  ;; SHRINK_0-NEXT:     (i32.const 1)
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:    (else
+  ;; SHRINK_0-NEXT:     (i32.eq
+  ;; SHRINK_0-NEXT:      (call $selectify-division
+  ;; SHRINK_0-NEXT:       (local.get $y)
+  ;; SHRINK_0-NEXT:      )
+  ;; SHRINK_0-NEXT:      (i32.const 2)
+  ;; SHRINK_0-NEXT:     )
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:   (then
+  ;; SHRINK_0-NEXT:    (drop
+  ;; SHRINK_0-NEXT:     (call $selectify-division
+  ;; SHRINK_0-NEXT:      (i32.const 99)
+  ;; SHRINK_0-NEXT:     )
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:    (unreachable)
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:  )
+  ;; SHRINK_0-NEXT:  (i32.const 42)
+  ;; SHRINK_0-NEXT: )
+  ;; SHRINK_1:      (func $lower-void-or-guard-unreachable-tail (type $2) (param $x i32) (param $y i32) (result i32)
+  ;; SHRINK_1-NEXT:  (if
+  ;; SHRINK_1-NEXT:   (if (result i32)
+  ;; SHRINK_1-NEXT:    (i32.eq
+  ;; SHRINK_1-NEXT:     (local.get $x)
+  ;; SHRINK_1-NEXT:     (i32.const 1)
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:    (then
+  ;; SHRINK_1-NEXT:     (i32.const 1)
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:    (else
+  ;; SHRINK_1-NEXT:     (i32.eq
+  ;; SHRINK_1-NEXT:      (call $selectify-division
+  ;; SHRINK_1-NEXT:       (local.get $y)
+  ;; SHRINK_1-NEXT:      )
+  ;; SHRINK_1-NEXT:      (i32.const 2)
+  ;; SHRINK_1-NEXT:     )
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:   (then
+  ;; SHRINK_1-NEXT:    (drop
+  ;; SHRINK_1-NEXT:     (call $selectify-division
+  ;; SHRINK_1-NEXT:      (i32.const 99)
+  ;; SHRINK_1-NEXT:     )
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:    (unreachable)
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:  )
+  ;; SHRINK_1-NEXT:  (i32.const 42)
+  ;; SHRINK_1-NEXT: )
+  ;; SHRINK_2:      (func $lower-void-or-guard-unreachable-tail (type $2) (param $x i32) (param $y i32) (result i32)
+  ;; SHRINK_2-NEXT:  (block $sc_out$0
+  ;; SHRINK_2-NEXT:   (if
+  ;; SHRINK_2-NEXT:    (i32.ne
+  ;; SHRINK_2-NEXT:     (local.get $x)
+  ;; SHRINK_2-NEXT:     (i32.const 1)
+  ;; SHRINK_2-NEXT:    )
+  ;; SHRINK_2-NEXT:    (then
+  ;; SHRINK_2-NEXT:     (br_if $sc_out$0
+  ;; SHRINK_2-NEXT:      (i32.ne
+  ;; SHRINK_2-NEXT:       (call $selectify-division
+  ;; SHRINK_2-NEXT:        (local.get $y)
+  ;; SHRINK_2-NEXT:       )
+  ;; SHRINK_2-NEXT:       (i32.const 2)
+  ;; SHRINK_2-NEXT:      )
+  ;; SHRINK_2-NEXT:     )
+  ;; SHRINK_2-NEXT:    )
+  ;; SHRINK_2-NEXT:   )
+  ;; SHRINK_2-NEXT:   (drop
+  ;; SHRINK_2-NEXT:    (call $selectify-division
+  ;; SHRINK_2-NEXT:     (i32.const 99)
+  ;; SHRINK_2-NEXT:    )
+  ;; SHRINK_2-NEXT:   )
+  ;; SHRINK_2-NEXT:   (unreachable)
+  ;; SHRINK_2-NEXT:  )
+  ;; SHRINK_2-NEXT:  (i32.const 42)
+  ;; SHRINK_2-NEXT: )
+  (func $lower-void-or-guard-unreachable-tail (param $x i32) (param $y i32) (result i32)
+    (if
+      (if (result i32)
+        (i32.eq (local.get $x) (i32.const 1))
+        (then
+          (i32.const 1)
+        )
+        (else
+          (i32.eq (call $selectify-division (local.get $y)) (i32.const 2))
+        )
+      )
+      (then
+        (drop (call $selectify-division (i32.const 99)))
+        (unreachable)
+      )
+    )
+    (i32.const 42)
+  )
+
+  ;; SHRINK_0:      (func $lower-br-if-null-second-arg (type $10) (param $x i32) (param $s (ref null $struct)) (result i32)
+  ;; SHRINK_0-NEXT:  (block $out
+  ;; SHRINK_0-NEXT:   (br_if $out
+  ;; SHRINK_0-NEXT:    (i32.eqz
+  ;; SHRINK_0-NEXT:     (local.get $x)
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:   (drop
+  ;; SHRINK_0-NEXT:    (call $selectify-division
+  ;; SHRINK_0-NEXT:     (i32.const 1)
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:   (br_if $out
+  ;; SHRINK_0-NEXT:    (ref.is_null
+  ;; SHRINK_0-NEXT:     (local.get $s)
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:   (return
+  ;; SHRINK_0-NEXT:    (i32.add
+  ;; SHRINK_0-NEXT:     (local.get $x)
+  ;; SHRINK_0-NEXT:     (ref.eq
+  ;; SHRINK_0-NEXT:      (ref.as_non_null
+  ;; SHRINK_0-NEXT:       (local.get $s)
+  ;; SHRINK_0-NEXT:      )
+  ;; SHRINK_0-NEXT:      (local.get $s)
+  ;; SHRINK_0-NEXT:     )
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:  )
+  ;; SHRINK_0-NEXT:  (i32.const 0)
+  ;; SHRINK_0-NEXT: )
+  ;; SHRINK_1:      (func $lower-br-if-null-second-arg (type $10) (param $x i32) (param $s (ref null $struct)) (result i32)
+  ;; SHRINK_1-NEXT:  (block $out
+  ;; SHRINK_1-NEXT:   (br_if $out
+  ;; SHRINK_1-NEXT:    (i32.eqz
+  ;; SHRINK_1-NEXT:     (local.get $x)
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:   (drop
+  ;; SHRINK_1-NEXT:    (call $selectify-division
+  ;; SHRINK_1-NEXT:     (i32.const 1)
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:   (br_if $out
+  ;; SHRINK_1-NEXT:    (ref.is_null
+  ;; SHRINK_1-NEXT:     (local.get $s)
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:   (return
+  ;; SHRINK_1-NEXT:    (i32.add
+  ;; SHRINK_1-NEXT:     (local.get $x)
+  ;; SHRINK_1-NEXT:     (ref.eq
+  ;; SHRINK_1-NEXT:      (ref.as_non_null
+  ;; SHRINK_1-NEXT:       (local.get $s)
+  ;; SHRINK_1-NEXT:      )
+  ;; SHRINK_1-NEXT:      (local.get $s)
+  ;; SHRINK_1-NEXT:     )
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:  )
+  ;; SHRINK_1-NEXT:  (i32.const 0)
+  ;; SHRINK_1-NEXT: )
+  ;; SHRINK_2:      (func $lower-br-if-null-second-arg (type $10) (param $x i32) (param $s (ref null $struct)) (result i32)
+  ;; SHRINK_2-NEXT:  (if
+  ;; SHRINK_2-NEXT:   (local.get $x)
+  ;; SHRINK_2-NEXT:   (then
+  ;; SHRINK_2-NEXT:    (drop
+  ;; SHRINK_2-NEXT:     (call $selectify-division
+  ;; SHRINK_2-NEXT:      (i32.const 1)
+  ;; SHRINK_2-NEXT:     )
+  ;; SHRINK_2-NEXT:    )
+  ;; SHRINK_2-NEXT:    (block $br_on_null$0
+  ;; SHRINK_2-NEXT:     (return
+  ;; SHRINK_2-NEXT:      (i32.add
+  ;; SHRINK_2-NEXT:       (local.get $x)
+  ;; SHRINK_2-NEXT:       (ref.eq
+  ;; SHRINK_2-NEXT:        (br_on_null $br_on_null$0
+  ;; SHRINK_2-NEXT:         (local.get $s)
+  ;; SHRINK_2-NEXT:        )
+  ;; SHRINK_2-NEXT:        (local.get $s)
+  ;; SHRINK_2-NEXT:       )
+  ;; SHRINK_2-NEXT:      )
+  ;; SHRINK_2-NEXT:     )
+  ;; SHRINK_2-NEXT:    )
+  ;; SHRINK_2-NEXT:   )
+  ;; SHRINK_2-NEXT:  )
+  ;; SHRINK_2-NEXT:  (i32.const 0)
+  ;; SHRINK_2-NEXT: )
+  (func $lower-br-if-null-second-arg (param $x i32) (param $s (ref null $struct)) (result i32)
+    (block $out
+      (br_if $out (i32.eqz (local.get $x)))
+      (drop (call $selectify-division (i32.const 1)))
+      (br_if $out (ref.is_null (local.get $s)))
+      (return
+        (i32.add
+          (local.get $x)
+          (ref.eq (ref.as_non_null (local.get $s)) (local.get $s))
+        )
+      )
+    )
+    (i32.const 0)
+  )
+
+  ;; SHRINK_0:      (func $short-circuit-trailing-prefix-and-multi-fold (type $11) (param $x i32) (param $y i32) (param $z i32) (result i32)
+  ;; SHRINK_0-NEXT:  (if (result i32)
+  ;; SHRINK_0-NEXT:   (i32.eq
+  ;; SHRINK_0-NEXT:    (call $selectify-division
+  ;; SHRINK_0-NEXT:     (local.get $x)
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:    (i32.const 1)
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:   (then
+  ;; SHRINK_0-NEXT:    (if (result i32)
+  ;; SHRINK_0-NEXT:     (i32.eq
+  ;; SHRINK_0-NEXT:      (local.get $y)
+  ;; SHRINK_0-NEXT:      (i32.const 2)
+  ;; SHRINK_0-NEXT:     )
+  ;; SHRINK_0-NEXT:     (then
+  ;; SHRINK_0-NEXT:      (if (result i32)
+  ;; SHRINK_0-NEXT:       (i32.eq
+  ;; SHRINK_0-NEXT:        (local.get $z)
+  ;; SHRINK_0-NEXT:        (i32.const 3)
+  ;; SHRINK_0-NEXT:       )
+  ;; SHRINK_0-NEXT:       (then
+  ;; SHRINK_0-NEXT:        (drop
+  ;; SHRINK_0-NEXT:         (call $selectify-division
+  ;; SHRINK_0-NEXT:          (i32.const 7)
+  ;; SHRINK_0-NEXT:         )
+  ;; SHRINK_0-NEXT:        )
+  ;; SHRINK_0-NEXT:        (i32.const 1)
+  ;; SHRINK_0-NEXT:       )
+  ;; SHRINK_0-NEXT:       (else
+  ;; SHRINK_0-NEXT:        (i32.const 0)
+  ;; SHRINK_0-NEXT:       )
+  ;; SHRINK_0-NEXT:      )
+  ;; SHRINK_0-NEXT:     )
+  ;; SHRINK_0-NEXT:     (else
+  ;; SHRINK_0-NEXT:      (i32.const 0)
+  ;; SHRINK_0-NEXT:     )
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:   (else
+  ;; SHRINK_0-NEXT:    (i32.const 0)
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:  )
+  ;; SHRINK_0-NEXT: )
+  ;; SHRINK_1:      (func $short-circuit-trailing-prefix-and-multi-fold (type $11) (param $x i32) (param $y i32) (param $z i32) (result i32)
+  ;; SHRINK_1-NEXT:  (if (result i32)
+  ;; SHRINK_1-NEXT:   (i32.eq
+  ;; SHRINK_1-NEXT:    (call $selectify-division
+  ;; SHRINK_1-NEXT:     (local.get $x)
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:    (i32.const 1)
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:   (then
+  ;; SHRINK_1-NEXT:    (if (result i32)
+  ;; SHRINK_1-NEXT:     (i32.eq
+  ;; SHRINK_1-NEXT:      (local.get $y)
+  ;; SHRINK_1-NEXT:      (i32.const 2)
+  ;; SHRINK_1-NEXT:     )
+  ;; SHRINK_1-NEXT:     (then
+  ;; SHRINK_1-NEXT:      (if (result i32)
+  ;; SHRINK_1-NEXT:       (i32.eq
+  ;; SHRINK_1-NEXT:        (local.get $z)
+  ;; SHRINK_1-NEXT:        (i32.const 3)
+  ;; SHRINK_1-NEXT:       )
+  ;; SHRINK_1-NEXT:       (then
+  ;; SHRINK_1-NEXT:        (drop
+  ;; SHRINK_1-NEXT:         (call $selectify-division
+  ;; SHRINK_1-NEXT:          (i32.const 7)
+  ;; SHRINK_1-NEXT:         )
+  ;; SHRINK_1-NEXT:        )
+  ;; SHRINK_1-NEXT:        (i32.const 1)
+  ;; SHRINK_1-NEXT:       )
+  ;; SHRINK_1-NEXT:       (else
+  ;; SHRINK_1-NEXT:        (i32.const 0)
+  ;; SHRINK_1-NEXT:       )
+  ;; SHRINK_1-NEXT:      )
+  ;; SHRINK_1-NEXT:     )
+  ;; SHRINK_1-NEXT:     (else
+  ;; SHRINK_1-NEXT:      (i32.const 0)
+  ;; SHRINK_1-NEXT:     )
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:   (else
+  ;; SHRINK_1-NEXT:    (i32.const 0)
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:  )
+  ;; SHRINK_1-NEXT: )
+  ;; SHRINK_2:      (func $short-circuit-trailing-prefix-and-multi-fold (type $11) (param $x i32) (param $y i32) (param $z i32) (result i32)
+  ;; SHRINK_2-NEXT:  (if
+  ;; SHRINK_2-NEXT:   (i32.eq
+  ;; SHRINK_2-NEXT:    (call $selectify-division
+  ;; SHRINK_2-NEXT:     (local.get $x)
+  ;; SHRINK_2-NEXT:    )
+  ;; SHRINK_2-NEXT:    (i32.const 1)
+  ;; SHRINK_2-NEXT:   )
+  ;; SHRINK_2-NEXT:   (then
+  ;; SHRINK_2-NEXT:    (block $sc_fail$0
+  ;; SHRINK_2-NEXT:     (br_if $sc_fail$0
+  ;; SHRINK_2-NEXT:      (i32.ne
+  ;; SHRINK_2-NEXT:       (local.get $y)
+  ;; SHRINK_2-NEXT:       (i32.const 2)
+  ;; SHRINK_2-NEXT:      )
+  ;; SHRINK_2-NEXT:     )
+  ;; SHRINK_2-NEXT:     (br_if $sc_fail$0
+  ;; SHRINK_2-NEXT:      (i32.ne
+  ;; SHRINK_2-NEXT:       (local.get $z)
+  ;; SHRINK_2-NEXT:       (i32.const 3)
+  ;; SHRINK_2-NEXT:      )
+  ;; SHRINK_2-NEXT:     )
+  ;; SHRINK_2-NEXT:     (return
+  ;; SHRINK_2-NEXT:      (block (result i32)
+  ;; SHRINK_2-NEXT:       (drop
+  ;; SHRINK_2-NEXT:        (call $selectify-division
+  ;; SHRINK_2-NEXT:         (i32.const 7)
+  ;; SHRINK_2-NEXT:        )
+  ;; SHRINK_2-NEXT:       )
+  ;; SHRINK_2-NEXT:       (i32.const 1)
+  ;; SHRINK_2-NEXT:      )
+  ;; SHRINK_2-NEXT:     )
+  ;; SHRINK_2-NEXT:    )
+  ;; SHRINK_2-NEXT:   )
+  ;; SHRINK_2-NEXT:  )
+  ;; SHRINK_2-NEXT:  (i32.const 0)
+  ;; SHRINK_2-NEXT: )
+  (func $short-circuit-trailing-prefix-and-multi-fold (param $x i32) (param $y i32) (param $z i32) (result i32)
+    (if (result i32)
+      (i32.eq (call $selectify-division (local.get $x)) (i32.const 1))
+      (then
+        (if (result i32)
+          (i32.eq (local.get $y) (i32.const 2))
+          (then
+            (if (result i32)
+              (i32.eq (local.get $z) (i32.const 3))
+              (then
+                (drop (call $selectify-division (i32.const 7)))
+                (i32.const 1)
+              )
+              (else
+                (i32.const 0)
+              )
+            )
+          )
+          (else
+            (i32.const 0)
+          )
+        )
+      )
+      (else
+        (i32.const 0)
+      )
+    )
+  )
 )

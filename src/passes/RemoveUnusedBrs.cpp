@@ -573,7 +573,8 @@ static void collectShortCircuitConjuncts(Expression* expr,
                                          Module& wasm,
                                          std::vector<ShortCircuitStep>& outSteps,
                                          std::vector<If*>& collapsedIfs,
-                                         int& kEqzOut) {
+                                         int& kEqzOut,
+                                         std::vector<Expression*>& trailingPrefix) {
   int localEqz = 0;
   while (auto* u = expr->dynCast<Unary>()) {
     if (u->op == EqZInt32) {
@@ -590,67 +591,85 @@ static void collectShortCircuitConjuncts(Expression* expr,
     std::vector<Expression*> armPrefix;
     Expression* armVal = nullptr;
     int32_t falseConst = 0;
-    int32_t dummyConst = 0;
+    int32_t armConst = 0;
     if (isI32Const(inner->ifFalse, falseConst) &&
         splitBoolIfArm(inner->ifTrue, passOptions, wasm, armPrefix, armVal) &&
-        !isI32Const(armVal, dummyConst) &&
         ((falseConst == 0 && !negated) || (falseConst != 0 && negated))) {
-      kEqzOut += localEqz;
-      collapsedIfs.push_back(inner);
-      collectShortCircuitConjuncts(inner->condition,
-                                   false,
-                                   passOptions,
-                                   wasm,
-                                   outSteps,
-                                   collapsedIfs,
-                                   kEqzOut);
-      Index secondIdx = outSteps.size();
-      collectShortCircuitConjuncts(armVal,
-                                   negated,
-                                   passOptions,
-                                   wasm,
-                                   outSteps,
-                                   collapsedIfs,
-                                   kEqzOut);
-      if (!armPrefix.empty()) {
-        outSteps[secondIdx].prefix.insert(outSteps[secondIdx].prefix.begin(),
-                                          armPrefix.begin(),
-                                          armPrefix.end());
+      bool armIsConst = isI32Const(armVal, armConst);
+      bool armIsPassConst =
+        armIsConst && !armPrefix.empty() &&
+        ((falseConst == 0 && armConst != 0) ||
+         (falseConst != 0 && armConst == 0));
+      if (!armIsConst || armIsPassConst) {
+        kEqzOut += localEqz;
+        collapsedIfs.push_back(inner);
+        collectShortCircuitConjuncts(inner->condition,
+                                     false,
+                                     passOptions,
+                                     wasm,
+                                     outSteps,
+                                     collapsedIfs,
+                                     kEqzOut,
+                                     trailingPrefix);
+        trailingPrefix.insert(
+          trailingPrefix.end(), armPrefix.begin(), armPrefix.end());
+        if (armIsPassConst) {
+          kEqzOut += 2;
+        } else {
+          collectShortCircuitConjuncts(armVal,
+                                       negated,
+                                       passOptions,
+                                       wasm,
+                                       outSteps,
+                                       collapsedIfs,
+                                       kEqzOut,
+                                       trailingPrefix);
+        }
+        return;
       }
-      return;
     }
     int32_t trueConst = 0;
     if (isI32Const(inner->ifTrue, trueConst) &&
         splitBoolIfArm(inner->ifFalse, passOptions, wasm, armPrefix, armVal) &&
-        !isI32Const(armVal, dummyConst) &&
         ((trueConst == 0 && !negated) || (trueConst != 0 && negated))) {
-      kEqzOut += localEqz;
-      collapsedIfs.push_back(inner);
-      collectShortCircuitConjuncts(inner->condition,
-                                   true,
-                                   passOptions,
-                                   wasm,
-                                   outSteps,
-                                   collapsedIfs,
-                                   kEqzOut);
-      Index secondIdx = outSteps.size();
-      collectShortCircuitConjuncts(armVal,
-                                   negated,
-                                   passOptions,
-                                   wasm,
-                                   outSteps,
-                                   collapsedIfs,
-                                   kEqzOut);
-      if (!armPrefix.empty()) {
-        outSteps[secondIdx].prefix.insert(outSteps[secondIdx].prefix.begin(),
-                                          armPrefix.begin(),
-                                          armPrefix.end());
+      bool armIsConst = isI32Const(armVal, armConst);
+      bool armIsPassConst =
+        armIsConst && !armPrefix.empty() &&
+        ((trueConst == 0 && armConst != 0) ||
+         (trueConst != 0 && armConst == 0));
+      if (!armIsConst || armIsPassConst) {
+        kEqzOut += localEqz;
+        collapsedIfs.push_back(inner);
+        collectShortCircuitConjuncts(inner->condition,
+                                     true,
+                                     passOptions,
+                                     wasm,
+                                     outSteps,
+                                     collapsedIfs,
+                                     kEqzOut,
+                                     trailingPrefix);
+        trailingPrefix.insert(
+          trailingPrefix.end(), armPrefix.begin(), armPrefix.end());
+        if (armIsPassConst) {
+          kEqzOut += 2;
+        } else {
+          collectShortCircuitConjuncts(armVal,
+                                       negated,
+                                       passOptions,
+                                       wasm,
+                                       outSteps,
+                                       collapsedIfs,
+                                       kEqzOut,
+                                       trailingPrefix);
+        }
+        return;
       }
-      return;
     }
   }
   kEqzOut += localEqz;
-  outSteps.push_back(ShortCircuitStep{{}, expr, negated});
+  ShortCircuitStep step{std::move(trailingPrefix), expr, negated};
+  trailingPrefix.clear();
+  outSteps.push_back(std::move(step));
 }
 
 static int estimateMinBinaryBytes(Expression* curr, Index depth = 0) {
@@ -899,6 +918,38 @@ static bool tryFoldBooleanIfCondition(If* curr,
       curr->finalize();
       return true;
     }
+  }
+
+  std::vector<Expression*> prefixTrue;
+  std::vector<Expression*> prefixFalse;
+  Expression* valTrue = nullptr;
+  Expression* valFalse = nullptr;
+  int32_t cTrue = 0, cFalse = 0;
+  if (splitBoolIfArm(inner->ifTrue, passOptions, wasm, prefixTrue, valTrue) &&
+      splitBoolIfArm(inner->ifFalse, passOptions, wasm, prefixFalse, valFalse) &&
+      isI32Const(valTrue, cTrue) && isI32Const(valFalse, cFalse) &&
+      ((cTrue != 0 && cFalse == 0) || (cTrue == 0 && cFalse != 0))) {
+    bool samePol =
+      (cTrue != 0 && cFalse == 0 && !negated) ||
+      (cTrue == 0 && cFalse != 0 && negated);
+    Expression* oldTrue = curr->ifTrue;
+    Expression* oldFalse = curr->ifFalse;
+    curr->condition = inner->condition;
+    if (samePol) {
+      curr->ifTrue = prependToArm(builder, prefixTrue, oldTrue);
+      if (oldFalse || !prefixFalse.empty()) {
+        curr->ifFalse = prependToArm(builder, prefixFalse, oldFalse);
+      }
+    } else {
+      curr->ifTrue = prependToArm(builder, prefixTrue, oldFalse);
+      if (!curr->ifTrue) {
+        curr->ifTrue = builder.makeNop();
+      }
+      curr->ifFalse = prependToArm(builder, prefixFalse, oldTrue);
+    }
+    BranchHints::copyTo(inner, curr, func);
+    curr->finalize();
+    return true;
   }
 
   return false;
@@ -1201,6 +1252,32 @@ static Expression* tryFoldBooleanBreakCondition(Break* curr,
       }
     }
   }
+
+  std::vector<Expression*> prefixTrue;
+  std::vector<Expression*> prefixFalse;
+  Expression* valTrue = nullptr;
+  Expression* valFalse = nullptr;
+  int32_t cTrue = 0, cFalse = 0;
+  if (splitBoolIfArm(inner->ifTrue, passOptions, wasm, prefixTrue, valTrue) &&
+      splitBoolIfArm(inner->ifFalse, passOptions, wasm, prefixFalse, valFalse) &&
+      isI32Const(valTrue, cTrue) && isI32Const(valFalse, cFalse) &&
+      ((cTrue != 0 && cFalse == 0) || (cTrue == 0 && cFalse != 0))) {
+    bool brOnTrue =
+      (cTrue != 0 && cFalse == 0 && !negated) ||
+      (cTrue == 0 && cFalse != 0 && negated);
+    Expression* uncondArm = finishUnconditionalArm();
+    auto* newIf =
+      brOnTrue
+        ? builder.makeIf(inner->condition,
+                         prependToArm(builder, prefixTrue, uncondArm),
+                         prependToArm(builder, prefixFalse, nullptr))
+        : builder.makeIf(inner->condition,
+                         prependToArm(builder, prefixTrue, nullptr),
+                         prependToArm(builder, prefixFalse, uncondArm));
+    BranchHints::copyTo(inner, newIf, func);
+    return newIf;
+  }
+
   return nullptr;
 }
 
@@ -3250,6 +3327,8 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                                  valGetOut);
     };
 
+    std::unordered_set<Index> localsWithSynthesizedGets;
+
     auto stripDeadTeeIfPossible =
       [&](Expression* refOperand,
           LocalSet* tee,
@@ -3266,7 +3345,8 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
       }
       Index localIdx = tee->index;
       bool canStrip = (localGetCounts[localIdx] == 0);
-      if (!canStrip && !func->getLocalType(localIdx).isNonNullable()) {
+      if (!canStrip && !func->getLocalType(localIdx).isNonNullable() &&
+          !localsWithSynthesizedGets.contains(localIdx)) {
         const auto& influences = localGraph.getSetInfluences(tee);
         if (influences.size() == 1 &&
             *influences.begin() == eliminatedValGet) {
@@ -3297,6 +3377,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
       Builder& builder;
       std::unordered_map<Name, Block*>& nameToBlock;
       std::vector<Index>& localGetCounts;
+      std::unordered_set<Index>& localsWithSynthesizedGets;
       LazyLocalGraph& localGraph;
       EnsureExitFn& ensureFuncExitLabel;
       MakeBlockNameFn& makeFreshBlockName;
@@ -3315,6 +3396,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                    Builder& builder,
                    std::unordered_map<Name, Block*>& nameToBlock,
                    std::vector<Index>& localGetCounts,
+                   std::unordered_set<Index>& localsWithSynthesizedGets,
                    LazyLocalGraph& localGraph,
                    EnsureExitFn& ensureFuncExitLabel,
                    MakeBlockNameFn& makeFreshBlockName,
@@ -3326,6 +3408,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                    bool neverUnconditionalize)
         : func(func), wasm(wasm), passOptions(passOptions), builder(builder),
           nameToBlock(nameToBlock), localGetCounts(localGetCounts),
+          localsWithSynthesizedGets(localsWithSynthesizedGets),
           localGraph(localGraph), ensureFuncExitLabel(ensureFuncExitLabel),
           makeFreshBlockName(makeFreshBlockName),
           decrementLocalGets(decrementLocalGets),
@@ -3346,116 +3429,348 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         PostWalker<GuardLowerer>::scan(self, currp);
       }
 
-      static Expression** firstEvaluatedChildSlot(Expression* node) {
-        if (!node) {
-          return nullptr;
+      bool findTargetSlotOnSpine(Expression* src,
+                                 Expression** rootSlot,
+                                 bool allowNamedRootBlock,
+                                 Expression**& matchedSlotOut,
+                                 LocalSet*& teeOut,
+                                 LocalGet*& matchedGetOut,
+                                 Expression*& matchedExprOut,
+                                 std::vector<Expression*>& spineAncestorsOut) {
+        matchedSlotOut = nullptr;
+        teeOut = nullptr;
+        matchedGetOut = nullptr;
+        matchedExprOut = nullptr;
+        spineAncestorsOut.clear();
+        if (!src || !src->type.isRef() || !src->type.isNullable() ||
+            src->type == Type::unreachable) {
+          return false;
         }
-        if (auto* b = node->dynCast<Block>()) {
-          if (!b->name.is() && !b->list.empty()) {
-            return &b->list[0];
+        bool hasTargetLocal = false;
+        Index targetLocal = 0;
+        Expression* pureX = nullptr;
+        if (auto* cGet = src->dynCast<LocalGet>()) {
+          hasTargetLocal = true;
+          targetLocal = cGet->index;
+        } else if (auto* cTee = src->dynCast<LocalSet>()) {
+          if (cTee->isTee() && cTee->value->type != Type::unreachable &&
+              cTee->value->type.isRef()) {
+            hasTargetLocal = true;
+            targetLocal = cTee->index;
+            teeOut = cTee;
           }
-          return nullptr;
+        } else if (!EffectAnalyzer(passOptions, wasm, src)
+                      .hasUnremovableSideEffects()) {
+          pureX = src;
         }
-        if (auto* iff = node->dynCast<If>()) {
-          return &iff->condition;
+        if (!hasTargetLocal && !pureX) {
+          return false;
         }
-        if (node->is<Loop>() || node->is<Try>() || node->is<TryTable>()) {
-          return nullptr;
-        }
-        if (auto* c = node->dynCast<Call>()) {
-          return !c->operands.empty() ? &c->operands[0] : nullptr;
-        }
-        if (auto* c = node->dynCast<CallIndirect>()) {
-          return !c->operands.empty() ? &c->operands[0] : &c->target;
-        }
-        if (auto* c = node->dynCast<CallRef>()) {
-          return !c->operands.empty() ? &c->operands[0] : &c->target;
-        }
-        if (auto* s = node->dynCast<LocalSet>()) {
-          return &s->value;
-        }
-        if (auto* s = node->dynCast<GlobalSet>()) {
-          return &s->value;
-        }
-        if (auto* d = node->dynCast<Drop>()) {
-          return &d->value;
-        }
-        if (auto* r = node->dynCast<Return>()) {
-          return r->value ? &r->value : nullptr;
-        }
-        if (auto* br = node->dynCast<Break>()) {
-          return br->value ? &br->value
-                           : (br->condition ? &br->condition : nullptr);
-        }
-        if (auto* sw = node->dynCast<Switch>()) {
-          return sw->value ? &sw->value : &sw->condition;
-        }
-        if (auto* u = node->dynCast<Unary>()) {
-          return &u->value;
-        }
-        if (auto* bin = node->dynCast<Binary>()) {
-          return &bin->left;
-        }
-        if (auto* sel = node->dynCast<Select>()) {
-          return &sel->ifTrue;
-        }
-        if (auto* sg = node->dynCast<StructGet>()) {
-          return &sg->ref;
-        }
-        if (auto* ss = node->dynCast<StructSet>()) {
-          return &ss->ref;
-        }
-        if (auto* sn = node->dynCast<StructNew>()) {
-          return (!sn->isWithDefault() && !sn->operands.empty())
-                   ? &sn->operands[0]
-                   : nullptr;
-        }
-        if (auto* ag = node->dynCast<ArrayGet>()) {
-          return &ag->ref;
-        }
-        if (auto* as = node->dynCast<ArraySet>()) {
-          return &as->ref;
-        }
-        if (auto* al = node->dynCast<ArrayLen>()) {
-          return &al->ref;
-        }
-        if (auto* af = node->dynCast<ArrayFill>()) {
-          return &af->ref;
-        }
-        if (auto* ac = node->dynCast<ArrayCopy>()) {
-          return &ac->destRef;
-        }
-        if (auto* an = node->dynCast<ArrayNew>()) {
-          return (!an->isWithDefault() && an->init) ? &an->init : nullptr;
-        }
-        if (auto* anf = node->dynCast<ArrayNewFixed>()) {
-          return !anf->values.empty() ? &anf->values[0] : nullptr;
-        }
-        if (auto* rin = node->dynCast<RefIsNull>()) {
-          return &rin->value;
-        }
-        if (auto* ra = node->dynCast<RefAs>()) {
-          return &ra->value;
-        }
-        if (auto* rc = node->dynCast<RefCast>()) {
-          return &rc->ref;
-        }
-        if (auto* rt = node->dynCast<RefTest>()) {
-          return &rt->ref;
-        }
-        if (auto* re = node->dynCast<RefEq>()) {
-          return &re->left;
-        }
-        if (auto* bo = node->dynCast<BrOn>()) {
-          return &bo->ref;
-        }
-        if (auto* l = node->dynCast<Load>()) {
-          return &l->ptr;
-        }
-        if (auto* st = node->dynCast<Store>()) {
-          return &st->ptr;
-        }
-        return nullptr;
+
+        auto matchesTarget = [&](Expression* candidate,
+                                 LocalGet*& getOut) -> bool {
+          getOut = nullptr;
+          if (hasTargetLocal) {
+            if (auto* g = candidate->dynCast<LocalGet>();
+                g && g->index == targetLocal) {
+              getOut = g;
+              return true;
+            }
+            return false;
+          }
+          return candidate->type == pureX->type &&
+                 ExpressionAnalyzer::equal(candidate, pureX);
+        };
+
+        auto canStepPast = [&](Expression* prev) -> bool {
+          EffectAnalyzer eff(passOptions, wasm, prev);
+          if (eff.hasSideEffects()) {
+            return false;
+          }
+          if (hasTargetLocal &&
+              (eff.localsRead.contains(targetLocal) ||
+               eff.localsWritten.contains(targetLocal))) {
+            return false;
+          }
+          return EffectAnalyzer::canReorder(passOptions, wasm, src, prev);
+        };
+
+        std::function<bool(Expression**, bool, bool, bool, Index)> search =
+          [&](Expression** slot,
+              bool isRoot,
+              bool pastConcreteOperand,
+              bool allowDirectMatch,
+              Index depth) -> bool {
+          if (!slot || !*slot || depth > 24) {
+            return false;
+          }
+          Expression* node = *slot;
+          if (allowDirectMatch) {
+            if (auto* ra = node->dynCast<RefAs>();
+                ra && ra->op == RefAsNonNull) {
+              LocalGet* g = nullptr;
+              if (matchesTarget(ra->value, g)) {
+                matchedSlotOut = slot;
+                matchedGetOut = g;
+                matchedExprOut = ra->value;
+                return true;
+              }
+            }
+            LocalGet* g = nullptr;
+            if (matchesTarget(node, g)) {
+              matchedSlotOut = slot;
+              matchedGetOut = g;
+              matchedExprOut = node;
+              return true;
+            }
+          }
+
+          auto tryChildren = [&](std::initializer_list<Expression**> children,
+                                 bool childAllowDirectMatch = true) -> bool {
+            spineAncestorsOut.push_back(node);
+            bool curPastConcrete = pastConcreteOperand;
+            for (Expression** childSlot : children) {
+              if (!childSlot || !*childSlot) {
+                continue;
+              }
+              if (search(childSlot,
+                         false,
+                         curPastConcrete,
+                         childAllowDirectMatch,
+                         depth + 1)) {
+                return true;
+              }
+              if (!canStepPast(*childSlot)) {
+                spineAncestorsOut.pop_back();
+                return false;
+              }
+              if ((*childSlot)->type.isConcrete()) {
+                curPastConcrete = true;
+              }
+            }
+            spineAncestorsOut.pop_back();
+            return false;
+          };
+
+          if (auto* b = node->dynCast<Block>()) {
+            if (!pastConcreteOperand && !b->list.empty() &&
+                (!b->name.is() ||
+                 (isRoot && allowNamedRootBlock && b->type == Type::none))) {
+              spineAncestorsOut.push_back(node);
+              for (Index idx = 0; idx < b->list.size(); idx++) {
+                if (b->list[idx]->is<Nop>()) {
+                  continue;
+                }
+                if (search(&b->list[idx], false, false, true, depth + 1)) {
+                  return true;
+                }
+                break;
+              }
+              spineAncestorsOut.pop_back();
+            }
+            return false;
+          }
+          if (auto* iff = node->dynCast<If>()) {
+            if (!pastConcreteOperand) {
+              return tryChildren({&iff->condition});
+            }
+            return false;
+          }
+          if (node->is<Loop>() || node->is<Try>() || node->is<TryTable>()) {
+            return false;
+          }
+          if (auto* c = node->dynCast<Call>()) {
+            spineAncestorsOut.push_back(node);
+            bool curPastConcrete = pastConcreteOperand;
+            for (Index idx = 0; idx < c->operands.size(); idx++) {
+              if (search(
+                    &c->operands[idx], false, curPastConcrete, true, depth + 1)) {
+                return true;
+              }
+              if (!canStepPast(c->operands[idx])) {
+                spineAncestorsOut.pop_back();
+                return false;
+              }
+              curPastConcrete = true;
+            }
+            spineAncestorsOut.pop_back();
+            return false;
+          }
+          if (auto* c = node->dynCast<CallIndirect>()) {
+            spineAncestorsOut.push_back(node);
+            bool curPastConcrete = pastConcreteOperand;
+            for (Index idx = 0; idx < c->operands.size(); idx++) {
+              if (search(
+                    &c->operands[idx], false, curPastConcrete, true, depth + 1)) {
+                return true;
+              }
+              if (!canStepPast(c->operands[idx])) {
+                spineAncestorsOut.pop_back();
+                return false;
+              }
+              curPastConcrete = true;
+            }
+            if (search(&c->target, false, curPastConcrete, true, depth + 1)) {
+              return true;
+            }
+            spineAncestorsOut.pop_back();
+            return false;
+          }
+          if (auto* c = node->dynCast<CallRef>()) {
+            spineAncestorsOut.push_back(node);
+            bool curPastConcrete = pastConcreteOperand;
+            for (Index idx = 0; idx < c->operands.size(); idx++) {
+              if (search(
+                    &c->operands[idx], false, curPastConcrete, true, depth + 1)) {
+                return true;
+              }
+              if (!canStepPast(c->operands[idx])) {
+                spineAncestorsOut.pop_back();
+                return false;
+              }
+              curPastConcrete = true;
+            }
+            if (search(&c->target, false, curPastConcrete, true, depth + 1)) {
+              return true;
+            }
+            spineAncestorsOut.pop_back();
+            return false;
+          }
+          if (auto* s = node->dynCast<LocalSet>()) {
+            return tryChildren({&s->value});
+          }
+          if (auto* s = node->dynCast<GlobalSet>()) {
+            return tryChildren({&s->value});
+          }
+          if (auto* d = node->dynCast<Drop>()) {
+            return tryChildren({&d->value});
+          }
+          if (auto* r = node->dynCast<Return>()) {
+            return r->value ? tryChildren({&r->value}) : false;
+          }
+          if (auto* br = node->dynCast<Break>()) {
+            return tryChildren({br->value ? &br->value : nullptr,
+                                br->condition ? &br->condition : nullptr});
+          }
+          if (auto* sw = node->dynCast<Switch>()) {
+            return tryChildren(
+              {sw->value ? &sw->value : nullptr, &sw->condition});
+          }
+          if (auto* u = node->dynCast<Unary>()) {
+            return tryChildren({&u->value});
+          }
+          if (auto* bin = node->dynCast<Binary>()) {
+            return tryChildren({&bin->left, &bin->right});
+          }
+          if (auto* sel = node->dynCast<Select>()) {
+            return tryChildren({&sel->ifTrue, &sel->ifFalse, &sel->condition});
+          }
+          if (auto* sg = node->dynCast<StructGet>()) {
+            return tryChildren({&sg->ref});
+          }
+          if (auto* ss = node->dynCast<StructSet>()) {
+            return tryChildren({&ss->ref, &ss->value});
+          }
+          if (auto* sn = node->dynCast<StructNew>()) {
+            if (sn->isWithDefault()) {
+              return false;
+            }
+            spineAncestorsOut.push_back(node);
+            bool curPastConcrete = pastConcreteOperand;
+            for (Index idx = 0; idx < sn->operands.size(); idx++) {
+              if (search(&sn->operands[idx],
+                         false,
+                         curPastConcrete,
+                         true,
+                         depth + 1)) {
+                return true;
+              }
+              if (!canStepPast(sn->operands[idx])) {
+                spineAncestorsOut.pop_back();
+                return false;
+              }
+              curPastConcrete = true;
+            }
+            spineAncestorsOut.pop_back();
+            return false;
+          }
+          if (auto* ag = node->dynCast<ArrayGet>()) {
+            return tryChildren({&ag->ref, &ag->index});
+          }
+          if (auto* as = node->dynCast<ArraySet>()) {
+            return tryChildren({&as->ref, &as->index, &as->value});
+          }
+          if (auto* al = node->dynCast<ArrayLen>()) {
+            return tryChildren({&al->ref});
+          }
+          if (auto* af = node->dynCast<ArrayFill>()) {
+            return tryChildren(
+              {&af->ref, &af->index, &af->value, &af->size});
+          }
+          if (auto* ac = node->dynCast<ArrayCopy>()) {
+            return tryChildren({&ac->destRef,
+                                &ac->destIndex,
+                                &ac->srcRef,
+                                &ac->srcIndex,
+                                &ac->length});
+          }
+          if (auto* an = node->dynCast<ArrayNew>()) {
+            if (an->isWithDefault() || !an->init) {
+              return false;
+            }
+            return tryChildren({&an->init, &an->size});
+          }
+          if (auto* anf = node->dynCast<ArrayNewFixed>()) {
+            spineAncestorsOut.push_back(node);
+            bool curPastConcrete = pastConcreteOperand;
+            for (Index idx = 0; idx < anf->values.size(); idx++) {
+              if (search(
+                    &anf->values[idx], false, curPastConcrete, true, depth + 1)) {
+                return true;
+              }
+              if (!canStepPast(anf->values[idx])) {
+                spineAncestorsOut.pop_back();
+                return false;
+              }
+              curPastConcrete = true;
+            }
+            spineAncestorsOut.pop_back();
+            return false;
+          }
+          if (auto* rin = node->dynCast<RefIsNull>()) {
+            return tryChildren({&rin->value}, /*childAllowDirectMatch=*/false);
+          }
+          if (auto* ra = node->dynCast<RefAs>()) {
+            return tryChildren({&ra->value});
+          }
+          if (auto* rc = node->dynCast<RefCast>()) {
+            return tryChildren({&rc->ref});
+          }
+          if (auto* rt = node->dynCast<RefTest>()) {
+            return tryChildren({&rt->ref});
+          }
+          if (auto* re = node->dynCast<RefEq>()) {
+            return tryChildren({&re->left, &re->right});
+          }
+          if (auto* bo = node->dynCast<BrOn>()) {
+            bool allowDirect =
+              (bo->op != BrOnNull && bo->op != BrOnNonNull);
+            return tryChildren({&bo->ref}, allowDirect);
+          }
+          if (auto* l = node->dynCast<Load>()) {
+            return tryChildren({&l->ptr});
+          }
+          if (auto* st = node->dynCast<Store>()) {
+            return tryChildren({&st->ptr, &st->value});
+          }
+          return false;
+        };
+
+        return search(rootSlot,
+                      /*isRoot=*/true,
+                      /*pastConcreteOperand=*/false,
+                      /*allowDirectMatch=*/true,
+                      0);
       }
 
       static bool stmtUnconditionallyWritesLocal(Expression* stmt,
@@ -3708,94 +4023,53 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                            : nullptr;
           if (isNull) {
             Expression* src = isNull->value;
-            if (src->type.isRef() && src->type.isNullable() &&
-                src->type != Type::unreachable) {
-              bool hasTargetLocal = false;
-              Index targetLocal = 0;
-              LocalSet* tee = nullptr;
-              Expression* pureX = nullptr;
-              if (auto* cGet = src->dynCast<LocalGet>()) {
-                hasTargetLocal = true;
-                targetLocal = cGet->index;
-              } else if (auto* cTee = src->dynCast<LocalSet>()) {
-                if (cTee->isTee() && cTee->value->type != Type::unreachable &&
-                    cTee->value->type.isRef()) {
-                  hasTargetLocal = true;
-                  targetLocal = cTee->index;
-                  tee = cTee;
-                }
-              } else if (!EffectAnalyzer(passOptions, wasm, src)
-                            .hasUnremovableSideEffects()) {
-                pureX = src;
+            Expression** matchedSlot = nullptr;
+            LocalSet* tee = nullptr;
+            LocalGet* matchedGet = nullptr;
+            Expression* matchedExpr = nullptr;
+            std::vector<Expression*> spineAncestors;
+            if (findTargetSlotOnSpine(src,
+                                      &curr->ifTrue,
+                                      /*allowNamedRootBlock=*/true,
+                                      matchedSlot,
+                                      tee,
+                                      matchedGet,
+                                      matchedExpr,
+                                      spineAncestors)) {
+              Expression* ref =
+                stripDeadTeeIfPossible(src, tee, matchedGet, matchedExpr);
+              Block* blk = curr->ifTrue->dynCast<Block>();
+              Name bName;
+              if (blk && !blk->name.is()) {
+                bName = makeFreshBlockName("br_on_null$");
+                blk->name = bName;
+              } else if (blk && blk->name.is() &&
+                         blk->type == Type::none) {
+                bName = blk->name;
+              } else {
+                bName = makeFreshBlockName("br_on_null$");
+                blk = nullptr;
               }
-              if (hasTargetLocal || pureX) {
-                auto matchesTarget = [&](Expression* candidate,
-                                         LocalGet*& getOut) -> bool {
-                  getOut = nullptr;
-                  if (hasTargetLocal) {
-                    if (auto* g = candidate->dynCast<LocalGet>();
-                        g && g->index == targetLocal) {
-                      getOut = g;
-                      return true;
-                    }
-                    return false;
-                  }
-                  return candidate->type == pureX->type &&
-                         ExpressionAnalyzer::equal(candidate, pureX);
-                };
-                Expression** slot = &curr->ifTrue;
-                Expression** matchedSlot = nullptr;
-                LocalGet* matchedGet = nullptr;
-                Expression* matchedExpr = nullptr;
-                while (slot && *slot) {
-                  Expression* node = *slot;
-                  if (auto* ra = node->dynCast<RefAs>();
-                      ra && ra->op == RefAsNonNull) {
-                    LocalGet* g = nullptr;
-                    if (matchesTarget(ra->value, g)) {
-                      matchedSlot = slot;
-                      matchedGet = g;
-                      matchedExpr = ra->value;
-                      break;
-                    }
-                  }
-                  LocalGet* g = nullptr;
-                  if (matchesTarget(node, g)) {
-                    matchedSlot = slot;
-                    matchedGet = g;
-                    matchedExpr = node;
-                    break;
-                  }
-                  slot = firstEvaluatedChildSlot(node);
-                }
-                if (matchedSlot) {
-                  Expression* ref =
-                    stripDeadTeeIfPossible(src, tee, matchedGet, matchedExpr);
-                  Block* blk = curr->ifTrue->dynCast<Block>();
-                  Name bName;
-                  if (blk && !blk->name.is()) {
-                    bName = makeFreshBlockName("br_on_null$");
-                    blk->name = bName;
-                  } else if (blk && blk->name.is() &&
-                             blk->type == Type::none) {
-                    bName = blk->name;
-                  } else {
-                    bName = makeFreshBlockName("br_on_null$");
-                    blk = nullptr;
-                  }
-                  *matchedSlot = builder.makeBrOn(BrOnNull, bName, ref);
-                  if (!blk) {
-                    blk = builder.makeBlock(bName, {curr->ifTrue}, Type::none);
-                  } else {
-                    blk->finalize(Type::none);
-                  }
-                  nameToBlock[bName] = blk;
-                  BranchHints::clear(curr, func);
-                  replaceCurrent(blk);
-                  changed = true;
-                  return;
+              *matchedSlot = builder.makeBrOn(BrOnNull, bName, ref);
+              for (auto ancIt = spineAncestors.rbegin();
+                   ancIt != spineAncestors.rend();
+                   ++ancIt) {
+                if (auto* b = (*ancIt)->dynCast<Block>()) {
+                  b->finalize(b->type);
+                } else {
+                  (*ancIt)->finalize();
                 }
               }
+              if (!blk) {
+                blk = builder.makeBlock(bName, {curr->ifTrue}, Type::none);
+              } else {
+                blk->finalize(Type::none);
+              }
+              nameToBlock[bName] = blk;
+              BranchHints::clear(curr, func);
+              replaceCurrent(blk);
+              changed = true;
+              return;
             }
           }
         }
@@ -3806,6 +4080,60 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
           (curr == func->body && func->getResults().isRef())
             ? func->getResults()
             : curr->type;
+
+        // Part 2(b): Adjacent [(br_if $L (ref.is_null X)), NEXT_STMT] ->
+        // fold (br_on_null $L X') directly into NEXT_STMT's spine.
+        if (wasm.features.hasGC() && allowFuncExit && !neverUnconditionalize &&
+            curr->list.size() >= 2) {
+          for (Index idx = curr->list.size() - 1; idx > 0; idx--) {
+            Index i = idx - 1;
+            auto* br = curr->list[i]->dynCast<Break>();
+            if (!br || br->value || !br->condition || br->type != Type::none) {
+              continue;
+            }
+            auto it = nameToBlock.find(br->name);
+            if (it == nameToBlock.end() || it->second->type != Type::none) {
+              continue;
+            }
+            auto* isNull = br->condition->dynCast<RefIsNull>();
+            if (!isNull) {
+              continue;
+            }
+            Expression* src = isNull->value;
+            Expression** matchedSlot = nullptr;
+            LocalSet* tee = nullptr;
+            LocalGet* matchedGet = nullptr;
+            Expression* matchedExpr = nullptr;
+            std::vector<Expression*> spineAncestors;
+            if (!findTargetSlotOnSpine(src,
+                                       &curr->list[i + 1],
+                                       /*allowNamedRootBlock=*/false,
+                                       matchedSlot,
+                                       tee,
+                                       matchedGet,
+                                       matchedExpr,
+                                       spineAncestors)) {
+              continue;
+            }
+            Expression* ref =
+              stripDeadTeeIfPossible(src, tee, matchedGet, matchedExpr);
+            *matchedSlot = builder.makeBrOn(BrOnNull, br->name, ref);
+            for (auto ancIt = spineAncestors.rbegin();
+                 ancIt != spineAncestors.rend();
+                 ++ancIt) {
+              if (auto* b = (*ancIt)->dynCast<Block>()) {
+                b->finalize(b->type);
+              } else {
+                (*ancIt)->finalize();
+              }
+            }
+            BranchHints::clear(br, func);
+            curr->list.erase(curr->list.begin() + i,
+                             curr->list.begin() + i + 1);
+            curr->finalize(curr->type);
+            changed = true;
+          }
+        }
 
         // Part 3(c): Lazy-init 1-arm void (if (ref.is_null X) (then BODY))
         // followed by VAL / (return VAL) / (br $L VAL) -> br_on_non_null.
@@ -3946,7 +4274,8 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                 bool canStripCondTee = false;
                 if (foldedLastSetIntoVal && localGetCounts[localIdx] == 1) {
                   canStripCondTee = true;
-                } else if (!func->getLocalType(localIdx).isNonNullable()) {
+                } else if (!func->getLocalType(localIdx).isNonNullable() &&
+                           !localsWithSynthesizedGets.contains(localIdx)) {
                   const auto& inf = localGraph.getSetInfluences(condTee);
                   if (inf.size() == 1 && *inf.begin() == valGet) {
                     canStripCondTee = true;
@@ -3964,7 +4293,8 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                 bool canDropLastSet =
                   (localGetCounts[localIdx] == 0) || isFuncExitTail;
                 if (!canDropLastSet &&
-                    !func->getLocalType(localIdx).isNonNullable()) {
+                    !func->getLocalType(localIdx).isNonNullable() &&
+                    !localsWithSynthesizedGets.contains(localIdx)) {
                   const auto& inf = localGraph.getSetInfluences(lastSet);
                   if (inf.size() == 1 && *inf.begin() == valGet) {
                     canDropLastSet = true;
@@ -4020,6 +4350,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                 if (existingV < func->getNumLocals()) {
                   decrementLocalGets(sgVal);
                   localGetCounts[existingV]++;
+                  localsWithSynthesizedGets.insert(existingV);
                   *valPtr = builder.makeLocalGet(
                     existingV, func->getLocalType(existingV));
                 } else if (isFuncExitTail) {
@@ -4034,6 +4365,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                       ss->finalize();
                       decrementLocalGets(sgVal);
                       localGetCounts[v]++;
+                      localsWithSynthesizedGets.insert(v);
                       *valPtr = builder.makeLocalGet(v, lt);
                       break;
                     }
@@ -4060,6 +4392,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                 }
                 if (existingV < func->getNumLocals()) {
                   localGetCounts[existingV]++;
+                  localsWithSynthesizedGets.insert(existingV);
                   *valPtr = builder.makeLocalGet(
                     existingV, func->getLocalType(existingV));
                 }
@@ -4188,6 +4521,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
               builder,
               nameToBlock,
               localGetCounts,
+              localsWithSynthesizedGets,
               localGraph,
               ensureFuncExitLabel,
               makeFreshBlockName,
@@ -4285,6 +4619,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         bool flipInitial = false;
         int deltaBytes = 0;
         std::vector<ShortCircuitStep> steps;
+        std::vector<Expression*> passPrefix;
         std::vector<If*> outerIfs;
         std::vector<If*> innerIfs;
         Expression* passArm = nullptr;
@@ -4311,6 +4646,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         If* curIf = rootIf;
         bool curFlip = flipInitial;
         Expression* curPass = nullptr;
+        std::vector<Expression*> trailingPrefix;
         while (true) {
           plan.outerIfs.push_back(curIf);
           collectShortCircuitConjuncts(curIf->condition,
@@ -4319,9 +4655,10 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                                        *getModule(),
                                        plan.steps,
                                        plan.innerIfs,
-                                       kEqz);
+                                       kEqz,
+                                       trailingPrefix);
           curPass = curFlip ? curIf->ifFalse : curIf->ifTrue;
-          if (!shortArmPure) {
+          if (!shortArmPure || !trailingPrefix.empty()) {
             break;
           }
           auto* nextIf = curPass->dynCast<If>();
@@ -4339,11 +4676,13 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
             break;
           }
         }
+        plan.passPrefix = std::move(trailingPrefix);
         plan.passArm = curPass;
         plan.shortArm = shortArm;
         int mOuter = int(plan.outerIfs.size());
         int kInner = int(plan.innerIfs.size());
-        if (mOuter + kInner < 2 || plan.steps.size() < 2) {
+        if (mOuter + kInner < 2 || plan.steps.empty() ||
+            (plan.steps.size() == 1 && plan.passPrefix.empty())) {
           return plan;
         }
         int bt = blockTypeBytes(rootIf->type);
@@ -4358,7 +4697,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
           (rootIf->type == Type::i32 && isI32Const(shortArm, shortConst) &&
            (shortConst == 0 || shortConst == 1));
         bool passIsOneBitPureSmall = false;
-        if (isBoolShort) {
+        if (isBoolShort && plan.passPrefix.empty() && remN >= 2) {
           if (isI32Const(plan.passArm, passConst) &&
               passConst == (1 - shortConst)) {
             const ShortCircuitStep& sLast = plan.steps[remN - 1];
@@ -4385,31 +4724,36 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                  .hasSideEffects() &&
               !tooCostlyToRunUnconditionally(getPassOptions(), plan.passArm);
           }
-          if (passIsOneBitPureSmall && remN >= 2) {
+          bool lastFoldedSmallEnoughForS0 =
+            (plan.foldLastConstIntoPass &&
+             estimateMinBinaryBytes(plan.steps[remN].cond) <= 4) ||
+            (!plan.foldLastConstIntoPass &&
+             estimateMinBinaryBytes(plan.passArm) <= 4);
+          while (passIsOneBitPureSmall && remN >= 2) {
             const ShortCircuitStep& sPrev = plan.steps[remN - 1];
             bool canOneBit = (shortConst == 0)
                                ? (sPrev.negated || isOneBitI32(sPrev.cond))
                                : (!sPrev.negated || isOneBitI32(sPrev.cond));
-            if (canOneBit) {
-              int eqzC =
-                (shortConst == 0) ? posEqzCost(sPrev) : negEqzCost(sPrev);
-              plan.numTrailingAndOrFolds = 1;
-              remN--;
-              extraPassBytes += 1 + eqzC;
-              if (remN == 1 && shortArmPure && sPrev.prefix.empty() &&
-                  !EffectAnalyzer(getPassOptions(), *getModule(), sPrev.cond)
-                     .hasSideEffects() &&
-                  estimateMinBinaryBytes(sPrev.cond) <= 4) {
-                const ShortCircuitStep& s0 = plan.steps[0];
-                bool s0OneBit = (shortConst == 0)
-                                  ? (s0.negated || isOneBitI32(s0.cond))
-                                  : (!s0.negated || isOneBitI32(s0.cond));
-                if (s0OneBit) {
-                  plan.foldAllToAndOr = true;
-                }
-              }
+            if (!canOneBit) {
+              break;
             }
-          } else if (passIsOneBitPureSmall && remN == 1 && shortArmPure) {
+            int eqzC =
+              (shortConst == 0) ? posEqzCost(sPrev) : negEqzCost(sPrev);
+            plan.numTrailingAndOrFolds++;
+            remN--;
+            extraPassBytes += 1 + eqzC;
+            bool sPrevPure =
+              sPrev.prefix.empty() &&
+              !EffectAnalyzer(getPassOptions(), *getModule(), sPrev.cond)
+                 .hasSideEffects();
+            lastFoldedSmallEnoughForS0 =
+              sPrevPure && estimateMinBinaryBytes(sPrev.cond) <= 4;
+            passIsOneBitPureSmall =
+              sPrevPure &&
+              !tooCostlyToRunUnconditionally(getPassOptions(), sPrev.cond);
+          }
+          if (passIsOneBitPureSmall && lastFoldedSmallEnoughForS0 &&
+              remN == 1 && shortArmPure) {
             const ShortCircuitStep& s0 = plan.steps[0];
             bool s0OneBit = (shortConst == 0)
                               ? (s0.negated || isOneBitI32(s0.cond))
@@ -4465,6 +4809,23 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                      posEqzCost(plan.steps[0]) + extraPassBytes;
           for (size_t i = 1; i < remN; i++) {
             newBytes += negEqzCost(plan.steps[i]);
+            if (plan.steps[i].cond->is<If>()) {
+              std::vector<ShortCircuitStep> subSteps;
+              std::vector<If*> subCollapsedIfs;
+              std::vector<Expression*> subTrailing;
+              int subEqz = 0;
+              collectShortCircuitConjuncts(plan.steps[i].cond,
+                                           !plan.steps[i].negated,
+                                           getPassOptions(),
+                                           *getModule(),
+                                           subSteps,
+                                           subCollapsedIfs,
+                                           subEqz,
+                                           subTrailing);
+              if (!subCollapsedIfs.empty() && subTrailing.empty()) {
+                newBytes -= 3 * int(subCollapsedIfs.size());
+              }
+            }
           }
         }
         plan.deltaBytes = newBytes - origBytes;
@@ -4486,7 +4847,8 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         int32_t shortConst = 0;
         isI32Const(plan.shortArm, shortConst);
         size_t remN = plan.steps.size();
-        Expression* newPassArm = plan.passArm;
+        Expression* newPassArm =
+          prependToArm(builder, plan.passPrefix, plan.passArm);
         if (plan.foldLastConstIntoPass) {
           const ShortCircuitStep& sLast = plan.steps[remN - 1];
           remN--;
@@ -4529,7 +4891,25 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
           const ShortCircuitStep& si = plan.steps[i];
           Expression* negC = materializeNegCond(si);
           auto* brFail = builder.makeBreak(failName, nullptr, negC);
-          appendPrefixAndStmt(failBlk, si.prefix, brFail);
+          Expression* failStmt = brFail;
+          if (auto* foldedBr = tryFoldBooleanBreakCondition(
+                brFail,
+                func,
+                *getModule(),
+                getPassOptions(),
+                neverUnconditionalize,
+                nullptr)) {
+            failStmt = foldedBr;
+            if (auto* foldedIf = failStmt->dynCast<If>()) {
+              while (tryFoldBooleanIfCondition(foldedIf,
+                                               func,
+                                               *getModule(),
+                                               getPassOptions(),
+                                               neverUnconditionalize)) {
+              }
+            }
+          }
+          appendPrefixAndStmt(failBlk, si.prefix, failStmt);
         }
 
         bool useReturnExit =
@@ -4640,6 +5020,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
               // Part 3: 1-arm void `||` guard lowering.
               std::vector<ShortCircuitStep> disjSteps;
               std::vector<If*> collapsedIfs;
+              std::vector<Expression*> disjTrailing;
               int kEqz = 0;
               collectShortCircuitConjuncts(iff->condition,
                                            /*negated=*/true,
@@ -4647,18 +5028,21 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                                            *getModule(),
                                            disjSteps,
                                            collapsedIfs,
-                                           kEqz);
-              if (disjSteps.size() >= 2) {
+                                           kEqz,
+                                           disjTrailing);
+              if (disjSteps.size() >= 2 && disjTrailing.empty()) {
                 ShortCircuitStep dLast = std::move(disjSteps.back());
                 disjSteps.pop_back();
                 std::vector<ShortCircuitStep> lastConjSteps;
+                std::vector<Expression*> conjTrailing;
                 collectShortCircuitConjuncts(dLast.cond,
                                              /*negated=*/!dLast.negated,
                                              getPassOptions(),
                                              *getModule(),
                                              lastConjSteps,
                                              collapsedIfs,
-                                             kEqz);
+                                             kEqz,
+                                             conjTrailing);
                 if (!dLast.prefix.empty()) {
                   lastConjSteps[0].prefix.insert(
                     lastConjSteps[0].prefix.begin(),
@@ -4719,7 +5103,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                     nameToBlock[doName] = doBlk;
                     outBlk->list.push_back(doBlk);
                   }
-                  appendPrefixAndStmt(outBlk, {}, iff->ifTrue);
+                  appendPrefixAndStmt(outBlk, conjTrailing, iff->ifTrue);
                   outBlk->finalize(Type::none);
                   nameToBlock[outName] = outBlk;
                   *currp = outBlk;
@@ -4805,6 +5189,153 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
             }
             bool hasEarlierUnreachable = false;
             for (Index i = 0; i + 1 < blk->list.size(); i++) {
+              if (!hasEarlierUnreachable) {
+                if (auto* iff = blk->list[i]->dynCast<If>();
+                    iff && !iff->ifFalse && iff->type == Type::none &&
+                    iff->condition->type != Type::unreachable) {
+                  bool tailMidVoid = true;
+                  for (Index j = i + 1; j < blk->list.size(); j++) {
+                    if (j + 1 < blk->list.size() &&
+                        blk->list[j]->type != Type::none) {
+                      tailMidVoid = false;
+                      break;
+                    }
+                    if (blk->name.is() &&
+                        BranchUtils::BranchSeeker::has(blk->list[j],
+                                                       blk->name)) {
+                      tailMidVoid = false;
+                      break;
+                    }
+                  }
+                  if (tailMidVoid) {
+                    bool isModeU =
+                      (iff->ifTrue->type == Type::unreachable &&
+                       blk->list.back()->type == Type::unreachable);
+                    bool isModeR = false;
+                    std::vector<Expression*> thenRetPrefix;
+                    Expression* thenRetVal = nullptr;
+                    if (!isModeU && isFuncReturnTail && tryDepth == 0 &&
+                        funcResults.isConcrete() &&
+                        blk->type != Type::unreachable &&
+                        blk->list.back()->type != Type::unreachable &&
+                        Type::isSubType(blk->list.back()->type, funcResults)) {
+                      Return* ret1 = iff->ifTrue->dynCast<Return>();
+                      if (!ret1) {
+                        if (auto* tb = iff->ifTrue->dynCast<Block>();
+                            tb && !tb->name.is() && !tb->list.empty()) {
+                          if (auto* r = tb->list.back()->dynCast<Return>()) {
+                            bool ok = true;
+                            for (Index j = 0; j + 1 < tb->list.size(); j++) {
+                              if (tb->list[j]->type != Type::none) {
+                                ok = false;
+                                break;
+                              }
+                              thenRetPrefix.push_back(tb->list[j]);
+                            }
+                            if (ok) {
+                              ret1 = r;
+                            } else {
+                              thenRetPrefix.clear();
+                            }
+                          }
+                        }
+                      }
+                      if (ret1 && ret1->value &&
+                          ret1->value->type != Type::unreachable &&
+                          Type::isSubType(ret1->value->type, blk->type) &&
+                          Type::isSubType(ret1->value->type, funcResults)) {
+                        isModeR = true;
+                        thenRetVal = ret1->value;
+                      }
+                    }
+                    if (isModeU || isModeR) {
+                      std::vector<ShortCircuitStep> disjSteps;
+                      std::vector<If*> collapsedIfs;
+                      std::vector<Expression*> disjTrailing;
+                      int kEqz = 0;
+                      collectShortCircuitConjuncts(iff->condition,
+                                                   /*negated=*/true,
+                                                   getPassOptions(),
+                                                   *getModule(),
+                                                   disjSteps,
+                                                   collapsedIfs,
+                                                   kEqz,
+                                                   disjTrailing);
+                      if (disjSteps.size() >= 2 && disjTrailing.empty()) {
+                        int kIf = int(collapsedIfs.size());
+                        int origBytes = 3 + 6 * kIf + kEqz;
+                        int newBytes = 3 + 2 * (int(disjSteps.size()) - 1) +
+                                       posEqzCost(disjSteps[0]);
+                        for (size_t m = 1; m < disjSteps.size(); m++) {
+                          newBytes += negEqzCost(disjSteps[m]);
+                        }
+                        if (newBytes < origBytes) {
+                          BranchHints::clear(iff, func);
+                          for (auto* cIf : collapsedIfs) {
+                            BranchHints::clear(cIf, func);
+                          }
+                          Name failName = makeFreshBlockName("sc_fail$");
+                          auto* failBlk =
+                            builder.makeBlock(failName, {}, Type::none);
+                          for (size_t m = 1; m < disjSteps.size(); m++) {
+                            const ShortCircuitStep& dm = disjSteps[m];
+                            auto* brFail = builder.makeBreak(
+                              failName, nullptr, materializeNegCond(dm));
+                            Expression* failStmt = brFail;
+                            if (auto* foldedBr =
+                                  tryFoldBooleanBreakCondition(
+                                    brFail,
+                                    func,
+                                    *getModule(),
+                                    getPassOptions(),
+                                    neverUnconditionalize,
+                                    nullptr)) {
+                              failStmt = foldedBr;
+                              if (auto* foldedIf = failStmt->dynCast<If>()) {
+                                while (tryFoldBooleanIfCondition(
+                                  foldedIf,
+                                  func,
+                                  *getModule(),
+                                  getPassOptions(),
+                                  neverUnconditionalize)) {
+                                }
+                              }
+                            }
+                            appendPrefixAndStmt(failBlk, dm.prefix, failStmt);
+                          }
+                          for (Index j = i + 1; j < blk->list.size(); j++) {
+                            Expression* restItem = blk->list[j];
+                            if (isModeR && j + 1 == blk->list.size()) {
+                              restItem = builder.makeReturn(restItem);
+                            }
+                            appendPrefixAndStmt(failBlk, {}, restItem);
+                          }
+                          failBlk->finalize(Type::none);
+                          nameToBlock[failName] = failBlk;
+                          const ShortCircuitStep& d0 = disjSteps[0];
+                          auto* outerVoidIf = builder.makeIf(
+                            materializePosCond(d0), failBlk, nullptr, Type::none);
+                          blk->list.resize(i);
+                          appendPrefixAndStmt(blk, d0.prefix, outerVoidIf);
+                          if (isModeR) {
+                            appendPrefixAndStmt(blk, thenRetPrefix, thenRetVal);
+                          } else {
+                            appendPrefixAndStmt(blk, {}, iff->ifTrue);
+                          }
+                          blk->finalize(blk->type);
+                          lowerer.changed = true;
+                          walkShortCircuitChains(currp,
+                                                 isVoidTail,
+                                                 isFuncReturnTail,
+                                                 elidableTailType,
+                                                 tryDepth);
+                          return;
+                        }
+                      }
+                    }
+                  }
+                }
+              }
               if (blk->list[i]->type == Type::unreachable) {
                 hasEarlierUnreachable = true;
               }
@@ -4862,9 +5393,11 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
             if (iff->condition->type == Type::unreachable) {
               return;
             }
+            bool isBareVoidReturn =
+              iff->ifTrue->is<Return>() && !iff->ifTrue->cast<Return>()->value;
             if (isVoidTail && !iff->ifFalse && iff->type == Type::none &&
-                iff->ifTrue->type == Type::none && !iff->ifTrue->is<Nop>() &&
-                !iff->ifTrue->is<Break>() && !iff->ifTrue->is<Return>()) {
+                !iff->ifTrue->is<Nop>() && !iff->ifTrue->is<Break>() &&
+                !isBareVoidReturn) {
               Expression* negCond = nullptr;
               if (auto* u = iff->condition->dynCast<Unary>();
                   u && u->op == EqZInt32 && u->value->type == Type::i32) {
@@ -4872,6 +5405,9 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
               } else if (canInvertBoolExprFree(iff->condition)) {
                 negCond = iff->condition;
                 invertBoolExprFree(negCond, builder);
+              } else if (canPushEqzIntoIfOrExprFree(iff->condition)) {
+                negCond = iff->condition;
+                pushEqzIntoIfOrExprFree(negCond, builder);
               }
               if (negCond) {
                 Name bName = makeFreshBlockName("tail_if$");
@@ -6403,6 +6939,27 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
             if (curr->list.size() >= 2) {
               restructureIf(curr);
             }
+            if (v4 && getCurrent() == curr) {
+              bool unnestedAny = false;
+              for (Index i = 0; i < curr->list.size(); i++) {
+                if (auto* iff = curr->list[i]->dynCast<If>();
+                    iff && iff->ifFalse) {
+                  if (auto* seq = tryUnnestOneUnreachableArmIf(
+                        iff, /*allowBrIfChain=*/true)) {
+                    unnestedIfBlocks.erase(seq);
+                    curr->list[i] = seq->list[0];
+                    for (Index j = 1; j < seq->list.size(); j++) {
+                      curr->list.insertAt(i + j, seq->list[j]);
+                    }
+                    unnestedAny = true;
+                  }
+                }
+              }
+              if (unnestedAny) {
+                curr->finalize(curr->type);
+                refinalize = true;
+              }
+            }
             peelTailReturnIfs();
             if (getCurrent() != curr) {
               return;
@@ -7888,16 +8445,85 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         }
       }
 
-      Block* tryUnnestOneUnreachableArmIf(If* iff) {
-        if (!shrink2 || !iff || !iff->ifFalse || !iff->type.isConcrete() ||
-            iff->condition->type == Type::unreachable ||
-            !((iff->ifTrue->type == Type::unreachable &&
-               iff->ifFalse->type.isConcrete()) ||
-              (iff->ifFalse->type == Type::unreachable &&
-               iff->ifTrue->type.isConcrete()))) {
+      bool isBrIfChain(If* rootIf) {
+        if (!rootIf || !rootIf->ifFalse || rootIf->type != Type::none) {
+          return false;
+        }
+        Name targetName;
+        If* cur = rootIf;
+        Index count = 0;
+        while (cur) {
+          if (cur->condition->type == Type::unreachable) {
+            return false;
+          }
+          Break* thenBr = cur->ifTrue->dynCast<Break>();
+          if (!thenBr) {
+            if (auto* tb = cur->ifTrue->dynCast<Block>();
+                tb && !tb->name.is() && !tb->list.empty()) {
+              if (auto* b = tb->list.back()->dynCast<Break>()) {
+                bool ok = true;
+                for (Index j = 0; j + 1 < tb->list.size(); j++) {
+                  if (tb->list[j]->type != Type::none) {
+                    ok = false;
+                    break;
+                  }
+                }
+                if (ok) {
+                  thenBr = b;
+                }
+              }
+            }
+          }
+          if (!thenBr || thenBr->condition) {
+            return false;
+          }
+          if (count == 0) {
+            targetName = thenBr->name;
+          } else if (thenBr->name != targetName) {
+            return false;
+          }
+          count++;
+          if (!cur->ifFalse) {
+            return count >= 2;
+          }
+          cur = cur->ifFalse->dynCast<If>();
+          if (!cur) {
+            return false;
+          }
+        }
+        return false;
+      }
+
+      Block* tryUnnestOneUnreachableArmIf(If* iff,
+                                          bool allowBrIfChain = false) {
+        if (!shrink2 || !iff || !iff->ifFalse ||
+            !(iff->type.isConcrete() || (v4 && iff->type == Type::none)) ||
+            iff->condition->type == Type::unreachable) {
           return nullptr;
         }
-        bool unreachWasTrue = iff->ifTrue->type == Type::unreachable;
+        auto isArmUnreachable = [&](Expression* arm) {
+          if (arm->type == Type::unreachable) {
+            return true;
+          }
+          if (v4) {
+            if (auto* b = arm->dynCast<Block>();
+                b && !b->name.is() && !b->list.empty() &&
+                b->list.back()->type == Type::unreachable) {
+              return true;
+            }
+          }
+          return false;
+        };
+        bool trueUnreach = isArmUnreachable(iff->ifTrue);
+        bool falseUnreach = isArmUnreachable(iff->ifFalse);
+        if (trueUnreach == falseUnreach) {
+          return nullptr;
+        }
+        if (v4 && !allowBrIfChain && iff->type == Type::none &&
+            isBrIfChain(iff)) {
+          return nullptr;
+        }
+        bool unreachWasTrue = trueUnreach;
         Expression* unreachArm = unreachWasTrue ? iff->ifTrue : iff->ifFalse;
         Expression* concreteArm = unreachWasTrue ? iff->ifFalse : iff->ifTrue;
         bool canStripUnreach = false;
@@ -7913,7 +8539,8 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         if (auto* u = iff->condition->dynCast<Unary>();
             u && u->op == EqZInt32) {
           condIsEqz = true;
-        } else if (v4 && canInvertBoolExprFree(iff->condition)) {
+        } else if (v4 && (canInvertBoolExprFree(iff->condition) ||
+                          canPushEqzIntoIfOrExprFree(iff->condition))) {
           condIsEqz = true;
         }
         bool indexedType =
@@ -7930,11 +8557,19 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
           } else {
             b->finalize();
           }
+        } else if (auto* b = unreachArm->dynCast<Block>();
+                   b && !b->name.is()) {
+          b->finalize();
         }
         if (!unreachWasTrue) {
-          iff->condition =
-            v4 ? makeNegatedBool(builder, iff->condition, true)
-               : negateCond(builder, iff->condition);
+          if (v4 && canPushEqzIntoIfOrExprFree(iff->condition) &&
+              !canInvertBoolExprFree(iff->condition)) {
+            pushEqzIntoIfOrExprFree(iff->condition, builder);
+          } else {
+            iff->condition =
+              v4 ? makeNegatedBool(builder, iff->condition, true)
+                 : negateCond(builder, iff->condition);
+          }
           BranchHints::flip(iff, getFunction());
         }
         iff->ifTrue = unreachArm;
@@ -7944,8 +8579,66 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                tryFoldBooleanIfCondition(
                  iff, getFunction(), *getModule(), passOptions)) {
         }
-        auto* seq = builder.makeBlock(iff);
+        Expression* firstStmt = iff;
+        if (v4 && iff->condition->type != Type::unreachable) {
+          while (auto* b = iff->ifTrue->dynCast<Block>()) {
+            if (!b->name.is() && b->list.size() == 1) {
+              iff->ifTrue = b->list[0];
+            } else {
+              break;
+            }
+          }
+          Drop* innerDrop = iff->ifTrue->dynCast<Drop>();
+          Break* br = innerDrop ? innerDrop->value->dynCast<Break>()
+                                : iff->ifTrue->dynCast<Break>();
+          if (innerDrop &&
+              (!br || !br->value || br->type == Type::unreachable)) {
+            innerDrop = nullptr;
+            br = nullptr;
+          }
+          if (br && !br->condition &&
+              canTurnIfIntoBrIf(
+                iff->condition, br->value, passOptions, *getModule())) {
+            br->condition = iff->condition;
+            BranchHints::copyTo(iff, br, getFunction());
+            br->finalize();
+            Expression* rep = innerDrop
+                                ? static_cast<Expression*>(innerDrop)
+                                : builder.dropIfConcretelyTyped(br);
+            if (innerDrop) {
+              innerDrop->finalize();
+            }
+            if (foldBoolIf) {
+              if (auto* folded =
+                    tryFoldBooleanBreakCondition(br,
+                                                 getFunction(),
+                                                 *getModule(),
+                                                 passOptions,
+                                                 neverUnconditionalize,
+                                                 rep->dynCast<Drop>())) {
+                rep = folded;
+                if (auto* foldedIf = rep->dynCast<If>()) {
+                  while (tryFoldBooleanIfCondition(
+                    foldedIf, getFunction(), *getModule(), passOptions)) {
+                  }
+                }
+              }
+            }
+            firstStmt = rep;
+          }
+        }
+        if (v4) {
+          if (auto* cIf = concreteArm->dynCast<If>()) {
+            if (auto* subSeq =
+                  tryUnnestOneUnreachableArmIf(cIf, allowBrIfChain)) {
+              unnestedIfBlocks.erase(subSeq);
+              concreteArm = subSeq;
+            }
+          }
+        }
+        auto* seq = builder.makeBlock(firstStmt);
         if (auto* cb = concreteArm->dynCast<Block>(); cb && !cb->name.is()) {
+          unnestedIfBlocks.erase(cb);
           for (auto* item : cb->list) {
             seq->list.push_back(item);
           }
@@ -8235,6 +8928,13 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                    curr, getFunction(), *getModule(), passOptions)) {
           }
           replaceCurrent(makeUnnestedSeq(curr, after));
+          return;
+        }
+        if (v4 && curr->ifFalse) {
+          if (auto* seq = tryUnnestOneUnreachableArmIf(curr)) {
+            replaceCurrent(seq);
+            return;
+          }
         }
       }
 
