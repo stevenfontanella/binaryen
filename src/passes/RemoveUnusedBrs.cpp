@@ -301,6 +301,18 @@ static bool tryInvertRelationalBinaryOp(BinaryOp op, BinaryOp& out) {
     case GtUInt64:
       out = LeUInt64;
       return true;
+    case EqFloat32:
+      out = NeFloat32;
+      return true;
+    case NeFloat32:
+      out = EqFloat32;
+      return true;
+    case EqFloat64:
+      out = NeFloat64;
+      return true;
+    case NeFloat64:
+      out = EqFloat64;
+      return true;
     default:
       return false;
   }
@@ -379,6 +391,68 @@ static void invertBoolExprFree(Expression*& curr, Builder& builder) {
     return;
   }
   WASM_UNREACHABLE("unexpected expression in invertBoolExprFree");
+}
+
+// Check whether `i32.eqz(curr)` can be pushed into `curr` with <= 0 net added
+// `i32.eqz` instructions (either 0 added `i32.eqz` via `canInvertBoolExprFree`,
+// or pushing `i32.eqz` through a 2-arm `If (result i32)` where at least one arm
+// is `canInvertBoolExprFree`).
+static bool canPushEqzIntoIfOrExprFree(Expression* curr, Index depth = 0) {
+  if (!curr || curr->type != Type::i32 || depth > 8) {
+    return false;
+  }
+  if (canInvertBoolExprFree(curr, depth)) {
+    return true;
+  }
+  if (auto* block = curr->dynCast<Block>()) {
+    if (!block->name.is() && !block->list.empty()) {
+      return canPushEqzIntoIfOrExprFree(block->list.back(), depth + 1);
+    }
+    return false;
+  }
+  if (auto* iff = curr->dynCast<If>()) {
+    if (!iff->ifFalse || iff->condition->type == Type::unreachable ||
+        iff->ifTrue->type != Type::i32 || iff->ifFalse->type != Type::i32) {
+      return false;
+    }
+    return canInvertBoolExprFree(iff->ifTrue, depth + 1) ||
+           canInvertBoolExprFree(iff->ifFalse, depth + 1);
+  }
+  return false;
+}
+
+static void pushEqzIntoIfOrExprFree(Expression*& curr,
+                                    Builder& builder,
+                                    Index depth = 0) {
+  if (canInvertBoolExprFree(curr, depth)) {
+    invertBoolExprFree(curr, builder);
+    return;
+  }
+  if (auto* u = curr->dynCast<Unary>();
+      u && u->op == EqZInt32 && isOneBitI32(u->value)) {
+    curr = u->value;
+    return;
+  }
+  if (auto* block = curr->dynCast<Block>()) {
+    if (!block->name.is() && !block->list.empty() &&
+        canPushEqzIntoIfOrExprFree(block->list.back(), depth + 1)) {
+      pushEqzIntoIfOrExprFree(block->list.back(), builder, depth + 1);
+      block->finalize(Type::i32);
+      return;
+    }
+  }
+  if (auto* iff = curr->dynCast<If>()) {
+    if (iff->ifFalse && iff->condition->type != Type::unreachable &&
+        iff->ifTrue->type == Type::i32 && iff->ifFalse->type == Type::i32 &&
+        (canInvertBoolExprFree(iff->ifTrue, depth + 1) ||
+         canInvertBoolExprFree(iff->ifFalse, depth + 1))) {
+      pushEqzIntoIfOrExprFree(iff->ifTrue, builder, depth + 1);
+      pushEqzIntoIfOrExprFree(iff->ifFalse, builder, depth + 1);
+      iff->finalize(Type::i32);
+      return;
+    }
+  }
+  curr = builder.makeUnary(EqZInt32, curr);
 }
 
 // Negate `expr` for use as a boolean condition (where only zero vs non-zero
@@ -481,12 +555,158 @@ static Expression* prependToArm(Builder& builder,
   return block;
 }
 
+struct ShortCircuitStep {
+  std::vector<Expression*> prefix;
+  Expression* cond = nullptr;
+  bool negated = false;
+};
+
+// Recursively decompose a boolean condition `expr` (interpreted as `expr != 0`
+// when `!negated`, or `expr == 0` when `negated`) into a short-circuit
+// conjunction of `ShortCircuitStep`s.
+// Note that by De Morgan's law, calling `collectShortCircuitConjuncts` with
+// `negated = true` decomposes a short-circuit disjunction `D_1 || D_2 || ...`
+// into the conjunction `!D_1 && !D_2 && ...`.
+static void collectShortCircuitConjuncts(Expression* expr,
+                                         bool negated,
+                                         const PassOptions& passOptions,
+                                         Module& wasm,
+                                         std::vector<ShortCircuitStep>& outSteps,
+                                         std::vector<If*>& collapsedIfs,
+                                         int& kEqzOut) {
+  int localEqz = 0;
+  while (auto* u = expr->dynCast<Unary>()) {
+    if (u->op == EqZInt32) {
+      negated = !negated;
+      expr = u->value;
+      localEqz++;
+    } else {
+      break;
+    }
+  }
+  if (auto* inner = expr->dynCast<If>();
+      inner && inner->ifFalse && inner->type == Type::i32 &&
+      inner->condition->type != Type::unreachable) {
+    std::vector<Expression*> armPrefix;
+    Expression* armVal = nullptr;
+    int32_t falseConst = 0;
+    int32_t dummyConst = 0;
+    if (isI32Const(inner->ifFalse, falseConst) &&
+        splitBoolIfArm(inner->ifTrue, passOptions, wasm, armPrefix, armVal) &&
+        !isI32Const(armVal, dummyConst) &&
+        ((falseConst == 0 && !negated) || (falseConst != 0 && negated))) {
+      kEqzOut += localEqz;
+      collapsedIfs.push_back(inner);
+      collectShortCircuitConjuncts(inner->condition,
+                                   false,
+                                   passOptions,
+                                   wasm,
+                                   outSteps,
+                                   collapsedIfs,
+                                   kEqzOut);
+      Index secondIdx = outSteps.size();
+      collectShortCircuitConjuncts(armVal,
+                                   negated,
+                                   passOptions,
+                                   wasm,
+                                   outSteps,
+                                   collapsedIfs,
+                                   kEqzOut);
+      if (!armPrefix.empty()) {
+        outSteps[secondIdx].prefix.insert(outSteps[secondIdx].prefix.begin(),
+                                          armPrefix.begin(),
+                                          armPrefix.end());
+      }
+      return;
+    }
+    int32_t trueConst = 0;
+    if (isI32Const(inner->ifTrue, trueConst) &&
+        splitBoolIfArm(inner->ifFalse, passOptions, wasm, armPrefix, armVal) &&
+        !isI32Const(armVal, dummyConst) &&
+        ((trueConst == 0 && !negated) || (trueConst != 0 && negated))) {
+      kEqzOut += localEqz;
+      collapsedIfs.push_back(inner);
+      collectShortCircuitConjuncts(inner->condition,
+                                   true,
+                                   passOptions,
+                                   wasm,
+                                   outSteps,
+                                   collapsedIfs,
+                                   kEqzOut);
+      Index secondIdx = outSteps.size();
+      collectShortCircuitConjuncts(armVal,
+                                   negated,
+                                   passOptions,
+                                   wasm,
+                                   outSteps,
+                                   collapsedIfs,
+                                   kEqzOut);
+      if (!armPrefix.empty()) {
+        outSteps[secondIdx].prefix.insert(outSteps[secondIdx].prefix.begin(),
+                                          armPrefix.begin(),
+                                          armPrefix.end());
+      }
+      return;
+    }
+  }
+  kEqzOut += localEqz;
+  outSteps.push_back(ShortCircuitStep{{}, expr, negated});
+}
+
+static int estimateMinBinaryBytes(Expression* curr, Index depth = 0) {
+  if (!curr || curr->is<Nop>() || depth > 6) {
+    return 0;
+  }
+  if (curr->is<Unreachable>()) {
+    return 1;
+  }
+  if (auto* c = curr->dynCast<Const>()) {
+    if (c->type == Type::f64) {
+      return 9;
+    }
+    if (c->type == Type::f32) {
+      return 5;
+    }
+    return 2;
+  }
+  if (curr->is<RefNull>() || curr->is<LocalGet>() || curr->is<GlobalGet>()) {
+    return 2;
+  }
+  if (auto* br = curr->dynCast<Break>()) {
+    return 2 + (br->value ? estimateMinBinaryBytes(br->value, depth + 1) : 0) +
+           (br->condition ? estimateMinBinaryBytes(br->condition, depth + 1)
+                          : 0);
+  }
+  if (auto* ret = curr->dynCast<Return>()) {
+    return 1 + (ret->value ? estimateMinBinaryBytes(ret->value, depth + 1) : 0);
+  }
+  if (auto* b = curr->dynCast<Block>()) {
+    int sum = b->name.is() ? 3 : 0;
+    for (auto* item : b->list) {
+      sum += estimateMinBinaryBytes(item, depth + 1);
+      if (sum >= 64) {
+        return 64;
+      }
+    }
+    return sum;
+  }
+  int sum = 1;
+  for (auto* child : ChildIterator(curr)) {
+    sum += estimateMinBinaryBytes(child, depth + 1);
+    if (sum >= 64) {
+      return 64;
+    }
+  }
+  return sum;
+}
+
 // Try to fold a boolean-producing `if (result i32)` condition (optionally
 // wrapped in `i32.eqz`) into `curr`.
 static bool tryFoldBooleanIfCondition(If* curr,
                                       Function* func,
                                       Module& wasm,
-                                      const PassOptions& passOptions) {
+                                      const PassOptions& passOptions,
+                                      bool neverUnconditionalize = false) {
   bool negated = false;
   Expression* cond = curr->condition;
   while (auto* u = cond->dynCast<Unary>()) {
@@ -547,18 +767,17 @@ static bool tryFoldBooleanIfCondition(If* curr,
       curr->finalize();
       return true;
     }
-    // (d) Short-circuit `&&` without outer `else`:
-    // `(if (if (result i32) c (then A E) (else 0)) (then T))`
-    //  => `(if c (then A (if E (then T))))`
-    // `(if (i32.eqz (if (result i32) c (then A E) (else 1))) (then T))`
-    //  => `(if c (then A (if (i32.eqz E) (then T))))`
-    if (!valIsConst && !curr->ifFalse &&
+    // (d) Short-circuit `&&`:
+    // `(if (if (result i32) c (then A E) (else 0)) (then T) [else F])`
+    // `(if (i32.eqz (if (result i32) c (then A E) (else 1))) (then T) [else F])`
+    if (!valIsConst &&
         ((falseConst == 0 && !negated) || (falseConst != 0 && negated))) {
       Expression* innerCond =
         negated
           ? makeNegatedBool(builder, val, isV4Enabled(passOptions))
           : val;
-      if (isV4Enabled(passOptions) && prefix.empty() &&
+      if (isV4Enabled(passOptions) && !neverUnconditionalize &&
+          prefix.empty() &&
           !EffectAnalyzer(passOptions, wasm, val).hasSideEffects() &&
           !tooCostlyToRunUnconditionally(passOptions, val) &&
           (isOneBitI32(inner->condition) || isOneBitI32(innerCond))) {
@@ -570,12 +789,29 @@ static bool tryFoldBooleanIfCondition(If* curr,
         curr->finalize();
         return true;
       }
-      auto* newInnerIf = builder.makeIf(innerCond, curr->ifTrue);
-      while (tryFoldBooleanIfCondition(newInnerIf, func, wasm, passOptions)) {
+      if (!curr->ifFalse) {
+        auto* newInnerIf = builder.makeIf(innerCond, curr->ifTrue);
+        while (tryFoldBooleanIfCondition(
+          newInnerIf, func, wasm, passOptions, neverUnconditionalize)) {
+        }
+        curr->condition = inner->condition;
+        curr->ifTrue = prependToArm(builder, prefix, newInnerIf);
+        BranchHints::copyTo(inner, curr, func);
+        curr->finalize();
+        return true;
       }
-      curr->condition = inner->condition;
-      curr->ifTrue = prependToArm(builder, prefix, newInnerIf);
-      BranchHints::copyTo(inner, curr, func);
+    }
+    // (e) Short-circuit `||` (`c ? E : 1` or `!(c ? E : 0)`):
+    if (!valIsConst && isV4Enabled(passOptions) && !neverUnconditionalize &&
+        prefix.empty() &&
+        ((falseConst != 0 && !negated) || (falseConst == 0 && negated)) &&
+        !EffectAnalyzer(passOptions, wasm, val).hasSideEffects() &&
+        !tooCostlyToRunUnconditionally(passOptions, val)) {
+      Expression* innerCond =
+        negated ? makeNegatedBool(builder, val, true) : val;
+      curr->condition = builder.makeBinary(
+        OrInt32, makeNegatedBool(builder, inner->condition, true), innerCond);
+      BranchHints::clear(curr, func);
       curr->finalize();
       return true;
     }
@@ -617,15 +853,15 @@ static bool tryFoldBooleanIfCondition(If* curr,
       curr->finalize();
       return true;
     }
-    // `(if (if (result i32) c (then 0) (else A E)) (then T))`
-    //  => `(if (i32.eqz c) (then A (if E (then T))))`
-    if (!valIsConst && !curr->ifFalse &&
+    // `(if (if (result i32) c (then 0) (else A E)) (then T) [else F])`
+    if (!valIsConst &&
         ((trueConst == 0 && !negated) || (trueConst != 0 && negated))) {
       Expression* innerCond =
         negated
           ? makeNegatedBool(builder, val, isV4Enabled(passOptions))
           : val;
-      if (isV4Enabled(passOptions) && prefix.empty() &&
+      if (isV4Enabled(passOptions) && !neverUnconditionalize &&
+          prefix.empty() &&
           !EffectAnalyzer(passOptions, wasm, val).hasSideEffects() &&
           !tooCostlyToRunUnconditionally(passOptions, val)) {
         curr->condition = builder.makeBinary(
@@ -636,13 +872,30 @@ static bool tryFoldBooleanIfCondition(If* curr,
         curr->finalize();
         return true;
       }
-      auto* newInnerIf = builder.makeIf(innerCond, curr->ifTrue);
-      while (tryFoldBooleanIfCondition(newInnerIf, func, wasm, passOptions)) {
+      if (!curr->ifFalse) {
+        auto* newInnerIf = builder.makeIf(innerCond, curr->ifTrue);
+        while (tryFoldBooleanIfCondition(
+          newInnerIf, func, wasm, passOptions, neverUnconditionalize)) {
+        }
+        curr->condition =
+          makeNegatedBool(builder, inner->condition, isV4Enabled(passOptions));
+        curr->ifTrue = prependToArm(builder, prefix, newInnerIf);
+        BranchHints::copyFlippedTo(inner, curr, func);
+        curr->finalize();
+        return true;
       }
+    }
+    // Short-circuit `||` (`c ? 1 : E` or `!(c ? 0 : E)`):
+    if (!valIsConst && isV4Enabled(passOptions) && !neverUnconditionalize &&
+        prefix.empty() &&
+        ((trueConst != 0 && !negated) || (trueConst == 0 && negated)) &&
+        !EffectAnalyzer(passOptions, wasm, val).hasSideEffects() &&
+        !tooCostlyToRunUnconditionally(passOptions, val)) {
+      Expression* innerCond =
+        negated ? makeNegatedBool(builder, val, true) : val;
       curr->condition =
-        makeNegatedBool(builder, inner->condition, isV4Enabled(passOptions));
-      curr->ifTrue = prependToArm(builder, prefix, newInnerIf);
-      BranchHints::copyFlippedTo(inner, curr, func);
+        builder.makeBinary(OrInt32, inner->condition, innerCond);
+      BranchHints::clear(curr, func);
       curr->finalize();
       return true;
     }
@@ -809,6 +1062,24 @@ static Expression* tryFoldBooleanBreakCondition(Break* curr,
         BranchHints::clear(curr, func);
         return finishInPlace();
       }
+      if (!curr->value && !outerDrop && isV4Enabled(passOptions) &&
+          prefix.empty()) {
+        Expression* c1 = makeNegatedBool(builder, inner->condition, true);
+        auto* br1 = builder.makeBreak(curr->name, nullptr, c1);
+        BranchHints::copyFlippedTo(inner, br1, func);
+        Expression* rep1 = br1;
+        if (auto* r1 = tryFoldBooleanBreakCondition(br1,
+                                                    func,
+                                                    wasm,
+                                                    passOptions,
+                                                    neverUnconditionalize,
+                                                    nullptr)) {
+          rep1 = r1;
+        }
+        curr->condition = rhs;
+        Expression* rep2 = finishConditionalArm();
+        return builder.makeBlock({rep1, rep2}, Type::none);
+      }
       if (!curr->value ||
           (isTrivialValueToCopy(curr->value) &&
            (!negated || isV4Enabled(passOptions)))) {
@@ -897,6 +1168,23 @@ static Expression* tryFoldBooleanBreakCondition(Break* curr,
         curr->condition = builder.makeBinary(OrInt32, inner->condition, rhs);
         BranchHints::clear(curr, func);
         return finishInPlace();
+      }
+      if (!curr->value && !outerDrop && isV4Enabled(passOptions) &&
+          prefix.empty()) {
+        auto* br1 = builder.makeBreak(curr->name, nullptr, inner->condition);
+        BranchHints::copyTo(inner, br1, func);
+        Expression* rep1 = br1;
+        if (auto* r1 = tryFoldBooleanBreakCondition(br1,
+                                                    func,
+                                                    wasm,
+                                                    passOptions,
+                                                    neverUnconditionalize,
+                                                    nullptr)) {
+          rep1 = r1;
+        }
+        curr->condition = rhs;
+        Expression* rep2 = finishConditionalArm();
+        return builder.makeBlock({rep1, rep2}, Type::none);
       }
       if (!curr->value || isTrivialValueToCopy(curr->value)) {
         Expression* valCopy =
@@ -2234,17 +2522,20 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
       void visitUnary(Unary* curr) {
         if (isV4Enabled(passOptions) && curr->op == EqZInt32 &&
             (curr->value->is<If>() || curr->value->is<Select>()) &&
-            canInvertBoolExprFree(curr->value)) {
+            canPushEqzIntoIfOrExprFree(curr->value)) {
           Builder builder(*getModule());
-          invertBoolExprFree(curr->value, builder);
+          pushEqzIntoIfOrExprFree(curr->value, builder);
           replaceCurrent(curr->value);
           worked = true;
         }
       }
 
       void visitIf(If* curr) {
-        while (tryFoldBooleanIfCondition(
-          curr, getFunction(), *getModule(), passOptions)) {
+        while (tryFoldBooleanIfCondition(curr,
+                                         getFunction(),
+                                         *getModule(),
+                                         passOptions,
+                                         neverUnconditionalize)) {
           worked = true;
         }
       }
@@ -2783,9 +3074,6 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
       return;
     }
     bool hasGC = getModule()->features.hasGC();
-    if (!hasGC) {
-      return;
-    }
 
     std::unordered_map<Name, Block*> nameToBlock;
     std::unordered_set<Name> usedNames;
@@ -2895,7 +3183,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
       condGetOut = nullptr;
       valGetOut = nullptr;
       refOperandOut = nullptr;
-      if (!targetType.isRef() || !valueExpr) {
+      if (!hasGC || !targetType.isRef() || !valueExpr) {
         return false;
       }
       auto* isNull = isNullExpr ? isNullExpr->dynCast<RefIsNull>() : nullptr;
@@ -3412,7 +3700,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
 
         // Part 2: br_on_null spine-consuming lowering for 1-arm void
         // (if (i32.eqz (ref.is_null X)) (then BODY)).
-        if (allowFuncExit && !neverUnconditionalize &&
+        if (wasm.features.hasGC() && allowFuncExit && !neverUnconditionalize &&
             curr->type == Type::none) {
           auto* eqz = curr->condition->dynCast<Unary>();
           auto* isNull = (eqz && eqz->op == EqZInt32)
@@ -3521,7 +3809,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
 
         // Part 3(c): Lazy-init 1-arm void (if (ref.is_null X) (then BODY))
         // followed by VAL / (return VAL) / (br $L VAL) -> br_on_non_null.
-        if (allowFuncExit && !neverUnconditionalize &&
+        if (wasm.features.hasGC() && allowFuncExit && !neverUnconditionalize &&
             curr->list.size() >= 2) {
           for (Index i = 0; i + 1 < curr->list.size(); i++) {
             auto* iff = curr->list[i]->dynCast<If>();
@@ -3921,6 +4209,643 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
       wrapper->finalize(funcResults);
     } else {
       func->body = root;
+    }
+
+    // Short-Circuit 2-Arm If (result T) Chain Rotation, Shared-Arm Collapsing,
+    // and 1-Arm Void `||` Guard Lowering (Idea #104).
+    if (allowFuncExit && func->body) {
+      auto blockTypeBytes = [](Type t) -> int {
+        if (t == Type::none || t == Type::unreachable) {
+          return 1;
+        }
+        if (t.isRef() && (!t.isNullable() || !t.getHeapType().isBasic())) {
+          return 2;
+        }
+        return 1;
+      };
+      auto canNegateFree = [](Expression* expr) -> bool {
+        return canInvertBoolExprFree(expr) || canPushEqzIntoIfOrExprFree(expr);
+      };
+      auto posEqzCost = [&](const ShortCircuitStep& s) -> int {
+        return (s.negated && !canNegateFree(s.cond)) ? 1 : 0;
+      };
+      auto negEqzCost = [&](const ShortCircuitStep& s) -> int {
+        return (!s.negated && !canNegateFree(s.cond)) ? 1 : 0;
+      };
+      auto makeNegated = [&](Expression* expr) -> Expression* {
+        if (canInvertBoolExprFree(expr)) {
+          invertBoolExprFree(expr, builder);
+          return expr;
+        }
+        if (canPushEqzIntoIfOrExprFree(expr)) {
+          pushEqzIntoIfOrExprFree(expr, builder);
+          return expr;
+        }
+        return makeNegatedBool(builder, expr, true);
+      };
+      auto materializePosCond = [&](const ShortCircuitStep& s) -> Expression* {
+        return s.negated ? makeNegated(s.cond) : s.cond;
+      };
+      auto materializeNegCond = [&](const ShortCircuitStep& s) -> Expression* {
+        return s.negated ? s.cond : makeNegated(s.cond);
+      };
+      auto materializePosOneBit =
+        [&](const ShortCircuitStep& s) -> Expression* {
+        return s.negated ? makeNegated(s.cond)
+                         : makeOneBitCond(builder, s.cond);
+      };
+      auto materializeNegOneBit =
+        [&](const ShortCircuitStep& s) -> Expression* {
+        return s.negated ? makeOneBitCond(builder, s.cond)
+                         : makeNegated(s.cond);
+      };
+      auto appendPrefixAndStmt = [&](Block* dst,
+                                     const std::vector<Expression*>& prefix,
+                                     Expression* stmt) {
+        for (auto* p : prefix) {
+          if (!p->is<Nop>()) {
+            dst->list.push_back(p);
+          }
+        }
+        if (stmt && !stmt->is<Nop>()) {
+          if (auto* b = stmt->dynCast<Block>(); b && !b->name.is()) {
+            for (auto* item : b->list) {
+              if (!item->is<Nop>()) {
+                dst->list.push_back(item);
+              }
+            }
+          } else {
+            dst->list.push_back(stmt);
+          }
+        }
+      };
+
+      struct ChainPlan {
+        bool valid = false;
+        bool flipInitial = false;
+        int deltaBytes = 0;
+        std::vector<ShortCircuitStep> steps;
+        std::vector<If*> outerIfs;
+        std::vector<If*> innerIfs;
+        Expression* passArm = nullptr;
+        Expression* shortArm = nullptr;
+        bool foldLastConstIntoPass = false;
+        Index numTrailingAndOrFolds = 0;
+        bool foldAllToAndOr = false;
+      };
+
+      auto evaluateChainPlan = [&](If* rootIf,
+                                   bool flipInitial,
+                                   bool isReturnNode,
+                                   bool isVoidTail,
+                                   bool isFuncReturnTail,
+                                   Type elidableTailType,
+                                   Index tryDepth) -> ChainPlan {
+        ChainPlan plan;
+        plan.flipInitial = flipInitial;
+        Expression* shortArm = flipInitial ? rootIf->ifTrue : rootIf->ifFalse;
+        bool shortArmPure =
+          !EffectAnalyzer(getPassOptions(), *getModule(), shortArm)
+             .hasSideEffects();
+        int kEqz = 0;
+        If* curIf = rootIf;
+        bool curFlip = flipInitial;
+        Expression* curPass = nullptr;
+        while (true) {
+          plan.outerIfs.push_back(curIf);
+          collectShortCircuitConjuncts(curIf->condition,
+                                       curFlip,
+                                       getPassOptions(),
+                                       *getModule(),
+                                       plan.steps,
+                                       plan.innerIfs,
+                                       kEqz);
+          curPass = curFlip ? curIf->ifFalse : curIf->ifTrue;
+          if (!shortArmPure) {
+            break;
+          }
+          auto* nextIf = curPass->dynCast<If>();
+          if (!nextIf || !nextIf->ifFalse ||
+              nextIf->condition->type == Type::unreachable) {
+            break;
+          }
+          if (ExpressionAnalyzer::equal(nextIf->ifFalse, shortArm)) {
+            curIf = nextIf;
+            curFlip = false;
+          } else if (ExpressionAnalyzer::equal(nextIf->ifTrue, shortArm)) {
+            curIf = nextIf;
+            curFlip = true;
+          } else {
+            break;
+          }
+        }
+        plan.passArm = curPass;
+        plan.shortArm = shortArm;
+        int mOuter = int(plan.outerIfs.size());
+        int kInner = int(plan.innerIfs.size());
+        if (mOuter + kInner < 2 || plan.steps.size() < 2) {
+          return plan;
+        }
+        int bt = blockTypeBytes(rootIf->type);
+        int shortBytes = (mOuter > 1) ? estimateMinBinaryBytes(shortArm) : 0;
+        int origBytes = (isReturnNode ? 1 : 0) + mOuter * (3 + bt) +
+                        (mOuter - 1) * shortBytes + 6 * kInner + kEqz;
+
+        size_t remN = plan.steps.size();
+        int extraPassBytes = 0;
+        int32_t shortConst = 0, passConst = 0;
+        bool isBoolShort =
+          (rootIf->type == Type::i32 && isI32Const(shortArm, shortConst) &&
+           (shortConst == 0 || shortConst == 1));
+        bool passIsOneBitPureSmall = false;
+        if (isBoolShort) {
+          if (isI32Const(plan.passArm, passConst) &&
+              passConst == (1 - shortConst)) {
+            const ShortCircuitStep& sLast = plan.steps[remN - 1];
+            int convCost = 0;
+            if (shortConst == 0) {
+              convCost = !sLast.negated ? (isOneBitI32(sLast.cond) ? 0 : 3)
+                                        : posEqzCost(sLast);
+            } else {
+              convCost = sLast.negated ? (isOneBitI32(sLast.cond) ? 0 : 3)
+                                       : negEqzCost(sLast);
+            }
+            plan.foldLastConstIntoPass = true;
+            remN--;
+            extraPassBytes += convCost - 2;
+            passIsOneBitPureSmall =
+              !neverUnconditionalize && sLast.prefix.empty() &&
+              !EffectAnalyzer(getPassOptions(), *getModule(), sLast.cond)
+                 .hasSideEffects() &&
+              !tooCostlyToRunUnconditionally(getPassOptions(), sLast.cond);
+          } else {
+            passIsOneBitPureSmall =
+              !neverUnconditionalize && isOneBitI32(plan.passArm) &&
+              !EffectAnalyzer(getPassOptions(), *getModule(), plan.passArm)
+                 .hasSideEffects() &&
+              !tooCostlyToRunUnconditionally(getPassOptions(), plan.passArm);
+          }
+          if (passIsOneBitPureSmall && remN >= 2) {
+            const ShortCircuitStep& sPrev = plan.steps[remN - 1];
+            bool canOneBit = (shortConst == 0)
+                               ? (sPrev.negated || isOneBitI32(sPrev.cond))
+                               : (!sPrev.negated || isOneBitI32(sPrev.cond));
+            if (canOneBit) {
+              int eqzC =
+                (shortConst == 0) ? posEqzCost(sPrev) : negEqzCost(sPrev);
+              plan.numTrailingAndOrFolds = 1;
+              remN--;
+              extraPassBytes += 1 + eqzC;
+              if (remN == 1 && shortArmPure && sPrev.prefix.empty() &&
+                  !EffectAnalyzer(getPassOptions(), *getModule(), sPrev.cond)
+                     .hasSideEffects() &&
+                  estimateMinBinaryBytes(sPrev.cond) <= 4) {
+                const ShortCircuitStep& s0 = plan.steps[0];
+                bool s0OneBit = (shortConst == 0)
+                                  ? (s0.negated || isOneBitI32(s0.cond))
+                                  : (!s0.negated || isOneBitI32(s0.cond));
+                if (s0OneBit) {
+                  plan.foldAllToAndOr = true;
+                }
+              }
+            }
+          } else if (passIsOneBitPureSmall && remN == 1 && shortArmPure) {
+            const ShortCircuitStep& s0 = plan.steps[0];
+            bool s0OneBit = (shortConst == 0)
+                              ? (s0.negated || isOneBitI32(s0.cond))
+                              : (!s0.negated || isOneBitI32(s0.cond));
+            if (s0OneBit) {
+              plan.foldAllToAndOr = true;
+            }
+          }
+        }
+
+        int newBytes = 0;
+        if (plan.foldAllToAndOr) {
+          assert(remN == 1);
+          int eqz0 = (shortConst == 0) ? posEqzCost(plan.steps[0])
+                                       : negEqzCost(plan.steps[0]);
+          // Eliminates the outer If (3 + bt) AND the remaining shortArm (2 B),
+          // replacing them with 1-byte i32.and/i32.or + eqz0.
+          newBytes = (isReturnNode ? 1 : 0) + 1 + eqz0 + extraPassBytes - 2;
+        } else if (remN == 1) {
+          newBytes = (isReturnNode ? 1 : 0) + (3 + bt) +
+                     posEqzCost(plan.steps[0]) + extraPassBytes;
+        } else {
+          int exitBytes = 0;
+          if (isReturnNode) {
+            int passRet =
+              (!plan.foldLastConstIntoPass &&
+               plan.numTrailingAndOrFolds == 0 &&
+               plan.passArm->type == Type::unreachable)
+                ? 0
+                : 1;
+            int shortRet = (plan.shortArm->type == Type::unreachable) ? 0 : 1;
+            exitBytes = passRet + shortRet;
+          } else if (!plan.foldLastConstIntoPass &&
+                     plan.numTrailingAndOrFolds == 0 &&
+                     plan.passArm->type == Type::unreachable) {
+            exitBytes = 0;
+          } else if (isFuncReturnTail && tryDepth == 0 &&
+                     Type::isSubType(rootIf->type, funcResults)) {
+            exitBytes = 1;
+          } else if ((rootIf->type == Type::none && isVoidTail) ||
+                     (elidableTailType != Type::unreachable &&
+                      elidableTailType != Type::none &&
+                      rootIf->type != Type::none &&
+                      elidableTailType.asWrittenGivenFeatures(
+                        getModule()->features) ==
+                        rootIf->type.asWrittenGivenFeatures(
+                          getModule()->features))) {
+            exitBytes = 2;
+          } else {
+            exitBytes = 4 + bt;
+          }
+          newBytes = 3 + 2 * (int(remN) - 1) + exitBytes +
+                     posEqzCost(plan.steps[0]) + extraPassBytes;
+          for (size_t i = 1; i < remN; i++) {
+            newBytes += negEqzCost(plan.steps[i]);
+          }
+        }
+        plan.deltaBytes = newBytes - origBytes;
+        plan.valid = (plan.deltaBytes < 0);
+        return plan;
+      };
+
+      auto materializeChainPlan = [&](const ChainPlan& plan,
+                                      If* rootIf,
+                                      bool isReturnNode,
+                                      bool isFuncReturnTail,
+                                      Index tryDepth) -> Expression* {
+        for (auto* iff : plan.outerIfs) {
+          BranchHints::clear(iff, func);
+        }
+        for (auto* iff : plan.innerIfs) {
+          BranchHints::clear(iff, func);
+        }
+        int32_t shortConst = 0;
+        isI32Const(plan.shortArm, shortConst);
+        size_t remN = plan.steps.size();
+        Expression* newPassArm = plan.passArm;
+        if (plan.foldLastConstIntoPass) {
+          const ShortCircuitStep& sLast = plan.steps[remN - 1];
+          remN--;
+          Expression* oneBit = (shortConst == 0) ? materializePosOneBit(sLast)
+                                                 : materializeNegOneBit(sLast);
+          newPassArm = prependToArm(builder, sLast.prefix, oneBit);
+        }
+        for (Index f = 0; f < plan.numTrailingAndOrFolds; f++) {
+          const ShortCircuitStep& sPrev = plan.steps[remN - 1];
+          remN--;
+          Expression* lhs = (shortConst == 0) ? materializePosOneBit(sPrev)
+                                              : materializeNegOneBit(sPrev);
+          BinaryOp op = (shortConst == 0) ? AndInt32 : OrInt32;
+          Expression* comb = builder.makeBinary(op, lhs, newPassArm);
+          newPassArm = prependToArm(builder, sPrev.prefix, comb);
+        }
+        if (plan.foldAllToAndOr) {
+          assert(remN == 1);
+          const ShortCircuitStep& s0 = plan.steps[0];
+          Expression* lhs = (shortConst == 0) ? materializePosOneBit(s0)
+                                              : materializeNegOneBit(s0);
+          BinaryOp op = (shortConst == 0) ? AndInt32 : OrInt32;
+          Expression* comb = builder.makeBinary(op, lhs, newPassArm);
+          Expression* res = prependToArm(builder, s0.prefix, comb);
+          return isReturnNode ? builder.makeReturn(res) : res;
+        }
+        if (remN == 1) {
+          const ShortCircuitStep& s0 = plan.steps[0];
+          Expression* cond0 = materializePosCond(s0);
+          auto* singleIf =
+            builder.makeIf(cond0, newPassArm, plan.shortArm, rootIf->type);
+          Expression* res = prependToArm(builder, s0.prefix, singleIf);
+          return isReturnNode ? builder.makeReturn(res) : res;
+        }
+
+        // Hybrid Form for remN >= 2:
+        Name failName = makeFreshBlockName("sc_fail$");
+        auto* failBlk = builder.makeBlock(failName, {}, Type::none);
+        for (size_t i = 1; i < remN; i++) {
+          const ShortCircuitStep& si = plan.steps[i];
+          Expression* negC = materializeNegCond(si);
+          auto* brFail = builder.makeBreak(failName, nullptr, negC);
+          appendPrefixAndStmt(failBlk, si.prefix, brFail);
+        }
+
+        bool useReturnExit =
+          isReturnNode ||
+          (isFuncReturnTail && tryDepth == 0 &&
+           Type::isSubType(newPassArm->type, funcResults));
+        bool passUnreach = (newPassArm->type == Type::unreachable);
+        bool passVoid = (newPassArm->type == Type::none);
+        Name outName;
+        if (passUnreach) {
+          appendPrefixAndStmt(failBlk, {}, newPassArm);
+        } else if (useReturnExit) {
+          if (passVoid) {
+            appendPrefixAndStmt(failBlk, {}, newPassArm);
+            appendPrefixAndStmt(failBlk, {}, builder.makeReturn());
+          } else {
+            appendPrefixAndStmt(failBlk, {}, builder.makeReturn(newPassArm));
+          }
+        } else {
+          outName = makeFreshBlockName("sc_out$");
+          if (passVoid) {
+            appendPrefixAndStmt(failBlk, {}, newPassArm);
+            appendPrefixAndStmt(failBlk, {}, builder.makeBreak(outName));
+          } else {
+            appendPrefixAndStmt(
+              failBlk, {}, builder.makeBreak(outName, newPassArm));
+          }
+        }
+        failBlk->finalize(Type::none);
+        nameToBlock[failName] = failBlk;
+
+        const ShortCircuitStep& s0 = plan.steps[0];
+        auto* outerVoidIf =
+          builder.makeIf(materializePosCond(s0), failBlk, nullptr, Type::none);
+
+        Expression* tailExpr = plan.shortArm;
+        if (isReturnNode && tailExpr->type != Type::unreachable) {
+          tailExpr = builder.makeReturn(tailExpr);
+        }
+
+        Type wrapperType = isReturnNode ? Type::unreachable : rootIf->type;
+        auto* outBlk = builder.makeBlock(outName, {}, wrapperType);
+        appendPrefixAndStmt(outBlk, s0.prefix, outerVoidIf);
+        appendPrefixAndStmt(outBlk, {}, tailExpr);
+        outBlk->finalize(wrapperType);
+        if (outName.is()) {
+          nameToBlock[outName] = outBlk;
+        }
+        return outBlk;
+      };
+
+      std::function<void(Expression**, bool, bool, Type, Index)>
+        walkShortCircuitChains = [&](Expression** currp,
+                                     bool isVoidTail,
+                                     bool isFuncReturnTail,
+                                     Type elidableTailType,
+                                     Index tryDepth) {
+          Expression* curr = *currp;
+          if (!curr) {
+            return;
+          }
+
+          // Case R: (return (if (result T) ...)) outside try/try_table.
+          if (auto* ret = curr->dynCast<Return>()) {
+            if (tryDepth == 0 && ret->value && funcResults.isConcrete()) {
+              if (auto* rootIf = ret->value->dynCast<If>();
+                  rootIf && rootIf->ifFalse && rootIf->type.isConcrete() &&
+                  rootIf->condition->type != Type::unreachable) {
+                ChainPlan pFalse = evaluateChainPlan(rootIf,
+                                                     /*flipInitial=*/false,
+                                                     /*isReturnNode=*/true,
+                                                     /*isVoidTail=*/false,
+                                                     /*isFuncReturnTail=*/true,
+                                                     funcResults,
+                                                     tryDepth);
+                ChainPlan pTrue = evaluateChainPlan(rootIf,
+                                                    /*flipInitial=*/true,
+                                                    /*isReturnNode=*/true,
+                                                    /*isVoidTail=*/false,
+                                                    /*isFuncReturnTail=*/true,
+                                                    funcResults,
+                                                    tryDepth);
+                const ChainPlan* best = nullptr;
+                if (pFalse.valid && pTrue.valid) {
+                  best = (pTrue.deltaBytes < pFalse.deltaBytes) ? &pTrue
+                                                                : &pFalse;
+                } else if (pFalse.valid) {
+                  best = &pFalse;
+                } else if (pTrue.valid) {
+                  best = &pTrue;
+                }
+                if (best) {
+                  *currp = materializeChainPlan(*best,
+                                                rootIf,
+                                                /*isReturnNode=*/true,
+                                                /*isFuncReturnTail=*/true,
+                                                tryDepth);
+                  lowerer.changed = true;
+                  curr = *currp;
+                }
+              }
+            }
+          } else if (auto* iff = curr->dynCast<If>()) {
+            if (iff->condition->type == Type::unreachable) {
+              return;
+            }
+            if (!iff->ifFalse && iff->type == Type::none) {
+              // Part 3: 1-arm void `||` guard lowering.
+              std::vector<ShortCircuitStep> disjSteps;
+              std::vector<If*> collapsedIfs;
+              int kEqz = 0;
+              collectShortCircuitConjuncts(iff->condition,
+                                           /*negated=*/true,
+                                           getPassOptions(),
+                                           *getModule(),
+                                           disjSteps,
+                                           collapsedIfs,
+                                           kEqz);
+              if (disjSteps.size() >= 2) {
+                ShortCircuitStep dLast = std::move(disjSteps.back());
+                disjSteps.pop_back();
+                std::vector<ShortCircuitStep> lastConjSteps;
+                collectShortCircuitConjuncts(dLast.cond,
+                                             /*negated=*/!dLast.negated,
+                                             getPassOptions(),
+                                             *getModule(),
+                                             lastConjSteps,
+                                             collapsedIfs,
+                                             kEqz);
+                if (!dLast.prefix.empty()) {
+                  lastConjSteps[0].prefix.insert(
+                    lastConjSteps[0].prefix.begin(),
+                    dLast.prefix.begin(),
+                    dLast.prefix.end());
+                }
+                int kIf = int(collapsedIfs.size());
+                int m = int(lastConjSteps.size());
+                int origBytes = 3 + 6 * kIf + kEqz;
+                int newBytes = (isVoidTail ? 0 : 3) + 3 + 2 * m;
+                for (const auto& g : lastConjSteps) {
+                  newBytes += negEqzCost(g);
+                }
+                if (disjSteps.size() == 1) {
+                  newBytes += posEqzCost(disjSteps[0]);
+                } else {
+                  newBytes += 2 * int(disjSteps.size());
+                  for (const auto& d : disjSteps) {
+                    newBytes += negEqzCost(d);
+                  }
+                }
+                if (newBytes < origBytes) {
+                  BranchHints::clear(iff, func);
+                  for (auto* cIf : collapsedIfs) {
+                    BranchHints::clear(cIf, func);
+                  }
+                  Name outName = makeFreshBlockName("sc_out$");
+                  auto* outBlk = builder.makeBlock(outName, {}, Type::none);
+                  if (disjSteps.size() == 1) {
+                    const ShortCircuitStep& d1 = disjSteps[0];
+                    auto* failChecks = builder.makeBlock();
+                    for (const auto& g : lastConjSteps) {
+                      auto* brOut = builder.makeBreak(
+                        outName, nullptr, materializeNegCond(g));
+                      appendPrefixAndStmt(failChecks, g.prefix, brOut);
+                    }
+                    failChecks->finalize();
+                    Expression* guardBody = (failChecks->list.size() == 1)
+                                              ? failChecks->list[0]
+                                              : failChecks;
+                    auto* guardIf = builder.makeIf(
+                      materializePosCond(d1), guardBody, nullptr, Type::none);
+                    appendPrefixAndStmt(outBlk, d1.prefix, guardIf);
+                  } else {
+                    Name doName = makeFreshBlockName("sc_do$");
+                    auto* doBlk = builder.makeBlock(doName, {}, Type::none);
+                    for (const auto& d : disjSteps) {
+                      auto* brDo = builder.makeBreak(
+                        doName, nullptr, materializeNegCond(d));
+                      appendPrefixAndStmt(doBlk, d.prefix, brDo);
+                    }
+                    for (const auto& g : lastConjSteps) {
+                      auto* brOut = builder.makeBreak(
+                        outName, nullptr, materializeNegCond(g));
+                      appendPrefixAndStmt(doBlk, g.prefix, brOut);
+                    }
+                    doBlk->finalize(Type::none);
+                    nameToBlock[doName] = doBlk;
+                    outBlk->list.push_back(doBlk);
+                  }
+                  appendPrefixAndStmt(outBlk, {}, iff->ifTrue);
+                  outBlk->finalize(Type::none);
+                  nameToBlock[outName] = outBlk;
+                  *currp = outBlk;
+                  lowerer.changed = true;
+                  curr = *currp;
+                }
+              }
+            } else if (iff->ifFalse && iff->type != Type::unreachable) {
+              // Parts 1 & 2: 2-arm If chain rotation & collapsing.
+              ChainPlan pFalse = evaluateChainPlan(iff,
+                                                   /*flipInitial=*/false,
+                                                   /*isReturnNode=*/false,
+                                                   isVoidTail,
+                                                   isFuncReturnTail,
+                                                   elidableTailType,
+                                                   tryDepth);
+              ChainPlan pTrue = evaluateChainPlan(iff,
+                                                  /*flipInitial=*/true,
+                                                  /*isReturnNode=*/false,
+                                                  isVoidTail,
+                                                  isFuncReturnTail,
+                                                  elidableTailType,
+                                                  tryDepth);
+              const ChainPlan* best = nullptr;
+              if (pFalse.valid && pTrue.valid) {
+                best = (pTrue.deltaBytes < pFalse.deltaBytes) ? &pTrue
+                                                              : &pFalse;
+              } else if (pFalse.valid) {
+                best = &pFalse;
+              } else if (pTrue.valid) {
+                best = &pTrue;
+              }
+              if (best) {
+                *currp = materializeChainPlan(*best,
+                                              iff,
+                                              /*isReturnNode=*/false,
+                                              isFuncReturnTail,
+                                              tryDepth);
+                lowerer.changed = true;
+                curr = *currp;
+              }
+            }
+          }
+
+          // Recurse into children of curr.
+          if (curr->is<Try>() || curr->is<TryTable>()) {
+            for (auto*& child : ChildIterator(curr)) {
+              walkShortCircuitChains(
+                &child, false, false, Type::unreachable, tryDepth + 1);
+            }
+            return;
+          }
+          if (auto* iff = curr->dynCast<If>()) {
+            if (iff->condition->type == Type::unreachable) {
+              return;
+            }
+            walkShortCircuitChains(
+              &iff->condition, false, false, Type::unreachable, tryDepth);
+            bool armVoidTail = (iff->type == Type::none);
+            bool armFuncReturnTail =
+              isFuncReturnTail &&
+              (iff->type == funcResults || iff->type == Type::unreachable);
+            Type armElidableType = iff->type;
+            walkShortCircuitChains(&iff->ifTrue,
+                                   armVoidTail &&
+                                     iff->ifTrue->type == Type::none,
+                                   armFuncReturnTail,
+                                   armElidableType,
+                                   tryDepth);
+            if (iff->ifFalse) {
+              walkShortCircuitChains(&iff->ifFalse,
+                                     armVoidTail &&
+                                       iff->ifFalse->type == Type::none,
+                                     armFuncReturnTail,
+                                     armElidableType,
+                                     tryDepth);
+            }
+            return;
+          }
+          if (auto* blk = curr->dynCast<Block>()) {
+            if (blk->list.empty()) {
+              return;
+            }
+            bool hasEarlierUnreachable = false;
+            for (Index i = 0; i + 1 < blk->list.size(); i++) {
+              if (blk->list[i]->type == Type::unreachable) {
+                hasEarlierUnreachable = true;
+              }
+              walkShortCircuitChains(
+                &blk->list[i], false, false, Type::unreachable, tryDepth);
+            }
+            if (hasEarlierUnreachable) {
+              walkShortCircuitChains(&blk->list.back(),
+                                     false,
+                                     false,
+                                     Type::unreachable,
+                                     tryDepth);
+              return;
+            }
+            bool isTargeted =
+              blk->name.is() && BranchUtils::BranchSeeker::has(blk, blk->name);
+            bool backIsVoidTail =
+              blk->type == Type::none && blk->list.back()->type == Type::none &&
+              (isVoidTail || isTargeted);
+            bool backIsFuncReturnTail =
+              isFuncReturnTail &&
+              (blk->type == funcResults || blk->type == Type::unreachable);
+            Type backElidableType = isTargeted ? blk->type : elidableTailType;
+            walkShortCircuitChains(&blk->list.back(),
+                                   backIsVoidTail,
+                                   backIsFuncReturnTail,
+                                   backElidableType,
+                                   tryDepth);
+            return;
+          }
+          for (auto*& child : ChildIterator(curr)) {
+            walkShortCircuitChains(
+              &child, false, false, Type::unreachable, tryDepth);
+          }
+        };
+
+      walkShortCircuitChains(&func->body,
+                             funcResults == Type::none,
+                             /*isFuncReturnTail=*/true,
+                             funcResults,
+                             /*tryDepth=*/0);
     }
 
     // Part 1: Tail 1-arm void If -> elided (block $b (br_if $b !C) BODY)
@@ -4703,11 +5628,12 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                                 ifFalseBreak->value,
                                 passOptions,
                                 *getModule())) {
+            Builder builder(*getModule());
             ifFalseBreak->condition =
-              Builder(*getModule()).makeUnary(EqZInt32, iff->condition);
+              makeNegatedBool(builder, iff->condition, v4);
             BranchHints::copyFlippedTo(iff, ifFalseBreak, getFunction());
             ifFalseBreak->finalize();
-            list[i] = Builder(*getModule()).dropIfConcretelyTyped(ifFalseBreak);
+            list[i] = builder.dropIfConcretelyTyped(ifFalseBreak);
             ExpressionManipulator::spliceIntoBlock(curr, i + 1, iff->ifTrue);
             continue;
           }
@@ -5508,6 +6434,8 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                 if (auto* u = iff->condition->dynCast<Unary>();
                     u && u->op == EqZInt32) {
                   condIsEqz = true;
+                } else if (v4 && canInvertBoolExprFree(iff->condition)) {
+                  condIsEqz = true;
                 }
                 bool indexedType =
                   iff->type.isRef() && !iff->type.getHeapType().isBasic();
@@ -5523,7 +6451,9 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                     }
                   }
                   if (!unreachWasTrue) {
-                    iff->condition = negateCond(builder, iff->condition);
+                    iff->condition =
+                      v4 ? makeNegatedBool(builder, iff->condition, true)
+                         : negateCond(builder, iff->condition);
                     BranchHints::flip(iff, getFunction());
                   }
                   iff->ifTrue = unreachArm;
@@ -6432,6 +7362,8 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
             if (!drop) {
               assert(!br->value);
               if (curr->type != Type::none ||
+                  curr->name.startsWith("sc_fail$") ||
+                  curr->name.startsWith("sc_do$") ||
                   (curr == getFunction()->body &&
                    getFunction()->getResults() == Type::none)) {
                 return;
@@ -6981,6 +7913,8 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         if (auto* u = iff->condition->dynCast<Unary>();
             u && u->op == EqZInt32) {
           condIsEqz = true;
+        } else if (v4 && canInvertBoolExprFree(iff->condition)) {
+          condIsEqz = true;
         }
         bool indexedType =
           iff->type.isRef() && !iff->type.getHeapType().isBasic();
@@ -6998,7 +7932,9 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
           }
         }
         if (!unreachWasTrue) {
-          iff->condition = negateCond(builder, iff->condition);
+          iff->condition =
+            v4 ? makeNegatedBool(builder, iff->condition, true)
+               : negateCond(builder, iff->condition);
           BranchHints::flip(iff, getFunction());
         }
         iff->ifTrue = unreachArm;
@@ -7028,8 +7964,8 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         }
         Builder builder(*getModule());
         if ((curr->value->is<If>() || curr->value->is<Select>()) &&
-            canInvertBoolExprFree(curr->value)) {
-          invertBoolExprFree(curr->value, builder);
+            canPushEqzIntoIfOrExprFree(curr->value)) {
+          pushEqzIntoIfOrExprFree(curr->value, builder);
           Expression* rep = curr->value;
           if (auto* iff = rep->dynCast<If>()) {
             if (auto* sel = selectify(iff)) {
@@ -7262,7 +8198,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                                 passOptions,
                                 *getModule())) {
             ifFalseBreak->condition =
-              builder.makeUnary(EqZInt32, curr->condition);
+              makeNegatedBool(builder, curr->condition, v4);
             BranchHints::copyFlippedTo(curr, ifFalseBreak, getFunction());
             ifFalseBreak->finalize();
             Expression* first = builder.dropIfConcretelyTyped(ifFalseBreak);
@@ -7791,6 +8727,18 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
               replaceCurrent(rep);
               if (auto* iff = rep->dynCast<If>()) {
                 visitIf(iff);
+              } else if (auto* blk = rep->dynCast<Block>()) {
+                unnestedIfBlocks.insert(blk);
+                for (auto*& item : blk->list) {
+                  if (auto* subIf = item->dynCast<If>()) {
+                    while (tryFoldBooleanIfCondition(subIf,
+                                                     getFunction(),
+                                                     *getModule(),
+                                                     passOptions,
+                                                     neverUnconditionalize)) {
+                    }
+                  }
+                }
               }
               return;
             }
