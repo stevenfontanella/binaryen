@@ -155,7 +155,7 @@
     )
   )
 
-  ;; SHRINK_0:      (func $if-tests (type $3) (param $x (ref $struct)) (param $y (ref $struct)) (result i32)
+  ;; SHRINK_0:      (func $if-tests (type $4) (param $x (ref $struct)) (param $y (ref $struct)) (result i32)
   ;; SHRINK_0-NEXT:  (if (result i32)
   ;; SHRINK_0-NEXT:   (ref.test (ref $substruct)
   ;; SHRINK_0-NEXT:    (local.get $x)
@@ -170,7 +170,7 @@
   ;; SHRINK_0-NEXT:   )
   ;; SHRINK_0-NEXT:  )
   ;; SHRINK_0-NEXT: )
-  ;; SHRINK_1:      (func $if-tests (type $3) (param $x (ref $struct)) (param $y (ref $struct)) (result i32)
+  ;; SHRINK_1:      (func $if-tests (type $4) (param $x (ref $struct)) (param $y (ref $struct)) (result i32)
   ;; SHRINK_1-NEXT:  (select
   ;; SHRINK_1-NEXT:   (ref.test (ref $substruct)
   ;; SHRINK_1-NEXT:    (local.get $y)
@@ -181,7 +181,7 @@
   ;; SHRINK_1-NEXT:   )
   ;; SHRINK_1-NEXT:  )
   ;; SHRINK_1-NEXT: )
-  ;; SHRINK_2:      (func $if-tests (type $3) (param $x (ref $struct)) (param $y (ref $struct)) (result i32)
+  ;; SHRINK_2:      (func $if-tests (type $4) (param $x (ref $struct)) (param $y (ref $struct)) (result i32)
   ;; SHRINK_2-NEXT:  (select
   ;; SHRINK_2-NEXT:   (ref.test (ref $substruct)
   ;; SHRINK_2-NEXT:    (local.get $y)
@@ -214,7 +214,7 @@
     )
   )
 
-  ;; SHRINK_0:      (func $if-tests-arms (type $4) (param $x (ref $struct)) (param $y (ref $struct)) (param $z (ref $struct)) (result i32)
+  ;; SHRINK_0:      (func $if-tests-arms (type $5) (param $x (ref $struct)) (param $y (ref $struct)) (param $z (ref $struct)) (result i32)
   ;; SHRINK_0-NEXT:  (if (result i32)
   ;; SHRINK_0-NEXT:   (ref.test (ref $substruct)
   ;; SHRINK_0-NEXT:    (local.get $x)
@@ -231,7 +231,7 @@
   ;; SHRINK_0-NEXT:   )
   ;; SHRINK_0-NEXT:  )
   ;; SHRINK_0-NEXT: )
-  ;; SHRINK_1:      (func $if-tests-arms (type $4) (param $x (ref $struct)) (param $y (ref $struct)) (param $z (ref $struct)) (result i32)
+  ;; SHRINK_1:      (func $if-tests-arms (type $5) (param $x (ref $struct)) (param $y (ref $struct)) (param $z (ref $struct)) (result i32)
   ;; SHRINK_1-NEXT:  (select
   ;; SHRINK_1-NEXT:   (ref.test (ref $substruct)
   ;; SHRINK_1-NEXT:    (local.get $y)
@@ -244,7 +244,7 @@
   ;; SHRINK_1-NEXT:   )
   ;; SHRINK_1-NEXT:  )
   ;; SHRINK_1-NEXT: )
-  ;; SHRINK_2:      (func $if-tests-arms (type $4) (param $x (ref $struct)) (param $y (ref $struct)) (param $z (ref $struct)) (result i32)
+  ;; SHRINK_2:      (func $if-tests-arms (type $5) (param $x (ref $struct)) (param $y (ref $struct)) (param $z (ref $struct)) (result i32)
   ;; SHRINK_2-NEXT:  (select
   ;; SHRINK_2-NEXT:   (ref.test (ref $substruct)
   ;; SHRINK_2-NEXT:    (local.get $y)
@@ -454,17 +454,15 @@
   ;; SHRINK_2-NEXT:    (drop
   ;; SHRINK_2-NEXT:     (struct.new_default $struct)
   ;; SHRINK_2-NEXT:    )
-  ;; SHRINK_2-NEXT:    (if (result i32)
-  ;; SHRINK_2-NEXT:     (local.get $x)
-  ;; SHRINK_2-NEXT:     (then
-  ;; SHRINK_2-NEXT:      (i32.const 10)
-  ;; SHRINK_2-NEXT:     )
-  ;; SHRINK_2-NEXT:     (else
+  ;; SHRINK_2-NEXT:    (select
+  ;; SHRINK_2-NEXT:     (i32.const 10)
+  ;; SHRINK_2-NEXT:     (block (result i32)
   ;; SHRINK_2-NEXT:      (drop
   ;; SHRINK_2-NEXT:       (struct.new_default $struct)
   ;; SHRINK_2-NEXT:      )
   ;; SHRINK_2-NEXT:      (i32.const 20)
   ;; SHRINK_2-NEXT:     )
+  ;; SHRINK_2-NEXT:     (local.get $x)
   ;; SHRINK_2-NEXT:    )
   ;; SHRINK_2-NEXT:   )
   ;; SHRINK_2-NEXT:   (i32.const 1)
@@ -571,6 +569,375 @@
           (struct.new_default $struct)
         )
         (unreachable)
+      )
+      (i32.const 1)
+    )
+  )
+
+  ;; SHRINK_0:      (func $multi-branch-peel (type $3) (param $x i32) (param $y i32) (result i32)
+  ;; SHRINK_0-NEXT:  (local $tmp i32)
+  ;; SHRINK_0-NEXT:  (block $out (result i32)
+  ;; SHRINK_0-NEXT:   (drop
+  ;; SHRINK_0-NEXT:    (br_if $out
+  ;; SHRINK_0-NEXT:     (i32.const 10)
+  ;; SHRINK_0-NEXT:     (local.get $x)
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:   (if
+  ;; SHRINK_0-NEXT:    (local.get $y)
+  ;; SHRINK_0-NEXT:    (then
+  ;; SHRINK_0-NEXT:     (local.set $tmp
+  ;; SHRINK_0-NEXT:      (i32.const 1)
+  ;; SHRINK_0-NEXT:     )
+  ;; SHRINK_0-NEXT:     (br $out
+  ;; SHRINK_0-NEXT:      (i32.const 20)
+  ;; SHRINK_0-NEXT:     )
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:   (i32.add
+  ;; SHRINK_0-NEXT:    (local.get $tmp)
+  ;; SHRINK_0-NEXT:    (i32.const 30)
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:  )
+  ;; SHRINK_0-NEXT: )
+  ;; SHRINK_1:      (func $multi-branch-peel (type $3) (param $x i32) (param $y i32) (result i32)
+  ;; SHRINK_1-NEXT:  (local $tmp i32)
+  ;; SHRINK_1-NEXT:  (block $out (result i32)
+  ;; SHRINK_1-NEXT:   (drop
+  ;; SHRINK_1-NEXT:    (br_if $out
+  ;; SHRINK_1-NEXT:     (i32.const 10)
+  ;; SHRINK_1-NEXT:     (local.get $x)
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:   (if
+  ;; SHRINK_1-NEXT:    (local.get $y)
+  ;; SHRINK_1-NEXT:    (then
+  ;; SHRINK_1-NEXT:     (local.set $tmp
+  ;; SHRINK_1-NEXT:      (i32.const 1)
+  ;; SHRINK_1-NEXT:     )
+  ;; SHRINK_1-NEXT:     (br $out
+  ;; SHRINK_1-NEXT:      (i32.const 20)
+  ;; SHRINK_1-NEXT:     )
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:   (i32.add
+  ;; SHRINK_1-NEXT:    (local.get $tmp)
+  ;; SHRINK_1-NEXT:    (i32.const 30)
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:  )
+  ;; SHRINK_1-NEXT: )
+  ;; SHRINK_2:      (func $multi-branch-peel (type $3) (param $x i32) (param $y i32) (result i32)
+  ;; SHRINK_2-NEXT:  (local $tmp i32)
+  ;; SHRINK_2-NEXT:  (if (result i32)
+  ;; SHRINK_2-NEXT:   (local.get $x)
+  ;; SHRINK_2-NEXT:   (then
+  ;; SHRINK_2-NEXT:    (i32.const 10)
+  ;; SHRINK_2-NEXT:   )
+  ;; SHRINK_2-NEXT:   (else
+  ;; SHRINK_2-NEXT:    (if
+  ;; SHRINK_2-NEXT:     (local.get $y)
+  ;; SHRINK_2-NEXT:     (then
+  ;; SHRINK_2-NEXT:      (local.set $tmp
+  ;; SHRINK_2-NEXT:       (i32.const 1)
+  ;; SHRINK_2-NEXT:      )
+  ;; SHRINK_2-NEXT:      (return
+  ;; SHRINK_2-NEXT:       (i32.const 20)
+  ;; SHRINK_2-NEXT:      )
+  ;; SHRINK_2-NEXT:     )
+  ;; SHRINK_2-NEXT:    )
+  ;; SHRINK_2-NEXT:    (i32.add
+  ;; SHRINK_2-NEXT:     (local.get $tmp)
+  ;; SHRINK_2-NEXT:     (i32.const 30)
+  ;; SHRINK_2-NEXT:    )
+  ;; SHRINK_2-NEXT:   )
+  ;; SHRINK_2-NEXT:  )
+  ;; SHRINK_2-NEXT: )
+  (func $multi-branch-peel (param $x i32) (param $y i32) (result i32)
+    (local $tmp i32)
+    (block $out (result i32)
+      (drop
+        (br_if $out
+          (i32.const 10)
+          (local.get $x)
+        )
+      )
+      (if
+        (local.get $y)
+        (then
+          (local.set $tmp (i32.const 1))
+          (br $out (i32.const 20))
+        )
+      )
+      (i32.add (local.get $tmp) (i32.const 30))
+    )
+  )
+
+  ;; SHRINK_0:      (func $selectify-tee-cond-and (type $1) (param $x i32) (result i32)
+  ;; SHRINK_0-NEXT:  (local $t i32)
+  ;; SHRINK_0-NEXT:  (if (result i32)
+  ;; SHRINK_0-NEXT:   (i32.gt_s
+  ;; SHRINK_0-NEXT:    (local.tee $t
+  ;; SHRINK_0-NEXT:     (i32.add
+  ;; SHRINK_0-NEXT:      (local.get $x)
+  ;; SHRINK_0-NEXT:      (i32.const 1)
+  ;; SHRINK_0-NEXT:     )
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:    (i32.const 0)
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:   (then
+  ;; SHRINK_0-NEXT:    (i32.lt_s
+  ;; SHRINK_0-NEXT:     (local.get $t)
+  ;; SHRINK_0-NEXT:     (i32.const 10)
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:   (else
+  ;; SHRINK_0-NEXT:    (i32.const 0)
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:  )
+  ;; SHRINK_0-NEXT: )
+  ;; SHRINK_1:      (func $selectify-tee-cond-and (type $1) (param $x i32) (result i32)
+  ;; SHRINK_1-NEXT:  (local $t i32)
+  ;; SHRINK_1-NEXT:  (if (result i32)
+  ;; SHRINK_1-NEXT:   (i32.gt_s
+  ;; SHRINK_1-NEXT:    (local.tee $t
+  ;; SHRINK_1-NEXT:     (i32.add
+  ;; SHRINK_1-NEXT:      (local.get $x)
+  ;; SHRINK_1-NEXT:      (i32.const 1)
+  ;; SHRINK_1-NEXT:     )
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:    (i32.const 0)
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:   (then
+  ;; SHRINK_1-NEXT:    (i32.lt_s
+  ;; SHRINK_1-NEXT:     (local.get $t)
+  ;; SHRINK_1-NEXT:     (i32.const 10)
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:   (else
+  ;; SHRINK_1-NEXT:    (i32.const 0)
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:  )
+  ;; SHRINK_1-NEXT: )
+  ;; SHRINK_2:      (func $selectify-tee-cond-and (type $1) (param $x i32) (result i32)
+  ;; SHRINK_2-NEXT:  (local $t i32)
+  ;; SHRINK_2-NEXT:  (i32.and
+  ;; SHRINK_2-NEXT:   (i32.gt_s
+  ;; SHRINK_2-NEXT:    (local.tee $t
+  ;; SHRINK_2-NEXT:     (i32.add
+  ;; SHRINK_2-NEXT:      (local.get $x)
+  ;; SHRINK_2-NEXT:      (i32.const 1)
+  ;; SHRINK_2-NEXT:     )
+  ;; SHRINK_2-NEXT:    )
+  ;; SHRINK_2-NEXT:    (i32.const 0)
+  ;; SHRINK_2-NEXT:   )
+  ;; SHRINK_2-NEXT:   (i32.lt_s
+  ;; SHRINK_2-NEXT:    (local.get $t)
+  ;; SHRINK_2-NEXT:    (i32.const 10)
+  ;; SHRINK_2-NEXT:   )
+  ;; SHRINK_2-NEXT:  )
+  ;; SHRINK_2-NEXT: )
+  (func $selectify-tee-cond-and (param $x i32) (result i32)
+    (local $t i32)
+    (if (result i32)
+      (i32.gt_s
+        (local.tee $t (i32.add (local.get $x) (i32.const 1)))
+        (i32.const 0)
+      )
+      (then
+        (i32.lt_s (local.get $t) (i32.const 10))
+      )
+      (else
+        (i32.const 0)
+      )
+    )
+  )
+
+  ;; SHRINK_0:      (func $eqz-pushdown-bool-if (type $3) (param $x i32) (param $y i32) (result i32)
+  ;; SHRINK_0-NEXT:  (i32.eqz
+  ;; SHRINK_0-NEXT:   (select
+  ;; SHRINK_0-NEXT:    (i32.const 1)
+  ;; SHRINK_0-NEXT:    (i32.eq
+  ;; SHRINK_0-NEXT:     (local.get $y)
+  ;; SHRINK_0-NEXT:     (i32.const 5)
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:    (local.get $x)
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:  )
+  ;; SHRINK_0-NEXT: )
+  ;; SHRINK_1:      (func $eqz-pushdown-bool-if (type $3) (param $x i32) (param $y i32) (result i32)
+  ;; SHRINK_1-NEXT:  (i32.eqz
+  ;; SHRINK_1-NEXT:   (select
+  ;; SHRINK_1-NEXT:    (i32.const 1)
+  ;; SHRINK_1-NEXT:    (i32.eq
+  ;; SHRINK_1-NEXT:     (local.get $y)
+  ;; SHRINK_1-NEXT:     (i32.const 5)
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:    (local.get $x)
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:  )
+  ;; SHRINK_1-NEXT: )
+  ;; SHRINK_2:      (func $eqz-pushdown-bool-if (type $3) (param $x i32) (param $y i32) (result i32)
+  ;; SHRINK_2-NEXT:  (select
+  ;; SHRINK_2-NEXT:   (i32.const 0)
+  ;; SHRINK_2-NEXT:   (i32.ne
+  ;; SHRINK_2-NEXT:    (local.get $y)
+  ;; SHRINK_2-NEXT:    (i32.const 5)
+  ;; SHRINK_2-NEXT:   )
+  ;; SHRINK_2-NEXT:   (local.get $x)
+  ;; SHRINK_2-NEXT:  )
+  ;; SHRINK_2-NEXT: )
+  (func $eqz-pushdown-bool-if (param $x i32) (param $y i32) (result i32)
+    (i32.eqz
+      (if (result i32)
+        (local.get $x)
+        (then
+          (i32.const 1)
+        )
+        (else
+          (i32.eq (local.get $y) (i32.const 5))
+        )
+      )
+    )
+  )
+
+  ;; SHRINK_0:      (func $fold-drop-br-if-then-br (type $3) (param $x i32) (param $y i32) (result i32)
+  ;; SHRINK_0-NEXT:  (local $tmp i32)
+  ;; SHRINK_0-NEXT:  (block $out (result i32)
+  ;; SHRINK_0-NEXT:   (if
+  ;; SHRINK_0-NEXT:    (local.get $x)
+  ;; SHRINK_0-NEXT:    (then
+  ;; SHRINK_0-NEXT:     (local.set $tmp
+  ;; SHRINK_0-NEXT:      (i32.const 1)
+  ;; SHRINK_0-NEXT:     )
+  ;; SHRINK_0-NEXT:     (drop
+  ;; SHRINK_0-NEXT:      (br_if $out
+  ;; SHRINK_0-NEXT:       (i32.const 100)
+  ;; SHRINK_0-NEXT:       (local.get $y)
+  ;; SHRINK_0-NEXT:      )
+  ;; SHRINK_0-NEXT:     )
+  ;; SHRINK_0-NEXT:     (br $out
+  ;; SHRINK_0-NEXT:      (i32.const 200)
+  ;; SHRINK_0-NEXT:     )
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:   (local.get $tmp)
+  ;; SHRINK_0-NEXT:  )
+  ;; SHRINK_0-NEXT: )
+  ;; SHRINK_1:      (func $fold-drop-br-if-then-br (type $3) (param $x i32) (param $y i32) (result i32)
+  ;; SHRINK_1-NEXT:  (local $tmp i32)
+  ;; SHRINK_1-NEXT:  (block $out (result i32)
+  ;; SHRINK_1-NEXT:   (if
+  ;; SHRINK_1-NEXT:    (local.get $x)
+  ;; SHRINK_1-NEXT:    (then
+  ;; SHRINK_1-NEXT:     (local.set $tmp
+  ;; SHRINK_1-NEXT:      (i32.const 1)
+  ;; SHRINK_1-NEXT:     )
+  ;; SHRINK_1-NEXT:     (drop
+  ;; SHRINK_1-NEXT:      (br_if $out
+  ;; SHRINK_1-NEXT:       (i32.const 100)
+  ;; SHRINK_1-NEXT:       (local.get $y)
+  ;; SHRINK_1-NEXT:      )
+  ;; SHRINK_1-NEXT:     )
+  ;; SHRINK_1-NEXT:     (br $out
+  ;; SHRINK_1-NEXT:      (i32.const 200)
+  ;; SHRINK_1-NEXT:     )
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:   (local.get $tmp)
+  ;; SHRINK_1-NEXT:  )
+  ;; SHRINK_1-NEXT: )
+  ;; SHRINK_2:      (func $fold-drop-br-if-then-br (type $3) (param $x i32) (param $y i32) (result i32)
+  ;; SHRINK_2-NEXT:  (local $tmp i32)
+  ;; SHRINK_2-NEXT:  (if
+  ;; SHRINK_2-NEXT:   (local.get $x)
+  ;; SHRINK_2-NEXT:   (then
+  ;; SHRINK_2-NEXT:    (local.set $tmp
+  ;; SHRINK_2-NEXT:     (i32.const 1)
+  ;; SHRINK_2-NEXT:    )
+  ;; SHRINK_2-NEXT:    (return
+  ;; SHRINK_2-NEXT:     (select
+  ;; SHRINK_2-NEXT:      (i32.const 100)
+  ;; SHRINK_2-NEXT:      (i32.const 200)
+  ;; SHRINK_2-NEXT:      (local.get $y)
+  ;; SHRINK_2-NEXT:     )
+  ;; SHRINK_2-NEXT:    )
+  ;; SHRINK_2-NEXT:   )
+  ;; SHRINK_2-NEXT:  )
+  ;; SHRINK_2-NEXT:  (local.get $tmp)
+  ;; SHRINK_2-NEXT: )
+  (func $fold-drop-br-if-then-br (param $x i32) (param $y i32) (result i32)
+    (local $tmp i32)
+    (block $out (result i32)
+      (if
+        (local.get $x)
+        (then
+          (local.set $tmp (i32.const 1))
+          (drop
+            (br_if $out
+              (i32.const 100)
+              (local.get $y)
+            )
+          )
+          (br $out (i32.const 200))
+        )
+      )
+      (local.get $tmp)
+    )
+  )
+
+  ;; SHRINK_0:      (func $lower-2-target-br-table (type $1) (param $x i32) (result i32)
+  ;; SHRINK_0-NEXT:  (block $outer (result i32)
+  ;; SHRINK_0-NEXT:   (block $target
+  ;; SHRINK_0-NEXT:    (block $default
+  ;; SHRINK_0-NEXT:     (br_table $target $target $target $default
+  ;; SHRINK_0-NEXT:      (local.get $x)
+  ;; SHRINK_0-NEXT:     )
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:    (br $outer
+  ;; SHRINK_0-NEXT:     (i32.const 0)
+  ;; SHRINK_0-NEXT:    )
+  ;; SHRINK_0-NEXT:   )
+  ;; SHRINK_0-NEXT:   (i32.const 1)
+  ;; SHRINK_0-NEXT:  )
+  ;; SHRINK_0-NEXT: )
+  ;; SHRINK_1:      (func $lower-2-target-br-table (type $1) (param $x i32) (result i32)
+  ;; SHRINK_1-NEXT:  (block $outer (result i32)
+  ;; SHRINK_1-NEXT:   (block $target
+  ;; SHRINK_1-NEXT:    (block $default
+  ;; SHRINK_1-NEXT:     (br_table $target $target $target $default
+  ;; SHRINK_1-NEXT:      (local.get $x)
+  ;; SHRINK_1-NEXT:     )
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:    (br $outer
+  ;; SHRINK_1-NEXT:     (i32.const 0)
+  ;; SHRINK_1-NEXT:    )
+  ;; SHRINK_1-NEXT:   )
+  ;; SHRINK_1-NEXT:   (i32.const 1)
+  ;; SHRINK_1-NEXT:  )
+  ;; SHRINK_1-NEXT: )
+  ;; SHRINK_2:      (func $lower-2-target-br-table (type $1) (param $x i32) (result i32)
+  ;; SHRINK_2-NEXT:  (if
+  ;; SHRINK_2-NEXT:   (i32.ge_u
+  ;; SHRINK_2-NEXT:    (local.get $x)
+  ;; SHRINK_2-NEXT:    (i32.const 3)
+  ;; SHRINK_2-NEXT:   )
+  ;; SHRINK_2-NEXT:   (then
+  ;; SHRINK_2-NEXT:    (return
+  ;; SHRINK_2-NEXT:     (i32.const 0)
+  ;; SHRINK_2-NEXT:    )
+  ;; SHRINK_2-NEXT:   )
+  ;; SHRINK_2-NEXT:  )
+  ;; SHRINK_2-NEXT:  (i32.const 1)
+  ;; SHRINK_2-NEXT: )
+  (func $lower-2-target-br-table (param $x i32) (result i32)
+    (block $outer (result i32)
+      (block $target
+        (block $default
+          (br_table $target $target $target $default
+            (local.get $x)
+          )
+        )
+        (br $outer (i32.const 0))
       )
       (i32.const 1)
     )

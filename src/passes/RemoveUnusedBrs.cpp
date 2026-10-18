@@ -169,6 +169,230 @@ static bool isI32Const(Expression* expr, int32_t& out) {
   return false;
 }
 
+static thread_local bool currentPassV4OverrideSet = false;
+static thread_local bool currentPassV4Override = false;
+
+static bool isV4Enabled(const PassOptions& passOptions) {
+  if (passOptions.shrinkLevel < 2) {
+    return false;
+  }
+  if (currentPassV4OverrideSet) {
+    return currentPassV4Override;
+  }
+  auto it = passOptions.arguments.find("remove-unused-brs-v4");
+  if (it != passOptions.arguments.end()) {
+    return it->second != "0";
+  }
+  return true;
+}
+
+// Check whether `curr` is guaranteed to evaluate to 0 or 1 (extending
+// Properties::emitsBoolean with 0/1 constants, bitwise ops, select, if, tee,
+// and unnamed blocks).
+static bool isOneBitI32(Expression* curr, Index depth = 0) {
+  if (!curr || curr->type != Type::i32 || depth > 8) {
+    return false;
+  }
+  if (Properties::emitsBoolean(curr)) {
+    return true;
+  }
+  int32_t c = 0;
+  if (isI32Const(curr, c)) {
+    return c == 0 || c == 1;
+  }
+  if (auto* b = curr->dynCast<Binary>()) {
+    if (b->op == AndInt32) {
+      return isOneBitI32(b->left, depth + 1) ||
+             isOneBitI32(b->right, depth + 1);
+    }
+    if (b->op == OrInt32 || b->op == XorInt32) {
+      return isOneBitI32(b->left, depth + 1) &&
+             isOneBitI32(b->right, depth + 1);
+    }
+    if (b->op == ShrUInt32) {
+      int32_t shift = 0;
+      if (isI32Const(b->right, shift) && (shift & 31) == 31) {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (auto* sel = curr->dynCast<Select>()) {
+    return isOneBitI32(sel->ifTrue, depth + 1) &&
+           isOneBitI32(sel->ifFalse, depth + 1);
+  }
+  if (auto* iff = curr->dynCast<If>()) {
+    return iff->ifFalse && isOneBitI32(iff->ifTrue, depth + 1) &&
+           isOneBitI32(iff->ifFalse, depth + 1);
+  }
+  if (auto* set = curr->dynCast<LocalSet>()) {
+    return set->isTee() && isOneBitI32(set->value, depth + 1);
+  }
+  if (auto* block = curr->dynCast<Block>()) {
+    if (!block->name.is() && !block->list.empty()) {
+      return isOneBitI32(block->list.back(), depth + 1);
+    }
+  }
+  return false;
+}
+
+static bool tryInvertRelationalBinaryOp(BinaryOp op, BinaryOp& out) {
+  switch (op) {
+    case EqInt32:
+      out = NeInt32;
+      return true;
+    case NeInt32:
+      out = EqInt32;
+      return true;
+    case LtSInt32:
+      out = GeSInt32;
+      return true;
+    case GeSInt32:
+      out = LtSInt32;
+      return true;
+    case LtUInt32:
+      out = GeUInt32;
+      return true;
+    case GeUInt32:
+      out = LtUInt32;
+      return true;
+    case LeSInt32:
+      out = GtSInt32;
+      return true;
+    case GtSInt32:
+      out = LeSInt32;
+      return true;
+    case LeUInt32:
+      out = GtUInt32;
+      return true;
+    case GtUInt32:
+      out = LeUInt32;
+      return true;
+    case EqInt64:
+      out = NeInt64;
+      return true;
+    case NeInt64:
+      out = EqInt64;
+      return true;
+    case LtSInt64:
+      out = GeSInt64;
+      return true;
+    case GeSInt64:
+      out = LtSInt64;
+      return true;
+    case LtUInt64:
+      out = GeUInt64;
+      return true;
+    case GeUInt64:
+      out = LtUInt64;
+      return true;
+    case LeSInt64:
+      out = GtSInt64;
+      return true;
+    case GtSInt64:
+      out = LeSInt64;
+      return true;
+    case LeUInt64:
+      out = GtUInt64;
+      return true;
+    case GtUInt64:
+      out = LeUInt64;
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Check whether `i32.eqz(curr)` can be pushed into `curr` with 0 net added
+// `i32.eqz` instructions, producing a 1-bit boolean result (0 or 1).
+static bool canInvertBoolExprFree(Expression* curr, Index depth = 0) {
+  if (!curr || curr->type != Type::i32 || depth > 6) {
+    return false;
+  }
+  int32_t c = 0;
+  if (isI32Const(curr, c)) {
+    return true;
+  }
+  if (auto* u = curr->dynCast<Unary>()) {
+    if (u->op == EqZInt32) {
+      return isOneBitI32(u->value);
+    }
+    return false;
+  }
+  if (auto* b = curr->dynCast<Binary>()) {
+    BinaryOp inv;
+    return tryInvertRelationalBinaryOp(b->op, inv);
+  }
+  if (auto* block = curr->dynCast<Block>()) {
+    if (!block->name.is() && !block->list.empty()) {
+      return canInvertBoolExprFree(block->list.back(), depth + 1);
+    }
+    return false;
+  }
+  if (auto* iff = curr->dynCast<If>()) {
+    return iff->ifFalse && canInvertBoolExprFree(iff->ifTrue, depth + 1) &&
+           canInvertBoolExprFree(iff->ifFalse, depth + 1);
+  }
+  if (auto* sel = curr->dynCast<Select>()) {
+    return canInvertBoolExprFree(sel->ifTrue, depth + 1) &&
+           canInvertBoolExprFree(sel->ifFalse, depth + 1);
+  }
+  return false;
+}
+
+static void invertBoolExprFree(Expression*& curr, Builder& builder) {
+  int32_t c = 0;
+  if (isI32Const(curr, c)) {
+    curr->cast<Const>()->value = Literal(int32_t(c == 0 ? 1 : 0));
+    return;
+  }
+  if (auto* u = curr->dynCast<Unary>()) {
+    assert(u->op == EqZInt32 && isOneBitI32(u->value));
+    curr = u->value;
+    return;
+  }
+  if (auto* b = curr->dynCast<Binary>()) {
+    BinaryOp inv;
+    bool ok = tryInvertRelationalBinaryOp(b->op, inv);
+    assert(ok);
+    (void)ok;
+    b->op = inv;
+    return;
+  }
+  if (auto* block = curr->dynCast<Block>()) {
+    assert(!block->name.is() && !block->list.empty());
+    invertBoolExprFree(block->list.back(), builder);
+    return;
+  }
+  if (auto* iff = curr->dynCast<If>()) {
+    assert(iff->ifFalse);
+    invertBoolExprFree(iff->ifTrue, builder);
+    invertBoolExprFree(iff->ifFalse, builder);
+    return;
+  }
+  if (auto* sel = curr->dynCast<Select>()) {
+    invertBoolExprFree(sel->ifTrue, builder);
+    invertBoolExprFree(sel->ifFalse, builder);
+    return;
+  }
+  WASM_UNREACHABLE("unexpected expression in invertBoolExprFree");
+}
+
+// Negate `expr` for use as a boolean condition (where only zero vs non-zero
+// matters): strips a leading `i32.eqz`, or under `shrink2` inverts `expr` in
+// place if free, otherwise wraps in `i32.eqz`.
+static Expression*
+makeNegatedBool(Builder& builder, Expression* expr, bool shrink2) {
+  if (auto* u = expr->dynCast<Unary>(); u && u->op == EqZInt32) {
+    return u->value;
+  }
+  if (shrink2 && canInvertBoolExprFree(expr)) {
+    invertBoolExprFree(expr, builder);
+    return expr;
+  }
+  return builder.makeUnary(EqZInt32, expr);
+}
+
 // Split an `if (result i32)` arm into its optional side-effecting prefix list
 // `prefixOut` (all `Type::none` and free of external branches) and its final
 // i32 value expression `valueOut`.
@@ -307,7 +531,9 @@ static bool tryFoldBooleanIfCondition(If* curr,
     if (!valIsConst && !curr->ifFalse &&
         ((falseConst == 0 && !negated) || (falseConst != 0 && negated))) {
       Expression* innerCond =
-        negated ? builder.makeUnary(EqZInt32, val) : val;
+        negated
+          ? makeNegatedBool(builder, val, isV4Enabled(passOptions))
+          : val;
       auto* newInnerIf = builder.makeIf(innerCond, curr->ifTrue);
       while (tryFoldBooleanIfCondition(newInnerIf, func, wasm, passOptions)) {
       }
@@ -359,7 +585,9 @@ static bool tryFoldBooleanIfCondition(If* curr,
     if (!valIsConst && !curr->ifFalse &&
         ((trueConst == 0 && !negated) || (trueConst != 0 && negated))) {
       Expression* innerCond =
-        negated ? builder.makeUnary(EqZInt32, val) : val;
+        negated
+          ? makeNegatedBool(builder, val, isV4Enabled(passOptions))
+          : val;
       auto* newInnerIf = builder.makeIf(innerCond, curr->ifTrue);
       while (tryFoldBooleanIfCondition(newInnerIf, func, wasm, passOptions)) {
       }
@@ -491,7 +719,9 @@ static Expression* tryFoldBooleanBreakCondition(Break* curr,
     if (!valIsConst &&
         ((falseConst == 0 && !negated) || (falseConst != 0 && negated))) {
       curr->condition =
-        negated ? builder.makeUnary(EqZInt32, val) : val;
+        negated
+          ? makeNegatedBool(builder, val, isV4Enabled(passOptions))
+          : val;
       auto* newIf = builder.makeIf(
         inner->condition,
         prependToArm(builder, prefix, finishConditionalArm()));
@@ -502,7 +732,10 @@ static Expression* tryFoldBooleanBreakCondition(Break* curr,
     // or `br_if $L (i32.eqz (if (result i32) c (then A E) (else 0)))`
     if (!valIsConst &&
         ((falseConst != 0 && !negated) || (falseConst == 0 && negated))) {
-      Expression* rhs = negated ? builder.makeUnary(EqZInt32, val) : val;
+      Expression* rhs =
+        negated
+          ? makeNegatedBool(builder, val, isV4Enabled(passOptions))
+          : val;
       if (prefix.empty() && !neverUnconditionalize &&
           !EffectAnalyzer(passOptions, wasm, val).hasSideEffects() &&
           !tooCostlyToRunUnconditionally(passOptions, val)) {
@@ -512,7 +745,8 @@ static Expression* tryFoldBooleanBreakCondition(Break* curr,
         return finishInPlace();
       }
       if (!curr->value ||
-          (isTrivialValueToCopy(curr->value) && !negated)) {
+          (isTrivialValueToCopy(curr->value) &&
+           (!negated || isV4Enabled(passOptions)))) {
         Expression* valCopy =
           curr->value ? ExpressionManipulator::copy(curr->value, wasm)
                       : nullptr;
@@ -562,7 +796,9 @@ static Expression* tryFoldBooleanBreakCondition(Break* curr,
     if (!valIsConst &&
         ((trueConst == 0 && !negated) || (trueConst != 0 && negated))) {
       curr->condition =
-        negated ? builder.makeUnary(EqZInt32, val) : val;
+        negated
+          ? makeNegatedBool(builder, val, isV4Enabled(passOptions))
+          : val;
       auto* newIf =
         builder.makeIf(builder.makeUnary(EqZInt32, inner->condition),
                        prependToArm(builder, prefix, finishConditionalArm()));
@@ -573,7 +809,10 @@ static Expression* tryFoldBooleanBreakCondition(Break* curr,
     // or `br_if $L (i32.eqz (if (result i32) c (then 0) (else A E)))`
     if (!valIsConst &&
         ((trueConst != 0 && !negated) || (trueConst == 0 && negated))) {
-      Expression* rhs = negated ? builder.makeUnary(EqZInt32, val) : val;
+      Expression* rhs =
+        negated
+          ? makeNegatedBool(builder, val, isV4Enabled(passOptions))
+          : val;
       if (prefix.empty() && !neverUnconditionalize &&
           !EffectAnalyzer(passOptions, wasm, val).hasSideEffects() &&
           !tooCostlyToRunUnconditionally(passOptions, val)) {
@@ -848,7 +1087,12 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
   bool isFunctionParallel() override { return true; }
 
   std::unique_ptr<Pass> create() override {
-    return std::make_unique<RemoveUnusedBrs>();
+    auto pass = std::make_unique<RemoveUnusedBrs>();
+    pass->name = name;
+    if (passArg) {
+      pass->setPassArg(*passArg);
+    }
+    return pass;
   }
 
   bool anotherCycle;
@@ -1043,6 +1287,28 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                                     builder.makeBreak(curr->default_),
                                     builder.makeBreak(curr->targets.front())));
     } else {
+      if (isV4Enabled(getPassOptions())) {
+        Name firstTarget = curr->targets.front();
+        bool allSameTarget = true;
+        for (Index i = 1; i < curr->targets.size(); i++) {
+          if (curr->targets[i] != firstTarget) {
+            allSameTarget = false;
+            break;
+          }
+        }
+        if (allSameTarget) {
+          Builder builder(*getModule());
+          replaceCurrent(builder.makeIf(
+            builder.makeBinary(
+              LtUInt32,
+              curr->condition,
+              builder.makeConst(int32_t(curr->targets.size()))),
+            builder.makeBreak(firstTarget),
+            builder.makeBreak(curr->default_)));
+          anotherCycle = true;
+          return;
+        }
+      }
       // there are also some other cases where we want to convert a switch into
       // ifs, especially if the switch is large and we are focusing on size. an
       // especially egregious case is a switch like this: [a b b [..] b b c]
@@ -1846,6 +2112,17 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         : passOptions(passOptions),
           neverUnconditionalize(neverUnconditionalize) {}
 
+      void visitUnary(Unary* curr) {
+        if (isV4Enabled(passOptions) && curr->op == EqZInt32 &&
+            (curr->value->is<If>() || curr->value->is<Select>()) &&
+            canInvertBoolExprFree(curr->value)) {
+          Builder builder(*getModule());
+          invertBoolExprFree(curr->value, builder);
+          replaceCurrent(curr->value);
+          worked = true;
+        }
+      }
+
       void visitIf(If* curr) {
         while (tryFoldBooleanIfCondition(
           curr, getFunction(), *getModule(), passOptions)) {
@@ -2383,6 +2660,16 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
   }
 
   void doWalkFunction(Function* func) {
+    auto instArg = getArgumentOrDefault("remove-unused-brs", "");
+    if (instArg == "v4") {
+      currentPassV4OverrideSet = true;
+      currentPassV4Override = true;
+    } else if (instArg == "v3") {
+      currentPassV4OverrideSet = true;
+      currentPassV4Override = false;
+    } else {
+      currentPassV4OverrideSet = false;
+    }
     neverUnconditionalize =
       hasArgument("remove-unused-brs-never-unconditionalize");
     bool foldBoolIf = getPassRunner()->options.shrinkLevel >= 2 ||
@@ -2640,12 +2927,14 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
 
       bool shrink;
       bool shrink2;
+      bool v4 = false;
       bool foldBoolIf;
       bool neverUnconditionalize;
 
       bool needUniqify = false;
       bool refinalize = false;
       std::unordered_set<Block*> unnestedIfBlocks;
+      std::unordered_set<Name> tailBlockNames;
 
       FinalOptimizer(PassOptions& passOptions) : passOptions(passOptions) {}
 
@@ -2971,17 +3260,62 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         // * note that we do this at the end, because un-conditionalizing can
         //   interfere with optimizeLoop()ing.
         auto& list = curr->list;
+        if (v4) {
+          if (curr->name.is() &&
+              !BranchUtils::BranchSeeker::has(curr, curr->name)) {
+            curr->name = Name();
+          }
+          Index writeIdx = 0;
+          for (Index readIdx = 0; readIdx < list.size(); readIdx++) {
+            if (!list[readIdx]->is<Nop>()) {
+              list[writeIdx++] = list[readIdx];
+            }
+          }
+          if (writeIdx != list.size()) {
+            list.resize(writeIdx);
+            curr->finalize(curr->type);
+          }
+          if (!curr->name.is() && list.empty() && curr->type == Type::none) {
+            ExpressionManipulator::nop(curr);
+            return;
+          }
+        }
         for (Index i = 0; i < list.size(); i++) {
-          if (auto* sub = list[i]->dynCast<Block>();
-              sub && unnestedIfBlocks.contains(sub)) {
+          while (auto* sub = list[i]->dynCast<Block>()) {
+            bool canSplice = unnestedIfBlocks.contains(sub);
+            if (!canSplice && v4 && !sub->name.is() &&
+                !sub->list.empty()) {
+              bool prefixVoid = true;
+              for (Index j = 0; j + 1 < sub->list.size(); j++) {
+                if (sub->list[j]->type != Type::none) {
+                  prefixVoid = false;
+                  break;
+                }
+              }
+              if (prefixVoid &&
+                  (i + 1 == list.size() ||
+                   sub->list.back()->type == Type::none)) {
+                canSplice = true;
+              }
+            }
+            if (!canSplice) {
+              break;
+            }
             unnestedIfBlocks.erase(sub);
             list[i] = sub->list[0];
             for (Index j = 1; j < sub->list.size(); j++) {
               list.insertAt(i + j, sub->list[j]);
             }
             curr->finalize(curr->type);
+            if (!v4) {
+              break;
+            }
           }
           auto* iff = list[i]->dynCast<If>();
+          if (v4 && iff && iff->ifFalse && iff->ifFalse->is<Nop>()) {
+            iff->ifFalse = nullptr;
+            iff->finalize();
+          }
           if (!iff || !iff->ifFalse) {
             // if it lacked an if-false, it would already be a br_if, as that's
             // the easy case
@@ -3121,7 +3455,66 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
               }
             }
           }
-          if (shrink && mergedWithNop) {
+          if (v4 && !neverUnconditionalize && list.size() >= 2) {
+            // Fold adjacent `[(drop (br_if $L V1 COND)), (br $L V2)]` and
+            // `[(drop (br_if $tail V1 COND)), (return V2)]` into
+            // `(br $L (if (result T) COND V1 V2))` / `(return (if ...))` +
+            // `selectify`.
+            for (Index idx = list.size() - 1; idx > 0; idx--) {
+              auto* drop1 = list[idx - 1]->dynCast<Drop>();
+              if (!drop1) {
+                continue;
+              }
+              auto* br1 = drop1->value->dynCast<Break>();
+              if (!br1 || !br1->condition || !br1->value ||
+                  br1->type == Type::unreachable ||
+                  !canTurnIfIntoBrIf(
+                    br1->condition, br1->value, passOptions, *getModule())) {
+                continue;
+              }
+              Break* br2 = list[idx]->dynCast<Break>();
+              Return* ret2 = list[idx]->dynCast<Return>();
+              Expression** val2Ptr = nullptr;
+              if (br2 && !br2->condition && br2->value &&
+                  br2->name == br1->name) {
+                val2Ptr = &br2->value;
+              } else if (ret2 && ret2->value &&
+                         tailBlockNames.contains(br1->name)) {
+                val2Ptr = &ret2->value;
+              }
+              if (!val2Ptr || (*val2Ptr)->type == Type::unreachable) {
+                continue;
+              }
+              Builder builder(*getModule());
+              auto* iff = builder.makeIf(br1->condition, br1->value, *val2Ptr);
+              BranchHints::copyTo(br1, iff, getFunction());
+              BranchHints::clear(br1, getFunction());
+              while (foldBoolIf &&
+                     tryFoldBooleanIfCondition(
+                       iff, getFunction(), *getModule(), passOptions)) {
+              }
+              if (auto* u = iff->condition->dynCast<Unary>();
+                  u && u->op == EqZInt32) {
+                iff->condition = u->value;
+                std::swap(iff->ifTrue, iff->ifFalse);
+                BranchHints::flip(iff, getFunction());
+              }
+              Expression* valExpr = iff;
+              if (auto* sel = selectify(iff)) {
+                valExpr = sel;
+              }
+              *val2Ptr = valExpr;
+              if (br2) {
+                br2->finalize();
+              } else {
+                ret2->finalize();
+              }
+              ExpressionManipulator::nop(drop1);
+              mergedWithNop = true;
+              refinalize = true;
+            }
+          }
+          if (shrink && (mergedWithNop || v4)) {
             Index writeIdx = 0;
             for (Index readIdx = 0; readIdx < list.size(); readIdx++) {
               if (!list[readIdx]->is<Nop>()) {
@@ -3216,13 +3609,15 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                 if (brConst == 0 && lastConst == 1) {
                   if (auto* u = br->condition->dynCast<Unary>();
                       u && u->op == EqZInt32 &&
-                      Properties::emitsBoolean(u->value)) {
+                      (v4 ? isOneBitI32(u->value)
+                          : Properties::emitsBoolean(u->value))) {
                     rep = u->value;
                   } else {
-                    rep = builder.makeUnary(EqZInt32, br->condition);
+                    rep = makeNegatedBool(builder, br->condition, v4);
                   }
                 } else {
-                  if (Properties::emitsBoolean(br->condition)) {
+                  if (v4 ? isOneBitI32(br->condition)
+                         : Properties::emitsBoolean(br->condition)) {
                     rep = br->condition;
                   } else {
                     rep = builder.makeBinary(
@@ -3277,7 +3672,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
               }
               break;
             }
-            if (tailChanged && curr->name.is() &&
+            if ((tailChanged || v4) && curr->name.is() &&
                 !BranchUtils::BranchSeeker::has(curr, curr->name)) {
               curr->name = Name();
               curr->finalize(curr->type);
@@ -3471,13 +3866,704 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
           return;
         }
 
-        // shrink2: scan list[k] (0 <= k < list.size() - 1) for the single
-        // branch targeting curr->name: either a conditional Break / Drop(Break)
-        // or a 1-arm If ending in an unconditional Break to curr->name.
-        for (Index k = 0; k + 1 < list.size(); k++) {
-          if (list[k]->type == Type::unreachable) {
+        if (!v4) {
+          // shrink2 (v3): scan list[k] (0 <= k < list.size() - 1) for the
+          // single branch targeting curr->name: either a conditional Break /
+          // Drop(Break) or a 1-arm If ending in an unconditional Break to
+          // curr->name.
+          for (Index k = 0; k + 1 < list.size(); k++) {
+            if (list[k]->type == Type::unreachable) {
+              return;
+            }
+            Break* br = nullptr;
+            Drop* drop = list[k]->dynCast<Drop>();
+            if (drop) {
+              br = drop->value->dynCast<Break>();
+            } else {
+              br = list[k]->dynCast<Break>();
+            }
+            if (br && br->condition && br->name == curr->name &&
+                br->type != Type::unreachable) {
+              if (BranchUtils::BranchSeeker::count(curr, curr->name) != 1) {
+                return;
+              }
+              if (!drop) {
+                assert(!br->value);
+                if (curr->type != Type::none) {
+                  return;
+                }
+                if (k == 0) {
+                  if (passOptions.trapsNeverHappen && list.size() >= 3 &&
+                      list.back()->is<Unreachable>() &&
+                      !list[list.size() - 2]->type.isConcrete()) {
+                    list.pop_back();
+                  }
+                  auto* iff = builder.makeIf(
+                    builder.makeUnary(EqZInt32, br->condition), curr);
+                  replaceCurrent(iff);
+                  BranchHints::copyFlippedTo(br, iff, getFunction());
+                  ExpressionManipulator::nop(br);
+                  BranchHints::clear(br, getFunction());
+                  curr->finalize(curr->type);
+                  while (foldBoolIf &&
+                         tryFoldBooleanIfCondition(
+                           iff, getFunction(), *getModule(), passOptions)) {
+                  }
+                } else {
+                  Index endIdx = list.size();
+                  if (passOptions.trapsNeverHappen && endIdx > k + 2 &&
+                      list.back()->is<Unreachable>() &&
+                      !list[endIdx - 2]->type.isConcrete()) {
+                    endIdx--;
+                  }
+                  Expression* body = stealSlice(builder, curr, k + 1, endIdx);
+                  auto* iff =
+                    builder.makeIf(negateCond(builder, br->condition), body);
+                  BranchHints::copyFlippedTo(br, iff, getFunction());
+                  BranchHints::clear(br, getFunction());
+                  while (foldBoolIf &&
+                         tryFoldBooleanIfCondition(
+                           iff, getFunction(), *getModule(), passOptions)) {
+                  }
+                  list[k] = iff;
+                  list.resize(k + 1);
+                  curr->name = Name();
+                  curr->finalize(curr->type);
+                }
+                return;
+              }
+
+              // drop(br_if $curr VAL COND)
+              if (!EffectAnalyzer(passOptions, *getModule(), br->value)
+                     .hasSideEffects() &&
+                  EffectAnalyzer::canReorder(
+                    passOptions, *getModule(), br->condition, br->value)) {
+                if (passOptions.trapsNeverHappen && curr->type.isConcrete() &&
+                    k + 2 < list.size() && list.back()->is<Unreachable>()) {
+                  bool tailVoid = true;
+                  for (Index j = k + 1; j + 1 < list.size(); j++) {
+                    if (list[j]->type.isConcrete()) {
+                      tailVoid = false;
+                      break;
+                    }
+                  }
+                  if (tailVoid) {
+                    Expression* noreturnBody =
+                      stealSlice(builder, curr, k + 1, list.size() - 1);
+                    auto* iff = builder.makeIf(
+                      negateCond(builder, br->condition), noreturnBody);
+                    BranchHints::copyFlippedTo(br, iff, getFunction());
+                    BranchHints::clear(br, getFunction());
+                    while (foldBoolIf &&
+                           tryFoldBooleanIfCondition(
+                             iff, getFunction(), *getModule(), passOptions)) {
+                    }
+                    Expression* val = br->value;
+                    list[k] = iff;
+                    list[k + 1] = val;
+                    list.resize(k + 2);
+                    curr->name = Name();
+                    curr->finalize(curr->type);
+                    refinalize = true;
+                    return;
+                  }
+                }
+                if (k == 0) {
+                  ExpressionManipulator::nop(list[0]);
+                  auto* iff = builder.makeIf(br->condition, br->value, curr);
+                  BranchHints::copyTo(br, iff, getFunction());
+                  replaceCurrent(iff);
+                  while (foldBoolIf &&
+                         tryFoldBooleanIfCondition(
+                           iff, getFunction(), *getModule(), passOptions)) {
+                  }
+                  if (iff->type != curr->type) {
+                    refinalize = true;
+                  }
+                  if (auto* seq = tryUnnestOneUnreachableArmIf(iff)) {
+                    replaceCurrent(seq);
+                  }
+                } else {
+                  Expression* falseArm =
+                    stealSlice(builder, curr, k + 1, list.size());
+                  auto* iff = builder.makeIf(
+                    br->condition, br->value, falseArm, curr->type);
+                  BranchHints::copyTo(br, iff, getFunction());
+                  BranchHints::clear(br, getFunction());
+                  while (foldBoolIf &&
+                         tryFoldBooleanIfCondition(
+                           iff, getFunction(), *getModule(), passOptions)) {
+                  }
+                  list[k] = iff;
+                  list.resize(k + 1);
+                  curr->name = Name();
+                  curr->finalize(curr->type);
+                  if (iff->type != curr->type) {
+                    refinalize = true;
+                  }
+                }
+                return;
+              }
+              if (passOptions.trapsNeverHappen && curr->type.isConcrete() &&
+                  k + 2 < list.size() && list.back()->is<Unreachable>()) {
+                if (auto* tee = br->value->dynCast<LocalSet>();
+                    tee && tee->isTee() &&
+                    Type::isSubType(tee->type, curr->type) &&
+                    !EffectAnalyzer(passOptions, *getModule(), br->condition)
+                       .localsWritten.contains(tee->index)) {
+                  bool tailVoid = true;
+                  for (Index j = k + 1; j + 1 < list.size(); j++) {
+                    if (list[j]->type.isConcrete()) {
+                      tailVoid = false;
+                      break;
+                    }
+                  }
+                  if (tailVoid) {
+                    Expression* noreturnBody =
+                      stealSlice(builder, curr, k + 1, list.size() - 1);
+                    auto* iff = builder.makeIf(
+                      negateCond(builder, br->condition), noreturnBody);
+                    BranchHints::copyFlippedTo(br, iff, getFunction());
+                    BranchHints::clear(br, getFunction());
+                    while (foldBoolIf &&
+                           tryFoldBooleanIfCondition(
+                             iff, getFunction(), *getModule(), passOptions)) {
+                    }
+                    Type localType = getFunction()->getLocalType(tee->index);
+                    tee->makeSet();
+                    list[k] = tee;
+                    list[k + 1] = iff;
+                    if (k + 2 < list.size()) {
+                      list[k + 2] = builder.makeLocalGet(tee->index, localType);
+                      list.resize(k + 3);
+                    } else {
+                      list.push_back(
+                        builder.makeLocalGet(tee->index, localType));
+                    }
+                    curr->name = Name();
+                    curr->finalize(curr->type);
+                    refinalize = true;
+                    return;
+                  }
+                }
+              }
+              if (k == 0 && !neverUnconditionalize) {
+                Expression* old = list[0];
+                Nop nop;
+                list[0] = &nop;
+                auto canReorder = EffectAnalyzer::canReorder(
+                  passOptions, *getModule(), br->condition, curr);
+                auto hasSideEffects =
+                  EffectAnalyzer(passOptions, *getModule(), curr)
+                    .hasSideEffects();
+                list[0] = old;
+                if (canReorder && !hasSideEffects &&
+                    Properties::canEmitSelectWithArms(br->value, curr)) {
+                  ExpressionManipulator::nop(list[0]);
+                  replaceCurrent(
+                    builder.makeSelect(br->condition, br->value, curr));
+                }
+              }
+              return;
+            }
+
+            // Part 1(a): 1-arm If ending in unconditional (br $curr [VAL]).
+            if (auto* iff = list[k]->dynCast<If>();
+                iff && !iff->ifFalse &&
+                iff->condition->type != Type::unreachable) {
+              std::vector<Expression*> thenPrefix;
+              Break* thenBr = iff->ifTrue->dynCast<Break>();
+              if (!thenBr) {
+                if (auto* tb = iff->ifTrue->dynCast<Block>();
+                    tb && !tb->name.is() && !tb->list.empty()) {
+                  if (auto* b = tb->list.back()->dynCast<Break>()) {
+                    bool prefixOk = true;
+                    for (Index j = 0; j + 1 < tb->list.size(); j++) {
+                      if (tb->list[j]->type != Type::none) {
+                        prefixOk = false;
+                        break;
+                      }
+                      thenPrefix.push_back(tb->list[j]);
+                    }
+                    if (prefixOk) {
+                      thenBr = b;
+                    } else {
+                      thenPrefix.clear();
+                    }
+                  }
+                }
+              }
+              if (thenBr && !thenBr->condition && thenBr->name == curr->name) {
+                if (BranchUtils::BranchSeeker::count(curr, curr->name) != 1) {
+                  return;
+                }
+                if (curr->type == Type::none) {
+                  if (thenBr->value) {
+                    return;
+                  }
+                } else if (curr->type.isConcrete()) {
+                  if (!thenBr->value ||
+                      !Type::isSubType(thenBr->value->type, curr->type)) {
+                    return;
+                  }
+                } else {
+                  return;
+                }
+
+                // Noreturn-tail inversion when curr is concrete and ends in
+                // ...noreturn_tail... (unreachable).
+                if (passOptions.trapsNeverHappen && curr->type.isConcrete() &&
+                    k + 2 < list.size() && list.back()->is<Unreachable>()) {
+                  bool tailVoid = true;
+                  for (Index j = k + 1; j + 1 < list.size(); j++) {
+                    if (list[j]->type.isConcrete()) {
+                      tailVoid = false;
+                      break;
+                    }
+                  }
+                  if (tailVoid) {
+                    Expression* noreturnBody =
+                      stealSlice(builder, curr, k + 1, list.size() - 1);
+                    Expression* brVal = thenBr->value;
+                    BranchHints::clear(thenBr, getFunction());
+                    iff->condition = negateCond(builder, iff->condition);
+                    iff->ifTrue = noreturnBody;
+                    BranchHints::flip(iff, getFunction());
+                    iff->finalize();
+                    while (foldBoolIf &&
+                           tryFoldBooleanIfCondition(
+                             iff, getFunction(), *getModule(), passOptions)) {
+                    }
+                    list.resize(k + 1);
+                    for (auto* item : thenPrefix) {
+                      list.push_back(item);
+                    }
+                    list.push_back(brVal);
+                    curr->name = Name();
+                    curr->finalize(curr->type);
+                    refinalize = true;
+                    return;
+                  }
+                }
+
+                // Normal 1-arm If -> 2-arm If restructuring.
+                if (curr->type == Type::none) {
+                  Index endIdx = list.size();
+                  if (passOptions.trapsNeverHappen && endIdx > k + 2 &&
+                      list.back()->is<Unreachable>() &&
+                      !list[endIdx - 2]->type.isConcrete()) {
+                    endIdx--;
+                  }
+                  Expression* falseArm =
+                    stealSlice(builder, curr, k + 1, endIdx);
+                  BranchHints::clear(thenBr, getFunction());
+                  if (thenPrefix.empty()) {
+                    iff->condition = negateCond(builder, iff->condition);
+                    iff->ifTrue = falseArm;
+                    BranchHints::flip(iff, getFunction());
+                  } else {
+                    auto* tb = iff->ifTrue->cast<Block>();
+                    tb->list.pop_back();
+                    if (tb->list.size() == 1) {
+                      iff->ifTrue = tb->list[0];
+                    } else {
+                      tb->finalize();
+                    }
+                    iff->ifFalse = falseArm;
+                  }
+                  iff->finalize(Type::none);
+                } else {
+                  Expression* falseArm =
+                    stealSlice(builder, curr, k + 1, list.size());
+                  Expression* brVal = thenBr->value;
+                  BranchHints::clear(thenBr, getFunction());
+                  if (thenPrefix.empty()) {
+                    iff->ifTrue = brVal;
+                  } else {
+                    auto* tb = iff->ifTrue->cast<Block>();
+                    tb->list.back() = brVal;
+                    tb->finalize();
+                  }
+                  iff->ifFalse = falseArm;
+                  iff->finalize(curr->type);
+                }
+                while (foldBoolIf &&
+                       tryFoldBooleanIfCondition(
+                         iff, getFunction(), *getModule(), passOptions)) {
+                }
+                Expression* rep = iff;
+                if (auto* sel = selectify(iff)) {
+                  if (!sel->type.isRef() || sel->type == curr->type ||
+                      sel->type.getHeapType().isBasic()) {
+                    rep = sel;
+                  }
+                }
+                if (k == 0) {
+                  curr->name = Name();
+                  if (auto* repIf = rep->dynCast<If>()) {
+                    if (auto* seq = tryUnnestOneUnreachableArmIf(repIf)) {
+                      rep = seq;
+                    }
+                  }
+                  replaceCurrent(rep);
+                  if (rep->type != curr->type) {
+                    refinalize = true;
+                  }
+                } else {
+                  list[k] = rep;
+                  list.resize(k + 1);
+                  curr->name = Name();
+                  curr->finalize(curr->type);
+                  if (rep->type != curr->type) {
+                    refinalize = true;
+                  }
+                }
+                return;
+              }
+            }
+            if (BranchUtils::BranchSeeker::has(list[k], curr->name)) {
+              return;
+            }
+          }
+          return;
+        }
+
+        // shrink2 (v4): iteratively peel branches targeting curr->name from the
+        // tail of curr->list backward (supporting multi-branch blocks,
+        // 1-arm Ifs, if/else-if chains, 2-level nested 1-arm Ifs, and
+        // drop(br_if) / void br_if).
+        auto peelTailDropBrIfs = [&]() {
+          while (curr->list.size() >= 2 && curr->name.is()) {
+            size_t sz = curr->list.size();
+            auto* secondLast = curr->list[sz - 2];
+            auto* last = curr->list[sz - 1];
+            auto* drop = secondLast->dynCast<Drop>();
+            if (!drop) {
+              break;
+            }
+            auto* br = drop->value->dynCast<Break>();
+            if (!br || !br->value || !br->condition ||
+                br->name != curr->name || br->type == Type::unreachable ||
+                last->type == Type::unreachable) {
+              break;
+            }
+            if (ExpressionAnalyzer::equal(br->value, last)) {
+              EffectAnalyzer valEff(passOptions, *getModule(), br->value);
+              if (!valEff.hasUnremovableSideEffects()) {
+                EffectAnalyzer condEff(
+                  passOptions, *getModule(), br->condition);
+                if (!condEff.invalidates(valEff)) {
+                  BranchHints::clear(br, getFunction());
+                  if (!condEff.hasUnremovableSideEffects()) {
+                    curr->list[sz - 2] = last;
+                    curr->list.pop_back();
+                    continue;
+                  }
+                  drop->value = br->condition;
+                }
+              }
+              break;
+            }
+            int32_t brConst = 0, lastConst = 0;
+            if (isI32Const(br->value, brConst) &&
+                isI32Const(last, lastConst) &&
+                ((brConst == 0 && lastConst == 1) ||
+                 (brConst == 1 && lastConst == 0))) {
+              Expression* rep = nullptr;
+              if (brConst == 0 && lastConst == 1) {
+                if (auto* u = br->condition->dynCast<Unary>();
+                    u && u->op == EqZInt32 && isOneBitI32(u->value)) {
+                  rep = u->value;
+                } else {
+                  rep = makeNegatedBool(builder, br->condition, shrink2);
+                }
+              } else {
+                if (isOneBitI32(br->condition)) {
+                  rep = br->condition;
+                } else {
+                  rep = builder.makeBinary(
+                    NeInt32, br->condition, builder.makeConst(int32_t(0)));
+                }
+              }
+              BranchHints::clear(br, getFunction());
+              curr->list[sz - 2] = rep;
+              curr->list.pop_back();
+              continue;
+            }
+            if (!neverUnconditionalize &&
+                (!curr->type.isRef() ||
+                 (sz == 2 &&
+                  BranchUtils::BranchSeeker::count(curr, curr->name) == 1)) &&
+                Properties::canEmitSelectWithArms(br->value, last) &&
+                !tooCostlyToRunUnconditionally(
+                  passOptions, br->value, last)) {
+              EffectAnalyzer valEff(passOptions, *getModule(), br->value);
+              EffectAnalyzer lastEff(passOptions, *getModule(), last);
+              if (!valEff.hasSideEffects() && !lastEff.hasSideEffects()) {
+                EffectAnalyzer condEff(
+                  passOptions, *getModule(), br->condition);
+                if (!condEff.invalidates(valEff) &&
+                    EffectAnalyzer::canReorder(
+                      passOptions, *getModule(), br->condition, last)) {
+                  auto* sel =
+                    builder.makeSelect(br->condition, br->value, last);
+                  if (!sel->type.isRef() || sel->type == curr->type ||
+                      sel->type.getHeapType().isBasic()) {
+                    if (sel->type != curr->type) {
+                      refinalize = true;
+                    }
+                    BranchHints::clear(br, getFunction());
+                    curr->list[sz - 2] = sel;
+                    curr->list.pop_back();
+                    continue;
+                  }
+                }
+              }
+            }
+            break;
+          }
+        };
+
+        auto extractThenBr = [&](Expression* arm,
+                                 std::vector<Expression*>& prefixOut) -> Break* {
+          prefixOut.clear();
+          if (auto* br = arm->dynCast<Break>()) {
+            return br;
+          }
+          if (auto* tb = arm->dynCast<Block>();
+              tb && !tb->name.is() && !tb->list.empty()) {
+            if (auto* b = tb->list.back()->dynCast<Break>()) {
+              for (Index j = 0; j + 1 < tb->list.size(); j++) {
+                if (tb->list[j]->type != Type::none) {
+                  prefixOut.clear();
+                  return nullptr;
+                }
+                prefixOut.push_back(tb->list[j]);
+              }
+              return b;
+            }
+          }
+          return nullptr;
+        };
+
+        auto matchBrIfChain =
+          [&](If* rootIf,
+              Index expectedRefs,
+              std::vector<If*>& chainIfs,
+              std::vector<std::vector<Expression*>>& chainPrefixes,
+              std::vector<Break*>& chainBrs) -> bool {
+          chainIfs.clear();
+          chainPrefixes.clear();
+          chainBrs.clear();
+          If* cur = rootIf;
+          while (cur) {
+            if (cur->condition->type == Type::unreachable) {
+              return false;
+            }
+            std::vector<Expression*> prefix;
+            Break* thenBr = extractThenBr(cur->ifTrue, prefix);
+            if (!thenBr || thenBr->condition || thenBr->name != curr->name) {
+              return false;
+            }
+            if (curr->type == Type::none) {
+              if (thenBr->value) {
+                return false;
+              }
+            } else if (curr->type.isConcrete()) {
+              if (!thenBr->value ||
+                  !Type::isSubType(thenBr->value->type, curr->type)) {
+                return false;
+              }
+            } else {
+              return false;
+            }
+            chainIfs.push_back(cur);
+            chainPrefixes.push_back(std::move(prefix));
+            chainBrs.push_back(thenBr);
+            if (!cur->ifFalse) {
+              break;
+            }
+            cur = cur->ifFalse->dynCast<If>();
+            if (!cur) {
+              return false;
+            }
+          }
+          return chainIfs.size() == expectedRefs;
+        };
+
+        auto isFreeNegCond = [](Expression* c) {
+          if (auto* u = c->dynCast<Unary>(); u && u->op == EqZInt32) {
+            return true;
+          }
+          return canInvertBoolExprFree(c);
+        };
+
+        int typeBytes =
+          (curr->type == Type::none)
+            ? 0
+            : ((curr->type.isRef() && !curr->type.getHeapType().isBasic()) ? 2
+                                                                           : 1);
+
+        auto canProfitablyPeelAll = [&](Index upToK) -> bool {
+          int totalDelta = 0;
+          Index firstBrIdx = upToK + 1;
+          for (Index i = 0; i <= upToK; i++) {
+            Index refs = BranchUtils::BranchSeeker::count(list[i], curr->name);
+            if (refs == 0) {
+              continue;
+            }
+            if (firstBrIdx > upToK) {
+              firstBrIdx = i;
+            }
+            Break* br = nullptr;
+            Drop* drop = list[i]->dynCast<Drop>();
+            if (drop) {
+              br = drop->value->dynCast<Break>();
+            } else {
+              br = list[i]->dynCast<Break>();
+            }
+            if (br && br->condition && br->name == curr->name &&
+                br->type != Type::unreachable) {
+              if (refs != 1) {
+                return false;
+              }
+              if (!drop) {
+                if (curr->type != Type::none) {
+                  return false;
+                }
+                totalDelta += isFreeNegCond(br->condition) ? -1 : 1;
+                continue;
+              }
+              if (!curr->type.isConcrete() ||
+                  EffectAnalyzer(passOptions, *getModule(), br->value)
+                    .hasSideEffects() ||
+                  !EffectAnalyzer::canReorder(
+                    passOptions, *getModule(), br->condition, br->value)) {
+                return false;
+              }
+              bool condEqz = false;
+              if (auto* u = br->condition->dynCast<Unary>();
+                  u && u->op == EqZInt32) {
+                condEqz = true;
+              }
+              totalDelta += typeBytes - (condEqz ? 1 : 0);
+              continue;
+            }
+            if (auto* iff = list[i]->dynCast<If>()) {
+              std::vector<If*> cIfs;
+              std::vector<std::vector<Expression*>> cPrefixes;
+              std::vector<Break*> cBrs;
+              if (matchBrIfChain(iff, refs, cIfs, cPrefixes, cBrs)) {
+                int d = int(cIfs.size());
+                if (curr->type == Type::none) {
+                  if (d == 1 && cPrefixes[0].empty()) {
+                    totalDelta += isFreeNegCond(iff->condition) ? -2 : -1;
+                  } else {
+                    totalDelta += -(2 * d - 1);
+                  }
+                } else {
+                  bool condEqz = false;
+                  if (d == 1 && cPrefixes[0].empty()) {
+                    if (auto* u = iff->condition->dynCast<Unary>();
+                        u && u->op == EqZInt32) {
+                      condEqz = true;
+                    }
+                  }
+                  totalDelta += typeBytes + 1 - 2 * d - (condEqz ? 1 : 0);
+                }
+                continue;
+              }
+            }
+            return false;
+          }
+          if (firstBrIdx > upToK) {
+            return false;
+          }
+          if (curr->type == Type::none) {
+            int blockSavings = (firstBrIdx == 0) ? 2 : 0;
+            return totalDelta - blockSavings < 0;
+          }
+          int blockSavings = (firstBrIdx == 0) ? (2 + typeBytes) : 2;
+          return totalDelta - blockSavings <= 0;
+        };
+
+        auto finishPeelAtK = [&](Index k,
+                                 Expression* rep,
+                                 bool isLastRefInCurr) -> bool {
+          if (isLastRefInCurr) {
+            if (k == 0) {
+              curr->name = Name();
+              if (auto* repIf = rep->dynCast<If>()) {
+                if (auto* seq = tryUnnestOneUnreachableArmIf(repIf)) {
+                  rep = seq;
+                }
+              }
+              replaceCurrent(rep);
+              if (rep->type != curr->type) {
+                refinalize = true;
+              }
+            } else {
+              list[k] = rep;
+              list.resize(k + 1);
+              curr->name = Name();
+              curr->finalize(curr->type);
+              if (rep->type != curr->type) {
+                refinalize = true;
+              }
+            }
+            return false;
+          }
+          list[k] = rep;
+          list.resize(k + 1);
+          curr->finalize(curr->type);
+          if (rep->type != curr->type) {
+            refinalize = true;
+          }
+          peelTailDropBrIfs();
+          return true;
+        };
+
+        while (curr->name.is() && list.size() >= 2) {
+          for (Index i = 0; i + 1 < list.size(); i++) {
+            if (list[i]->type == Type::unreachable) {
+              return;
+            }
+          }
+          if (BranchUtils::BranchSeeker::count(list.back(), curr->name) != 0) {
             return;
           }
+          Index k = list.size();
+          Index refsInK = 0;
+          for (Index i = list.size() - 1; i > 0; i--) {
+            Index c = BranchUtils::BranchSeeker::count(list[i - 1], curr->name);
+            if (c > 0) {
+              k = i - 1;
+              refsInK = c;
+              break;
+            }
+          }
+          if (k == list.size()) {
+            curr->name = Name();
+            curr->finalize(curr->type);
+            refinalize = true;
+            return;
+          }
+          Index earlierRefs = 0;
+          for (Index i = 0; i < k; i++) {
+            earlierRefs +=
+              BranchUtils::BranchSeeker::count(list[i], curr->name);
+          }
+          bool isLastRefInCurr = (earlierRefs == 0);
+
+          // Check whether list[k + 1 .. list.size() - 2] are all void.
+          bool midVoid = true;
+          for (Index j = k + 1; j + 1 < list.size(); j++) {
+            if (list[j]->type != Type::none) {
+              midVoid = false;
+              break;
+            }
+          }
+
           Break* br = nullptr;
           Drop* drop = list[k]->dynCast<Drop>();
           if (drop) {
@@ -3487,7 +4573,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
           }
           if (br && br->condition && br->name == curr->name &&
               br->type != Type::unreachable) {
-            if (BranchUtils::BranchSeeker::count(curr, curr->name) != 1) {
+            if (refsInK != 1) {
               return;
             }
             if (!drop) {
@@ -3495,45 +4581,28 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
               if (curr->type != Type::none) {
                 return;
               }
-              if (k == 0) {
-                if (passOptions.trapsNeverHappen && list.size() >= 3 &&
-                    list.back()->is<Unreachable>() &&
-                    !list[list.size() - 2]->type.isConcrete()) {
-                  list.pop_back();
-                }
-                auto* iff = builder.makeIf(
-                  builder.makeUnary(EqZInt32, br->condition), curr);
-                replaceCurrent(iff);
-                BranchHints::copyFlippedTo(br, iff, getFunction());
-                ExpressionManipulator::nop(br);
-                BranchHints::clear(br, getFunction());
-                curr->finalize(curr->type);
-                while (foldBoolIf &&
-                       tryFoldBooleanIfCondition(
-                         iff, getFunction(), *getModule(), passOptions)) {
-                }
-              } else {
-                Index endIdx = list.size();
-                if (passOptions.trapsNeverHappen && endIdx > k + 2 &&
-                    list.back()->is<Unreachable>() &&
-                    !list[endIdx - 2]->type.isConcrete()) {
-                  endIdx--;
-                }
-                Expression* body = stealSlice(builder, curr, k + 1, endIdx);
-                auto* iff =
-                  builder.makeIf(negateCond(builder, br->condition), body);
-                BranchHints::copyFlippedTo(br, iff, getFunction());
-                BranchHints::clear(br, getFunction());
-                while (foldBoolIf &&
-                       tryFoldBooleanIfCondition(
-                         iff, getFunction(), *getModule(), passOptions)) {
-                }
-                list[k] = iff;
-                list.resize(k + 1);
-                curr->name = Name();
-                curr->finalize(curr->type);
+              if (!isLastRefInCurr && !canProfitablyPeelAll(k)) {
+                return;
               }
-              return;
+              Index endIdx = list.size();
+              if (passOptions.trapsNeverHappen && endIdx > k + 2 &&
+                  list.back()->is<Unreachable>() &&
+                  !list[endIdx - 2]->type.isConcrete()) {
+                endIdx--;
+              }
+              Expression* body = stealSlice(builder, curr, k + 1, endIdx);
+              auto* iff = builder.makeIf(
+                makeNegatedBool(builder, br->condition, shrink2), body);
+              BranchHints::copyFlippedTo(br, iff, getFunction());
+              BranchHints::clear(br, getFunction());
+              while (foldBoolIf &&
+                     tryFoldBooleanIfCondition(
+                       iff, getFunction(), *getModule(), passOptions)) {
+              }
+              if (!finishPeelAtK(k, iff, isLastRefInCurr)) {
+                return;
+              }
+              continue;
             }
 
             // drop(br_if $curr VAL COND)
@@ -3541,115 +4610,142 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                    .hasSideEffects() &&
                 EffectAnalyzer::canReorder(
                   passOptions, *getModule(), br->condition, br->value)) {
+              // (1) Noreturn-tail inversion: valid for any totalRefs >= 1.
               if (passOptions.trapsNeverHappen && curr->type.isConcrete() &&
-                  k + 2 < list.size() && list.back()->is<Unreachable>()) {
-                bool tailVoid = true;
-                for (Index j = k + 1; j + 1 < list.size(); j++) {
-                  if (list[j]->type.isConcrete()) {
-                    tailVoid = false;
-                    break;
-                  }
-                }
-                if (tailVoid) {
-                  Expression* noreturnBody =
-                    stealSlice(builder, curr, k + 1, list.size() - 1);
-                  auto* iff = builder.makeIf(
-                    negateCond(builder, br->condition), noreturnBody);
-                  BranchHints::copyFlippedTo(br, iff, getFunction());
-                  BranchHints::clear(br, getFunction());
-                  while (foldBoolIf &&
-                         tryFoldBooleanIfCondition(
-                           iff, getFunction(), *getModule(), passOptions)) {
-                  }
-                  Expression* val = br->value;
-                  list[k] = iff;
-                  list[k + 1] = val;
-                  list.resize(k + 2);
-                  curr->name = Name();
-                  curr->finalize(curr->type);
-                  refinalize = true;
-                  return;
-                }
-              }
-              if (k == 0) {
-                ExpressionManipulator::nop(list[0]);
-                auto* iff = builder.makeIf(br->condition, br->value, curr);
-                BranchHints::copyTo(br, iff, getFunction());
-                replaceCurrent(iff);
+                  k + 2 < list.size() && list.back()->is<Unreachable>() &&
+                  midVoid) {
+                Expression* noreturnBody =
+                  stealSlice(builder, curr, k + 1, list.size() - 1);
+                auto* iff = builder.makeIf(
+                  makeNegatedBool(builder, br->condition, shrink2),
+                  noreturnBody);
+                BranchHints::copyFlippedTo(br, iff, getFunction());
+                BranchHints::clear(br, getFunction());
                 while (foldBoolIf &&
                        tryFoldBooleanIfCondition(
                          iff, getFunction(), *getModule(), passOptions)) {
                 }
-                if (iff->type != curr->type) {
-                  refinalize = true;
+                Expression* val = br->value;
+                list[k] = iff;
+                list[k + 1] = val;
+                list.resize(k + 2);
+                if (isLastRefInCurr) {
+                  curr->name = Name();
                 }
-                if (auto* seq = tryUnnestOneUnreachableArmIf(iff)) {
-                  replaceCurrent(seq);
+                curr->finalize(curr->type);
+                refinalize = true;
+                if (isLastRefInCurr) {
+                  return;
                 }
-              } else {
-                Expression* falseArm =
-                  stealSlice(builder, curr, k + 1, list.size());
-                auto* iff =
-                  builder.makeIf(br->condition, br->value, falseArm, curr->type);
-                BranchHints::copyTo(br, iff, getFunction());
+                peelTailDropBrIfs();
+                continue;
+              }
+              // (2) Shared tail value `br->value == list.back()` with void
+              // intermediate statements `list[k + 1 .. list.size() - 2]`.
+              if (curr->type.isConcrete() && k + 2 < list.size() && midVoid &&
+                  ExpressionAnalyzer::equal(br->value, list.back())) {
+                Expression* midBody =
+                  stealSlice(builder, curr, k + 1, list.size() - 1);
+                Expression* lastVal = list.back();
+                auto* iff = builder.makeIf(
+                  makeNegatedBool(builder, br->condition, shrink2), midBody);
+                BranchHints::copyFlippedTo(br, iff, getFunction());
                 BranchHints::clear(br, getFunction());
                 while (foldBoolIf &&
                        tryFoldBooleanIfCondition(
                          iff, getFunction(), *getModule(), passOptions)) {
                 }
                 list[k] = iff;
-                list.resize(k + 1);
-                curr->name = Name();
+                list[k + 1] = lastVal;
+                list.resize(k + 2);
+                if (isLastRefInCurr) {
+                  curr->name = Name();
+                }
                 curr->finalize(curr->type);
-                if (iff->type != curr->type) {
-                  refinalize = true;
+                refinalize = true;
+                if (isLastRefInCurr) {
+                  return;
+                }
+                peelTailDropBrIfs();
+                continue;
+              }
+              // (3) General 2-arm If peel.
+              if (!isLastRefInCurr) {
+                bool singleStepFree = false;
+                if (typeBytes == 1) {
+                  if (auto* u = br->condition->dynCast<Unary>();
+                      u && u->op == EqZInt32) {
+                    singleStepFree = true;
+                  }
+                }
+                if (!singleStepFree && !canProfitablyPeelAll(k)) {
+                  return;
                 }
               }
-              return;
+              Expression* falseArm =
+                stealSlice(builder, curr, k + 1, list.size());
+              auto* iff =
+                builder.makeIf(br->condition, br->value, falseArm, curr->type);
+              BranchHints::copyTo(br, iff, getFunction());
+              BranchHints::clear(br, getFunction());
+              while (foldBoolIf &&
+                     tryFoldBooleanIfCondition(
+                       iff, getFunction(), *getModule(), passOptions)) {
+              }
+              if (auto* u = iff->condition->dynCast<Unary>();
+                  u && u->op == EqZInt32) {
+                iff->condition = u->value;
+                std::swap(iff->ifTrue, iff->ifFalse);
+                BranchHints::flip(iff, getFunction());
+              }
+              Expression* rep = iff;
+              if (auto* sel = selectify(iff)) {
+                if (!sel->type.isRef() || sel->type == curr->type ||
+                    sel->type.getHeapType().isBasic()) {
+                  rep = sel;
+                }
+              }
+              if (!finishPeelAtK(k, rep, isLastRefInCurr)) {
+                return;
+              }
+              continue;
             }
-            if (passOptions.trapsNeverHappen && curr->type.isConcrete() &&
-                k + 2 < list.size() && list.back()->is<Unreachable>()) {
+            if (isLastRefInCurr && passOptions.trapsNeverHappen &&
+                curr->type.isConcrete() && k + 2 < list.size() &&
+                list.back()->is<Unreachable>() && midVoid) {
               if (auto* tee = br->value->dynCast<LocalSet>();
                   tee && tee->isTee() &&
                   Type::isSubType(tee->type, curr->type) &&
                   !EffectAnalyzer(passOptions, *getModule(), br->condition)
                      .localsWritten.contains(tee->index)) {
-                bool tailVoid = true;
-                for (Index j = k + 1; j + 1 < list.size(); j++) {
-                  if (list[j]->type.isConcrete()) {
-                    tailVoid = false;
-                    break;
-                  }
+                Expression* noreturnBody =
+                  stealSlice(builder, curr, k + 1, list.size() - 1);
+                auto* iff = builder.makeIf(
+                  makeNegatedBool(builder, br->condition, shrink2),
+                  noreturnBody);
+                BranchHints::copyFlippedTo(br, iff, getFunction());
+                BranchHints::clear(br, getFunction());
+                while (foldBoolIf &&
+                       tryFoldBooleanIfCondition(
+                         iff, getFunction(), *getModule(), passOptions)) {
                 }
-                if (tailVoid) {
-                  Expression* noreturnBody =
-                    stealSlice(builder, curr, k + 1, list.size() - 1);
-                  auto* iff = builder.makeIf(
-                    negateCond(builder, br->condition), noreturnBody);
-                  BranchHints::copyFlippedTo(br, iff, getFunction());
-                  BranchHints::clear(br, getFunction());
-                  while (foldBoolIf &&
-                         tryFoldBooleanIfCondition(
-                           iff, getFunction(), *getModule(), passOptions)) {
-                  }
-                  Type localType = getFunction()->getLocalType(tee->index);
-                  tee->makeSet();
-                  list[k] = tee;
-                  list[k + 1] = iff;
-                  if (k + 2 < list.size()) {
-                    list[k + 2] = builder.makeLocalGet(tee->index, localType);
-                    list.resize(k + 3);
-                  } else {
-                    list.push_back(builder.makeLocalGet(tee->index, localType));
-                  }
-                  curr->name = Name();
-                  curr->finalize(curr->type);
-                  refinalize = true;
-                  return;
+                Type localType = getFunction()->getLocalType(tee->index);
+                tee->makeSet();
+                list[k] = tee;
+                list[k + 1] = iff;
+                if (k + 2 < list.size()) {
+                  list[k + 2] = builder.makeLocalGet(tee->index, localType);
+                  list.resize(k + 3);
+                } else {
+                  list.push_back(builder.makeLocalGet(tee->index, localType));
                 }
+                curr->name = Name();
+                curr->finalize(curr->type);
+                refinalize = true;
+                return;
               }
             }
-            if (k == 0 && !neverUnconditionalize) {
+            if (isLastRefInCurr && k == 0 && !neverUnconditionalize) {
               Expression* old = list[0];
               Nop nop;
               list[0] = &nop;
@@ -3668,86 +4764,120 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
             return;
           }
 
-          // Part 1(a): 1-arm If ending in unconditional (br $curr [VAL]).
+          // Part 1(a): 1-arm If, if/else-if chain, or 2-level nested 1-arm If
+          // ending in unconditional (br $curr [VAL]).
           if (auto* iff = list[k]->dynCast<If>();
-              iff && !iff->ifFalse &&
-              iff->condition->type != Type::unreachable) {
-            std::vector<Expression*> thenPrefix;
-            Break* thenBr = iff->ifTrue->dynCast<Break>();
-            if (!thenBr) {
-              if (auto* tb = iff->ifTrue->dynCast<Block>();
-                  tb && !tb->name.is() && !tb->list.empty()) {
-                if (auto* b = tb->list.back()->dynCast<Break>()) {
-                  bool prefixOk = true;
-                  for (Index j = 0; j + 1 < tb->list.size(); j++) {
-                    if (tb->list[j]->type != Type::none) {
-                      prefixOk = false;
-                      break;
-                    }
-                    thenPrefix.push_back(tb->list[j]);
-                  }
-                  if (prefixOk) {
-                    thenBr = b;
+              iff && iff->condition->type != Type::unreachable) {
+            std::vector<If*> chainIfs;
+            std::vector<std::vector<Expression*>> chainPrefixes;
+            std::vector<Break*> chainBrs;
+            if (matchBrIfChain(
+                  iff, refsInK, chainIfs, chainPrefixes, chainBrs)) {
+              Index d = chainIfs.size();
+              // (1) Noreturn-tail inversion for a 1-arm If.
+              if (d == 1 && passOptions.trapsNeverHappen &&
+                  curr->type.isConcrete() && k + 2 < list.size() &&
+                  list.back()->is<Unreachable>() && midVoid) {
+                Expression* noreturnBody =
+                  stealSlice(builder, curr, k + 1, list.size() - 1);
+                Expression* brVal = chainBrs[0]->value;
+                BranchHints::clear(chainBrs[0], getFunction());
+                iff->condition =
+                  makeNegatedBool(builder, iff->condition, shrink2);
+                iff->ifTrue = noreturnBody;
+                BranchHints::flip(iff, getFunction());
+                iff->finalize();
+                while (foldBoolIf &&
+                       tryFoldBooleanIfCondition(
+                         iff, getFunction(), *getModule(), passOptions)) {
+                }
+                list.resize(k + 1);
+                for (auto* item : chainPrefixes[0]) {
+                  list.push_back(item);
+                }
+                list.push_back(brVal);
+                if (isLastRefInCurr) {
+                  curr->name = Name();
+                }
+                curr->finalize(curr->type);
+                refinalize = true;
+                if (isLastRefInCurr) {
+                  return;
+                }
+                peelTailDropBrIfs();
+                continue;
+              }
+              // (2) Shared tail value `thenBr->value == list.back()` for d == 1.
+              if (d == 1 && curr->type.isConcrete() && midVoid &&
+                  ExpressionAnalyzer::equal(chainBrs[0]->value, list.back()) &&
+                  !EffectAnalyzer(passOptions, *getModule(), chainBrs[0]->value)
+                     .hasSideEffects()) {
+                Expression* lastVal = list.back();
+                BranchHints::clear(chainBrs[0], getFunction());
+                if (k + 2 == list.size()) {
+                  if (chainPrefixes[0].empty()) {
+                    list[k] = builder.makeDrop(iff->condition);
                   } else {
-                    thenPrefix.clear();
+                    auto* tb = iff->ifTrue->cast<Block>();
+                    tb->list.pop_back();
+                    if (tb->list.size() == 1) {
+                      iff->ifTrue = tb->list[0];
+                    } else {
+                      tb->finalize();
+                    }
+                    iff->finalize(Type::none);
                   }
-                }
-              }
-            }
-            if (thenBr && !thenBr->condition && thenBr->name == curr->name) {
-              if (BranchUtils::BranchSeeker::count(curr, curr->name) != 1) {
-                return;
-              }
-              if (curr->type == Type::none) {
-                if (thenBr->value) {
-                  return;
-                }
-              } else if (curr->type.isConcrete()) {
-                if (!thenBr->value ||
-                    !Type::isSubType(thenBr->value->type, curr->type)) {
-                  return;
-                }
-              } else {
-                return;
-              }
-
-              // Noreturn-tail inversion when curr is concrete and ends in
-              // ...noreturn_tail... (unreachable).
-              if (passOptions.trapsNeverHappen && curr->type.isConcrete() &&
-                  k + 2 < list.size() && list.back()->is<Unreachable>()) {
-                bool tailVoid = true;
-                for (Index j = k + 1; j + 1 < list.size(); j++) {
-                  if (list[j]->type.isConcrete()) {
-                    tailVoid = false;
-                    break;
-                  }
-                }
-                if (tailVoid) {
-                  Expression* noreturnBody =
+                } else {
+                  Expression* midBody =
                     stealSlice(builder, curr, k + 1, list.size() - 1);
-                  Expression* brVal = thenBr->value;
-                  BranchHints::clear(thenBr, getFunction());
-                  iff->condition = negateCond(builder, iff->condition);
-                  iff->ifTrue = noreturnBody;
-                  BranchHints::flip(iff, getFunction());
-                  iff->finalize();
+                  if (chainPrefixes[0].empty()) {
+                    iff->condition =
+                      makeNegatedBool(builder, iff->condition, shrink2);
+                    iff->ifTrue = midBody;
+                    BranchHints::flip(iff, getFunction());
+                  } else {
+                    auto* tb = iff->ifTrue->cast<Block>();
+                    tb->list.pop_back();
+                    if (tb->list.size() == 1) {
+                      iff->ifTrue = tb->list[0];
+                    } else {
+                      tb->finalize();
+                    }
+                    iff->ifFalse = midBody;
+                  }
+                  iff->finalize(Type::none);
                   while (foldBoolIf &&
                          tryFoldBooleanIfCondition(
                            iff, getFunction(), *getModule(), passOptions)) {
                   }
-                  list.resize(k + 1);
-                  for (auto* item : thenPrefix) {
-                    list.push_back(item);
-                  }
-                  list.push_back(brVal);
+                  list[k + 1] = lastVal;
+                  list.resize(k + 2);
+                }
+                if (isLastRefInCurr) {
                   curr->name = Name();
-                  curr->finalize(curr->type);
-                  refinalize = true;
+                }
+                curr->finalize(curr->type);
+                refinalize = true;
+                if (isLastRefInCurr) {
+                  return;
+                }
+                peelTailDropBrIfs();
+                continue;
+              }
+              // (3) General 1-arm If / if-else-if chain peel.
+              if (!isLastRefInCurr) {
+                bool singleStepFree =
+                  (typeBytes <= 1) || (d >= 2);
+                if (!singleStepFree && d == 1 && chainPrefixes[0].empty()) {
+                  if (auto* u = iff->condition->dynCast<Unary>();
+                      u && u->op == EqZInt32) {
+                    singleStepFree = true;
+                  }
+                }
+                if (!singleStepFree && !canProfitablyPeelAll(k)) {
                   return;
                 }
               }
-
-              // Normal 1-arm If -> 2-arm If restructuring.
               if (curr->type == Type::none) {
                 Index endIdx = list.size();
                 if (passOptions.trapsNeverHappen && endIdx > k + 2 &&
@@ -3756,40 +4886,78 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                   endIdx--;
                 }
                 Expression* falseArm = stealSlice(builder, curr, k + 1, endIdx);
-                BranchHints::clear(thenBr, getFunction());
-                if (thenPrefix.empty()) {
-                  iff->condition = negateCond(builder, iff->condition);
-                  iff->ifTrue = falseArm;
-                  BranchHints::flip(iff, getFunction());
-                } else {
-                  auto* tb = iff->ifTrue->cast<Block>();
-                  tb->list.pop_back();
-                  if (tb->list.size() == 1) {
-                    iff->ifTrue = tb->list[0];
+                for (Index idx = 0; idx < d; idx++) {
+                  BranchHints::clear(chainBrs[idx], getFunction());
+                  If* curIf = chainIfs[idx];
+                  if (idx + 1 == d && chainPrefixes[idx].empty()) {
+                    curIf->condition =
+                      makeNegatedBool(builder, curIf->condition, shrink2);
+                    curIf->ifTrue = falseArm;
+                    curIf->ifFalse = nullptr;
+                    BranchHints::flip(curIf, getFunction());
                   } else {
-                    tb->finalize();
+                    if (chainPrefixes[idx].empty()) {
+                      curIf->ifTrue = builder.makeNop();
+                    } else {
+                      auto* tb = curIf->ifTrue->cast<Block>();
+                      tb->list.pop_back();
+                      if (tb->list.size() == 1) {
+                        curIf->ifTrue = tb->list[0];
+                      } else {
+                        tb->finalize();
+                      }
+                    }
+                    if (idx + 1 == d) {
+                      curIf->ifFalse = falseArm;
+                    }
                   }
-                  iff->ifFalse = falseArm;
                 }
-                iff->finalize(Type::none);
+                for (Index idx = d; idx > 0; idx--) {
+                  If* curIf = chainIfs[idx - 1];
+                  curIf->finalize(Type::none);
+                  while (foldBoolIf &&
+                         tryFoldBooleanIfCondition(
+                           curIf, getFunction(), *getModule(), passOptions)) {
+                  }
+                }
               } else {
                 Expression* falseArm =
                   stealSlice(builder, curr, k + 1, list.size());
-                Expression* brVal = thenBr->value;
-                BranchHints::clear(thenBr, getFunction());
-                if (thenPrefix.empty()) {
-                  iff->ifTrue = brVal;
-                } else {
-                  auto* tb = iff->ifTrue->cast<Block>();
-                  tb->list.back() = brVal;
-                  tb->finalize();
+                for (Index idx = 0; idx < d; idx++) {
+                  Expression* brVal = chainBrs[idx]->value;
+                  BranchHints::clear(chainBrs[idx], getFunction());
+                  If* curIf = chainIfs[idx];
+                  if (chainPrefixes[idx].empty()) {
+                    curIf->ifTrue = brVal;
+                  } else {
+                    auto* tb = curIf->ifTrue->cast<Block>();
+                    tb->list.back() = brVal;
+                    tb->finalize();
+                  }
                 }
-                iff->ifFalse = falseArm;
-                iff->finalize(curr->type);
-              }
-              while (foldBoolIf &&
-                     tryFoldBooleanIfCondition(
-                       iff, getFunction(), *getModule(), passOptions)) {
+                chainIfs.back()->ifFalse = falseArm;
+                for (Index idx = d; idx > 0; idx--) {
+                  If* curIf = chainIfs[idx - 1];
+                  curIf->finalize(curr->type);
+                  while (foldBoolIf &&
+                         tryFoldBooleanIfCondition(
+                           curIf, getFunction(), *getModule(), passOptions)) {
+                  }
+                  if (auto* u = curIf->condition->dynCast<Unary>();
+                      u && u->op == EqZInt32) {
+                    curIf->condition = u->value;
+                    std::swap(curIf->ifTrue, curIf->ifFalse);
+                    BranchHints::flip(curIf, getFunction());
+                  }
+                  if (idx > 1) {
+                    if (auto* sel = selectify(curIf)) {
+                      if (!sel->type.isRef() || sel->type == curr->type ||
+                          sel->type.getHeapType().isBasic()) {
+                        chainIfs[idx - 2]->ifFalse = sel;
+                      }
+                    }
+                  }
+                }
               }
               Expression* rep = iff;
               if (auto* sel = selectify(iff)) {
@@ -3798,29 +4966,138 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
                   rep = sel;
                 }
               }
-              if (k == 0) {
-                curr->name = Name();
-                if (auto* repIf = rep->dynCast<If>()) {
-                  if (auto* seq = tryUnnestOneUnreachableArmIf(repIf)) {
-                    rep = seq;
+              if (!finishPeelAtK(k, rep, isLastRefInCurr)) {
+                return;
+              }
+              continue;
+            }
+
+            // (4) 2-level nested 1-arm If:
+            // `(if C1 (then <prefix1> (if C2 (then <prefix2> (br $curr VAL)))))`
+            if (!iff->ifFalse && refsInK == 1 && curr->type.isConcrete()) {
+              std::vector<Expression*> prefix1;
+              If* innerIf = iff->ifTrue->dynCast<If>();
+              if (!innerIf) {
+                if (auto* tb = iff->ifTrue->dynCast<Block>();
+                    tb && !tb->name.is() && !tb->list.empty()) {
+                  if (auto* lastIf = tb->list.back()->dynCast<If>()) {
+                    bool ok = true;
+                    for (Index j = 0; j + 1 < tb->list.size(); j++) {
+                      if (tb->list[j]->type != Type::none) {
+                        ok = false;
+                        break;
+                      }
+                      prefix1.push_back(tb->list[j]);
+                    }
+                    if (ok) {
+                      innerIf = lastIf;
+                    } else {
+                      prefix1.clear();
+                    }
                   }
                 }
-                replaceCurrent(rep);
-                if (rep->type != curr->type) {
-                  refinalize = true;
-                }
-              } else {
-                list[k] = rep;
-                list.resize(k + 1);
-                curr->name = Name();
-                curr->finalize(curr->type);
-                if (rep->type != curr->type) {
-                  refinalize = true;
+              }
+              if (innerIf && !innerIf->ifFalse &&
+                  innerIf->condition->type != Type::unreachable) {
+                std::vector<Expression*> prefix2;
+                Break* thenBr = extractThenBr(innerIf->ifTrue, prefix2);
+                if (thenBr && !thenBr->condition &&
+                    thenBr->name == curr->name && thenBr->value &&
+                    Type::isSubType(thenBr->value->type, curr->type)) {
+                  // Shared tail value `thenBr->value == list.back()` with void
+                  // intermediate statements `list[k + 1 .. list.size() - 2]`:
+                  // rewrite to a void If `(if (if (result i32) C1 (then prefix1
+                  // !C2) (else 1)) (then midBody))` + `list.back()`.
+                  if (prefix2.empty() && k + 2 < list.size() && midVoid &&
+                      ExpressionAnalyzer::equal(thenBr->value, list.back()) &&
+                      !EffectAnalyzer(passOptions, *getModule(), thenBr->value)
+                         .hasSideEffects()) {
+                    Expression* midBody =
+                      stealSlice(builder, curr, k + 1, list.size() - 1);
+                    Expression* lastVal = list.back();
+                    BranchHints::clear(thenBr, getFunction());
+                    Expression* negC2 =
+                      makeNegatedBool(builder, innerIf->condition, shrink2);
+                    auto* condIf = builder.makeIf(
+                      iff->condition,
+                      prependToArm(builder, prefix1, negC2),
+                      builder.makeConst(int32_t(1)),
+                      Type::i32);
+                    BranchHints::copyTo(iff, condIf, getFunction());
+                    while (foldBoolIf &&
+                           tryFoldBooleanIfCondition(
+                             condIf, getFunction(), *getModule(), passOptions)) {
+                    }
+                    Expression* condExpr = condIf;
+                    if (auto* sel = selectify(condIf)) {
+                      condExpr = sel;
+                    }
+                    auto* newOuterIf = builder.makeIf(condExpr, midBody);
+                    while (foldBoolIf &&
+                           tryFoldBooleanIfCondition(newOuterIf,
+                                                     getFunction(),
+                                                     *getModule(),
+                                                     passOptions)) {
+                    }
+                    list[k] = newOuterIf;
+                    list[k + 1] = lastVal;
+                    list.resize(k + 2);
+                    if (isLastRefInCurr) {
+                      curr->name = Name();
+                    }
+                    curr->finalize(curr->type);
+                    refinalize = true;
+                    if (isLastRefInCurr) {
+                      return;
+                    }
+                    peelTailDropBrIfs();
+                    continue;
+                  }
+                  if (isLastRefInCurr) {
+                    auto* condIf = builder.makeIf(
+                      iff->condition,
+                      prependToArm(builder, prefix1, innerIf->condition),
+                      builder.makeConst(int32_t(0)),
+                      Type::i32);
+                    BranchHints::copyTo(iff, condIf, getFunction());
+                    while (foldBoolIf &&
+                           tryFoldBooleanIfCondition(
+                             condIf, getFunction(), *getModule(), passOptions)) {
+                    }
+                    Expression* condExpr = condIf;
+                    if (auto* sel = selectify(condIf)) {
+                      condExpr = sel;
+                    }
+                    if (k == 0 || condExpr != condIf) {
+                      Expression* falseArm =
+                        stealSlice(builder, curr, k + 1, list.size());
+                      Expression* trueArm =
+                        prependToArm(builder, prefix2, thenBr->value);
+                      BranchHints::clear(thenBr, getFunction());
+                      auto* newOuterIf = builder.makeIf(
+                        condExpr, trueArm, falseArm, curr->type);
+                      while (foldBoolIf &&
+                             tryFoldBooleanIfCondition(newOuterIf,
+                                                       getFunction(),
+                                                       *getModule(),
+                                                       passOptions)) {
+                      }
+                      Expression* rep = newOuterIf;
+                      if (auto* sel = selectify(newOuterIf)) {
+                        if (!sel->type.isRef() || sel->type == curr->type ||
+                            sel->type.getHeapType().isBasic()) {
+                          rep = sel;
+                        }
+                      }
+                      finishPeelAtK(k, rep, true);
+                      return;
+                    }
+                  }
                 }
               }
-              return;
             }
           }
+          return;
         }
       }
 
@@ -3888,6 +5165,65 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         unnestedIfBlocks.insert(seq);
         refinalize = true;
         return seq;
+      }
+
+      void visitUnary(Unary* curr) {
+        if (!v4 || curr->op != EqZInt32) {
+          return;
+        }
+        Builder builder(*getModule());
+        if ((curr->value->is<If>() || curr->value->is<Select>()) &&
+            canInvertBoolExprFree(curr->value)) {
+          invertBoolExprFree(curr->value, builder);
+          Expression* rep = curr->value;
+          if (auto* iff = rep->dynCast<If>()) {
+            if (auto* sel = selectify(iff)) {
+              rep = sel;
+            }
+          }
+          replaceCurrent(rep);
+          return;
+        }
+        if (auto* iff = curr->value->dynCast<If>();
+            iff && iff->ifFalse && iff->type == Type::i32 &&
+            iff->condition->type != Type::unreachable &&
+            !neverUnconditionalize) {
+          bool trueFree = canInvertBoolExprFree(iff->ifTrue);
+          bool falseFree = canInvertBoolExprFree(iff->ifFalse);
+          if ((trueFree || falseFree) &&
+              Properties::canEmitSelectWithArms(iff->ifTrue, iff->ifFalse) &&
+              !tooCostlyToRunUnconditionally(
+                passOptions, iff->ifTrue, iff->ifFalse)) {
+            EffectAnalyzer ifTrueEff(passOptions, *getModule(), iff->ifTrue);
+            EffectAnalyzer ifFalseEff(passOptions, *getModule(), iff->ifFalse);
+            if (!ifTrueEff.hasSideEffects() && !ifFalseEff.hasSideEffects()) {
+              EffectAnalyzer condEff(passOptions, *getModule(), iff->condition);
+              int32_t dummy = 0;
+              bool hasConstArm = (trueFree && isI32Const(iff->ifTrue, dummy)) ||
+                                 (falseFree && isI32Const(iff->ifFalse, dummy));
+              if (hasConstArm || (!condEff.invalidates(ifTrueEff) &&
+                                  !condEff.invalidates(ifFalseEff))) {
+                if (trueFree) {
+                  invertBoolExprFree(iff->ifTrue, builder);
+                } else {
+                  iff->ifTrue = builder.makeUnary(EqZInt32, iff->ifTrue);
+                }
+                if (falseFree) {
+                  invertBoolExprFree(iff->ifFalse, builder);
+                } else {
+                  iff->ifFalse = builder.makeUnary(EqZInt32, iff->ifFalse);
+                }
+                iff->finalize(Type::i32);
+                Expression* rep = iff;
+                if (auto* sel = selectify(iff)) {
+                  rep = sel;
+                }
+                replaceCurrent(rep);
+                return;
+              }
+            }
+          }
+        }
       }
 
       void visitIf(If* curr) {
@@ -4014,8 +5350,9 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         }
       }
 
-      // Convert an if into a select, if possible and beneficial to do so.
-      Select* selectify(If* iff) {
+      // Convert an if into a select (or under shrink2, a boolean expression or
+      // left-to-right i32.and/i32.or), if possible and beneficial to do so.
+      Expression* selectify(If* iff) {
         if (neverUnconditionalize) {
           return nullptr;
         }
@@ -4054,12 +5391,70 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         if (ifFalse.hasSideEffects()) {
           return nullptr;
         }
+        Builder builder(*getModule());
+        int32_t trueConst = 0, falseConst = 0;
+        bool trueIsConst = isI32Const(iff->ifTrue, trueConst);
+        bool falseIsConst = isI32Const(iff->ifFalse, falseConst);
+        if (v4 && iff->type == Type::i32) {
+          if (trueIsConst && falseIsConst) {
+            if (trueConst == 1 && falseConst == 0) {
+              if (isOneBitI32(iff->condition)) {
+                return iff->condition;
+              }
+              return builder.makeBinary(
+                NeInt32, iff->condition, builder.makeConst(int32_t(0)));
+            }
+            if (trueConst == 0 && falseConst == 1) {
+              if (auto* u = iff->condition->dynCast<Unary>();
+                  u && u->op == EqZInt32 && isOneBitI32(u->value)) {
+                return u->value;
+              }
+              return makeNegatedBool(builder, iff->condition, v4);
+            }
+          }
+        }
         EffectAnalyzer condition(passOptions, *getModule(), iff->condition);
         if (condition.invalidates(ifTrue) || condition.invalidates(ifFalse)) {
+          if (v4 && iff->type == Type::i32) {
+            auto makeOneBitCond = [&](Expression* c) -> Expression* {
+              if (isOneBitI32(c)) {
+                return c;
+              }
+              return builder.makeBinary(
+                NeInt32, c, builder.makeConst(int32_t(0)));
+            };
+            auto makeNegOneBitCond = [&](Expression* c) -> Expression* {
+              if (auto* u = c->dynCast<Unary>();
+                  u && u->op == EqZInt32 && isOneBitI32(u->value)) {
+                return u->value;
+              }
+              if (canInvertBoolExprFree(c)) {
+                invertBoolExprFree(c, builder);
+                return c;
+              }
+              return builder.makeUnary(EqZInt32, c);
+            };
+            if (falseIsConst && falseConst == 0 && isOneBitI32(iff->ifTrue)) {
+              return builder.makeBinary(
+                AndInt32, makeOneBitCond(iff->condition), iff->ifTrue);
+            }
+            if (trueIsConst && trueConst == 0 && isOneBitI32(iff->ifFalse)) {
+              return builder.makeBinary(
+                AndInt32, makeNegOneBitCond(iff->condition), iff->ifFalse);
+            }
+            if (trueIsConst && trueConst != 0 && isOneBitI32(iff->ifFalse)) {
+              return builder.makeBinary(
+                OrInt32, makeOneBitCond(iff->condition), iff->ifFalse);
+            }
+            if (falseIsConst && falseConst != 0 && isOneBitI32(iff->ifTrue)) {
+              return builder.makeBinary(
+                OrInt32, makeNegOneBitCond(iff->condition), iff->ifTrue);
+            }
+          }
           return nullptr;
         }
-        auto* select = Builder(*getModule())
-                         .makeSelect(iff->condition, iff->ifTrue, iff->ifFalse);
+        auto* select =
+          builder.makeSelect(iff->condition, iff->ifTrue, iff->ifFalse);
         if (select->type != iff->type) {
           // If the select is more refined than the if it replaces, we must
           // propagate that outwards.
@@ -4525,8 +5920,46 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
     finalOptimizer.setModule(getModule());
     finalOptimizer.shrink = getPassRunner()->options.shrinkLevel > 0;
     finalOptimizer.shrink2 = shrink2;
+    finalOptimizer.v4 = isV4Enabled(getPassOptions());
     finalOptimizer.foldBoolIf = foldBoolIf;
     finalOptimizer.neverUnconditionalize = neverUnconditionalize;
+    if (finalOptimizer.v4 && func->body) {
+      std::function<void(Expression*, bool)> collectTailNames =
+        [&](Expression* curr, bool insideArm) {
+          if (!curr) {
+            return;
+          }
+          if (auto* block = curr->dynCast<Block>()) {
+            if (block->list.empty()) {
+              return;
+            }
+            for (Index i = 0; i + 1 < block->list.size(); i++) {
+              if (block->list[i]->type == Type::unreachable) {
+                return;
+              }
+            }
+            if (block->name.is() && block->type == func->getResults() &&
+                (!insideArm || block->list.back()->type != Type::unreachable)) {
+              finalOptimizer.tailBlockNames.insert(block->name);
+            }
+            collectTailNames(block->list.back(), insideArm);
+          } else if (auto* iff = curr->dynCast<If>()) {
+            if (iff->condition->type == Type::unreachable ||
+                iff->type != func->getResults()) {
+              return;
+            }
+            collectTailNames(iff->ifTrue, true);
+            if (iff->ifFalse) {
+              collectTailNames(iff->ifFalse, true);
+            }
+          } else if (auto* loop = curr->dynCast<Loop>()) {
+            if (loop->type == func->getResults()) {
+              collectTailNames(loop->body, true);
+            }
+          }
+        };
+      collectTailNames(func->body, false);
+    }
 
     finalOptimizer.walkFunction(func);
     if (finalOptimizer.needUniqify) {
