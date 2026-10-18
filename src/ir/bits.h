@@ -508,6 +508,24 @@ Index getMaxBits(Expression* curr,
         return std::max(Index(1), getMaxBits(iff->ifFalse, localInfoProvider));
       }
     }
+  } else if (auto* tryy = curr->dynCast<Try>()) {
+    if (tryy->type.isInteger()) {
+      Index bits = 1;
+      bool hasConcreteArm = false;
+      if (tryy->body->type.isInteger()) {
+        bits = std::max(bits, getMaxBits(tryy->body, localInfoProvider));
+        hasConcreteArm = true;
+      }
+      for (auto* catchBody : tryy->catchBodies) {
+        if (catchBody->type.isInteger()) {
+          bits = std::max(bits, getMaxBits(catchBody, localInfoProvider));
+          hasConcreteArm = true;
+        }
+      }
+      if (hasConcreteArm && bits <= 1) {
+        return 1;
+      }
+    }
   } else if (auto* get = curr->dynCast<StructGet>()) {
     if (localInfoProvider) {
       auto bits = localInfoProvider->getMaxBitsForStructGet(get);

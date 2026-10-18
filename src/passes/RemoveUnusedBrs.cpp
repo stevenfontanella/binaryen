@@ -29,6 +29,7 @@
 #include "ir/literal-utils.h"
 #include "ir/local-graph.h"
 #include "ir/localize.h"
+#include "ir/one-bit.h"
 #include "ir/properties.h"
 #include "ir/utils.h"
 #include "parsing.h"
@@ -189,9 +190,13 @@ static bool isV4Enabled(const PassOptions& passOptions) {
   return true;
 }
 
+static thread_local const ModuleOneBitInfo* currentOneBitInfo = nullptr;
+static thread_local Function* currentOneBitFunc = nullptr;
+static thread_local Module* currentOneBitModule = nullptr;
+
 // Check whether `curr` is guaranteed to evaluate to 0 or 1 (extending
 // Properties::emitsBoolean with 0/1 constants, bitwise ops, select, if, tee,
-// and unnamed blocks).
+// blocks, and closed-world 1-bit summaries).
 static bool isOneBitI32(Expression* curr, Index depth = 0) {
   if (!curr || curr->type != Type::i32 || depth > 8) {
     return false;
@@ -225,16 +230,69 @@ static bool isOneBitI32(Expression* curr, Index depth = 0) {
            isOneBitI32(sel->ifFalse, depth + 1);
   }
   if (auto* iff = curr->dynCast<If>()) {
-    return iff->ifFalse && isOneBitI32(iff->ifTrue, depth + 1) &&
-           isOneBitI32(iff->ifFalse, depth + 1);
+    return iff->ifFalse &&
+           (iff->ifTrue->type == Type::unreachable ||
+            isOneBitI32(iff->ifTrue, depth + 1)) &&
+           (iff->ifFalse->type == Type::unreachable ||
+            isOneBitI32(iff->ifFalse, depth + 1));
   }
   if (auto* set = curr->dynCast<LocalSet>()) {
     return set->isTee() && isOneBitI32(set->value, depth + 1);
   }
   if (auto* block = curr->dynCast<Block>()) {
-    if (!block->name.is() && !block->list.empty()) {
-      return isOneBitI32(block->list.back(), depth + 1);
+    if (!block->name.is()) {
+      return !block->list.empty() && isOneBitI32(block->list.back(), depth + 1);
     }
+    if (currentOneBitInfo && currentOneBitInfo->isOneBitBlock(block)) {
+      return true;
+    }
+  }
+  if (auto* loop = curr->dynCast<Loop>()) {
+    return isOneBitI32(loop->body, depth + 1);
+  }
+  if (auto* br = curr->dynCast<Break>()) {
+    return br->condition && br->value && isOneBitI32(br->value, depth + 1);
+  }
+  if (auto* lg = curr->dynCast<LocalGet>()) {
+    if (currentOneBitInfo) {
+      if (currentOneBitInfo->isOneBitLocalGet(lg)) {
+        return true;
+      }
+      if (currentOneBitFunc &&
+          currentOneBitInfo->isOneBitLocal(currentOneBitFunc->name,
+                                           lg->index)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (auto* gg = curr->dynCast<GlobalGet>()) {
+    return currentOneBitInfo && currentOneBitInfo->isOneBitGlobal(gg->name);
+  }
+  if (auto* sg = curr->dynCast<StructGet>()) {
+    return currentOneBitInfo && sg->ref->type.isStruct() &&
+           currentOneBitInfo->isOneBitStructField(sg->ref->type.getHeapType(),
+                                                  sg->index);
+  }
+  if (auto* call = curr->dynCast<Call>()) {
+    if (currentOneBitInfo && currentOneBitInfo->isOneBitReturn(call->target)) {
+      return true;
+    }
+    if (currentOneBitModule) {
+      if (auto* callee = currentOneBitModule->getFunctionOrNull(call->target)) {
+        if (callee->effects && callee->effects->returnsOneBit) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+  if (auto* cr = curr->dynCast<CallRef>()) {
+    return currentOneBitInfo &&
+           currentOneBitInfo->isOneBitFuncRefExpr(
+             cr->target,
+             nullptr,
+             currentOneBitFunc ? currentOneBitFunc->name : Name());
   }
   return false;
 }
@@ -1529,12 +1587,26 @@ static bool stripVoidTrailingUnreachableExpr(Expression* curr,
 struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
   bool isFunctionParallel() override { return true; }
 
+  std::shared_ptr<ModuleOneBitInfo> moduleOneBitInfo;
+
+  bool hasPrepareToRun() override { return true; }
+
+  void prepareToRun(Module* module) override {
+    if (getPassOptions().worldMode == WorldMode::Closed) {
+      moduleOneBitInfo = std::make_shared<ModuleOneBitInfo>();
+      moduleOneBitInfo->compute(*module, getPassOptions());
+    } else {
+      moduleOneBitInfo.reset();
+    }
+  }
+
   std::unique_ptr<Pass> create() override {
     auto pass = std::make_unique<RemoveUnusedBrs>();
     pass->name = name;
     if (passArg) {
       pass->setPassArg(*passArg);
     }
+    pass->moduleOneBitInfo = moduleOneBitInfo;
     return pass;
   }
 
@@ -5480,6 +5552,19 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
   }
 
   void doWalkFunction(Function* func) {
+    struct OneBitScope {
+      OneBitScope(const ModuleOneBitInfo* info, Function* f, Module* m) {
+        currentOneBitInfo = info;
+        currentOneBitFunc = f;
+        currentOneBitModule = m;
+      }
+      ~OneBitScope() {
+        currentOneBitInfo = nullptr;
+        currentOneBitFunc = nullptr;
+        currentOneBitModule = nullptr;
+      }
+    } oneBitScope(moduleOneBitInfo.get(), func, getModule());
+
     auto instArg = getArgumentOrDefault("remove-unused-brs", "");
     if (instArg == "v4") {
       currentPassV4OverrideSet = true;

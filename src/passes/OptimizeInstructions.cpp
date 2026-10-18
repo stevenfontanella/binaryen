@@ -41,6 +41,7 @@
 #include <ir/manipulation.h>
 #include <ir/match.h>
 #include <ir/module-utils.h>
+#include <ir/one-bit.h>
 #include <ir/ordering.h>
 #include <ir/properties.h>
 #include <ir/subtypes.h>
@@ -92,919 +93,6 @@ struct LocalInfo {
   Index signExtBits = 0;
 };
 
-static bool isI32FuncRefType(Type t) {
-  return t.isSignature() && t.getHeapType().getSignature().results == Type::i32;
-}
-
-static bool isTrackedOneBitType(Type t) {
-  return t.isInteger() || isI32FuncRefType(t);
-}
-
-// Compute unique dominating LocalSet values reaching each LocalGet in a
-// function, allowing 1-bit and max-bits inference across coalesced locals whose
-// live ranges share a local index.
-static void computeReachingDefs(
-  Function* func,
-  std::vector<std::pair<LocalGet*, Expression*>>& reachingDefs) {
-  if (!func->body) {
-    return;
-  }
-  Index numLocals = func->getNumLocals();
-  struct State {
-    std::vector<Expression*> defs;
-    std::vector<uint8_t> known;
-    std::vector<std::vector<Index>> modifiedStack;
-
-    State(Index n) : defs(n, nullptr), known(n, 0) {}
-
-    void markModified(Index idx) {
-      for (auto& vec : modifiedStack) {
-        vec.push_back(idx);
-      }
-    }
-
-    void invalidateList(const std::vector<Index>& list) {
-      for (Index idx : list) {
-        defs[idx] = nullptr;
-        known[idx] = 0;
-      }
-    }
-  } state(numLocals);
-
-  struct CollectSets : PostWalker<CollectSets> {
-    std::vector<Index>& modified;
-    Index numLocals;
-    CollectSets(std::vector<Index>& modified, Index numLocals)
-      : modified(modified), numLocals(numLocals) {}
-    void visitLocalSet(LocalSet* curr) {
-      if (curr->index < numLocals) {
-        modified.push_back(curr->index);
-      }
-    }
-  };
-
-  std::function<void(Expression*)> walk = [&](Expression* curr) {
-    if (!curr) {
-      return;
-    }
-    if (auto* lg = curr->dynCast<LocalGet>()) {
-      if (lg->index < numLocals && state.known[lg->index] &&
-          state.defs[lg->index]) {
-        reachingDefs.emplace_back(lg, state.defs[lg->index]);
-      }
-      return;
-    }
-    if (auto* ls = curr->dynCast<LocalSet>()) {
-      walk(ls->value);
-      if (ls->index < numLocals) {
-        state.markModified(ls->index);
-        if (ls->value->type != Type::unreachable) {
-          state.defs[ls->index] = ls->value;
-          state.known[ls->index] = 1;
-        } else {
-          state.defs[ls->index] = nullptr;
-          state.known[ls->index] = 0;
-        }
-      }
-      return;
-    }
-    if (auto* blk = curr->dynCast<Block>()) {
-      if (blk->name.is()) {
-        state.modifiedStack.emplace_back();
-        for (auto* item : blk->list) {
-          walk(item);
-        }
-        auto mod = std::move(state.modifiedStack.back());
-        state.modifiedStack.pop_back();
-        state.invalidateList(mod);
-      } else {
-        for (auto* item : blk->list) {
-          walk(item);
-        }
-      }
-      return;
-    }
-    if (auto* iff = curr->dynCast<If>()) {
-      walk(iff->condition);
-      auto savedDefs = state.defs;
-      auto savedKnown = state.known;
-      state.modifiedStack.emplace_back();
-      walk(iff->ifTrue);
-      auto modTrue = std::move(state.modifiedStack.back());
-      state.modifiedStack.pop_back();
-      if (iff->ifFalse) {
-        state.defs = std::move(savedDefs);
-        state.known = std::move(savedKnown);
-        state.modifiedStack.emplace_back();
-        walk(iff->ifFalse);
-        auto modFalse = std::move(state.modifiedStack.back());
-        state.modifiedStack.pop_back();
-        state.invalidateList(modTrue);
-        state.invalidateList(modFalse);
-      } else {
-        state.defs = std::move(savedDefs);
-        state.known = std::move(savedKnown);
-        state.invalidateList(modTrue);
-      }
-      return;
-    }
-    if (curr->is<Loop>() || curr->is<Try>() || curr->is<TryTable>()) {
-      std::vector<Index> mod;
-      CollectSets(mod, numLocals).walk(curr);
-      state.invalidateList(mod);
-      for (Index idx : mod) {
-        state.markModified(idx);
-      }
-      for (auto* child : ChildIterator(curr)) {
-        walk(child);
-      }
-      state.invalidateList(mod);
-      return;
-    }
-    for (auto* child : ChildIterator(curr)) {
-      walk(child);
-    }
-  };
-
-  walk(func->body);
-}
-
-// Closed-world module-wide 1-bit boolean value inference (greatest fixed point
-// over struct fields, globals, function returns, function parameters, locals,
-// reaching definitions, named blocks, and i32-returning function references).
-struct ModuleOneBitInfo {
-  std::unordered_map<HeapType, std::vector<bool>> oneBitStructFields;
-  std::unordered_set<Name> oneBitGlobals;
-  std::unordered_set<Name> oneBitReturns;
-  std::unordered_map<Name, std::vector<bool>> oneBitLocals;
-  std::unordered_set<LocalGet*> oneBitLocalGets;
-  std::unordered_set<Block*> oneBitBlocks;
-
-  bool isOneBitStructField(HeapType ht, Index idx) const {
-    auto it = oneBitStructFields.find(ht);
-    return it != oneBitStructFields.end() && idx < it->second.size() &&
-           it->second[idx];
-  }
-
-  bool isOneBitGlobal(Name name) const { return oneBitGlobals.contains(name); }
-
-  bool isOneBitReturn(Name funcName) const {
-    return oneBitReturns.contains(funcName);
-  }
-
-  bool isOneBitLocal(Name funcName, Index localIdx) const {
-    auto it = oneBitLocals.find(funcName);
-    return it != oneBitLocals.end() && localIdx < it->second.size() &&
-           it->second[localIdx];
-  }
-
-  bool isOneBitLocalGet(LocalGet* get) const {
-    return oneBitLocalGets.contains(get);
-  }
-
-  bool isOneBitBlock(Block* block) const {
-    return oneBitBlocks.contains(block);
-  }
-
-  bool isOneBitFuncRefExpr(Expression* curr,
-                           const std::vector<bool>* currFuncLocals = nullptr,
-                           Name funcName = Name()) const {
-    if (!curr) {
-      return false;
-    }
-    if (curr->is<RefNull>() || curr->type.isNull()) {
-      return true;
-    }
-    if (!isI32FuncRefType(curr->type)) {
-      return false;
-    }
-    if (auto* rf = curr->dynCast<RefFunc>()) {
-      return isOneBitReturn(rf->func);
-    }
-    if (auto* lg = curr->dynCast<LocalGet>()) {
-      if (currFuncLocals && lg->index < currFuncLocals->size() &&
-          (*currFuncLocals)[lg->index]) {
-        return true;
-      }
-      if (!funcName.isNull() && isOneBitLocal(funcName, lg->index)) {
-        return true;
-      }
-      return isOneBitLocalGet(lg);
-    }
-    if (auto* ls = curr->dynCast<LocalSet>()) {
-      return isOneBitFuncRefExpr(ls->value, currFuncLocals, funcName);
-    }
-    if (auto* gg = curr->dynCast<GlobalGet>()) {
-      return isOneBitGlobal(gg->name);
-    }
-    if (auto* sg = curr->dynCast<StructGet>()) {
-      return sg->ref->type.isStruct() &&
-             isOneBitStructField(sg->ref->type.getHeapType(), sg->index);
-    }
-    if (auto* call = curr->dynCast<Call>()) {
-      return isOneBitReturn(call->target);
-    }
-    if (auto* cr = curr->dynCast<CallRef>()) {
-      return isOneBitFuncRefExpr(cr->target, currFuncLocals, funcName);
-    }
-    if (auto* ra = curr->dynCast<RefAs>()) {
-      return ra->op == RefAsNonNull &&
-             isOneBitFuncRefExpr(ra->value, currFuncLocals, funcName);
-    }
-    if (auto* rc = curr->dynCast<RefCast>()) {
-      return isOneBitFuncRefExpr(rc->ref, currFuncLocals, funcName);
-    }
-    if (auto* bo = curr->dynCast<BrOn>()) {
-      return (bo->op == BrOnNull || bo->op == BrOnCastFail) &&
-             isOneBitFuncRefExpr(bo->ref, currFuncLocals, funcName);
-    }
-    if (auto* blk = curr->dynCast<Block>()) {
-      if (!blk->name.is()) {
-        return !blk->list.empty() &&
-               isOneBitFuncRefExpr(blk->list.back(), currFuncLocals, funcName);
-      }
-      return isOneBitBlock(blk);
-    }
-    if (auto* sel = curr->dynCast<Select>()) {
-      return isOneBitFuncRefExpr(sel->ifTrue, currFuncLocals, funcName) &&
-             isOneBitFuncRefExpr(sel->ifFalse, currFuncLocals, funcName);
-    }
-    if (auto* iff = curr->dynCast<If>()) {
-      return iff->ifFalse &&
-             (iff->ifTrue->type == Type::unreachable ||
-              isOneBitFuncRefExpr(iff->ifTrue, currFuncLocals, funcName)) &&
-             (iff->ifFalse->type == Type::unreachable ||
-              isOneBitFuncRefExpr(iff->ifFalse, currFuncLocals, funcName));
-    }
-    return false;
-  }
-
-  void compute(Module& wasm, const PassOptions& options) {
-    oneBitStructFields.clear();
-    oneBitGlobals.clear();
-    oneBitReturns.clear();
-    oneBitLocals.clear();
-    oneBitLocalGets.clear();
-    oneBitBlocks.clear();
-
-    if (options.worldMode != WorldMode::Closed) {
-      for (auto& f : wasm.functions) {
-        if (f->imported()) {
-          if (f->module == WasmStringsModule &&
-              (f->base == "equals" || f->base == "test") &&
-              f->getResults() == Type::i32) {
-            oneBitReturns.insert(f->name);
-          }
-        } else if (f->getResults() == Type::i32 && f->effects &&
-                   f->effects->returnsOneBit) {
-          oneBitReturns.insert(f->name);
-        }
-      }
-      return;
-    }
-
-    std::optional<SubTypes> subTypes;
-    if (wasm.features.hasGC()) {
-      subTypes.emplace(wasm);
-      for (HeapType ht : subTypes->types) {
-        if (ht.isStruct()) {
-          const auto& fields = ht.getStruct().fields;
-          auto& vec = oneBitStructFields[ht];
-          vec.resize(fields.size(), false);
-          for (Index i = 0; i < fields.size(); i++) {
-            vec[i] = isTrackedOneBitType(fields[i].type);
-          }
-        }
-      }
-    }
-
-    struct FuncSummary {
-      std::vector<std::vector<Expression*>> localWrites;
-      std::vector<std::pair<LocalGet*, Expression*>> reachingDefs;
-      std::unordered_map<Block*, std::vector<Expression*>> blockValues;
-      std::unordered_set<Block*> disqualifiedBlocks;
-      std::vector<Expression*> returnValues;
-      std::vector<Name> tailCallTargets;
-      std::vector<CallRef*> tailCallRefs;
-      bool hasIndirectTailCall = false;
-      std::vector<std::pair<Name, Expression*>> globalWrites;
-      std::vector<std::pair<std::pair<HeapType, Index>, Expression*>>
-        structNewWrites;
-      std::vector<std::pair<std::pair<HeapType, Index>, Expression*>>
-        structSetWrites;
-      std::vector<std::pair<HeapType, Index>> structDisqualifiedFields;
-      std::vector<Call*> directCalls;
-      std::vector<CallRef*> callRefs;
-      std::vector<Name> refFuncs;
-    };
-
-    struct SummaryScanner
-      : public ExpressionStackWalker<SummaryScanner,
-                                     UnifiedExpressionVisitor<SummaryScanner>> {
-      FuncSummary& summary;
-      Function* func;
-      SummaryScanner(FuncSummary& summary, Function* func = nullptr)
-        : summary(summary), func(func) {}
-
-      void visitExpression(Expression* curr) {
-        if (BranchUtils::isBranchReachable(curr)) {
-          BranchUtils::operateOnScopeNameUsesAndSentValues(
-            curr, [&](Name& name, Expression* val) {
-              if (auto* target = findBreakTarget(name)) {
-                if (auto* blk = target->dynCast<Block>();
-                    blk && blk->name.is() && isTrackedOneBitType(blk->type)) {
-                  if (!val) {
-                    summary.disqualifiedBlocks.insert(blk);
-                  } else if (val->type != Type::unreachable) {
-                    summary.blockValues[blk].push_back(val);
-                  }
-                }
-              }
-            });
-        }
-        if (auto* blk = curr->dynCast<Block>()) {
-          if (blk->name.is() && isTrackedOneBitType(blk->type)) {
-            auto& vec = summary.blockValues[blk];
-            if (blk->list.empty()) {
-              summary.disqualifiedBlocks.insert(blk);
-            } else if (blk->list.back()->type != Type::unreachable) {
-              vec.push_back(blk->list.back());
-            }
-          }
-        } else if (auto* ls = curr->dynCast<LocalSet>()) {
-          if (func && ls->index < summary.localWrites.size() &&
-              isTrackedOneBitType(func->getLocalType(ls->index)) &&
-              ls->value->type != Type::unreachable) {
-            summary.localWrites[ls->index].push_back(ls->value);
-          }
-        } else if (auto* gs = curr->dynCast<GlobalSet>()) {
-          if (isTrackedOneBitType(gs->value->type) ||
-              gs->value->type.isNull()) {
-            summary.globalWrites.emplace_back(gs->name, gs->value);
-          }
-        } else if (auto* ret = curr->dynCast<Return>()) {
-          if (func && isTrackedOneBitType(func->getResults()) && ret->value &&
-              ret->value->type != Type::unreachable) {
-            summary.returnValues.push_back(ret->value);
-          }
-        } else if (auto* call = curr->dynCast<Call>()) {
-          bool reachable = true;
-          for (auto* op : call->operands) {
-            if (op->type == Type::unreachable) {
-              reachable = false;
-              break;
-            }
-          }
-          if (reachable) {
-            summary.directCalls.push_back(call);
-            if (call->isReturn) {
-              summary.tailCallTargets.push_back(call->target);
-            }
-          }
-        } else if (auto* ci = curr->dynCast<CallIndirect>()) {
-          if (ci->isReturn) {
-            summary.hasIndirectTailCall = true;
-          }
-        } else if (auto* cr = curr->dynCast<CallRef>()) {
-          bool reachable = cr->target->type != Type::unreachable;
-          for (auto* op : cr->operands) {
-            if (op->type == Type::unreachable) {
-              reachable = false;
-              break;
-            }
-          }
-          if (reachable) {
-            if (cr->target->type.isSignature()) {
-              summary.callRefs.push_back(cr);
-            }
-            if (cr->isReturn) {
-              summary.tailCallRefs.push_back(cr);
-            }
-          }
-        } else if (auto* rf = curr->dynCast<RefFunc>()) {
-          summary.refFuncs.push_back(rf->func);
-        } else if (auto* sn = curr->dynCast<StructNew>()) {
-          if (sn->type.isStruct() && !sn->isWithDefault()) {
-            HeapType ht = sn->type.getHeapType();
-            const auto& fields = ht.getStruct().fields;
-            for (Index i = 0; i < fields.size() && i < sn->operands.size();
-                 i++) {
-              if (isTrackedOneBitType(fields[i].type) &&
-                  sn->operands[i]->type != Type::unreachable) {
-                summary.structNewWrites.push_back({{ht, i}, sn->operands[i]});
-              }
-            }
-          }
-        } else if (auto* ss = curr->dynCast<StructSet>()) {
-          if (ss->ref->type.isStruct() &&
-              ss->value->type != Type::unreachable) {
-            HeapType ht = ss->ref->type.getHeapType();
-            const auto& fields = ht.getStruct().fields;
-            if (ss->index < fields.size() &&
-                isTrackedOneBitType(fields[ss->index].type)) {
-              summary.structSetWrites.push_back({{ht, ss->index}, ss->value});
-            }
-          }
-        } else if (auto* rmw = curr->dynCast<StructRMW>()) {
-          if (rmw->ref->type.isStruct()) {
-            summary.structDisqualifiedFields.push_back(
-              {rmw->ref->type.getHeapType(), rmw->index});
-          }
-        } else if (auto* cmpx = curr->dynCast<StructCmpxchg>()) {
-          if (cmpx->ref->type.isStruct()) {
-            summary.structDisqualifiedFields.push_back(
-              {cmpx->ref->type.getHeapType(), cmpx->index});
-          }
-        }
-      }
-    };
-
-    ModuleUtils::ParallelFunctionAnalysis<FuncSummary> analysis(
-      wasm, [&](Function* func, FuncSummary& summary) {
-        if (func->imported() || !func->body) {
-          return;
-        }
-        summary.localWrites.resize(func->getNumLocals());
-        SummaryScanner scanner(summary, func);
-        scanner.walk(func->body);
-        if (isTrackedOneBitType(func->getResults()) &&
-            func->body->type != Type::unreachable) {
-          summary.returnValues.push_back(func->body);
-        }
-        std::vector<std::pair<LocalGet*, Expression*>> rawDefs;
-        computeReachingDefs(func, rawDefs);
-        for (auto& [lg, defVal] : rawDefs) {
-          if (isTrackedOneBitType(lg->type) &&
-              defVal->type != Type::unreachable) {
-            summary.reachingDefs.emplace_back(lg, defVal);
-          }
-        }
-      });
-
-    FuncSummary moduleSummary;
-    {
-      SummaryScanner scanner(moduleSummary);
-      for (auto& g : wasm.globals) {
-        if (!g->imported() && g->init) {
-          scanner.walk(g->init);
-        }
-      }
-      for (auto& seg : wasm.elementSegments) {
-        for (auto* e : seg->data) {
-          scanner.walk(e);
-        }
-      }
-    }
-
-    std::unordered_set<Name> exportedOrStartFuncs;
-    std::unordered_set<Name> refFuncTaken;
-    std::unordered_set<Name> exportedGlobals;
-    for (auto& ex : wasm.exports) {
-      if (ex->kind == ExternalKind::Function) {
-        exportedOrStartFuncs.insert(*ex->getInternalName());
-      } else if (ex->kind == ExternalKind::Global) {
-        exportedGlobals.insert(*ex->getInternalName());
-      }
-    }
-    if (wasm.start.is()) {
-      exportedOrStartFuncs.insert(wasm.start);
-    }
-    for (Name rf : moduleSummary.refFuncs) {
-      refFuncTaken.insert(rf);
-    }
-
-    std::unordered_set<HeapType> unoptimizableSigTypes;
-    bool canInferIndirectParams =
-      wasm.features.hasGC() && wasm.tables.empty() && subTypes.has_value();
-    if (canInferIndirectParams) {
-      for (auto type : ModuleUtils::getPublicHeapTypes(wasm, options.worldMode)) {
-        if (type.isFunction()) {
-          unoptimizableSigTypes.insert(type);
-        }
-      }
-      for (auto& tag : wasm.tags) {
-        unoptimizableSigTypes.insert(tag->type);
-      }
-      if (wasm.features.hasStackSwitching()) {
-        for (auto type : subTypes->types) {
-          if (type.isContinuation()) {
-            unoptimizableSigTypes.insert(type.getContinuation().type);
-          }
-        }
-      }
-      for (auto func : Intrinsics(wasm).getJSCalledFunctions()) {
-        unoptimizableSigTypes.insert(wasm.getFunction(func)->type.getHeapType());
-      }
-    }
-
-    std::unordered_map<Name, Index> directCallCount;
-    std::unordered_set<HeapType> sigHasCallRef;
-    for (auto& [func, fs] : analysis.map) {
-      for (Name rf : fs.refFuncs) {
-        refFuncTaken.insert(rf);
-      }
-      for (Call* call : fs.directCalls) {
-        directCallCount[call->target]++;
-        if (canInferIndirectParams &&
-            Intrinsics(wasm).isCallWithoutEffects(call) &&
-            !call->operands.empty() &&
-            call->operands.back()->type.isFunction()) {
-          unoptimizableSigTypes.insert(
-            call->operands.back()->type.getHeapType());
-        }
-      }
-      if (canInferIndirectParams) {
-        for (CallRef* cr : fs.callRefs) {
-          HeapType sigHt = cr->target->type.getHeapType();
-          if (sigHasCallRef.insert(sigHt).second) {
-            subTypes->iterSubTypes(sigHt, [&](HeapType subHt, int) {
-              sigHasCallRef.insert(subHt);
-              return true;
-            });
-          }
-        }
-      }
-    }
-    if (canInferIndirectParams && !unoptimizableSigTypes.empty()) {
-      std::vector<HeapType> seeds(unoptimizableSigTypes.begin(),
-                                  unoptimizableSigTypes.end());
-      for (HeapType ht : seeds) {
-        subTypes->iterSubTypes(ht, [&](HeapType subHt, int) {
-          unoptimizableSigTypes.insert(subHt);
-          return true;
-        });
-      }
-    }
-
-    for (auto& g : wasm.globals) {
-      if (!g->imported() && g->init && isTrackedOneBitType(g->type) &&
-          (!g->mutable_ || !exportedGlobals.contains(g->name))) {
-        oneBitGlobals.insert(g->name);
-      }
-    }
-
-    std::unordered_map<HeapType, std::vector<Name>> refFuncsBySig;
-    std::unordered_map<HeapType, std::vector<bool>> oneBitSigParams;
-    if (canInferIndirectParams) {
-      for (HeapType ht : subTypes->types) {
-        if (ht.isSignature()) {
-          auto params = ht.getSignature().params;
-          auto& vec = oneBitSigParams[ht];
-          vec.resize(params.size(), false);
-          for (Index i = 0; i < params.size(); i++) {
-            vec[i] = isTrackedOneBitType(params[i]);
-          }
-        }
-      }
-    }
-
-    for (auto& f : wasm.functions) {
-      if (f->imported()) {
-        if (f->module == WasmStringsModule &&
-            (f->base == "equals" || f->base == "test") &&
-            f->getResults() == Type::i32) {
-          oneBitReturns.insert(f->name);
-        }
-        continue;
-      }
-      if (!f->body) {
-        continue;
-      }
-      auto& fs = analysis.map[f.get()];
-      if (isTrackedOneBitType(f->getResults()) && !fs.hasIndirectTailCall &&
-          (!fs.returnValues.empty() || !fs.tailCallTargets.empty() ||
-           !fs.tailCallRefs.empty())) {
-        oneBitReturns.insert(f->name);
-      }
-      auto& locals = oneBitLocals[f->name];
-      locals.resize(f->getNumLocals(), false);
-      bool isExported = exportedOrStartFuncs.contains(f->name);
-      bool isRefTaken = refFuncTaken.contains(f->name);
-      HeapType fSig = f->type.getHeapType();
-      bool canInferParams = false;
-      if (!isExported) {
-        if (!isRefTaken) {
-          canInferParams = directCallCount[f->name] > 0;
-        } else if (canInferIndirectParams &&
-                   !unoptimizableSigTypes.contains(fSig)) {
-          canInferParams =
-            directCallCount[f->name] > 0 || sigHasCallRef.contains(fSig);
-          if (canInferParams) {
-            refFuncsBySig[fSig].push_back(f->name);
-          }
-        }
-      }
-      for (Index i = 0; i < f->getNumLocals(); i++) {
-        if (isTrackedOneBitType(f->getLocalType(i)) &&
-            (!f->isParam(i) || canInferParams)) {
-          locals[i] = true;
-        }
-      }
-      for (auto& [lg, defVal] : fs.reachingDefs) {
-        oneBitLocalGets.insert(lg);
-      }
-      for (auto& [blk, vals] : fs.blockValues) {
-        if (!fs.disqualifiedBlocks.contains(blk) && !vals.empty()) {
-          oneBitBlocks.insert(blk);
-        }
-      }
-    }
-
-    bool changed = false;
-    auto disqualifyStructFieldAndSupers = [&](HeapType ht, Index idx) {
-      std::optional<HeapType> curr = ht;
-      while (curr && curr->isStruct()) {
-        auto it = oneBitStructFields.find(*curr);
-        if (it == oneBitStructFields.end() || idx >= it->second.size()) {
-          break;
-        }
-        if (it->second[idx]) {
-          it->second[idx] = false;
-          changed = true;
-        }
-        curr = curr->getDeclaredSuperType();
-      }
-    };
-
-    std::unordered_set<std::pair<HeapType, Index>> disqualifiedStructSetFields;
-    auto disqualifyStructFieldSubtreeAndSupers = [&](HeapType ht, Index idx) {
-      if (!subTypes || !disqualifiedStructSetFields.insert({ht, idx}).second) {
-        return;
-      }
-      disqualifyStructFieldAndSupers(ht, idx);
-      subTypes->iterSubTypes(ht, [&](HeapType subHt, int) {
-        auto it = oneBitStructFields.find(subHt);
-        if (it != oneBitStructFields.end() && idx < it->second.size() &&
-            it->second[idx]) {
-          it->second[idx] = false;
-          changed = true;
-        }
-        return true;
-      });
-    };
-
-    auto disqualifySigParam = [&](HeapType sigHt, Index p) {
-      if (!subTypes) {
-        return;
-      }
-      auto it = oneBitSigParams.find(sigHt);
-      if (it == oneBitSigParams.end() || p >= it->second.size() ||
-          !it->second[p]) {
-        return;
-      }
-      subTypes->iterSubTypes(sigHt, [&](HeapType subHt, int) {
-        auto subIt = oneBitSigParams.find(subHt);
-        if (subIt != oneBitSigParams.end() && p < subIt->second.size() &&
-            subIt->second[p]) {
-          subIt->second[p] = false;
-          auto fnIt = refFuncsBySig.find(subHt);
-          if (fnIt != refFuncsBySig.end()) {
-            for (Name fnName : fnIt->second) {
-              auto& fnLocals = oneBitLocals[fnName];
-              if (p < fnLocals.size() && fnLocals[p]) {
-                fnLocals[p] = false;
-                changed = true;
-              }
-            }
-          }
-        }
-        return true;
-      });
-    };
-
-    for (auto& [ht, idx] : moduleSummary.structDisqualifiedFields) {
-      disqualifyStructFieldSubtreeAndSupers(ht, idx);
-    }
-    for (auto& [func, fs] : analysis.map) {
-      for (auto& [ht, idx] : fs.structDisqualifiedFields) {
-        disqualifyStructFieldSubtreeAndSupers(ht, idx);
-      }
-    }
-
-    struct FPBitProvider : Bits::DummyLocalInfoProvider {
-      const ModuleOneBitInfo& info;
-      const std::vector<bool>* currFuncLocals = nullptr;
-      FPBitProvider(const ModuleOneBitInfo& info) : info(info) {}
-
-      Index getMaxBitsForLocal(LocalGet* get) {
-        if ((currFuncLocals && get->index < currFuncLocals->size() &&
-             (*currFuncLocals)[get->index]) ||
-            info.isOneBitLocalGet(get)) {
-          return 1;
-        }
-        return get->type == Type::i64 ? 64 : 32;
-      }
-      Index getMaxBitsForBlock(Block* block) {
-        if (info.isOneBitBlock(block)) {
-          return 1;
-        }
-        return block->type == Type::i64 ? 64 : 32;
-      }
-      Index getMaxBitsForStructGet(StructGet* get) {
-        if (get->ref->type.isStruct() &&
-            info.isOneBitStructField(get->ref->type.getHeapType(),
-                                     get->index)) {
-          return 1;
-        }
-        return get->type == Type::i64 ? 64 : 32;
-      }
-      Index getMaxBitsForCall(Call* call) {
-        if (call->type == Type::i32 && info.isOneBitReturn(call->target)) {
-          return 1;
-        }
-        return call->type == Type::i64 ? 64 : 32;
-      }
-      Index getMaxBitsForCallRef(CallRef* call) {
-        if (call->type == Type::i32 &&
-            info.isOneBitFuncRefExpr(call->target, currFuncLocals)) {
-          return 1;
-        }
-        return call->type == Type::i64 ? 64 : 32;
-      }
-      Index getMaxBitsForGlobalGet(GlobalGet* get) {
-        if (info.isOneBitGlobal(get->name)) {
-          return 1;
-        }
-        return get->type == Type::i64 ? 64 : 32;
-      }
-    } provider(*this);
-
-    auto isOneBitExpr = [&](Expression* val) -> bool {
-      if (val->type.isInteger()) {
-        return Bits::getMaxBits(val, &provider) <= 1;
-      }
-      return isOneBitFuncRefExpr(val, provider.currFuncLocals);
-    };
-
-    changed = true;
-    while (changed) {
-      changed = false;
-      provider.currFuncLocals = nullptr;
-
-      for (auto& g : wasm.globals) {
-        if (oneBitGlobals.contains(g->name) && !isOneBitExpr(g->init)) {
-          oneBitGlobals.erase(g->name);
-          changed = true;
-        }
-      }
-      for (auto& [field, val] : moduleSummary.structNewWrites) {
-        if (isOneBitStructField(field.first, field.second) &&
-            !isOneBitExpr(val)) {
-          disqualifyStructFieldAndSupers(field.first, field.second);
-        }
-      }
-      for (auto& [field, val] : moduleSummary.structSetWrites) {
-        if (!disqualifiedStructSetFields.contains(field) &&
-            !isOneBitExpr(val)) {
-          disqualifyStructFieldSubtreeAndSupers(field.first, field.second);
-        }
-      }
-
-      for (auto& f : wasm.functions) {
-        if (f->imported() || !f->body) {
-          continue;
-        }
-        auto& fs = analysis.map[f.get()];
-        auto& locals = oneBitLocals[f->name];
-        provider.currFuncLocals = &locals;
-
-        for (Index i = 0; i < locals.size(); i++) {
-          if (!locals[i]) {
-            continue;
-          }
-          for (auto* val : fs.localWrites[i]) {
-            if (!isOneBitExpr(val)) {
-              locals[i] = false;
-              changed = true;
-              break;
-            }
-          }
-        }
-
-        for (auto& [lg, defVal] : fs.reachingDefs) {
-          if (oneBitLocalGets.contains(lg) && !isOneBitExpr(defVal)) {
-            oneBitLocalGets.erase(lg);
-            changed = true;
-          }
-        }
-
-        for (auto& [blk, vals] : fs.blockValues) {
-          if (!oneBitBlocks.contains(blk)) {
-            continue;
-          }
-          for (auto* val : vals) {
-            if (!isOneBitExpr(val)) {
-              oneBitBlocks.erase(blk);
-              changed = true;
-              break;
-            }
-          }
-        }
-
-        if (oneBitReturns.contains(f->name)) {
-          bool ok = true;
-          for (Name target : fs.tailCallTargets) {
-            if (!oneBitReturns.contains(target)) {
-              ok = false;
-              break;
-            }
-          }
-          if (ok) {
-            for (CallRef* cr : fs.tailCallRefs) {
-              if (!isOneBitFuncRefExpr(cr->target, provider.currFuncLocals)) {
-                ok = false;
-                break;
-              }
-            }
-          }
-          if (ok) {
-            for (auto* val : fs.returnValues) {
-              if (!isOneBitExpr(val)) {
-                ok = false;
-                break;
-              }
-            }
-          }
-          if (!ok) {
-            oneBitReturns.erase(f->name);
-            changed = true;
-          }
-        }
-
-        for (auto& [gName, val] : fs.globalWrites) {
-          if (oneBitGlobals.contains(gName) && !isOneBitExpr(val)) {
-            oneBitGlobals.erase(gName);
-            changed = true;
-          }
-        }
-
-        for (auto& [field, val] : fs.structNewWrites) {
-          if (isOneBitStructField(field.first, field.second) &&
-              !isOneBitExpr(val)) {
-            disqualifyStructFieldAndSupers(field.first, field.second);
-          }
-        }
-
-        for (auto& [field, val] : fs.structSetWrites) {
-          if (!disqualifiedStructSetFields.contains(field) &&
-              !isOneBitExpr(val)) {
-            disqualifyStructFieldSubtreeAndSupers(field.first, field.second);
-          }
-        }
-
-        for (Call* call : fs.directCalls) {
-          auto it = oneBitLocals.find(call->target);
-          if (it == oneBitLocals.end()) {
-            continue;
-          }
-          auto& targetLocals = it->second;
-          for (Index p = 0;
-               p < call->operands.size() && p < targetLocals.size();
-               p++) {
-            if (targetLocals[p] && !isOneBitExpr(call->operands[p])) {
-              targetLocals[p] = false;
-              changed = true;
-            }
-          }
-        }
-
-        if (canInferIndirectParams) {
-          for (CallRef* cr : fs.callRefs) {
-            HeapType sigHt = cr->target->type.getHeapType();
-            auto sigIt = oneBitSigParams.find(sigHt);
-            if (sigIt == oneBitSigParams.end()) {
-              continue;
-            }
-            for (Index p = 0;
-                 p < cr->operands.size() && p < sigIt->second.size();
-                 p++) {
-              if (sigIt->second[p] && !isOneBitExpr(cr->operands[p])) {
-                disqualifySigParam(sigHt, p);
-              }
-            }
-          }
-        }
-      }
-    }
-
-    for (auto& f : wasm.functions) {
-      if (f->getResults() == Type::i32 && f->effects) {
-        bool isOneBit = oneBitReturns.contains(f->name);
-        if (f->effects->returnsOneBit != isOneBit) {
-          if (f->effects.use_count() == 1) {
-            const_cast<EffectAnalyzer*>(f->effects.get())->returnsOneBit =
-              isOneBit;
-          } else {
-            auto copy = std::make_shared<EffectAnalyzer>(*f->effects);
-            copy->returnsOneBit = isOneBit;
-            f->effects = std::move(copy);
-          }
-        }
-      }
-    }
-  }
-};
-
 struct LocalScanner : ExpressionStackWalker<LocalScanner> {
   std::vector<LocalInfo>& localInfo;
   std::unordered_map<Block*, Index>& blockBreakMaxBits;
@@ -1032,7 +120,9 @@ struct LocalScanner : ExpressionStackWalker<LocalScanner> {
         self->disqualifiedBlocks.insert(blk);
       }
     }
-    if (BranchUtils::isBranchReachable(curr)) {
+    if ((curr->is<Break>() || curr->is<Switch>() || curr->is<BrOn>() ||
+         curr->is<TryTable>()) &&
+        BranchUtils::isBranchReachable(curr)) {
       BranchUtils::operateOnScopeNameUsesAndSentValues(
         curr, [&](Name& name, Expression* val) {
           if (auto* target = self->findBreakTarget(name)) {
@@ -1057,7 +147,8 @@ struct LocalScanner : ExpressionStackWalker<LocalScanner> {
       auto& info = localInfo[i];
       if (func->isParam(i)) {
         if (moduleOneBitInfo &&
-            moduleOneBitInfo->isOneBitLocal(func->name, i)) {
+            (moduleOneBitInfo->isOneBitLocal(func->name, i) ||
+             moduleOneBitInfo->isOneBitParam(func->name, i))) {
           info.maxBits = 1;
         } else {
           info.maxBits = getBitsForType(func->getLocalType(i)); // worst-case
@@ -4709,6 +3800,12 @@ private:
               select->ifFalse,
               optimizeBoolean(select->condition, mustBeOneBit));
           }
+          if (Bits::getMaxBits(select->ifFalse, this) <= 1) {
+            return builder.makeBinary(
+              AndInt32,
+              select->ifFalse,
+              makeNegatedOneBit(select->condition));
+          }
           if (canNegateForFree(select->ifFalse)) {
             return builder.makeUnary(
               EqZInt32,
@@ -4724,6 +3821,17 @@ private:
               select->ifTrue,
               optimizeBoolean(builder.makeUnary(EqZInt32, select->condition),
                               mustBeOneBit));
+          }
+          if (Bits::getMaxBits(select->ifTrue, this) <= 1) {
+            select->condition = optimizeBoolean(select->condition);
+            if (Bits::getMaxBits(select->condition, this) <= 1) {
+              return builder.makeBinary(
+                AndInt32, select->ifTrue, select->condition);
+            }
+            if (canNegateForFree(select->condition)) {
+              return builder.makeBinary(
+                AndInt32, select->ifTrue, makeOneBit(select->condition));
+            }
           }
           if (canNegateForFree(select->ifTrue) &&
               canNegateForFree(select->condition)) {
@@ -5088,6 +4196,38 @@ private:
         if (matches(curr, select(ival(1), any(&y), any(&x)))) {
           return builder.makeBinary(OrInt32, y, x);
         }
+      } else {
+        // When condition x is not 1-bit, folding is still smaller if x or y
+        // can be negated without adding an instruction, or if y is (z != 0).
+        if (matches(curr, select(any(&y), ival(0), any(&x)))) {
+          if (canNegateForFree(x)) {
+            return builder.makeBinary(AndInt32, y, makeOneBit(x));
+          }
+          if (isRemovableOneBitEqZ(y)) {
+            return builder.makeUnary(
+              EqZInt32,
+              builder.makeBinary(
+                OrInt32, makeNegatedOneBit(y), makeNegatedOneBit(x)));
+          }
+        }
+        if (matches(curr, select(ival(1), any(&y), any(&x)))) {
+          Expression* z;
+          if (matches(y, binary(NeInt32, any(&z), i32(0)))) {
+            return builder.makeBinary(
+              NeInt32,
+              builder.makeBinary(OrInt32, z, x),
+              builder.makeConst(int32_t(0)));
+          }
+          if (canNegateForFree(x)) {
+            return builder.makeBinary(OrInt32, y, makeOneBit(x));
+          }
+          if (isRemovableOneBitEqZ(y)) {
+            return builder.makeUnary(
+              EqZInt32,
+              builder.makeBinary(
+                AndInt32, makeNegatedOneBit(y), makeNegatedOneBit(x)));
+          }
+        }
       }
 
       // x ? 0 : y   ==>   y & !x
@@ -5098,6 +4238,142 @@ private:
       // x ? y : 1   ==>   y | !x
       if (matches(curr, select(any(&y), ival(1), any(&x)))) {
         return builder.makeBinary(OrInt32, y, makeNegatedOneBit(x));
+      }
+    }
+    if (curr->type == Type::i32 && curr->ifTrue->type == Type::i32 &&
+        curr->ifFalse->type == Type::i32 &&
+        curr->condition->type == Type::i32) {
+      // x ? x : 1   ==>   x | !x
+      // x ? x : -1  ==>   x - !x
+      if (auto* cFalse = curr->ifFalse->dynCast<Const>()) {
+        int32_t k = cFalse->value.geti32();
+        if ((k == 1 || k == -1) &&
+            (curr->ifTrue->is<LocalSet>() ||
+             canNegateForFree(curr->condition)) &&
+            areConsecutiveInputsEqual(curr->ifTrue, curr->condition)) {
+          return builder.makeBinary(k == 1 ? OrInt32 : SubInt32,
+                                    curr->ifTrue,
+                                    makeNegatedOneBit(curr->condition));
+        }
+      }
+
+      // Increment/decrement select:
+      //   c ? (x +/- 1) : x  ==>  x +/- makeOneBit(c)
+      //   c ? x : (x +/- 1)  ==>  x +/- makeNegatedOneBit(c)
+      auto matchIncDec = [](Expression* arm,
+                            Expression*& base,
+                            int32_t& delta) -> bool {
+        auto* bin = arm->dynCast<Binary>();
+        if (!bin || (bin->op != AddInt32 && bin->op != SubInt32)) {
+          return false;
+        }
+        if (auto* c = bin->right->dynCast<Const>()) {
+          int32_t v = c->value.geti32();
+          if (v == 1 || v == -1) {
+            base = bin->left;
+            delta = (bin->op == AddInt32) ? v : -v;
+            return true;
+          }
+        }
+        if (bin->op == AddInt32) {
+          if (auto* c = bin->left->dynCast<Const>()) {
+            int32_t v = c->value.geti32();
+            if (v == 1 || v == -1) {
+              base = bin->right;
+              delta = v;
+              return true;
+            }
+          }
+        }
+        return false;
+      };
+      Expression* base = nullptr;
+      int32_t delta = 0;
+      if (matchIncDec(curr->ifTrue, base, delta) &&
+          areConsecutiveInputsEqualAndFoldable(base, curr->ifFalse)) {
+        bool useNeg = isRemovableOneBitEqZ(curr->condition);
+        if (!useNeg) {
+          return builder.makeBinary(delta == 1 ? AddInt32 : SubInt32,
+                                    base,
+                                    makeOneBit(curr->condition));
+        }
+      }
+      if (matchIncDec(curr->ifFalse, base, delta) &&
+          areConsecutiveInputsEqualAndFoldable(curr->ifTrue, base)) {
+        return builder.makeBinary(delta == 1 ? AddInt32 : SubInt32,
+                                  curr->ifTrue,
+                                  makeNegatedOneBit(curr->condition));
+      }
+
+      // Three-way comparison select:
+      //   (a < b) ? -1 : (a > b)  ==>  (a > b) - (a < b)
+      if (auto* cTrue = curr->ifTrue->dynCast<Const>();
+          cTrue && cTrue->value.geti32() == -1) {
+        auto* bF = curr->ifFalse->dynCast<Binary>();
+        auto* bC = curr->condition->dynCast<Binary>();
+        if (bF && bC) {
+          auto isOppositeStrictCmp = [](BinaryOp op1, BinaryOp op2) {
+            switch (op1) {
+              case LtSInt32:
+                return op2 == GtSInt32;
+              case GtSInt32:
+                return op2 == LtSInt32;
+              case LtUInt32:
+                return op2 == GtUInt32;
+              case GtUInt32:
+                return op2 == LtUInt32;
+              case LtSInt64:
+                return op2 == GtSInt64;
+              case GtSInt64:
+                return op2 == LtSInt64;
+              case LtUInt64:
+                return op2 == GtUInt64;
+              case GtUInt64:
+                return op2 == LtUInt64;
+              case LtFloat32:
+                return op2 == GtFloat32;
+              case GtFloat32:
+                return op2 == LtFloat32;
+              case LtFloat64:
+                return op2 == GtFloat64;
+              case GtFloat64:
+                return op2 == LtFloat64;
+              default:
+                return false;
+            }
+          };
+          auto isStrictCmp = [&](BinaryOp op) {
+            return isOppositeStrictCmp(op, reverseRelationalOp(op));
+          };
+          auto isSamePureOrTeeOperand = [](Expression* first,
+                                           Expression* second) {
+            if (!second->is<LocalGet>() && !second->is<GlobalGet>() &&
+                !second->is<Const>()) {
+              return false;
+            }
+            if (ExpressionAnalyzer::equal(first, second)) {
+              return true;
+            }
+            if (auto* tee = first->dynCast<LocalSet>();
+                tee && tee->isTee() && second->is<LocalGet>()) {
+              return tee->index == second->cast<LocalGet>()->index;
+            }
+            return false;
+          };
+          bool matchSameOrder =
+            isOppositeStrictCmp(bF->op, bC->op) &&
+            isSamePureOrTeeOperand(bF->left, bC->left) &&
+            isSamePureOrTeeOperand(bF->right, bC->right) &&
+            !effects(bF->right).invalidates(effects(bC->left));
+          bool matchReversedOrder =
+            bF->op == bC->op && isStrictCmp(bF->op) &&
+            isSamePureOrTeeOperand(bF->left, bC->right) &&
+            isSamePureOrTeeOperand(bF->right, bC->left) &&
+            !effects(bF->right).invalidates(effects(bC->right));
+          if (matchSameOrder || matchReversedOrder) {
+            return builder.makeBinary(SubInt32, curr->ifFalse, curr->condition);
+          }
+        }
       }
     }
     {
@@ -5120,6 +4396,83 @@ private:
           curr->ifTrue->cast<Const>()->value = Literal::makeOne(type);
           return builder.makeBinary(
             Abstract::getBinary(type, Or), bin, curr->ifTrue);
+        }
+      }
+    }
+    if (curr->type == Type::i32 && curr->ifTrue->type == Type::i32 &&
+        curr->ifFalse->type == Type::i32 &&
+        curr->condition->type == Type::i32) {
+      if (auto* c1 = curr->ifTrue->dynCast<Const>()) {
+        if (auto* c2 = curr->ifFalse->dynCast<Const>()) {
+          int32_t k1 = c1->value.geti32();
+          int32_t k2 = c2->value.geti32();
+          bool isNonOneBitEqz =
+            curr->condition->is<Unary>() &&
+            curr->condition->cast<Unary>()->op == EqZInt32 &&
+            !isRemovableOneBitEqZ(curr->condition);
+          bool condOneBit =
+            Bits::getMaxBits(curr->condition, this) <= 1 && !isNonOneBitEqz;
+          bool condFreeNeg = canNegateForFree(curr->condition);
+          bool allowNonOneBit = getPassOptions().shrinkLevel > 0;
+          // c ? (k2 + 1) : k2
+          if (int64_t(k1) - int64_t(k2) == 1 &&
+              (condOneBit || condFreeNeg || allowNonOneBit)) {
+            if (isRemovableOneBitEqZ(curr->condition) || !condOneBit) {
+              return builder.makeBinary(
+                SubInt32,
+                builder.makeConst(k1),
+                makeNegatedOneBit(curr->condition));
+            }
+            return builder.makeBinary(
+              AddInt32, curr->condition, builder.makeConst(k2));
+          }
+          // c ? k1 : (k1 + 1)
+          if (int64_t(k2) - int64_t(k1) == 1 &&
+              (condOneBit || condFreeNeg || allowNonOneBit)) {
+            if (k1 == -1 && k2 == 0 && condOneBit && !condFreeNeg) {
+              return builder.makeBinary(
+                SubInt32, builder.makeConst(int32_t(0)), curr->condition);
+            }
+            if (condFreeNeg || !condOneBit) {
+              return builder.makeBinary(AddInt32,
+                                        makeNegatedOneBit(curr->condition),
+                                        builder.makeConst(k1));
+            }
+            return builder.makeBinary(
+              SubInt32, builder.makeConst(k2), curr->condition);
+          }
+          // Power-of-two with zero:
+          //   c ? (1 << sh) : 0  ==>  makeOneBit(c) << sh
+          //   c ? 0 : (1 << sh)  ==>  makeNegatedOneBit(c) << sh
+          if (k2 == 0 && k1 > 1 && Bits::isPowerOf2(uint32_t(k1))) {
+            int32_t sh = Bits::countTrailingZeroes(k1);
+            if (condOneBit || condFreeNeg || (allowNonOneBit && sh >= 6)) {
+              return builder.makeBinary(ShlInt32,
+                                        makeOneBit(curr->condition),
+                                        builder.makeConst(sh));
+            }
+          }
+          if (k1 == 0 && k2 > 1 && Bits::isPowerOf2(uint32_t(k2))) {
+            int32_t sh = Bits::countTrailingZeroes(k2);
+            if (condOneBit || condFreeNeg || allowNonOneBit) {
+              return builder.makeBinary(ShlInt32,
+                                        makeNegatedOneBit(curr->condition),
+                                        builder.makeConst(sh));
+            }
+          }
+          // Doubling / halving positive constants when condition is 1-bit:
+          //   c_1bit ? 2*k2 : k2  ==>  k2 << c_1bit
+          //   c_1bit ? k1 : 2*k1  ==>  (2*k1) >>_u c_1bit
+          if (condOneBit && !isRemovableOneBitEqZ(curr->condition)) {
+            if (k2 > 0 && k2 <= 0x3fffffff && k1 == 2 * k2) {
+              return builder.makeBinary(
+                ShlInt32, builder.makeConst(k2), curr->condition);
+            }
+            if (k1 > 0 && k1 <= 0x3fffffff && k2 == 2 * k1) {
+              return builder.makeBinary(
+                ShrUInt32, builder.makeConst(k2), curr->condition);
+            }
+          }
         }
       }
     }
@@ -5634,6 +4987,19 @@ private:
     using namespace Abstract;
     using namespace Match;
 
+    {
+      // (x == 0) | (y == 0)   ==>   (x & y) == 0   when x and y are 1-bit
+      Expression *x, *y;
+      if (matches(curr->left, unary(EqZ, any(&x))) &&
+          matches(curr->right, unary(EqZ, any(&y))) && x->type == y->type &&
+          Bits::getMaxBits(x, this) <= 1 && Bits::getMaxBits(y, this) <= 1 &&
+          !isRemovableOneBitEqZ(x) && !isRemovableOneBitEqZ(y)) {
+        auto* inner = curr->left->cast<Unary>();
+        inner->value =
+          Builder(*getModule()).makeBinary(getBinary(x->type, And), x, y);
+        return inner;
+      }
+    }
     if (auto* left = curr->left->dynCast<Binary>()) {
       if (auto* right = curr->right->dynCast<Binary>()) {
         if (left->op != right->op &&

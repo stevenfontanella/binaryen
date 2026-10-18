@@ -18994,4 +18994,76 @@
       )
     )
   )
+
+  ;; CHECK:      (func $one-bit-select-and-demorgan-folds (param $x i32) (param $y i32) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (i32.eq
+  ;; CHECK-NEXT:      (local.get $y)
+  ;; CHECK-NEXT:      (i32.const 2)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.and
+  ;; CHECK-NEXT:     (i32.and
+  ;; CHECK-NEXT:      (local.get $x)
+  ;; CHECK-NEXT:      (i32.const 1)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.eq
+  ;; CHECK-NEXT:      (local.get $y)
+  ;; CHECK-NEXT:      (i32.const 1)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (i32.eqz
+  ;; CHECK-NEXT:     (i32.and
+  ;; CHECK-NEXT:      (i32.and
+  ;; CHECK-NEXT:       (local.get $x)
+  ;; CHECK-NEXT:       (i32.const 1)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (i32.and
+  ;; CHECK-NEXT:       (local.get $y)
+  ;; CHECK-NEXT:       (i32.const 1)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (i32.eq
+  ;; CHECK-NEXT:      (local.get $y)
+  ;; CHECK-NEXT:      (i32.const 3)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.const 5)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $one-bit-select-and-demorgan-folds (param $x i32) (param $y i32) (result i32)
+    (i32.add
+      (i32.add
+        (select
+          (i32.and (local.get $x) (i32.const 1))
+          (i32.const 0)
+          (i32.eq (local.get $y) (i32.const 1))
+        )
+        (select
+          (i32.add (local.get $x) (i32.const 1))
+          (local.get $x)
+          (i32.eq (local.get $y) (i32.const 2))
+        )
+      )
+      (i32.add
+        (select
+          (i32.const 6)
+          (i32.const 5)
+          (i32.eq (local.get $y) (i32.const 3))
+        )
+        (i32.or
+          (i32.eqz (i32.and (local.get $x) (i32.const 1)))
+          (i32.eqz (i32.and (local.get $y) (i32.const 1)))
+        )
+      )
+    )
+  )
 )
