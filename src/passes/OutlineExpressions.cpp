@@ -362,6 +362,9 @@ struct KeyInfo {
   // For multi-write helpers (written.size() >= 2), the module-level scratch
   // globals used to pass written[1 .. k-1] back to the caller.
   SmallVector<Name, 3> scratchGlobals;
+  // For early-exit slice helpers with written locals, the module-level i32
+  // scratch global used to pass the branch flag (1 = branch, 0 = fallthrough).
+  Name branchScratchGlobal;
   // Whether we decided to outline the sites with this key.
   bool outline = false;
   // Whether this key holds leftover sites that were rejected during constant
@@ -407,6 +410,9 @@ struct Site {
   // If true, the last statement of the slice is a LocalSet whose value is
   // returned by the helper while the LocalSet itself stays at the call site.
   bool trailingSet = false;
+  // If non-empty, this slice may early-exit its enclosing Type::none Block via
+  // unvalued br / br_if to exitBlockLabel.
+  Name exitBlockLabel;
   // A hash of the tree's shape, with holes abstracted away. Trees with equal
   // shapes can share a helper.
   size_t hash = 0;
@@ -522,6 +528,9 @@ struct NodeInfo {
   SmallVector<Index, 2> written;
   // Locals unconditionally written on every normal-exit path of this subtree.
   SmallVector<Index, 2> mustWrite;
+  // Locals unconditionally written before the first early-exit branch in this
+  // slice.
+  SmallVector<Index, 2> mustWriteOnExit;
   // Locals that may be read before being written in this subtree.
   SmallVector<Index, 4> readBeforeWrite;
   // The labels of branches in the tree that no block or loop in the tree
@@ -765,6 +774,9 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
   // Whether reference-typed local holes are canonicalized to their demanded
   // types.
   bool canonicalizeLocalHoles;
+  // Whether block slices that early-exit their enclosing block via unvalued
+  // br / br_if are eligible for outlining.
+  bool allowEarlyExitSlices;
   std::vector<Index> totalReads;
   std::vector<Index> totalWrites;
   std::vector<Expression*> parentStack;
@@ -780,9 +792,11 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
           const RankTables& ranks,
           Mode mode,
           bool constHoles,
-          bool canonicalizeLocalHoles)
+          bool canonicalizeLocalHoles,
+          bool allowEarlyExitSlices)
     : wasm(wasm), func(func), info(info), ranks(ranks), mode(mode),
-      constHoles(constHoles), canonicalizeLocalHoles(canonicalizeLocalHoles) {
+      constHoles(constHoles), canonicalizeLocalHoles(canonicalizeLocalHoles),
+      allowEarlyExitSlices(allowEarlyExitSlices) {
     LocalUseCounter counter(func->getNumLocals());
     counter.walk(func->body);
     totalReads = std::move(counter.reads);
@@ -916,7 +930,8 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
     }
     bool recordedFullBlockSlice = false;
     if (auto* block = curr->dynCast<Block>()) {
-      recordedFullBlockSlice = scanBlockSlices(block, stackBase);
+      recordedFullBlockSlice =
+        scanBlockSlices(block, stackBase, node.localCounts);
     }
     stack.resize(stackBase);
     if (auto* get = curr->dynCast<LocalGet>()) {
@@ -946,13 +961,57 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
         return gget->name.startsWith("oe$out_");
       }
     }
+    if (auto* br = e->dynCast<Break>()) {
+      if (!br->value && br->condition) {
+        if (auto* gget = br->condition->dynCast<GlobalGet>()) {
+          return gget->name.startsWith("oe$out_");
+        }
+      }
+    }
     return false;
   }
 
-  bool scanBlockSlices(Block* block, Index stackBase) {
+  static bool hasOnlyUnvaluedBreaksTo(Expression* root, Name targetLabel) {
+    struct Checker : public PostWalker<Checker> {
+      Name targetLabel;
+      bool ok = true;
+      bool found = false;
+      Checker(Name targetLabel) : targetLabel(targetLabel) {}
+      void visitBreak(Break* curr) {
+        if (curr->name == targetLabel) {
+          found = true;
+          if (curr->value) {
+            ok = false;
+          }
+        }
+      }
+      void visitSwitch(Switch* curr) {
+        for (auto t : curr->targets) {
+          if (t == targetLabel) {
+            ok = false;
+          }
+        }
+        if (curr->default_ == targetLabel) {
+          ok = false;
+        }
+      }
+      void visitBrOn(BrOn* curr) {
+        if (curr->name == targetLabel) {
+          ok = false;
+        }
+      }
+    } checker(targetLabel);
+    checker.walk(root);
+    return checker.ok && checker.found;
+  }
+
+  bool scanBlockSlices(Block* block,
+                       Index stackBase,
+                       const SmallVector<LocalCount, 4>& blockLocalCounts) {
     bool recordedFull = false;
     Index n = block->list.size();
-    for (Index k = 2; k <= 6; k++) {
+    Index maxK = allowEarlyExitSlices ? 8 : 6;
+    for (Index k = 2; k <= maxK; k++) {
       if (n < k) {
         continue;
       }
@@ -993,6 +1052,14 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
         if (trailingSet) {
           sliceType = lastExpr->cast<LocalSet>()->value->type;
         }
+        bool allowBlockExit = allowEarlyExitSlices && !trailingSet &&
+                              block->name.is() && block->type == Type::none &&
+                              sliceType == Type::none;
+        if (k > 6 && !allowBlockExit) {
+          continue;
+        }
+        Name exitBlockLabel;
+        bool seenExitBranch = false;
         NodeInfo sliceNode;
         sliceNode.hash = wasm::hash(0);
         rehash(sliceNode.hash, Expression::Id(Expression::BlockId));
@@ -1001,9 +1068,20 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
         sliceNode.trivialChildren = false;
         for (Index j = i; j < i + k; j++) {
           auto& child = stack[stackBase + j];
-          if (!child.movable || !child.openLabels.empty()) {
+          if (!child.movable) {
             sliceNode.movable = false;
             break;
+          }
+          bool childBranchesToBlock = false;
+          if (!child.openLabels.empty()) {
+            if (!allowBlockExit || child.openLabels.size() != 1 ||
+                child.openLabels[0] != block->name ||
+                !hasOnlyUnvaluedBreaksTo(block->list[j], block->name)) {
+              sliceNode.movable = false;
+              break;
+            }
+            exitBlockLabel = block->name;
+            childBranchesToBlock = true;
           }
           addLocalCounts(sliceNode.localCounts, child.localCounts);
           for (Index x : child.readBeforeWrite) {
@@ -1017,6 +1095,9 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
             for (Index x : child.mustWrite) {
               if (x != set->index) {
                 noteUnique(sliceNode.mustWrite, x);
+                if (!seenExitBranch) {
+                  noteUnique(sliceNode.mustWriteOnExit, x);
+                }
               }
             }
             hash_combine(sliceNode.hash, child.setValueHash);
@@ -1025,6 +1106,9 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
           } else {
             for (Index x : child.mustWrite) {
               noteUnique(sliceNode.mustWrite, x);
+              if (!seenExitBranch) {
+                noteUnique(sliceNode.mustWriteOnExit, x);
+              }
             }
             hash_combine(sliceNode.hash, child.hash);
             sliceNode.bytes += child.bytes;
@@ -1032,16 +1116,46 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
               noteUnique(sliceNode.written, local);
             }
           }
+          if (childBranchesToBlock) {
+            seenExitBranch = true;
+          }
           for (auto local : child.locals) {
             noteUnique(sliceNode.locals, local);
           }
           sliceNode.interesting = sliceNode.interesting || child.interesting;
           sliceNode.hasGuard = sliceNode.hasGuard || child.hasGuard;
         }
-        if (!sliceNode.movable) {
+        if (!sliceNode.movable || (k > 6 && !exitBlockLabel.is())) {
           continue;
         }
-        recordSite(block, i, k, trailingSet, sliceType, sliceNode);
+        if (!trailingSet && exitBlockLabel.is()) {
+          auto isTrivialBoundarySet = [&](Index pos) {
+            if (auto* bSet = block->list[pos]->dynCast<LocalSet>()) {
+              if (stack[stackBase + pos].bytes <= 4 &&
+                  totalReads[bSet->index] > 0) {
+                auto lc = getLocalCount(sliceNode.localCounts, bSet->index);
+                if (lc.reads == 0 && lc.writes == 1) {
+                  return true;
+                }
+              }
+            }
+            return false;
+          };
+          if (isTrivialBoundarySet(i) || isTrivialBoundarySet(i + k - 1)) {
+            continue;
+          }
+        }
+        if (exitBlockLabel.is()) {
+          rehash(sliceNode.hash, uint32_t(1));
+        }
+        recordSite(block,
+                   i,
+                   k,
+                   trailingSet,
+                   sliceType,
+                   sliceNode,
+                   &blockLocalCounts,
+                   exitBlockLabel);
         if (n == k) {
           recordedFull = true;
         }
@@ -1086,7 +1200,9 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
                   Index sliceLen,
                   bool trailingSet,
                   Type type,
-                  const NodeInfo& node) {
+                  const NodeInfo& node,
+                  const SmallVector<LocalCount, 4>* blockLocalCounts = nullptr,
+                  Name exitBlockLabel = Name()) {
     if (!node.movable || !node.openLabels.empty()) {
       return;
     }
@@ -1152,6 +1268,26 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
       }
       written.push_back({index, localType});
     }
+    auto isLiveAfterExitBlock = [&](Index index) {
+      if (!exitBlockLabel.is()) {
+        return false;
+      }
+      if (loopDepth > 0 || !blockLocalCounts) {
+        return true;
+      }
+      auto blc = getLocalCount(*blockLocalCounts, index);
+      return blc.reads < totalReads[index];
+    };
+    auto isMustWriteOnAllLiveExits = [&](Index index) {
+      if (!contains(node.mustWrite, index)) {
+        return false;
+      }
+      if (!exitBlockLabel.is()) {
+        return true;
+      }
+      return contains(node.mustWriteOnExit, index) ||
+             !isLiveAfterExitBlock(index);
+    };
     SmallVector<Index, 2> overwriteLocals;
     Index numInputLocals = 0;
     for (Index index : node.locals) {
@@ -1159,7 +1295,7 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
         continue;
       }
       if (!contains(node.readBeforeWrite, index) &&
-          contains(node.mustWrite, index)) {
+          isMustWriteOnAllLiveExits(index)) {
         overwriteLocals.push_back(index);
         continue;
       }
@@ -1168,7 +1304,7 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
     SmallVector<Index, 2> passthroughLocals;
     for (auto& w : written) {
       if (!contains(node.locals, w.index) &&
-          !contains(node.mustWrite, w.index)) {
+          !isMustWriteOnAllLiveExits(w.index)) {
         auto lc = getLocalCount(node.localCounts, w.index);
         if (func->isParam(w.index) || lc.writes < totalWrites[w.index] ||
             loopDepth > 0) {
@@ -1181,6 +1317,11 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
     Index siteBytes = LocalGetBytes * numInputLocals + CallBytes;
     if (!written.empty()) {
       siteBytes += LocalSetBytes + 4 * (written.size() - 1);
+      if (exitBlockLabel.is()) {
+        siteBytes += 4;
+      }
+    } else if (exitBlockLabel.is()) {
+      siteBytes += 2;
     }
     if (node.bytes <= siteBytes) {
       return;
@@ -1195,6 +1336,9 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
     rehash(siteHash, written.size());
     rehash(siteHash, internalLocals.size());
     rehash(siteHash, passthroughLocals.size());
+    if (exitBlockLabel.is()) {
+      rehash(siteHash, uint32_t(1));
+    }
 
     info.sites.emplace_back();
     auto& site = info.sites.back();
@@ -1203,6 +1347,7 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
     site.sliceOffset = sliceOffset;
     site.sliceLen = sliceLen;
     site.trailingSet = trailingSet;
+    site.exitBlockLabel = exitBlockLabel;
     site.hash = siteHash;
     site.bytes = node.bytes;
     site.written = std::move(written);
@@ -1401,6 +1546,9 @@ struct Scanner : public PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>> {
         return !curr->cast<CallIndirect>()->isReturn;
       case Expression::CallRefId:
         return !curr->cast<CallRef>()->isReturn;
+      case Expression::GlobalGetId:
+        return !allowEarlyExitSlices ||
+               !curr->cast<GlobalGet>()->name.startsWith("oe$out_");
       case Expression::GlobalSetId:
         return !curr->cast<GlobalSet>()->name.startsWith("oe$out_");
       default:
@@ -1581,12 +1729,12 @@ struct Replacer : public WalkerPass<
       Expression* firstSet = builder.makeLocalSet(
         firstWritten.index,
         builder.makeCall(replacement.helper, args, firstWritten.type));
-      if (site->written.size() == 1) {
+      if (site->written.size() == 1 && !site->exitBlockLabel.is()) {
         return firstSet;
       }
       assert(site->key->scratchGlobals.size() == site->written.size() - 1);
       std::vector<Expression*> stmts;
-      stmts.reserve(site->written.size());
+      stmts.reserve(site->written.size() + (site->exitBlockLabel.is() ? 1 : 0));
       stmts.push_back(firstSet);
       for (Index j = 1; j < site->written.size(); j++) {
         auto& w = site->written[j];
@@ -1594,7 +1742,20 @@ struct Replacer : public WalkerPass<
           w.index,
           builder.makeGlobalGet(site->key->scratchGlobals[j - 1], w.type)));
       }
+      if (site->exitBlockLabel.is()) {
+        assert(site->key->branchScratchGlobal.is());
+        stmts.push_back(builder.makeBreak(
+          site->exitBlockLabel,
+          nullptr,
+          builder.makeGlobalGet(site->key->branchScratchGlobal, Type::i32)));
+      }
       return builder.makeBlock(stmts, Type::none);
+    }
+    if (site->exitBlockLabel.is()) {
+      return builder.makeBreak(
+        site->exitBlockLabel,
+        nullptr,
+        builder.makeCall(replacement.helper, args, Type::i32));
     }
     Type callType = type;
     if (site->key->helper && type != Type::unreachable &&
@@ -1720,6 +1881,9 @@ struct OutlineExpressions : public Pass {
   bool constHoles = false;
   // Whether reference-typed local holes are canonicalized to demanded types.
   bool canonicalizeLocalHoles = false;
+  // Whether block slices that early-exit their enclosing block via unvalued
+  // br / br_if are eligible for outlining.
+  bool allowEarlyExitSlices = false;
   // Whether module functions have precomputed GlobalEffects summaries.
   bool hasModuleEffects = false;
   RankTables ranks;
@@ -1739,6 +1903,7 @@ struct OutlineExpressions : public Pass {
       getArgumentOrDefault("outline-expressions-mode", ""));
     bool forceRankAware =
       name == "rank-aware" || hasArgument("outline-expressions-rank-aware");
+    allowEarlyExitSlices = forceRankAware || wasm->functions.size() <= 128;
     bool activeMode =
       (name.empty() && mode == Mode::All && getPassOptions().shrinkLevel > 0) ||
       forceRankAware;
@@ -3446,8 +3611,14 @@ struct OutlineExpressions : public Pass {
         if (func->imported()) {
           return;
         }
-        Scanner(
-          *wasm, func, info, ranks, mode, constHoles, canonicalizeLocalHoles)
+        Scanner(*wasm,
+                func,
+                info,
+                ranks,
+                mode,
+                constHoles,
+                canonicalizeLocalHoles,
+                allowEarlyExitSlices)
           .walk(func->body);
         noteParents(func->body, info);
       });
@@ -3527,11 +3698,16 @@ struct OutlineExpressions : public Pass {
             // into scratch globals, and declares any written locals that are
             // not parameters.
             cost += LocalSetBytes + 4 * int64_t(site->written.size() - 1);
+            if (site->exitBlockLabel.is()) {
+              cost += 4;
+            }
             for (auto& w : site->written) {
               if (!isWrittenParam(site, w.index)) {
                 cost += LocalSetBytes;
               }
             }
+          } else if (site->exitBlockLabel.is()) {
+            cost += 2;
           }
           outline = saved > cost;
         }
@@ -3732,7 +3908,8 @@ struct OutlineExpressions : public Pass {
     if (leftSite->written.size() != rightSite->written.size() ||
         leftSite->internalLocals.size() != rightSite->internalLocals.size() ||
         leftSite->passthroughLocals.size() !=
-          rightSite->passthroughLocals.size()) {
+          rightSite->passthroughLocals.size() ||
+        leftSite->exitBlockLabel.is() != rightSite->exitBlockLabel.is()) {
       return false;
     }
     std::unordered_map<Index, Index> leftToRight, rightToLeft;
@@ -3843,6 +4020,33 @@ struct OutlineExpressions : public Pass {
           mismatch = true;
         }
         return true;
+      }
+      if (leftSite->exitBlockLabel.is()) {
+        auto* leftBr = left->dynCast<Break>();
+        auto* rightBr = right->dynCast<Break>();
+        bool leftIsExit = leftBr && leftBr->name == leftSite->exitBlockLabel;
+        bool rightIsExit = rightBr && rightBr->name == rightSite->exitBlockLabel;
+        if (leftIsExit || rightIsExit) {
+          if (!leftIsExit || !rightIsExit || leftBr->type != rightBr->type ||
+              bool(leftBr->value) != bool(rightBr->value) ||
+              bool(leftBr->condition) != bool(rightBr->condition)) {
+            mismatch = true;
+            return true;
+          }
+          if (leftBr->value &&
+              !ExpressionAnalyzer::flexibleEqual(
+                leftBr->value, rightBr->value, comparer)) {
+            mismatch = true;
+            return true;
+          }
+          if (leftBr->condition &&
+              !ExpressionAnalyzer::flexibleEqual(
+                leftBr->condition, rightBr->condition, comparer)) {
+            mismatch = true;
+            return true;
+          }
+          return true;
+        }
       }
       return false;
     };
@@ -4292,7 +4496,11 @@ struct OutlineExpressions : public Pass {
       return CallBytes + 1;
     }
     if (!site->written.empty()) {
-      return CallBytes + LocalSetBytes + 4 * (site->written.size() - 1);
+      return CallBytes + LocalSetBytes + 4 * (site->written.size() - 1) +
+             (site->exitBlockLabel.is() ? 4 : 0);
+    }
+    if (site->exitBlockLabel.is()) {
+      return CallBytes + 2;
     }
     return CallBytes;
   }
@@ -4366,6 +4574,9 @@ struct OutlineExpressions : public Pass {
     if (!site->written.empty()) {
       return site->written[0].type;
     }
+    if (site->exitBlockLabel.is()) {
+      return Type::i32;
+    }
     Type type = site->getType();
     return type == Type::unreachable ? Type::none : type;
   }
@@ -4409,7 +4620,7 @@ struct OutlineExpressions : public Pass {
   void noteExistingHelper(Function* func,
                           Site& site,
                           const std::unordered_set<Name>& escapedFuncs) {
-    if (!site.written.empty() ||
+    if (!site.written.empty() || site.exitBlockLabel.is() ||
         (!site.internalLocals.empty() &&
          func->vars.size() != site.internalLocals.size())) {
       return;
@@ -4660,6 +4871,137 @@ struct OutlineExpressions : public Pass {
       vars.push_back(site->func->getLocalType(internalIdx));
       replacer.paramOfLocal[internalIdx] = helperIdx;
     }
+    std::unordered_set<Name> usedScratchGlobals;
+    for (auto* gg : FindAll<GlobalGet>(body).list) {
+      if (gg->name.startsWith("oe$out_")) {
+        usedScratchGlobals.insert(gg->name);
+      }
+    }
+    std::unordered_map<Type, Index> typeCounts;
+    auto allocHelperScratchGlobal = [&](Type t) {
+      while (true) {
+        Index rank = typeCounts[t]++;
+        Name g = getScratchGlobal(t, rank);
+        if (!usedScratchGlobals.count(g)) {
+          return g;
+        }
+      }
+    };
+    auto rewriteExitBlock = [&](Block* sliceBlock) -> Expression* {
+      bool convertedTailBreak = false;
+      if (!sliceBlock->list.empty()) {
+        if (auto* lastBr = sliceBlock->list.back()->dynCast<Break>()) {
+          if (lastBr->name == site->exitBlockLabel && !lastBr->value) {
+            if (lastBr->condition && lastBr->condition->type == Type::i32) {
+              sliceBlock->list.back() = lastBr->condition;
+              convertedTailBreak = true;
+            } else if (!lastBr->condition) {
+              sliceBlock->list.back() = builder.makeConst(int32_t(1));
+              convertedTailBreak = true;
+            }
+          }
+        }
+      }
+      if (!convertedTailBreak) {
+        sliceBlock->list.push_back(builder.makeConst(int32_t(0)));
+      }
+      bool onlyTopLevelCondBreaks = true;
+      for (Index j = 0; j + 1 < sliceBlock->list.size(); j++) {
+        Expression* stmt = sliceBlock->list[j];
+        if (auto* br = stmt->dynCast<Break>()) {
+          if (br->name == site->exitBlockLabel) {
+            if (br->value || !br->condition ||
+                br->condition->type != Type::i32 ||
+                BranchUtils::BranchSeeker::has(br->condition,
+                                               site->exitBlockLabel)) {
+              onlyTopLevelCondBreaks = false;
+              break;
+            }
+            continue;
+          }
+        }
+        if (BranchUtils::BranchSeeker::has(stmt, site->exitBlockLabel)) {
+          onlyTopLevelCondBreaks = false;
+          break;
+        }
+      }
+      if (onlyTopLevelCondBreaks &&
+          !BranchUtils::BranchSeeker::has(sliceBlock->list.back(),
+                                          site->exitBlockLabel)) {
+        std::vector<Expression*> curTail;
+        curTail.push_back(sliceBlock->list.back());
+        for (Index j = sliceBlock->list.size() - 1; j > 0;) {
+          j--;
+          Expression* stmt = sliceBlock->list[j];
+          if (auto* br = stmt->dynCast<Break>();
+              br && br->name == site->exitBlockLabel) {
+            std::reverse(curTail.begin(), curTail.end());
+            Expression* elseExpr =
+              curTail.size() == 1 ? curTail[0]
+                                  : builder.makeBlock(curTail, Type::i32);
+            Expression* iff = builder.makeIf(
+              br->condition, builder.makeConst(int32_t(1)), elseExpr, Type::i32);
+            curTail.clear();
+            curTail.push_back(iff);
+          } else {
+            curTail.push_back(stmt);
+          }
+        }
+        if (curTail.size() == 1) {
+          return curTail[0];
+        }
+        std::reverse(curTail.begin(), curTail.end());
+        sliceBlock->list.set(curTail);
+        sliceBlock->finalize(Type::i32);
+        return sliceBlock;
+      }
+      Name exitLabel("oe$exit");
+      Index labelIdx = 0;
+      auto hasLabelConflict = [&](Name cand) {
+        for (auto* b : FindAll<Block>(sliceBlock).list) {
+          if (b->name == cand) {
+            return true;
+          }
+        }
+        for (auto* l : FindAll<Loop>(sliceBlock).list) {
+          if (l->name == cand) {
+            return true;
+          }
+        }
+        return false;
+      };
+      while (exitLabel == site->exitBlockLabel || hasLabelConflict(exitLabel)) {
+        exitLabel = Name("oe$exit_" + std::to_string(++labelIdx));
+      }
+      struct ExitBreakRewriter : public PostWalker<ExitBreakRewriter> {
+        Module& wasm;
+        Name oldLabel;
+        Name newLabel;
+        bool rewroteAny = false;
+        ExitBreakRewriter(Module& wasm, Name oldLabel, Name newLabel)
+          : wasm(wasm), oldLabel(oldLabel), newLabel(newLabel) {}
+        void visitBreak(Break* curr) {
+          if (curr->name == oldLabel) {
+            assert(!curr->value);
+            Builder builder(wasm);
+            rewroteAny = true;
+            curr->name = newLabel;
+            curr->value = builder.makeConst(int32_t(1));
+            curr->finalize();
+            if (curr->condition) {
+              replaceCurrent(builder.makeDrop(curr));
+            }
+          }
+        }
+      } exitRewriter(*wasm, site->exitBlockLabel, exitLabel);
+      Expression* sliceRoot = sliceBlock;
+      exitRewriter.walk(sliceRoot);
+      if (exitRewriter.rewroteAny) {
+        sliceBlock->name = exitLabel;
+      }
+      sliceBlock->finalize(Type::i32);
+      return sliceBlock;
+    };
     if (!site->written.empty()) {
       SmallVector<Index, 4> writtenHelperIndices;
       for (auto& w : site->written) {
@@ -4675,16 +5017,32 @@ struct OutlineExpressions : public Pass {
         writtenHelperIndices.push_back(index);
       }
       if (site->written.size() >= 2) {
-        std::unordered_map<Type, Index> typeCounts;
         for (Index j = 1; j < site->written.size(); j++) {
-          Type t = site->written[j].type;
-          Index rank = typeCounts[t]++;
-          key.scratchGlobals.push_back(getScratchGlobal(t, rank));
+          key.scratchGlobals.push_back(
+            allocHelperScratchGlobal(site->written[j].type));
         }
+      }
+      if (site->exitBlockLabel.is()) {
+        key.branchScratchGlobal = allocHelperScratchGlobal(Type::i32);
       }
       replacer.walk(body);
       auto& firstWritten = site->written[0];
-      if (site->sliceLen > 0) {
+      if (site->exitBlockLabel.is()) {
+        Expression* exitExpr = rewriteExitBlock(body->cast<Block>());
+        std::vector<Expression*> list;
+        list.reserve(site->written.size() + 1);
+        list.push_back(
+          builder.makeGlobalSet(key.branchScratchGlobal, exitExpr));
+        for (Index j = site->written.size() - 1; j >= 1; j--) {
+          list.push_back(builder.makeGlobalSet(
+            key.scratchGlobals[j - 1],
+            builder.makeLocalGet(writtenHelperIndices[j],
+                                 site->written[j].type)));
+        }
+        list.push_back(
+          builder.makeLocalGet(writtenHelperIndices[0], firstWritten.type));
+        body = builder.makeBlock(list, firstWritten.type);
+      } else if (site->sliceLen > 0) {
         auto* block = body->cast<Block>();
         for (Index j = site->written.size() - 1; j >= 1; j--) {
           block->list.push_back(builder.makeGlobalSet(
@@ -4711,6 +5069,9 @@ struct OutlineExpressions : public Pass {
       }
     } else {
       replacer.walk(body);
+      if (site->exitBlockLabel.is()) {
+        body = rewriteExitBlock(body->cast<Block>());
+      }
     }
     auto name = Names::getValidFunctionName(*wasm, "outlined");
     Function* newFunc = wasm->addFunction(
@@ -4718,7 +5079,7 @@ struct OutlineExpressions : public Pass {
                             Signature(Type(params), getHelperResults(site)),
                             std::move(vars),
                             body));
-    if (canonicalizeLocalHoles) {
+    if (canonicalizeLocalHoles || site->exitBlockLabel.is()) {
       ReFinalize().walkFunctionInModule(newFunc, wasm);
     }
     initHelperEffects(newFunc);
