@@ -164,15 +164,7 @@
   )
 
   ;; CHECK:      (func $11 (type $1) (param $0 i32) (result i32)
-  ;; CHECK-NEXT:  (if
-  ;; CHECK-NEXT:   (local.get $0)
-  ;; CHECK-NEXT:   (then
-  ;; CHECK-NEXT:    (return
-  ;; CHECK-NEXT:     (local.get $0)
-  ;; CHECK-NEXT:    )
-  ;; CHECK-NEXT:   )
-  ;; CHECK-NEXT:  )
-  ;; CHECK-NEXT:  (i32.const 0)
+  ;; CHECK-NEXT:  (local.get $0)
   ;; CHECK-NEXT: )
   (func $11 (export "eliminate-redundant-checks-1") (param $0 i32) (result i32)
     (if
@@ -202,15 +194,7 @@
     (i32.const 0)
   )
   ;; CHECK:      (func $12 (type $0) (param $0 i32) (param $1 i32) (result i32)
-  ;; CHECK-NEXT:  (if
-  ;; CHECK-NEXT:   (local.get $0)
-  ;; CHECK-NEXT:   (then
-  ;; CHECK-NEXT:    (return
-  ;; CHECK-NEXT:     (local.get $0)
-  ;; CHECK-NEXT:    )
-  ;; CHECK-NEXT:   )
-  ;; CHECK-NEXT:  )
-  ;; CHECK-NEXT:  (i32.const 0)
+  ;; CHECK-NEXT:  (local.get $0)
   ;; CHECK-NEXT: )
   (func $12 (export "eliminate-redundant-checks-2") (param $0 i32) (param $1 i32) (result i32)
     (if
@@ -240,19 +224,15 @@
     (i32.const 0)
   )
   ;; CHECK:      (func $13 (type $0) (param $0 i32) (param $1 i32) (result i32)
-  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:  (select
+  ;; CHECK-NEXT:   (local.get $0)
+  ;; CHECK-NEXT:   (i32.const 0)
   ;; CHECK-NEXT:   (select
   ;; CHECK-NEXT:    (local.get $1)
   ;; CHECK-NEXT:    (i32.const 0)
   ;; CHECK-NEXT:    (local.get $0)
   ;; CHECK-NEXT:   )
-  ;; CHECK-NEXT:   (then
-  ;; CHECK-NEXT:    (return
-  ;; CHECK-NEXT:     (local.get $0)
-  ;; CHECK-NEXT:    )
-  ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
-  ;; CHECK-NEXT:  (i32.const 0)
   ;; CHECK-NEXT: )
   (func $13 (export "eliminate-redundant-checks-skip-1") (param $0 i32) (param $1 i32) (result i32)
     (if
@@ -269,19 +249,15 @@
   )
 
   ;; CHECK:      (func $14 (type $0) (param $0 i32) (param $1 i32) (result i32)
-  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:  (select
+  ;; CHECK-NEXT:   (local.get $0)
+  ;; CHECK-NEXT:   (i32.const 0)
   ;; CHECK-NEXT:   (select
   ;; CHECK-NEXT:    (i32.const 0)
   ;; CHECK-NEXT:    (local.get $1)
   ;; CHECK-NEXT:    (local.get $0)
   ;; CHECK-NEXT:   )
-  ;; CHECK-NEXT:   (then
-  ;; CHECK-NEXT:    (return
-  ;; CHECK-NEXT:     (local.get $0)
-  ;; CHECK-NEXT:    )
-  ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
-  ;; CHECK-NEXT:  (i32.const 0)
   ;; CHECK-NEXT: )
   (func $14 (export "eliminate-redundant-checks-skip-2") (param $0 i32) (param $1 i32) (result i32)
     (if
