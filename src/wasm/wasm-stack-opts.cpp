@@ -47,6 +47,7 @@ void StackIROptimizer::run() {
   if (passOptions.optimizeLevel >= 3 || passOptions.shrinkLevel >= 1) {
     local2Stack();
   }
+  vacuum();
   removeUnneededBlocks();
   dce();
   vacuum();
@@ -780,8 +781,9 @@ void StackIROptimizer::local2Stack() {
 }
 
 // There may be unnecessary blocks we can remove: blocks without arriving
-// branches are always ok to remove.
-// TODO: A branch to a block in an if body can become a branch to that if body.
+// branches are always ok to remove, as are blocks whose end coincides with an
+// enclosing function body, if arm, if expression, or outer block of the same
+// written result type.
 void StackIROptimizer::removeUnneededBlocks() {
   // First, find all branch targets.
   std::unordered_set<Name> targets;
@@ -803,6 +805,235 @@ void StackIROptimizer::removeUnneededBlocks() {
         inst = nullptr;
       }
     }
+  }
+
+  auto sameWrittenType = [&](Type a, Type b) {
+    return a != Type::unreachable && b != Type::unreachable &&
+           a.asWrittenGivenFeatures(features) ==
+             b.asWrittenGivenFeatures(features);
+  };
+
+  auto nextNonNull = [&](Index idx) -> Index {
+    for (Index j = idx + 1; j < insts.size(); j++) {
+      if (insts[j]) {
+        return j;
+      }
+    }
+    return insts.size();
+  };
+
+  // Index the remaining control-flow begins and ends.
+  std::unordered_map<Block*, Index> blockBeginIdx;
+  std::unordered_map<Block*, Index> blockEndIdx;
+  std::unordered_map<If*, Index> ifBeginIdx;
+  std::unordered_map<If*, Index> ifElseIdx;
+  std::unordered_map<If*, Index> ifEndIdx;
+  std::vector<Block*> blocksByEndOrder;
+  for (Index i = 0; i < insts.size(); i++) {
+    auto* inst = insts[i];
+    if (!inst) {
+      continue;
+    }
+    switch (inst->op) {
+      case StackInst::BlockBegin:
+        blockBeginIdx[inst->origin->cast<Block>()] = i;
+        break;
+      case StackInst::BlockEnd: {
+        auto* b = inst->origin->cast<Block>();
+        blockEndIdx[b] = i;
+        blocksByEndOrder.push_back(b);
+        break;
+      }
+      case StackInst::IfBegin:
+        ifBeginIdx[inst->origin->cast<If>()] = i;
+        break;
+      case StackInst::IfElse:
+        ifElseIdx[inst->origin->cast<If>()] = i;
+        break;
+      case StackInst::IfEnd:
+        ifEndIdx[inst->origin->cast<If>()] = i;
+        break;
+      default:
+        break;
+    }
+  }
+
+  auto elideBlock = [&](Block* b) {
+    auto itBegin = blockBeginIdx.find(b);
+    auto itEnd = blockEndIdx.find(b);
+    if (itBegin == blockBeginIdx.end() || itEnd == blockEndIdx.end()) {
+      return false;
+    }
+    insts[itBegin->second] = nullptr;
+    insts[itEnd->second] = nullptr;
+    return true;
+  };
+
+  auto bindLabel = [&](Name& slot, Name newName) {
+    if (!slot.is()) {
+      slot = newName;
+    } else if (slot != newName) {
+      insts.labelAliases[newName] = slot;
+    }
+  };
+
+  // 1(c) Nested tail-Block elision: when BlockEnd(b) is immediately followed
+  // by BlockEnd(outerB) and both blocks have the same written result type,
+  // elide b and alias its label to outerB->name. Iterate in forward BlockEnd
+  // order so inner blocks are elided into outer blocks before the outer blocks
+  // are considered for function-body or if-scope elision.
+  for (auto* b : blocksByEndOrder) {
+    auto itBegin = blockBeginIdx.find(b);
+    auto itEnd = blockEndIdx.find(b);
+    if (itBegin == blockBeginIdx.end() || itEnd == blockEndIdx.end() ||
+        !insts[itEnd->second]) {
+      continue;
+    }
+    Index nextIdx = nextNonNull(itEnd->second);
+    if (nextIdx >= insts.size()) {
+      continue;
+    }
+    auto* nextInst = insts[nextIdx];
+    if (nextInst->op == StackInst::BlockEnd) {
+      auto* outerB = nextInst->origin->cast<Block>();
+      auto itOuterBegin = blockBeginIdx.find(outerB);
+      if (itOuterBegin != blockBeginIdx.end() &&
+          itOuterBegin->second < itBegin->second &&
+          sameWrittenType(b->type, outerB->type)) {
+        if (elideBlock(b)) {
+          insts.labelAliases[b->name] = outerB->name;
+        }
+      }
+    }
+  }
+
+  // 1(b.1) & 1(b.2) If-arm tail-Block elision: when BlockEnd(b) inside an If
+  // arm is immediately followed by IfElse(iff) or IfEnd(iff) and b has the
+  // same written result type as iff, elide b and bind iff's arm label.
+  for (auto* b : blocksByEndOrder) {
+    auto itBegin = blockBeginIdx.find(b);
+    auto itEnd = blockEndIdx.find(b);
+    if (itBegin == blockBeginIdx.end() || itEnd == blockEndIdx.end() ||
+        !insts[itEnd->second]) {
+      continue;
+    }
+    Index nextIdx = nextNonNull(itEnd->second);
+    if (nextIdx >= insts.size()) {
+      continue;
+    }
+    auto* nextInst = insts[nextIdx];
+    if (nextInst->op == StackInst::IfElse) {
+      auto* iff = nextInst->origin->cast<If>();
+      auto itIfBegin = ifBeginIdx.find(iff);
+      if (itIfBegin != ifBeginIdx.end() &&
+          itIfBegin->second < itBegin->second &&
+          sameWrittenType(b->type, iff->type)) {
+        if (elideBlock(b)) {
+          bindLabel(insts.ifTrueLabels[iff], b->name);
+        }
+      }
+    } else if (nextInst->op == StackInst::IfEnd) {
+      auto* iff = nextInst->origin->cast<If>();
+      auto itIfBegin = ifBeginIdx.find(iff);
+      if (itIfBegin != ifBeginIdx.end() &&
+          itIfBegin->second < itBegin->second &&
+          sameWrittenType(b->type, iff->type)) {
+        auto itIfElse = ifElseIdx.find(iff);
+        if (itIfElse == ifElseIdx.end()) {
+          // 1-arm If: b is inside ifTrue.
+          if (elideBlock(b)) {
+            bindLabel(insts.ifTrueLabels[iff], b->name);
+          }
+        } else if (itIfElse->second < itBegin->second) {
+          // 2-arm If: b is inside ifFalse.
+          if (elideBlock(b)) {
+            bindLabel(insts.ifFalseLabels[iff], b->name);
+          }
+        }
+      }
+    }
+  }
+
+  // 1(b.3) If-wrapper Block elision: when BlockEnd(b) is immediately after
+  // IfEnd(iff), BlockBegin(b) precedes IfBegin(iff), no instruction in
+  // (BlockBegin(b), IfBegin(iff)] branches to b->name, and b has the same
+  // written result type as iff, elide b and bind iff's arm label(s).
+  for (auto* b : blocksByEndOrder) {
+    auto itBegin = blockBeginIdx.find(b);
+    auto itEnd = blockEndIdx.find(b);
+    if (itBegin == blockBeginIdx.end() || itEnd == blockEndIdx.end() ||
+        !insts[itEnd->second]) {
+      continue;
+    }
+    Index prevIdx = itEnd->second;
+    while (prevIdx > 0 && !insts[prevIdx - 1]) {
+      prevIdx--;
+    }
+    if (prevIdx == 0) {
+      continue;
+    }
+    auto* prevInst = insts[prevIdx - 1];
+    if (prevInst->op != StackInst::IfEnd) {
+      continue;
+    }
+    auto* iff = prevInst->origin->cast<If>();
+    auto itIfBegin = ifBeginIdx.find(iff);
+    if (itIfBegin == ifBeginIdx.end() ||
+        !(itBegin->second < itIfBegin->second) ||
+        !sameWrittenType(b->type, iff->type)) {
+      continue;
+    }
+    bool branchBeforeIf = false;
+    for (Index j = itBegin->second + 1; j <= itIfBegin->second; j++) {
+      if (!insts[j]) {
+        continue;
+      }
+      BranchUtils::operateOnScopeNameUses(insts[j]->origin, [&](Name& name) {
+        Name resolved = name;
+        while (true) {
+          auto it = insts.labelAliases.find(resolved);
+          if (it == insts.labelAliases.end()) {
+            break;
+          }
+          resolved = it->second;
+        }
+        if (resolved == b->name) {
+          branchBeforeIf = true;
+        }
+      });
+      if (branchBeforeIf) {
+        break;
+      }
+    }
+    if (branchBeforeIf) {
+      continue;
+    }
+    if (elideBlock(b)) {
+      bindLabel(insts.ifTrueLabels[iff], b->name);
+      if (ifElseIdx.contains(iff)) {
+        bindLabel(insts.ifFalseLabels[iff], b->name);
+      }
+    }
+  }
+
+  // 1(a) Function-body tail Block elision: when BlockEnd(b) is the last
+  // non-null instruction in stackIR and b has the same written result type as
+  // func->getResults(), elide b and bind functionBodyLabel.
+  for (Index i = insts.size(); i > 0; i--) {
+    auto* inst = insts[i - 1];
+    if (!inst) {
+      continue;
+    }
+    if (inst->op == StackInst::BlockEnd) {
+      auto* b = inst->origin->cast<Block>();
+      if (sameWrittenType(b->type, func->getResults())) {
+        if (elideBlock(b)) {
+          bindLabel(insts.functionBodyLabel, b->name);
+          continue;
+        }
+      }
+    }
+    break;
   }
 }
 

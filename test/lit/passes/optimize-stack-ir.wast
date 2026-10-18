@@ -97,39 +97,37 @@
 
   ;; CHECK:      (func $importedDoubles (type $4) (result f64)
   ;; CHECK-NEXT:  (local $temp f64)
-  ;; CHECK-NEXT:  block $topmost (result f64)
-  ;; CHECK-NEXT:   i32.const 8
-  ;; CHECK-NEXT:   f64.load
-  ;; CHECK-NEXT:   i32.const 16
-  ;; CHECK-NEXT:   f64.load
-  ;; CHECK-NEXT:   f64.add
-  ;; CHECK-NEXT:   i32.const 16
-  ;; CHECK-NEXT:   f64.load
-  ;; CHECK-NEXT:   f64.neg
-  ;; CHECK-NEXT:   f64.add
-  ;; CHECK-NEXT:   i32.const 8
-  ;; CHECK-NEXT:   f64.load
-  ;; CHECK-NEXT:   f64.neg
-  ;; CHECK-NEXT:   f64.add
-  ;; CHECK-NEXT:   local.set $temp
-  ;; CHECK-NEXT:   i32.const 24
-  ;; CHECK-NEXT:   i32.load
-  ;; CHECK-NEXT:   i32.const 0
-  ;; CHECK-NEXT:   i32.gt_s
-  ;; CHECK-NEXT:   if
-  ;; CHECK-NEXT:    f64.const -3.4
-  ;; CHECK-NEXT:    br $topmost
-  ;; CHECK-NEXT:   end
-  ;; CHECK-NEXT:   i32.const 32
-  ;; CHECK-NEXT:   f64.load
-  ;; CHECK-NEXT:   f64.const 0
-  ;; CHECK-NEXT:   f64.gt
-  ;; CHECK-NEXT:   if
-  ;; CHECK-NEXT:    f64.const 5.6
-  ;; CHECK-NEXT:    br $topmost
-  ;; CHECK-NEXT:   end
-  ;; CHECK-NEXT:   f64.const 1.2
+  ;; CHECK-NEXT:  i32.const 8
+  ;; CHECK-NEXT:  f64.load
+  ;; CHECK-NEXT:  i32.const 16
+  ;; CHECK-NEXT:  f64.load
+  ;; CHECK-NEXT:  f64.add
+  ;; CHECK-NEXT:  i32.const 16
+  ;; CHECK-NEXT:  f64.load
+  ;; CHECK-NEXT:  f64.neg
+  ;; CHECK-NEXT:  f64.add
+  ;; CHECK-NEXT:  i32.const 8
+  ;; CHECK-NEXT:  f64.load
+  ;; CHECK-NEXT:  f64.neg
+  ;; CHECK-NEXT:  f64.add
+  ;; CHECK-NEXT:  local.set $temp
+  ;; CHECK-NEXT:  i32.const 24
+  ;; CHECK-NEXT:  i32.load
+  ;; CHECK-NEXT:  i32.const 0
+  ;; CHECK-NEXT:  i32.gt_s
+  ;; CHECK-NEXT:  if
+  ;; CHECK-NEXT:   f64.const -3.4
+  ;; CHECK-NEXT:   br $topmost
   ;; CHECK-NEXT:  end
+  ;; CHECK-NEXT:  i32.const 32
+  ;; CHECK-NEXT:  f64.load
+  ;; CHECK-NEXT:  f64.const 0
+  ;; CHECK-NEXT:  f64.gt
+  ;; CHECK-NEXT:  if
+  ;; CHECK-NEXT:   f64.const 5.6
+  ;; CHECK-NEXT:   br $topmost
+  ;; CHECK-NEXT:  end
+  ;; CHECK-NEXT:  f64.const 1.2
   ;; CHECK-NEXT: )
   (func $importedDoubles (type $4) (result f64)
     (local $temp f64)
@@ -192,37 +190,35 @@
   ;; CHECK-NEXT:  (local $t f64)
   ;; CHECK-NEXT:  (local $Int f64)
   ;; CHECK-NEXT:  (local $Double i32)
-  ;; CHECK-NEXT:  block $topmost (result f64)
-  ;; CHECK-NEXT:   local.get $x
-  ;; CHECK-NEXT:   f64.const 0
-  ;; CHECK-NEXT:   f64.gt
-  ;; CHECK-NEXT:   if
-  ;; CHECK-NEXT:    f64.const 1.2
-  ;; CHECK-NEXT:    br $topmost
-  ;; CHECK-NEXT:   end
-  ;; CHECK-NEXT:   local.get $Int
-  ;; CHECK-NEXT:   f64.const 0
-  ;; CHECK-NEXT:   f64.gt
-  ;; CHECK-NEXT:   if
-  ;; CHECK-NEXT:    f64.const -3.4
-  ;; CHECK-NEXT:    br $topmost
-  ;; CHECK-NEXT:   end
-  ;; CHECK-NEXT:   local.get $Double
-  ;; CHECK-NEXT:   i32.const 0
-  ;; CHECK-NEXT:   i32.gt_s
-  ;; CHECK-NEXT:   if
-  ;; CHECK-NEXT:    f64.const 5.6
-  ;; CHECK-NEXT:    br $topmost
-  ;; CHECK-NEXT:   end
-  ;; CHECK-NEXT:   local.get $x
-  ;; CHECK-NEXT:   local.get $y
-  ;; CHECK-NEXT:   f64.lt
-  ;; CHECK-NEXT:   if
-  ;; CHECK-NEXT:    local.get $x
-  ;; CHECK-NEXT:    br $topmost
-  ;; CHECK-NEXT:   end
-  ;; CHECK-NEXT:   local.get $y
+  ;; CHECK-NEXT:  local.get $x
+  ;; CHECK-NEXT:  f64.const 0
+  ;; CHECK-NEXT:  f64.gt
+  ;; CHECK-NEXT:  if
+  ;; CHECK-NEXT:   f64.const 1.2
+  ;; CHECK-NEXT:   br $topmost
   ;; CHECK-NEXT:  end
+  ;; CHECK-NEXT:  local.get $Int
+  ;; CHECK-NEXT:  f64.const 0
+  ;; CHECK-NEXT:  f64.gt
+  ;; CHECK-NEXT:  if
+  ;; CHECK-NEXT:   f64.const -3.4
+  ;; CHECK-NEXT:   br $topmost
+  ;; CHECK-NEXT:  end
+  ;; CHECK-NEXT:  local.get $Double
+  ;; CHECK-NEXT:  i32.const 0
+  ;; CHECK-NEXT:  i32.gt_s
+  ;; CHECK-NEXT:  if
+  ;; CHECK-NEXT:   f64.const 5.6
+  ;; CHECK-NEXT:   br $topmost
+  ;; CHECK-NEXT:  end
+  ;; CHECK-NEXT:  local.get $x
+  ;; CHECK-NEXT:  local.get $y
+  ;; CHECK-NEXT:  f64.lt
+  ;; CHECK-NEXT:  if
+  ;; CHECK-NEXT:   local.get $x
+  ;; CHECK-NEXT:   br $topmost
+  ;; CHECK-NEXT:  end
+  ;; CHECK-NEXT:  local.get $y
   ;; CHECK-NEXT: )
   (func $doubleCompares (type $FUNCSIG$ddd) (param $x f64) (param $y f64) (result f64)
     (local $t f64)
@@ -381,65 +377,59 @@
   )
 
   ;; CHECK:      (func $switcher (type $6) (param $x i32) (result i32)
-  ;; CHECK-NEXT:  block $topmost (result i32)
-  ;; CHECK-NEXT:   block $switch-default$3
-  ;; CHECK-NEXT:    block $switch-case$2
-  ;; CHECK-NEXT:     block $switch-case$1
-  ;; CHECK-NEXT:      local.get $x
-  ;; CHECK-NEXT:      i32.const 1
-  ;; CHECK-NEXT:      i32.sub
-  ;; CHECK-NEXT:      br_table $switch-case$1 $switch-case$2 $switch-default$3
-  ;; CHECK-NEXT:     end
+  ;; CHECK-NEXT:  block $switch-default$3
+  ;; CHECK-NEXT:   block $switch-case$2
+  ;; CHECK-NEXT:    block $switch-case$1
+  ;; CHECK-NEXT:     local.get $x
   ;; CHECK-NEXT:     i32.const 1
-  ;; CHECK-NEXT:     br $topmost
+  ;; CHECK-NEXT:     i32.sub
+  ;; CHECK-NEXT:     br_table $switch-case$1 $switch-case$2 $switch-default$3
   ;; CHECK-NEXT:    end
-  ;; CHECK-NEXT:    i32.const 2
+  ;; CHECK-NEXT:    i32.const 1
   ;; CHECK-NEXT:    br $topmost
   ;; CHECK-NEXT:   end
-  ;; CHECK-NEXT:   block $switch-default$7
-  ;; CHECK-NEXT:    block $switch-case$6
-  ;; CHECK-NEXT:     block $switch-case$5
-  ;; CHECK-NEXT:      local.get $x
-  ;; CHECK-NEXT:      i32.const 5
-  ;; CHECK-NEXT:      i32.sub
-  ;; CHECK-NEXT:      br_table $switch-case$6 $switch-default$7 $switch-default$7 $switch-default$7 $switch-default$7 $switch-default$7 $switch-default$7 $switch-case$5 $switch-default$7
-  ;; CHECK-NEXT:     end
-  ;; CHECK-NEXT:     i32.const 121
-  ;; CHECK-NEXT:     br $topmost
+  ;; CHECK-NEXT:   i32.const 2
+  ;; CHECK-NEXT:   br $topmost
+  ;; CHECK-NEXT:  end
+  ;; CHECK-NEXT:  block $switch-default$7
+  ;; CHECK-NEXT:   block $switch-case$6
+  ;; CHECK-NEXT:    block $switch-case$5
+  ;; CHECK-NEXT:     local.get $x
+  ;; CHECK-NEXT:     i32.const 5
+  ;; CHECK-NEXT:     i32.sub
+  ;; CHECK-NEXT:     br_table $switch-case$6 $switch-default$7 $switch-default$7 $switch-default$7 $switch-default$7 $switch-default$7 $switch-default$7 $switch-case$5 $switch-default$7
   ;; CHECK-NEXT:    end
-  ;; CHECK-NEXT:    i32.const 51
+  ;; CHECK-NEXT:    i32.const 121
   ;; CHECK-NEXT:    br $topmost
   ;; CHECK-NEXT:   end
-  ;; CHECK-NEXT:   block $label$break$Lout
-  ;; CHECK-NEXT:    block $switch-default$16
-  ;; CHECK-NEXT:     block $switch-case$15
-  ;; CHECK-NEXT:      block $switch-case$12
-  ;; CHECK-NEXT:       block $switch-case$9
-  ;; CHECK-NEXT:        block $switch-case$8
-  ;; CHECK-NEXT:         local.get $x
-  ;; CHECK-NEXT:         i32.const 2
-  ;; CHECK-NEXT:         i32.sub
-  ;; CHECK-NEXT:         br_table $switch-case$15 $switch-default$16 $switch-default$16 $switch-case$12 $switch-default$16 $switch-default$16 $switch-default$16 $switch-default$16 $switch-case$9 $switch-default$16 $switch-case$8 $switch-default$16
-  ;; CHECK-NEXT:        end
-  ;; CHECK-NEXT:        br $label$break$Lout
-  ;; CHECK-NEXT:       end
-  ;; CHECK-NEXT:       br $label$break$Lout
+  ;; CHECK-NEXT:   i32.const 51
+  ;; CHECK-NEXT:   br $topmost
+  ;; CHECK-NEXT:  end
+  ;; CHECK-NEXT:  block $label$break$Lout
+  ;; CHECK-NEXT:   block $switch-case$15
+  ;; CHECK-NEXT:    block $switch-case$12
+  ;; CHECK-NEXT:     block $switch-case$9
+  ;; CHECK-NEXT:      block $switch-case$8
+  ;; CHECK-NEXT:       local.get $x
+  ;; CHECK-NEXT:       i32.const 2
+  ;; CHECK-NEXT:       i32.sub
+  ;; CHECK-NEXT:       br_table $switch-case$15 $switch-default$16 $switch-default$16 $switch-case$12 $switch-default$16 $switch-default$16 $switch-default$16 $switch-default$16 $switch-case$9 $switch-default$16 $switch-case$8 $switch-default$16
   ;; CHECK-NEXT:      end
-  ;; CHECK-NEXT:      block $while-out$10
-  ;; CHECK-NEXT:       loop $while-in$11
-  ;; CHECK-NEXT:        br $while-out$10
-  ;; CHECK-NEXT:       end
-  ;; CHECK-NEXT:       unreachable
-  ;; CHECK-NEXT:      end
-  ;; CHECK-NEXT:     end
-  ;; CHECK-NEXT:     loop $while-in$14
   ;; CHECK-NEXT:      br $label$break$Lout
   ;; CHECK-NEXT:     end
-  ;; CHECK-NEXT:     unreachable
+  ;; CHECK-NEXT:     br $label$break$Lout
   ;; CHECK-NEXT:    end
+  ;; CHECK-NEXT:    loop $while-in$11
+  ;; CHECK-NEXT:     br $while-out$10
+  ;; CHECK-NEXT:    end
+  ;; CHECK-NEXT:    unreachable
   ;; CHECK-NEXT:   end
-  ;; CHECK-NEXT:   i32.const 0
+  ;; CHECK-NEXT:   loop $while-in$14
+  ;; CHECK-NEXT:    br $label$break$Lout
+  ;; CHECK-NEXT:   end
+  ;; CHECK-NEXT:   unreachable
   ;; CHECK-NEXT:  end
+  ;; CHECK-NEXT:  i32.const 0
   ;; CHECK-NEXT: )
   (func $switcher (type $6) (param $x i32) (result i32)
     (block $topmost (result i32)
@@ -529,9 +519,7 @@
   )
 
   ;; CHECK:      (func $blocker (type $FUNCSIG$v)
-  ;; CHECK-NEXT:  block $label$break$L
-  ;; CHECK-NEXT:   br $label$break$L
-  ;; CHECK-NEXT:  end
+  ;; CHECK-NEXT:  br $label$break$L
   ;; CHECK-NEXT: )
   (func $blocker (type $FUNCSIG$v)
     (block $label$break$L
@@ -1629,6 +1617,56 @@
         (local.get $temp)
       )
       (local.get $temp)
+    )
+  )
+
+  ;; Elide blocks that share their end and written result type with an enclosing
+  ;; if arm, if wrapper, nested tail block, or function body.
+  ;; CHECK:      (func $elide-if-and-tail-blocks (type $6) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  local.get $x
+  ;; CHECK-NEXT:  if
+  ;; CHECK-NEXT:   local.get $x
+  ;; CHECK-NEXT:   br_if $then_block
+  ;; CHECK-NEXT:   i32.const 1
+  ;; CHECK-NEXT:   br $nested_tail
+  ;; CHECK-NEXT:  else
+  ;; CHECK-NEXT:   local.get $x
+  ;; CHECK-NEXT:   br_if $else_block
+  ;; CHECK-NEXT:   i32.const 2
+  ;; CHECK-NEXT:   br $func_tail
+  ;; CHECK-NEXT:  end
+  ;; CHECK-NEXT:  local.get $x
+  ;; CHECK-NEXT:  if
+  ;; CHECK-NEXT:   br $if_wrapper
+  ;; CHECK-NEXT:  end
+  ;; CHECK-NEXT:  i32.const 3
+  ;; CHECK-NEXT: )
+  (func $elide-if-and-tail-blocks (param $x i32) (result i32)
+    (block $func_tail (result i32)
+      (block $nested_tail (result i32)
+        (if (local.get $x)
+          (then
+            (block $then_block
+              (br_if $then_block (local.get $x))
+              (br $nested_tail (i32.const 1))
+            )
+          )
+          (else
+            (block $else_block
+              (br_if $else_block (local.get $x))
+              (br $func_tail (i32.const 2))
+            )
+          )
+        )
+        (block $if_wrapper
+          (if (local.get $x)
+            (then
+              (br $if_wrapper)
+            )
+          )
+        )
+        (i32.const 3)
+      )
     )
   )
 )

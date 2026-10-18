@@ -25,6 +25,7 @@
 #include "ir/effects.h"
 #include "ir/gc-type-utils.h"
 #include "ir/literal-utils.h"
+#include "ir/local-graph.h"
 #include "ir/localize.h"
 #include "ir/properties.h"
 #include "ir/utils.h"
@@ -2659,6 +2660,354 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
     }
   }
 
+  void lowerNonNullAndVoidReturnGuards(Function* func, bool allowFuncExit) {
+    if (!func->body) {
+      return;
+    }
+    bool hasGC = getModule()->features.hasGC();
+    if (!hasGC) {
+      return;
+    }
+
+    std::unordered_map<Name, Block*> nameToBlock;
+    std::unordered_set<Name> usedNames;
+    std::vector<Index> localGetCounts(func->getNumLocals(), 0);
+
+    struct PreScanner : public PostWalker<PreScanner> {
+      std::unordered_map<Name, Block*>& nameToBlock;
+      std::unordered_set<Name>& usedNames;
+      std::vector<Index>& localGetCounts;
+
+      PreScanner(std::unordered_map<Name, Block*>& nameToBlock,
+                 std::unordered_set<Name>& usedNames,
+                 std::vector<Index>& localGetCounts)
+        : nameToBlock(nameToBlock), usedNames(usedNames),
+          localGetCounts(localGetCounts) {}
+
+      void visitBlock(Block* curr) {
+        if (curr->name.is()) {
+          nameToBlock[curr->name] = curr;
+          usedNames.insert(curr->name);
+        }
+      }
+      void visitLoop(Loop* curr) {
+        if (curr->name.is()) {
+          usedNames.insert(curr->name);
+        }
+      }
+      void visitTry(Try* curr) {
+        if (curr->name.is()) {
+          usedNames.insert(curr->name);
+        }
+      }
+      void visitLocalGet(LocalGet* curr) { localGetCounts[curr->index]++; }
+    } preScanner(nameToBlock, usedNames, localGetCounts);
+    preScanner.walkFunction(func);
+
+    LazyLocalGraph localGraph(func);
+    Builder builder(*getModule());
+    Type funcResults = func->getResults();
+
+    Name funcExitName;
+    auto ensureFuncExitLabel = [&]() -> Name {
+      if (funcExitName.is()) {
+        return funcExitName;
+      }
+      if (auto* bodyBlock = func->body->dynCast<Block>()) {
+        if (!bodyBlock->name.is()) {
+          Index id = 0;
+          Name candidate;
+          do {
+            candidate = Name("func_exit$" + std::to_string(id++));
+          } while (usedNames.contains(candidate));
+          usedNames.insert(candidate);
+          bodyBlock->name = candidate;
+          nameToBlock[candidate] = bodyBlock;
+        }
+        funcExitName = bodyBlock->name;
+        return funcExitName;
+      }
+      Index id = 0;
+      Name candidate;
+      do {
+        candidate = Name("func_exit$" + std::to_string(id++));
+      } while (usedNames.contains(candidate));
+      usedNames.insert(candidate);
+      auto* wrapper = builder.makeBlock(candidate, {func->body}, funcResults);
+      func->body = wrapper;
+      nameToBlock[candidate] = wrapper;
+      funcExitName = candidate;
+      return funcExitName;
+    };
+
+    // Match (i32.eqz (ref.is_null SRC)) where SRC is (local.get $x) or
+    // (local.tee $x EXPR) and valueExpr is (local.get $x).
+    auto matchNonNullGuard = [&](Expression* cond,
+                                 Expression* valueExpr,
+                                 Type targetType,
+                                 Expression*& refOperandOut,
+                                 LocalSet*& teeOut,
+                                 LocalGet*& condGetOut,
+                                 LocalGet*& valGetOut) -> bool {
+      teeOut = nullptr;
+      condGetOut = nullptr;
+      valGetOut = nullptr;
+      refOperandOut = nullptr;
+      if (!targetType.isRef()) {
+        return false;
+      }
+      auto* valGet = valueExpr ? valueExpr->dynCast<LocalGet>() : nullptr;
+      if (!valGet) {
+        return false;
+      }
+      auto* eqz = cond ? cond->dynCast<Unary>() : nullptr;
+      if (!eqz || eqz->op != EqZInt32) {
+        return false;
+      }
+      auto* isNull = eqz->value->dynCast<RefIsNull>();
+      if (!isNull) {
+        return false;
+      }
+      Expression* src = isNull->value;
+      if (!src->type.isRef() || src->type == Type::unreachable) {
+        return false;
+      }
+      Index localIdx = valGet->index;
+      if (auto* cGet = src->dynCast<LocalGet>()) {
+        if (cGet->index != localIdx) {
+          return false;
+        }
+        condGetOut = cGet;
+      } else if (auto* cTee = src->dynCast<LocalSet>()) {
+        if (!cTee->isTee() || cTee->index != localIdx ||
+            cTee->value->type == Type::unreachable) {
+          return false;
+        }
+        teeOut = cTee;
+      } else {
+        return false;
+      }
+      Type sentType(src->type.getHeapType(), NonNullable, src->type.getExactness());
+      if (!Type::isSubType(sentType, targetType)) {
+        return false;
+      }
+      refOperandOut = src;
+      valGetOut = valGet;
+      return true;
+    };
+
+    auto stripDeadTeeIfPossible = [&](Expression* refOperand,
+                                      LocalSet* tee,
+                                      LocalGet* eliminatedValGet) -> Expression* {
+      assert(localGetCounts[eliminatedValGet->index] > 0);
+      localGetCounts[eliminatedValGet->index]--;
+      if (!tee) {
+        return refOperand;
+      }
+      Index localIdx = tee->index;
+      bool canStrip = (localGetCounts[localIdx] == 0);
+      if (!canStrip && !func->getLocalType(localIdx).isNonNullable()) {
+        const auto& influences = localGraph.getSetInfluences(tee);
+        if (influences.size() == 1 &&
+            *influences.begin() == eliminatedValGet) {
+          canStrip = true;
+        }
+      }
+      if (!canStrip) {
+        return refOperand;
+      }
+      Expression* inner = tee->value;
+      if (inner->type.isRef()) {
+        return inner;
+      }
+      return refOperand;
+    };
+
+    using EnsureExitFn = decltype(ensureFuncExitLabel);
+    using MatchGuardFn = decltype(matchNonNullGuard);
+    using StripTeeFn = decltype(stripDeadTeeIfPossible);
+
+    struct GuardLowerer : public PostWalker<GuardLowerer> {
+      Function* func;
+      Builder& builder;
+      const std::unordered_map<Name, Block*>& nameToBlock;
+      EnsureExitFn& ensureFuncExitLabel;
+      MatchGuardFn& matchNonNullGuard;
+      StripTeeFn& stripDeadTeeIfPossible;
+      bool allowFuncExit;
+      Index tryDepth = 0;
+      bool changed = false;
+
+      GuardLowerer(Function* func,
+                   Builder& builder,
+                   const std::unordered_map<Name, Block*>& nameToBlock,
+                   EnsureExitFn& ensureFuncExitLabel,
+                   MatchGuardFn& matchNonNullGuard,
+                   StripTeeFn& stripDeadTeeIfPossible,
+                   bool allowFuncExit)
+        : func(func), builder(builder), nameToBlock(nameToBlock),
+          ensureFuncExitLabel(ensureFuncExitLabel),
+          matchNonNullGuard(matchNonNullGuard),
+          stripDeadTeeIfPossible(stripDeadTeeIfPossible),
+          allowFuncExit(allowFuncExit) {}
+
+      static void scan(GuardLowerer* self, Expression** currp) {
+        Expression* curr = *currp;
+        if (curr->is<Try>() || curr->is<TryTable>()) {
+          self->tryDepth++;
+          PostWalker<GuardLowerer>::scan(self, currp);
+          self->tryDepth--;
+          return;
+        }
+        PostWalker<GuardLowerer>::scan(self, currp);
+      }
+
+      void visitDrop(Drop* curr) {
+        auto* br = curr->value->dynCast<Break>();
+        if (!br || !br->condition || !br->value ||
+            br->type == Type::unreachable) {
+          return;
+        }
+        auto it = nameToBlock.find(br->name);
+        if (it == nameToBlock.end()) {
+          return;
+        }
+        Block* targetBlock = it->second;
+        Expression* refOperand = nullptr;
+        LocalSet* tee = nullptr;
+        LocalGet* condGet = nullptr;
+        LocalGet* valGet = nullptr;
+        if (!matchNonNullGuard(br->condition,
+                               br->value,
+                               targetBlock->type,
+                               refOperand,
+                               tee,
+                               condGet,
+                               valGet)) {
+          return;
+        }
+        Expression* ref = stripDeadTeeIfPossible(refOperand, tee, valGet);
+        BranchHints::clear(br, func);
+        replaceCurrent(builder.makeBrOn(BrOnNonNull, br->name, ref));
+        changed = true;
+      }
+
+      void visitIf(If* curr) {
+        if (curr->ifFalse || curr->condition->type == Type::unreachable) {
+          return;
+        }
+        // Unwrap single-element unnamed Block in ifTrue if present.
+        Expression* arm = curr->ifTrue;
+        while (auto* b = arm->dynCast<Block>()) {
+          if (!b->name.is() && b->list.size() == 1) {
+            arm = b->list[0];
+          } else {
+            break;
+          }
+        }
+
+        // 2(a): (if (i32.eqz (ref.is_null (local.get/tee $x EXPR)))
+        //           (then (br $L (local.get $x))))
+        if (auto* br = arm->dynCast<Break>();
+            br && !br->condition && br->value) {
+          auto it = nameToBlock.find(br->name);
+          if (it != nameToBlock.end()) {
+            Block* targetBlock = it->second;
+            Expression* refOperand = nullptr;
+            LocalSet* tee = nullptr;
+            LocalGet* condGet = nullptr;
+            LocalGet* valGet = nullptr;
+            if (matchNonNullGuard(curr->condition,
+                                  br->value,
+                                  targetBlock->type,
+                                  refOperand,
+                                  tee,
+                                  condGet,
+                                  valGet)) {
+              Expression* ref = stripDeadTeeIfPossible(refOperand, tee, valGet);
+              BranchHints::clear(curr, func);
+              BranchHints::clear(br, func);
+              replaceCurrent(builder.makeBrOn(BrOnNonNull, br->name, ref));
+              changed = true;
+              return;
+            }
+          }
+        }
+
+        // 2(b) & 2(c): 1-arm If whose arm is (return [VAL]), outside try/try_table.
+        if (allowFuncExit && tryDepth == 0) {
+          if (auto* ret = arm->dynCast<Return>()) {
+            Type funcResults = func->getResults();
+            // 2(b): (if (i32.eqz (ref.is_null (local.get/tee $x EXPR)))
+            //           (then (return (local.get $x))))
+            if (ret->value && funcResults.isRef()) {
+              Expression* refOperand = nullptr;
+              LocalSet* tee = nullptr;
+              LocalGet* condGet = nullptr;
+              LocalGet* valGet = nullptr;
+              if (matchNonNullGuard(curr->condition,
+                                    ret->value,
+                                    funcResults,
+                                    refOperand,
+                                    tee,
+                                    condGet,
+                                    valGet)) {
+                Expression* ref =
+                  stripDeadTeeIfPossible(refOperand, tee, valGet);
+                Name exitLabel = ensureFuncExitLabel();
+                BranchHints::clear(curr, func);
+                replaceCurrent(builder.makeBrOn(BrOnNonNull, exitLabel, ref));
+                changed = true;
+                return;
+              }
+            }
+            // 2(c): (if COND (then (return))) in a void function.
+            if (!ret->value && funcResults == Type::none) {
+              Name exitLabel = ensureFuncExitLabel();
+              auto* brIf =
+                builder.makeBreak(exitLabel, nullptr, curr->condition);
+              BranchHints::copyTo(curr, brIf, func);
+              BranchHints::clear(curr, func);
+              replaceCurrent(brIf);
+              changed = true;
+              return;
+            }
+          }
+        }
+      }
+    } lowerer(func,
+              builder,
+              nameToBlock,
+              ensureFuncExitLabel,
+              matchNonNullGuard,
+              stripDeadTeeIfPossible,
+              allowFuncExit);
+
+    // Walk func->body (and if ensureFuncExitLabel wraps func->body during the
+    // walk, func->body is updated after the root completes or during the walk).
+    Expression* root = func->body;
+    lowerer.walk(root);
+    if (func->body != root && funcExitName.is()) {
+      // ensureFuncExitLabel wrapped the old func->body in a new Block* wrapper.
+      auto* wrapper = func->body->cast<Block>();
+      wrapper->list[0] = root;
+      wrapper->finalize(funcResults);
+    } else {
+      func->body = root;
+    }
+
+    if (lowerer.changed) {
+      ReFinalize().walkFunctionInModule(func, getModule());
+      if (funcExitName.is()) {
+        if (auto* bodyBlock = func->body->dynCast<Block>();
+            bodyBlock && bodyBlock->name == funcExitName &&
+            bodyBlock->type != Type::unreachable) {
+          bodyBlock->type = funcResults;
+        }
+      }
+    }
+  }
+
   void doWalkFunction(Function* func) {
     auto instArg = getArgumentOrDefault("remove-unused-brs", "");
     if (instArg == "v4") {
@@ -4480,7 +4829,8 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
             return false;
           }
           if (curr->type == Type::none) {
-            int blockSavings = (firstBrIdx == 0) ? 2 : 0;
+            int blockSavings =
+              (firstBrIdx == 0 && curr != getFunction()->body) ? 2 : 0;
             return totalDelta - blockSavings < 0;
           }
           int blockSavings = (firstBrIdx == 0) ? (2 + typeBytes) : 2;
@@ -4578,7 +4928,9 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
             }
             if (!drop) {
               assert(!br->value);
-              if (curr->type != Type::none) {
+              if (curr->type != Type::none ||
+                  (curr == getFunction()->body &&
+                   getFunction()->getResults() == Type::none)) {
                 return;
               }
               if (!isLastRefInCurr && !canProfitablyPeelAll(k)) {
@@ -5916,11 +6268,15 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         }
       }
     };
+    bool v4 = isV4Enabled(getPassOptions());
+    if (v4) {
+      lowerNonNullAndVoidReturnGuards(func, /*allowFuncExit=*/false);
+    }
     FinalOptimizer finalOptimizer(getPassOptions());
     finalOptimizer.setModule(getModule());
     finalOptimizer.shrink = getPassRunner()->options.shrinkLevel > 0;
     finalOptimizer.shrink2 = shrink2;
-    finalOptimizer.v4 = isV4Enabled(getPassOptions());
+    finalOptimizer.v4 = v4;
     finalOptimizer.foldBoolIf = foldBoolIf;
     finalOptimizer.neverUnconditionalize = neverUnconditionalize;
     if (finalOptimizer.v4 && func->body) {
@@ -5979,6 +6335,9 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
             func->body, func->getResults() == Type::none)) {
         ReFinalize().walkFunctionInModule(func, getModule());
       }
+    }
+    if (v4) {
+      lowerNonNullAndVoidReturnGuards(func, /*allowFuncExit=*/true);
     }
   }
 };

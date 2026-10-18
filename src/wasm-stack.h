@@ -88,7 +88,12 @@ public:
   Type type;
 };
 
-using StackIR = std::vector<StackInst*>;
+struct StackIR : public std::vector<StackInst*> {
+  Name functionBodyLabel;
+  std::unordered_map<If*, Name> ifTrueLabels;
+  std::unordered_map<If*, Name> ifFalseLabels;
+  std::unordered_map<Name, Name> labelAliases;
+};
 
 class BinaryInstWriter : public OverriddenVisitor<BinaryInstWriter> {
 public:
@@ -132,6 +137,11 @@ public:
 
   // The explicitly named labels of this function, as (label index, name).
   std::vector<std::pair<Index, Name>> labelNames;
+
+  Name functionBodyLabel;
+  std::unordered_map<If*, Name> ifTrueLabels;
+  std::unordered_map<If*, Name> ifFalseLabels;
+  std::unordered_map<Name, Name> labelAliases;
 
 private:
   // The index the next scope in this function will take.

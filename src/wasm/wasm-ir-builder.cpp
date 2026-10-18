@@ -1334,7 +1334,8 @@ Result<> IRBuilder::visitEnd() {
 
   // If the scope expression cannot be directly labeled, we may need to wrap it
   // in a block.
-  auto maybeWrapForLabel = [&](Expression* curr) -> Expression* {
+  auto maybeWrapForLabel = [&](Expression* curr,
+                               bool moveBinaryPos = true) -> Expression* {
     if (!label) {
       return curr;
     }
@@ -1343,7 +1344,9 @@ Result<> IRBuilder::visitEnd() {
     if (auto* block = fixed->dynCast<Block>(); block && !block->name) {
       block->name = label;
       block->type = blockType;
-      moveBinaryPosToWrapper(curr, block);
+      if (moveBinaryPos) {
+        moveBinaryPosToWrapper(curr, block);
+      }
       return block;
     }
     auto* block = builder.makeBlock();
@@ -1351,7 +1354,9 @@ Result<> IRBuilder::visitEnd() {
     block->list.push_back(fixed);
     block->finalize(blockType,
                     scope.labelUsed ? Block::HasBreak : Block::NoBreak);
-    moveBinaryPosToWrapper(curr, block);
+    if (moveBinaryPos) {
+      moveBinaryPosToWrapper(curr, block);
+    }
     return block;
   };
 
@@ -1360,7 +1365,7 @@ Result<> IRBuilder::visitEnd() {
   lastBinaryPos = scope.startPos;
 
   if (auto* func = scope.getFunction()) {
-    func->body = maybeWrapForLabel(*expr);
+    func->body = maybeWrapForLabel(*expr, /*moveBinaryPos=*/false);
     labelDepths.clear();
     if (scope.needsPopFixup()) {
       // We may be in the binary parser, where pops need to be fixed up before
@@ -1400,8 +1405,16 @@ Result<> IRBuilder::visitEnd() {
     } else {
       iff->ifFalse = nullptr;
     }
-    iff->finalize(iff->type);
-    push(maybeWrapForLabel(iff));
+    if (!iff->ifFalse && !scope.labelExplicit &&
+        scope.inputType == Type::none && scope.outputLabels.empty()) {
+      iff->ifTrue =
+        maybeWrapForLabel(iff->ifTrue, /*moveBinaryPos=*/false);
+      iff->finalize(iff->type);
+      push(iff);
+    } else {
+      iff->finalize(iff->type);
+      push(maybeWrapForLabel(iff));
+    }
   } else if (auto* iff = scope.getElse()) {
     iff->ifFalse = *expr;
     iff->finalize(iff->type);

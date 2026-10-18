@@ -50,10 +50,11 @@ void BinaryInstWriter::visitBlock(Block* curr) {
 void BinaryInstWriter::visitIf(If* curr) {
   // An `if` never has a name in Binaryen IR, but it still takes a label index.
   noteScopeStart();
-  // the binary format requires this; we have a block if we need one
-  // TODO: optimize this in Stack IR (if child is a block, we may break to this
-  // instead)
-  breakStack.emplace_back(IMPOSSIBLE_CONTINUE);
+  Name label = IMPOSSIBLE_CONTINUE;
+  if (auto it = ifTrueLabels.find(curr); it != ifTrueLabels.end()) {
+    label = it->second;
+  }
+  breakStack.push_back(label);
   o << static_cast<int8_t>(BinaryConsts::If);
   emitResultType(curr->type);
 }
@@ -62,6 +63,12 @@ void BinaryInstWriter::emitIfElse(If* curr) {
   if (func) {
     parent.trackExpressionDelimiter(curr, func, BinaryLocations::Else);
   }
+  Name label = IMPOSSIBLE_CONTINUE;
+  if (auto it = ifFalseLabels.find(curr); it != ifFalseLabels.end()) {
+    label = it->second;
+  }
+  assert(!breakStack.empty());
+  breakStack.back() = label;
   o << static_cast<int8_t>(BinaryConsts::Else);
 }
 
@@ -3591,13 +3598,21 @@ void BinaryInstWriter::emitMemoryAccess(size_t alignment,
 }
 
 int32_t BinaryInstWriter::getBreakIndex(Name name) { // -1 if not found
-  if (name == DELEGATE_CALLER_TARGET) {
-    return breakStack.size();
+  while (true) {
+    auto it = labelAliases.find(name);
+    if (it == labelAliases.end()) {
+      break;
+    }
+    name = it->second;
   }
-  for (int i = breakStack.size() - 1; i >= 0; i--) {
+  for (int i = int(breakStack.size()) - 1; i >= 0; i--) {
     if (breakStack[i] == name) {
       return breakStack.size() - 1 - i;
     }
+  }
+  if (name == DELEGATE_CALLER_TARGET ||
+      (functionBodyLabel.is() && name == functionBodyLabel)) {
+    return breakStack.size();
   }
   WASM_UNREACHABLE("break index not found");
 }
@@ -3726,6 +3741,10 @@ ModuleStackIR::ModuleStackIR(Module& wasm, const PassOptions& options)
     }) {}
 
 void StackIRToBinaryWriter::write() {
+  writer.functionBodyLabel = stackIR.functionBodyLabel;
+  writer.ifTrueLabels = stackIR.ifTrueLabels;
+  writer.ifFalseLabels = stackIR.ifFalseLabels;
+  writer.labelAliases = stackIR.labelAliases;
   if (func->prologLocation) {
     parent.writeDebugLocation(*func->prologLocation);
   }
