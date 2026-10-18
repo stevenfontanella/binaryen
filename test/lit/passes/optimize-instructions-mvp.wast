@@ -1343,15 +1343,16 @@
     )
   )
   ;; CHECK:      (func $select-and-negation-impossible (param $x i32) (param $y i32) (result i32)
-  ;; CHECK-NEXT:  (select
+  ;; CHECK-NEXT:  (i32.or
+  ;; CHECK-NEXT:   (i32.eqz
+  ;; CHECK-NEXT:    (i32.shr_u
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:     (i32.const 31)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:   (i32.eq
   ;; CHECK-NEXT:    (local.get $y)
   ;; CHECK-NEXT:    (i32.const 1337)
-  ;; CHECK-NEXT:   )
-  ;; CHECK-NEXT:   (i32.const 1)
-  ;; CHECK-NEXT:   (i32.shr_u
-  ;; CHECK-NEXT:    (local.get $x)
-  ;; CHECK-NEXT:    (i32.const 31)
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
@@ -1371,15 +1372,16 @@
     )
   )
   ;; CHECK:      (func $select-and-negation-impossible-float (param $x f64) (param $y i32) (result i32)
-  ;; CHECK-NEXT:  (select
+  ;; CHECK-NEXT:  (i32.or
+  ;; CHECK-NEXT:   (i32.eqz
+  ;; CHECK-NEXT:    (f64.le
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:     (f64.const 3.14159)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:   (i32.eq
   ;; CHECK-NEXT:    (local.get $y)
   ;; CHECK-NEXT:    (i32.const 1337)
-  ;; CHECK-NEXT:   )
-  ;; CHECK-NEXT:   (i32.const 1)
-  ;; CHECK-NEXT:   (f64.le
-  ;; CHECK-NEXT:    (local.get $x)
-  ;; CHECK-NEXT:    (f64.const 3.14159)
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
@@ -10894,10 +10896,7 @@
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT:  (drop
-  ;; CHECK-NEXT:   (i32.and
-  ;; CHECK-NEXT:    (local.get $x4)
-  ;; CHECK-NEXT:    (i32.const 7)
-  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.get $x4)
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT:  (local.set $x5
   ;; CHECK-NEXT:   (if (result i32)
@@ -15880,8 +15879,7 @@
   ;; CHECK:      (func $ternary (param $x i32) (param $y i32)
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (i32.eqz
-  ;; CHECK-NEXT:    (select
-  ;; CHECK-NEXT:     (i32.const 1)
+  ;; CHECK-NEXT:    (i32.or
   ;; CHECK-NEXT:     (local.get $y)
   ;; CHECK-NEXT:     (local.get $x)
   ;; CHECK-NEXT:    )
@@ -15906,10 +15904,11 @@
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT:  (drop
-  ;; CHECK-NEXT:   (i32.eqz
-  ;; CHECK-NEXT:    (select
+  ;; CHECK-NEXT:   (i32.or
+  ;; CHECK-NEXT:    (i32.eqz
   ;; CHECK-NEXT:     (local.get $y)
-  ;; CHECK-NEXT:     (i32.const 0)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.eqz
   ;; CHECK-NEXT:     (local.get $x)
   ;; CHECK-NEXT:    )
   ;; CHECK-NEXT:   )
@@ -18724,6 +18723,202 @@
     )
     (local.tee $temp
       (unreachable)
+    )
+  )
+
+  ;; CHECK:      (func $select-0-1-and-eqz (param $x i32) (param $y i32)
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (i32.and
+  ;; CHECK-NEXT:    (i32.eqz
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.eq
+  ;; CHECK-NEXT:     (local.get $y)
+  ;; CHECK-NEXT:     (i32.const 7)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (i32.or
+  ;; CHECK-NEXT:    (i32.eqz
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.eq
+  ;; CHECK-NEXT:     (local.get $y)
+  ;; CHECK-NEXT:     (i32.const 7)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (i32.and
+  ;; CHECK-NEXT:    (if (result i32)
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:     (then
+  ;; CHECK-NEXT:      (i32.eq
+  ;; CHECK-NEXT:       (local.get $y)
+  ;; CHECK-NEXT:       (i32.const 1)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (else
+  ;; CHECK-NEXT:      (i32.const 0)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.gt_s
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:     (i32.const 0)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (i32.or
+  ;; CHECK-NEXT:    (local.get $y)
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (nop)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (i32.or
+  ;; CHECK-NEXT:    (local.get $y)
+  ;; CHECK-NEXT:    (i32.eqz
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (nop)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (i32.or
+  ;; CHECK-NEXT:    (i32.eqz
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.ne
+  ;; CHECK-NEXT:     (local.get $y)
+  ;; CHECK-NEXT:     (i32.const 3)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (i32.and
+  ;; CHECK-NEXT:    (i32.eqz
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.ne
+  ;; CHECK-NEXT:     (local.get $y)
+  ;; CHECK-NEXT:     (i32.const 3)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (i32.and
+  ;; CHECK-NEXT:    (i32.eqz
+  ;; CHECK-NEXT:     (local.get $y)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.and
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:     (i32.const 1)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (i32.or
+  ;; CHECK-NEXT:    (i32.eqz
+  ;; CHECK-NEXT:     (local.get $y)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.and
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:     (i32.const 1)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $select-0-1-and-eqz (param $x i32) (param $y i32)
+    ;; select(0, y_bool, x) => y_bool & !x
+    (drop
+      (select
+        (i32.const 0)
+        (i32.eq (local.get $y) (i32.const 7))
+        (local.get $x)
+      )
+    )
+    ;; select(y_bool, 1, x) => y_bool | !x
+    (drop
+      (select
+        (i32.eq (local.get $y) (i32.const 7))
+        (i32.const 1)
+        (local.get $x)
+      )
+    )
+    ;; Nested select/if recognized as 1-bit by Bits::getMaxBits
+    (drop
+      (select
+        (if (result i32)
+          (local.get $x)
+          (then (i32.eq (local.get $y) (i32.const 1)))
+          (else (i32.const 0))
+        )
+        (i32.const 0)
+        (i32.gt_s (local.get $x) (i32.const 0))
+      )
+    )
+    ;; Boolean context: select(1, y, x) => y | x, select(y, 1, x) => y | !x
+    (if
+      (select
+        (i32.const 1)
+        (local.get $y)
+        (local.get $x)
+      )
+      (then (nop))
+    )
+    (if
+      (select
+        (local.get $y)
+        (i32.const 1)
+        (local.get $x)
+      )
+      (then (nop))
+    )
+    ;; i32.eqz(select(y, 0, x)) => !y | !x
+    (drop
+      (i32.eqz
+        (select
+          (i32.eq (local.get $y) (i32.const 3))
+          (i32.const 0)
+          (local.get $x)
+        )
+      )
+    )
+    ;; i32.eqz(select(1, y, x)) => !y & !x
+    (drop
+      (i32.eqz
+        (select
+          (i32.const 1)
+          (i32.eq (local.get $y) (i32.const 3))
+          (local.get $x)
+        )
+      )
+    )
+    ;; i32.eqz(select(y, 2, x_bool)) => !y & x_bool
+    (drop
+      (i32.eqz
+        (select
+          (local.get $y)
+          (i32.const 2)
+          (i32.and (local.get $x) (i32.const 1))
+        )
+      )
+    )
+    ;; i32.eqz(select(0, y, x_bool)) => !y | x_bool
+    (drop
+      (i32.eqz
+        (select
+          (i32.const 0)
+          (local.get $y)
+          (i32.and (local.get $x) (i32.const 1))
+        )
+      )
     )
   )
 )

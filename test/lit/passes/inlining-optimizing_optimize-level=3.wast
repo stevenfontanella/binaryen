@@ -8557,13 +8557,14 @@
  ;; CHECK-NEXT:                             (local.tee $7
  ;; CHECK-NEXT:                              (i32.add
  ;; CHECK-NEXT:                               (local.tee $8
- ;; CHECK-NEXT:                                (select
- ;; CHECK-NEXT:                                 (i32.const 0)
+ ;; CHECK-NEXT:                                (i32.and
  ;; CHECK-NEXT:                                 (local.get $28)
- ;; CHECK-NEXT:                                 (local.tee $6
- ;; CHECK-NEXT:                                  (f64.ne
- ;; CHECK-NEXT:                                   (local.get $14)
- ;; CHECK-NEXT:                                   (local.get $14)
+ ;; CHECK-NEXT:                                 (i32.eqz
+ ;; CHECK-NEXT:                                  (local.tee $6
+ ;; CHECK-NEXT:                                   (f64.ne
+ ;; CHECK-NEXT:                                    (local.get $14)
+ ;; CHECK-NEXT:                                    (local.get $14)
+ ;; CHECK-NEXT:                                   )
  ;; CHECK-NEXT:                                  )
  ;; CHECK-NEXT:                                 )
  ;; CHECK-NEXT:                                )

@@ -1104,12 +1104,37 @@ struct OptimizeInstructions
     }
 
     if (curr->op == EqZInt32) {
+      if (auto* select = curr->value->dynCast<Select>()) {
+        if (auto* ret = optimizeEqZSelect(select)) {
+          return replaceCurrent(ret);
+        }
+      }
       if (auto* inner = curr->value->dynCast<Binary>()) {
         // Try to invert a relational operation using De Morgan's law
         auto op = invertBinaryOp(inner->op);
         if (op != InvalidBinary) {
           inner->op = op;
           return replaceCurrent(inner);
+        }
+        if (inner->op == OrInt32 &&
+            (isRemovableOneBitEqZ(inner->left) ||
+             isRemovableOneBitEqZ(inner->right))) {
+          return replaceCurrent(
+            Builder(*getModule())
+              .makeBinary(AndInt32,
+                          makeNegatedOneBit(inner->left),
+                          makeNegatedOneBit(inner->right)));
+        }
+        if (inner->op == AndInt32 &&
+            Bits::getMaxBits(inner->left, this) <= 1 &&
+            Bits::getMaxBits(inner->right, this) <= 1 &&
+            (isRemovableOneBitEqZ(inner->left) ||
+             isRemovableOneBitEqZ(inner->right))) {
+          return replaceCurrent(
+            Builder(*getModule())
+              .makeBinary(OrInt32,
+                          makeNegatedOneBit(inner->left),
+                          makeNegatedOneBit(inner->right)));
         }
       }
       // eqz of a sign extension can be of zero-extension
@@ -2768,6 +2793,10 @@ struct OptimizeInstructions
 
     switch (GCTypeUtils::evaluateCastCheck(refType, curr->castType)) {
       case GCTypeUtils::Unknown:
+        if (auto* folded = tryFoldRefTest(curr->ref, curr->castType)) {
+          replaceCurrent(folded);
+          return;
+        }
         break;
       case GCTypeUtils::Success:
         replaceCurrent(builder.makeBlock(
@@ -2786,9 +2815,17 @@ struct OptimizeInstructions
                                             builder.makeConst(int32_t(0))));
         return;
       case GCTypeUtils::SuccessOnlyIfNull:
+        if (auto* folded = tryFoldRefTest(curr->ref, curr->castType)) {
+          replaceCurrent(folded);
+          return;
+        }
         replaceCurrent(builder.makeRefIsNull(curr->ref));
         return;
       case GCTypeUtils::SuccessOnlyIfNonNull:
+        if (auto* folded = tryFoldRefTest(curr->ref, curr->castType)) {
+          replaceCurrent(folded);
+          return;
+        }
         // This adds an EqZ, but code size does not regress since ref.test
         // also encodes a type, and ref.is_null does not. The EqZ may also add
         // some work, but a cast is likely more expensive than a null check +
@@ -3380,6 +3417,11 @@ private:
               return binary;
             }
           }
+          if (auto* select = unary->value->dynCast<Select>()) {
+            if (auto* ret = optimizeEqZSelect(select)) {
+              return ret;
+            }
+          }
         }
         if (unary->op == EqZInt32 || unary->op == EqZInt64) {
           if (auto* c = getFallthrough(unary->value)->dynCast<Const>()) {
@@ -3447,6 +3489,23 @@ private:
     } else if (auto* select = boolean->dynCast<Select>()) {
       select->ifTrue = optimizeBoolean(select->ifTrue);
       select->ifFalse = optimizeBoolean(select->ifFalse);
+      if (select->type == Type::i32 && select->ifTrue->type == Type::i32 &&
+          select->ifFalse->type == Type::i32 &&
+          select->condition->type == Type::i32) {
+        Builder builder(*getModule());
+        if (auto* c = select->ifTrue->dynCast<Const>();
+            c && c->value.geti32() != 0) {
+          return builder.makeBinary(
+            OrInt32, select->ifFalse, optimizeBoolean(select->condition));
+        }
+        if (auto* c = select->ifFalse->dynCast<Const>();
+            c && c->value.geti32() != 0) {
+          return builder.makeBinary(
+            OrInt32,
+            select->ifTrue,
+            optimizeBoolean(builder.makeUnary(EqZInt32, select->condition)));
+        }
+      }
     } else if (auto* tryy = boolean->dynCast<Try>()) {
       if (tryy->type == Type::i32) {
         tryy->body = optimizeBoolean(tryy->body);
@@ -3457,6 +3516,175 @@ private:
     }
     // TODO: recurse into br values?
     return boolean;
+  }
+
+  bool isRemovableOneBitEqZ(Expression* expr) {
+    auto* u = expr->dynCast<Unary>();
+    return u && u->op == EqZInt32 && Bits::getMaxBits(u->value, this) <= 1 &&
+           !(u->value->is<Unary>() && u->value->cast<Unary>()->op == EqZInt32);
+  }
+
+  Expression* makeNegatedOneBit(Expression* expr) {
+    Builder builder(*getModule());
+    if (auto* u = expr->dynCast<Unary>(); u && u->op == EqZInt32) {
+      if (Bits::getMaxBits(u->value, this) <= 1) {
+        return u->value;
+      }
+      return builder.makeUnary(EqZInt32, expr);
+    }
+    return optimizeBoolean(builder.makeUnary(EqZInt32, expr));
+  }
+
+  Expression* makeOneBit(Expression* expr) {
+    expr = optimizeBoolean(expr);
+    if (Bits::getMaxBits(expr, this) <= 1) {
+      return expr;
+    }
+    Builder builder(*getModule());
+    return builder.makeUnary(EqZInt32, makeNegatedOneBit(expr));
+  }
+
+  Expression* optimizeEqZSelect(Select* select) {
+    if (select->type != Type::i32 || select->ifTrue->type != Type::i32 ||
+        select->ifFalse->type != Type::i32 ||
+        select->condition->type != Type::i32) {
+      return nullptr;
+    }
+    Builder builder(*getModule());
+    // (i32.eqz (select y (i32.const 0) x)) ==> !y | !x
+    if (auto* c = select->ifFalse->dynCast<Const>();
+        c && c->value.geti32() == 0) {
+      return builder.makeBinary(OrInt32,
+                                makeNegatedOneBit(select->ifTrue),
+                                makeNegatedOneBit(select->condition));
+    }
+    // (i32.eqz (select (i32.const K) y x)) (K != 0) ==> !y & !x
+    if (auto* c = select->ifTrue->dynCast<Const>();
+        c && c->value.geti32() != 0) {
+      auto* lhs = makeNegatedOneBit(select->ifFalse);
+      auto* rhs = makeNegatedOneBit(select->condition);
+      if (auto* u1 = lhs->dynCast<Unary>(); u1 && u1->op == EqZInt32) {
+        if (auto* u2 = rhs->dynCast<Unary>(); u2 && u2->op == EqZInt32) {
+          return builder.makeUnary(
+            EqZInt32, builder.makeBinary(OrInt32, u1->value, u2->value));
+        }
+      }
+      return builder.makeBinary(AndInt32, lhs, rhs);
+    }
+    // (i32.eqz (select y (i32.const K) x)) (K != 0, maxBits(x) <= 1) ==> !y & x
+    if (auto* c = select->ifFalse->dynCast<Const>();
+        c && c->value.geti32() != 0 &&
+        Bits::getMaxBits(select->condition, this) <= 1) {
+      return builder.makeBinary(
+        AndInt32, makeNegatedOneBit(select->ifTrue), select->condition);
+    }
+    // (i32.eqz (select (i32.const 0) y x)) (maxBits(x) <= 1) ==> !y | x
+    if (auto* c = select->ifTrue->dynCast<Const>();
+        c && c->value.geti32() == 0 &&
+        Bits::getMaxBits(select->condition, this) <= 1) {
+      return builder.makeBinary(
+        OrInt32, makeNegatedOneBit(select->ifFalse), select->condition);
+    }
+    return nullptr;
+  }
+
+  Type getExactFallthroughType(Expression* curr) {
+    auto baseType = getFallthroughType(curr);
+    if (!baseType.isRef()) {
+      return baseType;
+    }
+    auto isExactAllocation = [](Expression* e) {
+      return e->is<StructNew>() || e->is<ArrayNew>() ||
+             e->is<ArrayNewFixed>() || e->is<ArrayNewData>() ||
+             e->is<ArrayNewElem>() || e->is<RefFunc>();
+    };
+    auto* fallthrough = getFallthrough(curr);
+    if (auto* gg = fallthrough->dynCast<GlobalGet>()) {
+      if (auto* g = getModule()->getGlobalOrNull(gg->name)) {
+        if (!g->imported() && !g->mutable_ && g->init) {
+          auto* init = getFallthrough(g->init);
+          if (init->type.isRef() && isExactAllocation(init)) {
+            return Type::getGreatestLowerBound(baseType,
+                                               init->type.with(Exact));
+          }
+          return Type::getGreatestLowerBound(baseType,
+                                             getFallthroughType(init));
+        }
+      }
+    }
+    if (fallthrough->type.isRef() && isExactAllocation(fallthrough)) {
+      return Type::getGreatestLowerBound(baseType,
+                                         fallthrough->type.with(Exact));
+    }
+    return baseType;
+  }
+
+  Expression* tryFoldRefTest(Expression* ref, Type castType, int depth = 0) {
+    Builder builder(*getModule());
+    Expression *ifTrue = nullptr, *ifFalse = nullptr, *cond = nullptr;
+    bool isIf = false;
+    if (auto* select = ref->dynCast<Select>()) {
+      ifTrue = select->ifTrue;
+      ifFalse = select->ifFalse;
+      cond = select->condition;
+    } else if (auto* iff = ref->dynCast<If>(); iff && iff->ifFalse) {
+      ifTrue = iff->ifTrue;
+      ifFalse = iff->ifFalse;
+      cond = iff->condition;
+      isIf = true;
+    } else {
+      return nullptr;
+    }
+
+    if (ifTrue->type == Type::unreachable ||
+        ifFalse->type == Type::unreachable ||
+        cond->type == Type::unreachable) {
+      return nullptr;
+    }
+
+    auto trueRes =
+      GCTypeUtils::evaluateCastCheck(getExactFallthroughType(ifTrue), castType);
+    auto falseRes = GCTypeUtils::evaluateCastCheck(
+      getExactFallthroughType(ifFalse), castType);
+
+    if (!effects(ifTrue).hasSideEffects() &&
+        !effects(ifFalse).hasSideEffects()) {
+      if (trueRes == GCTypeUtils::Success && falseRes == GCTypeUtils::Failure) {
+        return makeOneBit(cond);
+      }
+      if (trueRes == GCTypeUtils::Failure && falseRes == GCTypeUtils::Success) {
+        return makeNegatedOneBit(cond);
+      }
+      if (trueRes == GCTypeUtils::Success && trueRes == falseRes) {
+        return getDroppedChildrenAndAppend(cond, Literal::makeOne(Type::i32));
+      }
+      if (trueRes == GCTypeUtils::Failure && trueRes == falseRes) {
+        return getDroppedChildrenAndAppend(cond, Literal::makeZero(Type::i32));
+      }
+    }
+
+    if (isIf && depth < 1) {
+      if ((trueRes == GCTypeUtils::Success ||
+           trueRes == GCTypeUtils::Failure) &&
+          !effects(ifTrue).hasSideEffects()) {
+        if (auto* foldedFalse = tryFoldRefTest(ifFalse, castType, depth + 1)) {
+          auto* trueConst = builder.makeConst(
+            int32_t(trueRes == GCTypeUtils::Success ? 1 : 0));
+          return builder.makeIf(optimizeBoolean(cond), trueConst, foldedFalse);
+        }
+      }
+      if ((falseRes == GCTypeUtils::Success ||
+           falseRes == GCTypeUtils::Failure) &&
+          !effects(ifFalse).hasSideEffects()) {
+        if (auto* foldedTrue = tryFoldRefTest(ifTrue, castType, depth + 1)) {
+          auto* falseConst = builder.makeConst(
+            int32_t(falseRes == GCTypeUtils::Success ? 1 : 0));
+          return builder.makeIf(optimizeBoolean(cond), foldedTrue, falseConst);
+        }
+      }
+    }
+
+    return nullptr;
   }
 
   Expression* optimizeSelect(Select* curr) {
@@ -3556,23 +3784,36 @@ private:
         }
       }
     }
-    if (curr->type == Type::i32 &&
-        Bits::getMaxBits(curr->condition, this) <= 1 &&
+    if (curr->type == Type::i32 && curr->ifTrue->type == Type::i32 &&
+        curr->ifFalse->type == Type::i32 &&
+        curr->condition->type == Type::i32 &&
         Bits::getMaxBits(curr->ifTrue, this) <= 1 &&
         Bits::getMaxBits(curr->ifFalse, this) <= 1) {
-      // The condition and both arms are i32 booleans, which allows us to do
-      // boolean optimizations.
+      // Both arms are i32 booleans, which allows us to do boolean
+      // optimizations.
       Expression* x;
       Expression* y;
 
-      // x ? y : 0   ==>   x & y
-      if (matches(curr, select(any(&y), ival(0), any(&x)))) {
-        return builder.makeBinary(AndInt32, y, x);
+      if (Bits::getMaxBits(curr->condition, this) <= 1) {
+        // x ? y : 0   ==>   x & y
+        if (matches(curr, select(any(&y), ival(0), any(&x)))) {
+          return builder.makeBinary(AndInt32, y, x);
+        }
+
+        // x ? 1 : y   ==>   x | y
+        if (matches(curr, select(ival(1), any(&y), any(&x)))) {
+          return builder.makeBinary(OrInt32, y, x);
+        }
       }
 
-      // x ? 1 : y   ==>   x | y
-      if (matches(curr, select(ival(1), any(&y), any(&x)))) {
-        return builder.makeBinary(OrInt32, y, x);
+      // x ? 0 : y   ==>   y & !x
+      if (matches(curr, select(ival(0), any(&y), any(&x)))) {
+        return builder.makeBinary(AndInt32, y, makeNegatedOneBit(x));
+      }
+
+      // x ? y : 1   ==>   y | !x
+      if (matches(curr, select(any(&y), ival(1), any(&x)))) {
+        return builder.makeBinary(OrInt32, y, makeNegatedOneBit(x));
       }
     }
     {

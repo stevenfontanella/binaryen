@@ -460,6 +460,32 @@ Index getMaxBits(Expression* curr,
     if (!block->name.is() && !block->list.empty() && block->type.isConcrete()) {
       return getMaxBits(block->list.back(), localInfoProvider);
     }
+  } else if (auto* select = curr->dynCast<Select>()) {
+    if (select->ifTrue->type.isInteger() && select->ifFalse->type.isInteger()) {
+      return std::max(getMaxBits(select->ifTrue, localInfoProvider),
+                      getMaxBits(select->ifFalse, localInfoProvider));
+    }
+  } else if (auto* iff = curr->dynCast<If>()) {
+    if (iff->ifFalse && iff->ifTrue->type.isInteger() &&
+        iff->ifFalse->type.isInteger()) {
+      return std::max(getMaxBits(iff->ifTrue, localInfoProvider),
+                      getMaxBits(iff->ifFalse, localInfoProvider));
+    }
+  } else if (auto* get = curr->dynCast<StructGet>()) {
+    if (!get->signed_ && get->ref->type.isStruct()) {
+      const auto& field =
+        get->ref->type.getHeapType().getStruct().fields[get->index];
+      if (field.isPacked()) {
+        return 8 * field.getByteSize();
+      }
+    }
+  } else if (auto* get = curr->dynCast<ArrayGet>()) {
+    if (!get->signed_ && get->ref->type.isArray()) {
+      const auto& field = get->ref->type.getHeapType().getArray().element;
+      if (field.isPacked()) {
+        return 8 * field.getByteSize();
+      }
+    }
   }
   switch (curr->type.getBasic()) {
     case Type::i32:

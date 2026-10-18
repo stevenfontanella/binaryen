@@ -39,11 +39,11 @@
 
   ;; CHECK:      (type $11 (func (param (ref null $struct))))
 
-  ;; CHECK:      (type $12 (func (param eqref) (result i32)))
-
-  ;; CHECK:      (type $13 (func (param (ref null $B) (ref $B))))
-
   ;; CHECK:      (type $C (sub $A (struct (field i32) (field i32) (field f64))))
+
+  ;; CHECK:      (type $13 (func (param eqref) (result i32)))
+
+  ;; CHECK:      (type $14 (func (param (ref null $B) (ref $B))))
 
   ;; CHECK:      (type $15 (func (param (ref null $array))))
 
@@ -135,6 +135,10 @@
   ;; CHECK:      (type $51 (func (param i32 (ref null $struct) i32 i32)))
 
   ;; CHECK:      (type $52 (func (param (ref null $struct)) (result i32)))
+
+  ;; CHECK:      (type $53 (func (param (ref $struct) (ref $array)) (result i32)))
+
+  ;; CHECK:      (type $54 (func (param (ref $B) (ref $C) i32) (result i32)))
 
   ;; CHECK:      (import "env" "get-i32" (func $get-i32 (type $8) (result i32)))
   (import "env" "get-i32" (func $get-i32 (result i32)))
@@ -1478,7 +1482,7 @@
     )
   )
 
-  ;; CHECK:      (func $compatible-test-separate-fallthrough (type $12) (param $eqref eqref) (result i32)
+  ;; CHECK:      (func $compatible-test-separate-fallthrough (type $13) (param $eqref eqref) (result i32)
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (local.tee $eqref
   ;; CHECK-NEXT:    (block (result eqref)
@@ -1512,7 +1516,7 @@
     )
   )
 
-  ;; CHECK:      (func $improvable-test-separate-fallthrough (type $12) (param $eqref eqref) (result i32)
+  ;; CHECK:      (func $improvable-test-separate-fallthrough (type $13) (param $eqref eqref) (result i32)
   ;; CHECK-NEXT:  (ref.test (ref i31)
   ;; CHECK-NEXT:   (block (result eqref)
   ;; CHECK-NEXT:    (ref.as_non_null
@@ -1533,7 +1537,7 @@
     )
   )
 
-  ;; CHECK:      (func $incompatible-test-separate-fallthrough (type $12) (param $eqref eqref) (result i32)
+  ;; CHECK:      (func $incompatible-test-separate-fallthrough (type $13) (param $eqref eqref) (result i32)
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (local.tee $eqref
   ;; CHECK-NEXT:    (block (result eqref)
@@ -2278,7 +2282,7 @@
     )
   )
 
-  ;; CHECK:      (func $ref-test-static-subtype (type $13) (param $nullable (ref null $B)) (param $non-nullable (ref $B))
+  ;; CHECK:      (func $ref-test-static-subtype (type $14) (param $nullable (ref null $B)) (param $non-nullable (ref $B))
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (i32.eqz
   ;; CHECK-NEXT:    (ref.is_null
@@ -2465,7 +2469,7 @@
     )
   )
 
-  ;; CHECK:      (func $ref-cast-heap-type (type $13) (param $null-b (ref null $B)) (param $b (ref $B))
+  ;; CHECK:      (func $ref-cast-heap-type (type $14) (param $null-b (ref null $B)) (param $b (ref $B))
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (local.get $b)
   ;; CHECK-NEXT:  )
@@ -2512,7 +2516,7 @@
     )
   )
 
-  ;; CHECK:      (func $ref-cast-heap-type-incompatible (type $13) (param $null-b (ref null $B)) (param $b (ref $B))
+  ;; CHECK:      (func $ref-cast-heap-type-incompatible (type $14) (param $null-b (ref null $B)) (param $b (ref $B))
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (unreachable)
   ;; CHECK-NEXT:  )
@@ -4008,6 +4012,72 @@
         )
       )
       (local.get $x)
+    )
+  )
+
+  ;; CHECK:      (func $packed-get-max-bits (type $53) (param $s (ref $struct)) (param $a (ref $array)) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (struct.get_u $struct $i16
+  ;; CHECK-NEXT:     (local.get $s)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (array.get_u $array
+  ;; CHECK-NEXT:     (local.get $a)
+  ;; CHECK-NEXT:     (i32.const 0)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (struct.get_u $struct $i8
+  ;; CHECK-NEXT:    (local.get $s)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $packed-get-max-bits (param $s (ref $struct)) (param $a (ref $array)) (result i32)
+    (i32.add
+      (i32.and
+        (struct.get_u $struct $i8 (local.get $s))
+        (i32.const 255)
+      )
+      (i32.add
+        (i32.and
+          (struct.get_u $struct $i16 (local.get $s))
+          (i32.const 65535)
+        )
+        (i32.and
+          (array.get_u $array (local.get $a) (i32.const 0))
+          (i32.const 255)
+        )
+      )
+    )
+  )
+
+  ;; CHECK:      (func $ref-test-through-select-and-if (type $54) (param $b (ref $B)) (param $c (ref $C)) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (i32.eq
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (i32.const 1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.eq
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (i32.const 2)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $ref-test-through-select-and-if (param $b (ref $B)) (param $c (ref $C)) (param $x i32) (result i32)
+    (i32.add
+      (ref.test (ref $B)
+        (select (result (ref $A))
+          (local.get $b)
+          (local.get $c)
+          (i32.eq (local.get $x) (i32.const 1))
+        )
+      )
+      (ref.test (ref $B)
+        (if (result (ref null $B))
+          (i32.eq (local.get $x) (i32.const 2))
+          (then (local.get $b))
+          (else (ref.null none))
+        )
+      )
     )
   )
 )
