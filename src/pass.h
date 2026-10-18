@@ -461,6 +461,11 @@ public:
   // Walker, as otherwise this will create the parent class.
   virtual std::unique_ptr<Pass> create() { WASM_UNREACHABLE("unimplenented"); }
 
+  // Optional module-level preparation hook called before running a
+  // function-parallel pass across the module.
+  virtual bool hasPrepareToRun() { return false; }
+  virtual void prepareToRun(Module* module) {}
+
   // Whether this pass modifies the Binaryen IR in the module. This is true for
   // most passes, except for passes that have no side effects, or passes that
   // only modify other things than Binaryen IR (for example, the Stack IR

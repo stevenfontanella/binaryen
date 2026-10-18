@@ -95,6 +95,7 @@
 #include <deque>
 #include <map>
 
+#include "ir/bits.h"
 #include "ir/branch-utils.h"
 #include "ir/effects.h"
 #include "ir/find_all.h"
@@ -6479,12 +6480,14 @@ struct OutlineExpressions : public Pass {
     }
     bool wasIdempotent = func->effects->isIdempotent;
     bool wasOnlyInit = func->effects->onlyTouchesInitGlobals;
+    bool wasReturnsOneBit = func->effects->returnsOneBit;
     auto newEff =
       std::make_unique<EffectAnalyzer>(getPassOptions(), *wasm, func);
     if (wasIdempotent && wasOnlyInit && !newEff->throws()) {
       newEff->isIdempotent = true;
       newEff->onlyTouchesInitGlobals = true;
     }
+    newEff->returnsOneBit = wasReturnsOneBit;
     func->effects = std::move(newEff);
   }
 
@@ -6494,6 +6497,26 @@ struct OutlineExpressions : public Pass {
     }
     auto newEff =
       std::make_unique<EffectAnalyzer>(getPassOptions(), *wasm, newFunc);
+    if (newFunc->getResults() == Type::i32 && newFunc->body &&
+        newFunc->body->type == Type::i32) {
+      struct HelperBitProvider : Bits::DummyLocalInfoProvider {
+        const Module& module;
+        HelperBitProvider(const Module& module) : module(module) {}
+        Index getMaxBitsForCall(Call* call) {
+          if (call->type == Type::i32) {
+            if (auto* callee = module.getFunctionOrNull(call->target)) {
+              if (callee->effects && callee->effects->returnsOneBit) {
+                return 1;
+              }
+            }
+          }
+          return call->type == Type::i64 ? 64 : 32;
+        }
+      } provider(*wasm);
+      if (Bits::getMaxBits(newFunc->body, &provider) <= 1) {
+        newEff->returnsOneBit = true;
+      }
+    }
     if (getPassOptions().shrinkLevel > 0 && !newEff->throws() &&
         !newEff->suspends && !newEff->calls && !newEff->mayNotReturn &&
         !newEff->danglingPop && !newEff->hasSynchronization() &&

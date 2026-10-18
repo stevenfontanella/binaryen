@@ -45,9 +45,9 @@ public:
       implicitTrap(false), throws_(false), danglingPop(false),
       mayNotReturn(false), hasReturnCallThrow(false), suspends(false),
       generative(false), isIdempotent(false), onlyTouchesInitGlobals(false),
-      mustNotReturn(false), hasUnknownMutableStructRead(false),
-      hasUnknownMutableStructWrite(false), module(module),
-      features(module.features) {}
+      mustNotReturn(false), returnsOneBit(false),
+      hasUnknownMutableStructRead(false), hasUnknownMutableStructWrite(false),
+      module(module), features(module.features) {}
 
   EffectAnalyzer(const PassOptions& passOptions,
                  const Module& module,
@@ -155,6 +155,9 @@ public:
 
   // Whether calling this function is guaranteed never to return normally.
   bool mustNotReturn : 1;
+
+  // Whether calling this function is guaranteed to return an i32 in {0, 1}.
+  bool returnsOneBit : 1;
 
   // Whether this function reads a mutable struct field that could not be
   // statically enumerated in mutableStructFieldsRead.

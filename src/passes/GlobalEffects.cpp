@@ -19,6 +19,7 @@
 // PassOptions structure; see more details there.
 //
 
+#include "ir/bits.h"
 #include "ir/effects.h"
 #include "ir/find_all.h"
 #include "ir/intrinsics.h"
@@ -134,6 +135,7 @@ std::map<Function*, FuncInfo> analyzeFuncs(Module& module,
             funcInfo.effects.emplace(passOptions, module);
             funcInfo.effects->isIdempotent = true;
             funcInfo.effects->onlyTouchesInitGlobals = true;
+            funcInfo.effects->returnsOneBit = true;
             return;
           }
           if (func->base == "compare" || func->base == "length" ||
@@ -813,31 +815,88 @@ void propagateEffects(
 
     if (ccEffects && cc.size() == 1 && ccFuncs.size() == 1) {
       Function* f = ccFuncs[0];
-      if (!f->imported() && f->body &&
-          !funcInfos.at(f).calledFunctions.contains(f->name)) {
+      if (f->imported()) {
+        if (const auto& eff = funcInfos.at(f).effects) {
+          ccEffects->isIdempotent = eff->isIdempotent;
+          ccEffects->onlyTouchesInitGlobals = eff->onlyTouchesInitGlobals;
+          ccEffects->returnsOneBit = eff->returnsOneBit;
+        }
+      } else if (f->body && !funcInfos.at(f).calledFunctions.contains(f->name)) {
         struct ReturnOrTailCallFinder
           : public PostWalker<ReturnOrTailCallFinder> {
           bool found = false;
-          void visitReturn(Return*) { found = true; }
+          bool hasIndirectTailCall = false;
+          std::vector<Expression*> returnValues;
+          std::vector<Name> tailCallTargets;
+          void visitReturn(Return* curr) {
+            found = true;
+            if (curr->value && curr->value->type == Type::i32) {
+              returnValues.push_back(curr->value);
+            }
+          }
           void visitCall(Call* curr) {
             if (curr->isReturn) {
               found = true;
+              tailCallTargets.push_back(curr->target);
             }
           }
           void visitCallIndirect(CallIndirect* curr) {
             if (curr->isReturn) {
               found = true;
+              hasIndirectTailCall = true;
             }
           }
           void visitCallRef(CallRef* curr) {
             if (curr->isReturn) {
               found = true;
+              hasIndirectTailCall = true;
             }
           }
         } finder;
         finder.walk(f->body);
         if (!finder.found && exprDoesNotReturn(f->body, module)) {
           ccEffects->mustNotReturn = true;
+        }
+        if (f->getResults() == Type::i32 && !finder.hasIndirectTailCall) {
+          if (f->body->type == Type::i32) {
+            finder.returnValues.push_back(f->body);
+          }
+          if (!finder.returnValues.empty() || !finder.tailCallTargets.empty()) {
+            bool allOneBit = true;
+            for (Name target : finder.tailCallTargets) {
+              auto* callee = module.getFunctionOrNull(target);
+              if (!callee || !callee->effects ||
+                  !callee->effects->returnsOneBit) {
+                allOneBit = false;
+                break;
+              }
+            }
+            if (allOneBit) {
+              struct CallBitProvider : Bits::DummyLocalInfoProvider {
+                const Module& module;
+                CallBitProvider(const Module& module) : module(module) {}
+                Index getMaxBitsForCall(Call* call) {
+                  if (call->type == Type::i32) {
+                    if (auto* callee = module.getFunctionOrNull(call->target)) {
+                      if (callee->effects && callee->effects->returnsOneBit) {
+                        return 1;
+                      }
+                    }
+                  }
+                  return call->type == Type::i64 ? 64 : 32;
+                }
+              } provider(module);
+              for (auto* val : finder.returnValues) {
+                if (Bits::getMaxBits(val, &provider) > 1) {
+                  allOneBit = false;
+                  break;
+                }
+              }
+            }
+            if (allOneBit) {
+              ccEffects->returnsOneBit = true;
+            }
+          }
         }
       }
     }

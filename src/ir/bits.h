@@ -141,6 +141,21 @@ struct DummyLocalInfoProvider {
     }
     WASM_UNREACHABLE("type has no integer bit size");
   }
+  Index getMaxBitsForStructGet(StructGet* get) {
+    return get->type == Type::i64 ? 64 : 32;
+  }
+  Index getMaxBitsForCall(Call* call) {
+    return call->type == Type::i64 ? 64 : 32;
+  }
+  Index getMaxBitsForCallRef(CallRef* call) {
+    return call->type == Type::i64 ? 64 : 32;
+  }
+  Index getMaxBitsForGlobalGet(GlobalGet* get) {
+    return get->type == Type::i64 ? 64 : 32;
+  }
+  Index getMaxBitsForBlock(Block* block) {
+    return block->type == Type::i64 ? 64 : 32;
+  }
 };
 
 // Returns the maximum amount of bits used in an integer expression
@@ -457,8 +472,23 @@ Index getMaxBits(Expression* curr,
       return 8 * load->bytes;
     }
   } else if (auto* block = curr->dynCast<Block>()) {
-    if (!block->name.is() && !block->list.empty() && block->type.isConcrete()) {
-      return getMaxBits(block->list.back(), localInfoProvider);
+    if (!block->list.empty() && block->type.isConcrete()) {
+      if (!block->name.is()) {
+        if (block->list.back()->type.isInteger()) {
+          return getMaxBits(block->list.back(), localInfoProvider);
+        }
+      } else if (localInfoProvider) {
+        return localInfoProvider->getMaxBitsForBlock(block);
+      }
+    }
+  } else if (auto* loop = curr->dynCast<Loop>()) {
+    if (loop->type.isInteger() && loop->body->type.isInteger()) {
+      return getMaxBits(loop->body, localInfoProvider);
+    }
+  } else if (auto* br = curr->dynCast<Break>()) {
+    if (br->condition && br->value && br->type.isInteger() &&
+        br->value->type.isInteger()) {
+      return getMaxBits(br->value, localInfoProvider);
     }
   } else if (auto* select = curr->dynCast<Select>()) {
     if (select->ifTrue->type.isInteger() && select->ifFalse->type.isInteger()) {
@@ -466,12 +496,25 @@ Index getMaxBits(Expression* curr,
                       getMaxBits(select->ifFalse, localInfoProvider));
     }
   } else if (auto* iff = curr->dynCast<If>()) {
-    if (iff->ifFalse && iff->ifTrue->type.isInteger() &&
-        iff->ifFalse->type.isInteger()) {
-      return std::max(getMaxBits(iff->ifTrue, localInfoProvider),
-                      getMaxBits(iff->ifFalse, localInfoProvider));
+    if (iff->ifFalse && iff->type.isInteger()) {
+      if (iff->ifTrue->type.isInteger() && iff->ifFalse->type.isInteger()) {
+        return std::max(getMaxBits(iff->ifTrue, localInfoProvider),
+                        getMaxBits(iff->ifFalse, localInfoProvider));
+      }
+      if (iff->ifTrue->type.isInteger()) {
+        return std::max(Index(1), getMaxBits(iff->ifTrue, localInfoProvider));
+      }
+      if (iff->ifFalse->type.isInteger()) {
+        return std::max(Index(1), getMaxBits(iff->ifFalse, localInfoProvider));
+      }
     }
   } else if (auto* get = curr->dynCast<StructGet>()) {
+    if (localInfoProvider) {
+      auto bits = localInfoProvider->getMaxBitsForStructGet(get);
+      if (bits < (get->type == Type::i64 ? Index(64) : Index(32))) {
+        return bits;
+      }
+    }
     if (!get->signed_ && get->ref->type.isStruct()) {
       const auto& field =
         get->ref->type.getHeapType().getStruct().fields[get->index];
@@ -485,6 +528,18 @@ Index getMaxBits(Expression* curr,
       if (field.isPacked()) {
         return 8 * field.getByteSize();
       }
+    }
+  } else if (auto* call = curr->dynCast<Call>()) {
+    if (localInfoProvider && call->type.isInteger()) {
+      return localInfoProvider->getMaxBitsForCall(call);
+    }
+  } else if (auto* call = curr->dynCast<CallRef>()) {
+    if (localInfoProvider && call->type.isInteger()) {
+      return localInfoProvider->getMaxBitsForCallRef(call);
+    }
+  } else if (auto* get = curr->dynCast<GlobalGet>()) {
+    if (localInfoProvider && get->type.isInteger()) {
+      return localInfoProvider->getMaxBitsForGlobalGet(get);
     }
   }
   switch (curr->type.getBasic()) {

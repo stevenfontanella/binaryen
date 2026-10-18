@@ -384,7 +384,7 @@
   ;; CHECK-NEXT:      (loop $l
   ;; CHECK-NEXT:       (br_if $l
   ;; CHECK-NEXT:        (local.tee $1
-  ;; CHECK-NEXT:         (i32.div_s
+  ;; CHECK-NEXT:         (i32.div_u
   ;; CHECK-NEXT:          (i32.add
   ;; CHECK-NEXT:           (local.get $1)
   ;; CHECK-NEXT:           (i32.const 1)
@@ -1261,10 +1261,11 @@
   ;; CHECK-NEXT:     )
   ;; CHECK-NEXT:     (br_if $l
   ;; CHECK-NEXT:      (i32.eqz
-  ;; CHECK-NEXT:       (select
+  ;; CHECK-NEXT:       (i32.or
   ;; CHECK-NEXT:        (global.get $__asyncify_state)
-  ;; CHECK-NEXT:        (i32.const 1)
-  ;; CHECK-NEXT:        (local.get $0)
+  ;; CHECK-NEXT:        (i32.eqz
+  ;; CHECK-NEXT:         (local.get $0)
+  ;; CHECK-NEXT:        )
   ;; CHECK-NEXT:       )
   ;; CHECK-NEXT:      )
   ;; CHECK-NEXT:     )

@@ -15896,10 +15896,11 @@
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (i32.eqz
-  ;; CHECK-NEXT:    (select
+  ;; CHECK-NEXT:    (i32.or
   ;; CHECK-NEXT:     (local.get $y)
-  ;; CHECK-NEXT:     (i32.const 1)
-  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:     (i32.eqz
+  ;; CHECK-NEXT:      (local.get $x)
+  ;; CHECK-NEXT:     )
   ;; CHECK-NEXT:    )
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
@@ -18917,6 +18918,78 @@
           (i32.const 0)
           (local.get $y)
           (i32.and (local.get $x) (i32.const 1))
+        )
+      )
+    )
+  )
+
+  ;; CHECK:      (func $one-bit-block-and-if-select (param $x i32) (param $y i32) (result i32)
+  ;; CHECK-NEXT:  (local $b i32)
+  ;; CHECK-NEXT:  (local.set $b
+  ;; CHECK-NEXT:   (block $blk (result i32)
+  ;; CHECK-NEXT:    (drop
+  ;; CHECK-NEXT:     (br_if $blk
+  ;; CHECK-NEXT:      (i32.eq
+  ;; CHECK-NEXT:       (local.get $x)
+  ;; CHECK-NEXT:       (i32.const 1)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (local.get $y)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.eq
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:     (i32.const 2)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (if (result i32)
+  ;; CHECK-NEXT:   (i32.or
+  ;; CHECK-NEXT:    (i32.eqz
+  ;; CHECK-NEXT:     (local.get $y)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (i32.and
+  ;; CHECK-NEXT:     (i32.eq
+  ;; CHECK-NEXT:      (local.get $y)
+  ;; CHECK-NEXT:      (i32.const 3)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (local.get $b)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (else
+  ;; CHECK-NEXT:    (i32.const 42)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $one-bit-block-and-if-select (param $x i32) (param $y i32) (result i32)
+    (local $b i32)
+    (local.set $b
+      (block $blk (result i32)
+        (drop
+          (br_if $blk
+            (i32.eq (local.get $x) (i32.const 1))
+            (local.get $y)
+          )
+        )
+        (i32.eq (local.get $x) (i32.const 2))
+      )
+    )
+    (if (result i32)
+      (select
+        (i32.const 0)
+        (local.get $y)
+        (local.get $x)
+      )
+      (then
+        (i32.const 42)
+      )
+      (else
+        (select
+          (local.get $b)
+          (i32.const 0)
+          (i32.eq (local.get $y) (i32.const 3))
         )
       )
     )

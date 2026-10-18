@@ -250,11 +250,12 @@
 
   ;; CHECK:      (func $14 (type $0) (param $0 i32) (param $1 i32) (result i32)
   ;; CHECK-NEXT:  (select
-  ;; CHECK-NEXT:   (local.get $0)
   ;; CHECK-NEXT:   (i32.const 0)
-  ;; CHECK-NEXT:   (select
-  ;; CHECK-NEXT:    (i32.const 0)
-  ;; CHECK-NEXT:    (local.get $1)
+  ;; CHECK-NEXT:   (local.get $0)
+  ;; CHECK-NEXT:   (i32.or
+  ;; CHECK-NEXT:    (i32.eqz
+  ;; CHECK-NEXT:     (local.get $1)
+  ;; CHECK-NEXT:    )
   ;; CHECK-NEXT:    (local.get $0)
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )

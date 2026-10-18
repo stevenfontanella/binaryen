@@ -966,6 +966,10 @@ void PassRunner::run() {
       }
       auto before = std::chrono::steady_clock::now();
       if (pass->isFunctionParallel()) {
+        if (!isNested && !options.passesToSkip.contains(pass->name)) {
+          pass->setPassRunner(this);
+          pass->prepareToRun(wasm);
+        }
         // function-parallel passes should get a new instance per function
         ModuleUtils::iterDefinedFunctions(
           *wasm, [&](Function* func) { runPassOnFunction(pass.get(), func); });
@@ -1013,6 +1017,14 @@ void PassRunner::run() {
     std::vector<Pass*> stack;
     auto flush = [&]() {
       if (stack.size() > 0) {
+        if (!isNested) {
+          for (auto* pass : stack) {
+            if (!options.passesToSkip.contains(pass->name)) {
+              pass->setPassRunner(this);
+              pass->prepareToRun(wasm);
+            }
+          }
+        }
         // run the stack of passes on all the functions, in parallel
         size_t num = ThreadPool::get()->size();
         std::vector<std::function<ThreadWorkState()>> doWorkers;
@@ -1045,6 +1057,9 @@ void PassRunner::run() {
     };
     for (auto& pass : passes) {
       if (pass->isFunctionParallel()) {
+        if (!isNested && pass->hasPrepareToRun() && !stack.empty()) {
+          flush();
+        }
         stack.push_back(pass.get());
       } else {
         flush();

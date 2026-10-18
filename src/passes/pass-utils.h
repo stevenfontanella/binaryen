@@ -46,6 +46,13 @@ struct FilteredPass : public Pass {
     return true;
   }
 
+  bool hasPrepareToRun() override { return pass->hasPrepareToRun(); }
+
+  void prepareToRun(Module* module) override {
+    pass->setPassRunner(getPassRunner());
+    pass->prepareToRun(module);
+  }
+
   void runOnFunction(Module* module, Function* func) override {
     if (!relevantFuncs.contains(func)) {
       return;
