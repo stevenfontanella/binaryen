@@ -42,14 +42,17 @@ StackIROptimizer::StackIROptimizer(Module& module,
 
 void StackIROptimizer::run() {
   dce();
+  vacuum();
+  removeUnneededBlocks();
+  dce();
   // FIXME: local2Stack is currently rather slow (due to localGraph),
   //        so for now run it only when really optimizing
   if (passOptions.optimizeLevel >= 3 || passOptions.shrinkLevel >= 1) {
     local2Stack();
+    vacuum();
+    removeUnneededBlocks();
+    dce();
   }
-  vacuum();
-  removeUnneededBlocks();
-  dce();
   vacuum();
 }
 
@@ -785,12 +788,25 @@ void StackIROptimizer::local2Stack() {
 // enclosing function body, if arm, if expression, or outer block of the same
 // written result type.
 void StackIROptimizer::removeUnneededBlocks() {
+  auto resolveLabel = [&](Name name) {
+    while (true) {
+      auto it = insts.labelAliases.find(name);
+      if (it == insts.labelAliases.end()) {
+        break;
+      }
+      name = it->second;
+    }
+    return name;
+  };
+
   // First, find all branch targets.
   std::unordered_set<Name> targets;
   for (auto*& inst : insts) {
     if (inst) {
-      BranchUtils::operateOnScopeNameUses(
-        inst->origin, [&](Name& name) { targets.insert(name); });
+      BranchUtils::operateOnScopeNameUses(inst->origin, [&](Name& name) {
+        targets.insert(name);
+        targets.insert(resolveLabel(name));
+      });
     }
   }
 
@@ -807,12 +823,6 @@ void StackIROptimizer::removeUnneededBlocks() {
     }
   }
 
-  auto sameWrittenType = [&](Type a, Type b) {
-    return a != Type::unreachable && b != Type::unreachable &&
-           a.asWrittenGivenFeatures(features) ==
-             b.asWrittenGivenFeatures(features);
-  };
-
   auto nextNonNull = [&](Index idx) -> Index {
     for (Index j = idx + 1; j < insts.size(); j++) {
       if (insts[j]) {
@@ -822,12 +832,18 @@ void StackIROptimizer::removeUnneededBlocks() {
     return insts.size();
   };
 
-  // Index the remaining control-flow begins and ends.
+  // Index the remaining control-flow begins and ends, and track labels targeted
+  // by non-dropped value-carrying br_if instructions (whose fallthrough type in
+  // Wasm binary validation depends on the target label's exact written type).
   std::unordered_map<Block*, Index> blockBeginIdx;
   std::unordered_map<Block*, Index> blockEndIdx;
+  std::unordered_map<Name, Block*> blockByName;
   std::unordered_map<If*, Index> ifBeginIdx;
   std::unordered_map<If*, Index> ifElseIdx;
   std::unordered_map<If*, Index> ifEndIdx;
+  std::unordered_map<Loop*, Index> loopBeginIdx;
+  std::unordered_map<Loop*, Index> loopEndIdx;
+  std::unordered_set<Name> labelsWithUndroppedBrIf;
   std::vector<Block*> blocksByEndOrder;
   for (Index i = 0; i < insts.size(); i++) {
     auto* inst = insts[i];
@@ -835,9 +851,14 @@ void StackIROptimizer::removeUnneededBlocks() {
       continue;
     }
     switch (inst->op) {
-      case StackInst::BlockBegin:
-        blockBeginIdx[inst->origin->cast<Block>()] = i;
+      case StackInst::BlockBegin: {
+        auto* b = inst->origin->cast<Block>();
+        blockBeginIdx[b] = i;
+        if (b->name.is()) {
+          blockByName[b->name] = b;
+        }
         break;
+      }
       case StackInst::BlockEnd: {
         auto* b = inst->origin->cast<Block>();
         blockEndIdx[b] = i;
@@ -853,10 +874,46 @@ void StackIROptimizer::removeUnneededBlocks() {
       case StackInst::IfEnd:
         ifEndIdx[inst->origin->cast<If>()] = i;
         break;
+      case StackInst::LoopBegin:
+        loopBeginIdx[inst->origin->cast<Loop>()] = i;
+        break;
+      case StackInst::LoopEnd:
+        loopEndIdx[inst->origin->cast<Loop>()] = i;
+        break;
+      case StackInst::Basic: {
+        if (auto* br = inst->origin->dynCast<Break>()) {
+          if (br->condition && br->value) {
+            Index nextIdx = nextNonNull(i);
+            if (nextIdx >= insts.size() ||
+                insts[nextIdx]->op != StackInst::Basic ||
+                !insts[nextIdx]->origin->is<Drop>()) {
+              labelsWithUndroppedBrIf.insert(br->name);
+              labelsWithUndroppedBrIf.insert(resolveLabel(br->name));
+            }
+          }
+        }
+        break;
+      }
       default:
         break;
     }
   }
+
+  auto compatibleWrittenType = [&](Type inner, Type outer, Block* innerBlock) {
+    if (inner == Type::unreachable || outer == Type::unreachable) {
+      return false;
+    }
+    Type innerW = inner.asWrittenGivenFeatures(features);
+    Type outerW = outer.asWrittenGivenFeatures(features);
+    if (innerW == outerW) {
+      return true;
+    }
+    if (!Type::isSubType(innerW, outerW)) {
+      return false;
+    }
+    return !labelsWithUndroppedBrIf.contains(innerBlock->name) &&
+           !labelsWithUndroppedBrIf.contains(resolveLabel(innerBlock->name));
+  };
 
   auto elideBlock = [&](Block* b) {
     auto itBegin = blockBeginIdx.find(b);
@@ -869,16 +926,26 @@ void StackIROptimizer::removeUnneededBlocks() {
     return true;
   };
 
+  auto aliasLabel = [&](Name from, Name to) {
+    Name resolvedTo = resolveLabel(to);
+    if (from != resolvedTo) {
+      insts.labelAliases[from] = resolvedTo;
+      if (labelsWithUndroppedBrIf.contains(from)) {
+        labelsWithUndroppedBrIf.insert(resolvedTo);
+      }
+    }
+  };
+
   auto bindLabel = [&](Name& slot, Name newName) {
     if (!slot.is()) {
-      slot = newName;
-    } else if (slot != newName) {
-      insts.labelAliases[newName] = slot;
+      slot = resolveLabel(newName);
+    } else {
+      aliasLabel(newName, slot);
     }
   };
 
   // 1(c) Nested tail-Block elision: when BlockEnd(b) is immediately followed
-  // by BlockEnd(outerB) and both blocks have the same written result type,
+  // by BlockEnd(outerB) and b's written result type is compatible with outerB,
   // elide b and alias its label to outerB->name. Iterate in forward BlockEnd
   // order so inner blocks are elided into outer blocks before the outer blocks
   // are considered for function-body or if-scope elision.
@@ -899,17 +966,17 @@ void StackIROptimizer::removeUnneededBlocks() {
       auto itOuterBegin = blockBeginIdx.find(outerB);
       if (itOuterBegin != blockBeginIdx.end() &&
           itOuterBegin->second < itBegin->second &&
-          sameWrittenType(b->type, outerB->type)) {
+          compatibleWrittenType(b->type, outerB->type, b)) {
         if (elideBlock(b)) {
-          insts.labelAliases[b->name] = outerB->name;
+          aliasLabel(b->name, outerB->name);
         }
       }
     }
   }
 
   // 1(b.1) & 1(b.2) If-arm tail-Block elision: when BlockEnd(b) inside an If
-  // arm is immediately followed by IfElse(iff) or IfEnd(iff) and b has the
-  // same written result type as iff, elide b and bind iff's arm label.
+  // arm is immediately followed by IfElse(iff) or IfEnd(iff) and b has a
+  // written result type compatible with iff, elide b and bind iff's arm label.
   for (auto* b : blocksByEndOrder) {
     auto itBegin = blockBeginIdx.find(b);
     auto itEnd = blockEndIdx.find(b);
@@ -927,7 +994,7 @@ void StackIROptimizer::removeUnneededBlocks() {
       auto itIfBegin = ifBeginIdx.find(iff);
       if (itIfBegin != ifBeginIdx.end() &&
           itIfBegin->second < itBegin->second &&
-          sameWrittenType(b->type, iff->type)) {
+          compatibleWrittenType(b->type, iff->type, b)) {
         if (elideBlock(b)) {
           bindLabel(insts.ifTrueLabels[iff], b->name);
         }
@@ -937,7 +1004,7 @@ void StackIROptimizer::removeUnneededBlocks() {
       auto itIfBegin = ifBeginIdx.find(iff);
       if (itIfBegin != ifBeginIdx.end() &&
           itIfBegin->second < itBegin->second &&
-          sameWrittenType(b->type, iff->type)) {
+          compatibleWrittenType(b->type, iff->type, b)) {
         auto itIfElse = ifElseIdx.find(iff);
         if (itIfElse == ifElseIdx.end()) {
           // 1-arm If: b is inside ifTrue.
@@ -956,8 +1023,8 @@ void StackIROptimizer::removeUnneededBlocks() {
 
   // 1(b.3) If-wrapper Block elision: when BlockEnd(b) is immediately after
   // IfEnd(iff), BlockBegin(b) precedes IfBegin(iff), no instruction in
-  // (BlockBegin(b), IfBegin(iff)] branches to b->name, and b has the same
-  // written result type as iff, elide b and bind iff's arm label(s).
+  // (BlockBegin(b), IfBegin(iff)] branches to b->name, and b has a written
+  // result type compatible with iff, elide b and bind iff's arm label(s).
   for (auto* b : blocksByEndOrder) {
     auto itBegin = blockBeginIdx.find(b);
     auto itEnd = blockEndIdx.find(b);
@@ -980,7 +1047,7 @@ void StackIROptimizer::removeUnneededBlocks() {
     auto itIfBegin = ifBeginIdx.find(iff);
     if (itIfBegin == ifBeginIdx.end() ||
         !(itBegin->second < itIfBegin->second) ||
-        !sameWrittenType(b->type, iff->type)) {
+        !compatibleWrittenType(b->type, iff->type, b)) {
       continue;
     }
     bool branchBeforeIf = false;
@@ -989,15 +1056,7 @@ void StackIROptimizer::removeUnneededBlocks() {
         continue;
       }
       BranchUtils::operateOnScopeNameUses(insts[j]->origin, [&](Name& name) {
-        Name resolved = name;
-        while (true) {
-          auto it = insts.labelAliases.find(resolved);
-          if (it == insts.labelAliases.end()) {
-            break;
-          }
-          resolved = it->second;
-        }
-        if (resolved == b->name) {
+        if (resolveLabel(name) == b->name) {
           branchBeforeIf = true;
         }
       });
@@ -1012,8 +1071,11 @@ void StackIROptimizer::removeUnneededBlocks() {
       auto bindOuterToArm = [&](Name& armLabel) {
         if (!armLabel.is()) {
           armLabel = b->name;
-        } else if (armLabel != b->name) {
-          insts.labelAliases[armLabel] = b->name;
+        } else {
+          Name resolvedArm = resolveLabel(armLabel);
+          if (resolvedArm != b->name) {
+            aliasLabel(resolvedArm, b->name);
+          }
           armLabel = b->name;
         }
       };
@@ -1025,8 +1087,8 @@ void StackIROptimizer::removeUnneededBlocks() {
   }
 
   // 1(a) Function-body tail Block elision: when BlockEnd(b) is the last
-  // non-null instruction in stackIR and b has the same written result type as
-  // func->getResults(), elide b and bind functionBodyLabel.
+  // non-null instruction in stackIR and b has a written result type compatible
+  // with func->getResults(), elide b and bind functionBodyLabel.
   for (Index i = insts.size(); i > 0; i--) {
     auto* inst = insts[i - 1];
     if (!inst) {
@@ -1034,7 +1096,7 @@ void StackIROptimizer::removeUnneededBlocks() {
     }
     if (inst->op == StackInst::BlockEnd) {
       auto* b = inst->origin->cast<Block>();
-      if (sameWrittenType(b->type, func->getResults())) {
+      if (compatibleWrittenType(b->type, func->getResults(), b)) {
         if (elideBlock(b)) {
           bindLabel(insts.functionBodyLabel, b->name);
           continue;
@@ -1042,6 +1104,115 @@ void StackIROptimizer::removeUnneededBlocks() {
       }
     }
     break;
+  }
+
+  // 1(d) Unconditional-exit Block elision: when BlockEnd(b) is immediately
+  // followed by an unconditional Return or Break consuming b's result (or void
+  // after a void block), elide b and redirect its label to the exit target.
+  for (auto* b : blocksByEndOrder) {
+    auto itBegin = blockBeginIdx.find(b);
+    auto itEnd = blockEndIdx.find(b);
+    if (itBegin == blockBeginIdx.end() || itEnd == blockEndIdx.end() ||
+        !insts[itEnd->second]) {
+      continue;
+    }
+    Index nextIdx = nextNonNull(itEnd->second);
+    if (nextIdx >= insts.size()) {
+      continue;
+    }
+    auto* nextInst = insts[nextIdx];
+    if (nextInst->op != StackInst::Basic) {
+      continue;
+    }
+    auto elideBeforeExit = [&]() {
+      if (!elideBlock(b)) {
+        return false;
+      }
+      Index prevIdx = itEnd->second;
+      while (prevIdx > 0 && !insts[prevIdx - 1]) {
+        prevIdx--;
+      }
+      if (prevIdx > 0 && insts[prevIdx - 1]->type == Type::unreachable) {
+        insts[nextIdx] = nullptr;
+      }
+      return true;
+    };
+    if (auto* ret = nextInst->origin->dynCast<Return>()) {
+      if ((b->type != Type::none) == (ret->value != nullptr) &&
+          compatibleWrittenType(b->type, func->getResults(), b)) {
+        if (elideBeforeExit()) {
+          bindLabel(insts.functionBodyLabel, b->name);
+        }
+      }
+    } else if (auto* br = nextInst->origin->dynCast<Break>()) {
+      if (br->condition || (b->type != Type::none) != (br->value != nullptr)) {
+        continue;
+      }
+      Name targetName = resolveLabel(br->name);
+      if (!targetName.is() || targetName == b->name) {
+        continue;
+      }
+      if (insts.functionBodyLabel.is() &&
+          targetName == resolveLabel(insts.functionBodyLabel)) {
+        if (compatibleWrittenType(b->type, func->getResults(), b)) {
+          if (elideBeforeExit()) {
+            bindLabel(insts.functionBodyLabel, b->name);
+          }
+        }
+        continue;
+      }
+      if (auto itTargetB = blockByName.find(targetName);
+          itTargetB != blockByName.end()) {
+        auto* targetB = itTargetB->second;
+        auto itTargetBegin = blockBeginIdx.find(targetB);
+        auto itTargetEnd = blockEndIdx.find(targetB);
+        if (itTargetBegin != blockBeginIdx.end() &&
+            itTargetEnd != blockEndIdx.end() && insts[itTargetBegin->second] &&
+            itTargetBegin->second < itBegin->second &&
+            itEnd->second < itTargetEnd->second &&
+            compatibleWrittenType(b->type, targetB->type, b)) {
+          if (elideBeforeExit()) {
+            aliasLabel(b->name, targetB->name);
+          }
+        }
+        continue;
+      }
+      bool matchedIf = false;
+      for (auto& [iff, trueLabel] : insts.ifTrueLabels) {
+        if (trueLabel.is() && resolveLabel(trueLabel) == targetName) {
+          auto itIfBegin = ifBeginIdx.find(iff);
+          auto itIfEnd = ifEndIdx.find(iff);
+          if (itIfBegin != ifBeginIdx.end() && itIfEnd != ifEndIdx.end() &&
+              itIfBegin->second < itBegin->second &&
+              itEnd->second < itIfEnd->second &&
+              compatibleWrittenType(b->type, iff->type, b)) {
+            if (elideBeforeExit()) {
+              aliasLabel(b->name, targetName);
+            }
+          }
+          matchedIf = true;
+          break;
+        }
+      }
+      if (matchedIf) {
+        continue;
+      }
+      for (auto& [iff, falseLabel] : insts.ifFalseLabels) {
+        if (falseLabel.is() && resolveLabel(falseLabel) == targetName) {
+          auto itIfBegin = ifBeginIdx.find(iff);
+          auto itIfEnd = ifEndIdx.find(iff);
+          if (itIfBegin != ifBeginIdx.end() && itIfEnd != ifEndIdx.end() &&
+              itIfBegin->second < itBegin->second &&
+              itEnd->second < itIfEnd->second &&
+              compatibleWrittenType(b->type, iff->type, b)) {
+            if (elideBeforeExit()) {
+              aliasLabel(b->name, targetName);
+            }
+          }
+          break;
+        }
+      }
+    }
   }
 }
 

@@ -18,6 +18,8 @@
 
   ;; CHECK:      (type $10 (func (param f32) (result f32)))
 
+  ;; CHECK:      (type $11 (func (param (ref any)) (result anyref)))
+
   ;; CHECK:      (type $FUNCSIG$id (func (param f64) (result i32)))
   (type $FUNCSIG$id (func (param f64) (result i32)))
   (type $FUNCSIG$ddd (func (param f64 f64) (result f64)))
@@ -31,9 +33,9 @@
   ;; CHECK:      (type $9 (func (param i32 i64)))
   (type $9 (func (param i32 i64)))
 
-  ;; CHECK:      (type $15 (func (param eqref) (result i32)))
+  ;; CHECK:      (type $16 (func (param eqref) (result i32)))
 
-  ;; CHECK:      (type $16 (func (param eqref) (result eqref)))
+  ;; CHECK:      (type $17 (func (param eqref) (result eqref)))
 
   ;; CHECK:      (import "env" "_emscripten_asm_const_vi" (func $_emscripten_asm_const_vi (type $FUNCSIG$v)))
   (import "env" "_emscripten_asm_const_vi" (func $_emscripten_asm_const_vi))
@@ -408,16 +410,10 @@
   ;; CHECK-NEXT:  block $label$break$Lout
   ;; CHECK-NEXT:   block $switch-case$15
   ;; CHECK-NEXT:    block $switch-case$12
-  ;; CHECK-NEXT:     block $switch-case$9
-  ;; CHECK-NEXT:      block $switch-case$8
-  ;; CHECK-NEXT:       local.get $x
-  ;; CHECK-NEXT:       i32.const 2
-  ;; CHECK-NEXT:       i32.sub
-  ;; CHECK-NEXT:       br_table $switch-case$15 $switch-default$16 $switch-default$16 $switch-case$12 $switch-default$16 $switch-default$16 $switch-default$16 $switch-default$16 $switch-case$9 $switch-default$16 $switch-case$8 $switch-default$16
-  ;; CHECK-NEXT:      end
-  ;; CHECK-NEXT:      br $label$break$Lout
-  ;; CHECK-NEXT:     end
-  ;; CHECK-NEXT:     br $label$break$Lout
+  ;; CHECK-NEXT:     local.get $x
+  ;; CHECK-NEXT:     i32.const 2
+  ;; CHECK-NEXT:     i32.sub
+  ;; CHECK-NEXT:     br_table $switch-case$15 $switch-default$16 $switch-default$16 $switch-case$12 $switch-default$16 $switch-default$16 $switch-default$16 $switch-default$16 $switch-case$9 $switch-default$16 $switch-case$8 $switch-default$16
   ;; CHECK-NEXT:    end
   ;; CHECK-NEXT:    loop $while-in$11
   ;; CHECK-NEXT:     br $while-out$10
@@ -1466,7 +1462,7 @@
   )
 
   ;; A ref.eq with an intervening value: its operands can be swapped.
-  ;; CHECK:      (func $local-to-stack-ref-eq (type $15) (param $x eqref) (result i32)
+  ;; CHECK:      (func $local-to-stack-ref-eq (type $16) (param $x eqref) (result i32)
   ;; CHECK-NEXT:  (local $temp eqref)
   ;; CHECK-NEXT:  local.get $x
   ;; CHECK-NEXT:  call $eqref-value
@@ -1486,7 +1482,7 @@
     )
   )
 
-  ;; CHECK:      (func $eqref-value (type $16) (param $x eqref) (result eqref)
+  ;; CHECK:      (func $eqref-value (type $17) (param $x eqref) (result eqref)
   ;; CHECK-NEXT:  local.get $x
   ;; CHECK-NEXT:  call $eqref-value
   ;; CHECK-NEXT: )
@@ -1667,6 +1663,101 @@
         )
         (i32.const 3)
       )
+    )
+  )
+
+  ;; Running removeUnneededBlocks before local2Stack allows local2Stack to
+  ;; eliminate a local.set/local.get pair across an elided untargeted block.
+  ;; CHECK:      (func $local-to-stack-across-elided-block (type $6) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (local $temp i32)
+  ;; CHECK-NEXT:  i32.const 1
+  ;; CHECK-NEXT:  call $local-to-stack
+  ;; CHECK-NEXT:  i32.const 2
+  ;; CHECK-NEXT:  call $local-to-stack
+  ;; CHECK-NEXT:  drop
+  ;; CHECK-NEXT: )
+  (func $local-to-stack-across-elided-block (param $x i32) (result i32)
+    (local $temp i32)
+    (local.set $temp (call $local-to-stack (i32.const 1)))
+    (block $unneeded
+      (drop (call $local-to-stack (i32.const 2)))
+    )
+    (local.get $temp)
+  )
+
+  ;; Elide a tail block whose non-nullable result type is a subtype of the
+  ;; enclosing function's nullable result type when no undropped br_if uses its
+  ;; fallthrough type.
+  ;; CHECK:      (func $elide-subtype-tail-block (type $11) (param $x (ref any)) (result anyref)
+  ;; CHECK-NEXT:  local.get $x
+  ;; CHECK-NEXT:  i32.const 1
+  ;; CHECK-NEXT:  br_if $tail
+  ;; CHECK-NEXT:  drop
+  ;; CHECK-NEXT:  local.get $x
+  ;; CHECK-NEXT: )
+  (func $elide-subtype-tail-block (param $x (ref any)) (result anyref)
+    (block $tail (result (ref any))
+      (drop (br_if $tail (local.get $x) (i32.const 1)))
+      (local.get $x)
+    )
+  )
+
+  ;; Keep a subtype tail block when an undropped value-carrying br_if relies on
+  ;; the block's exact non-nullable result type on fallthrough.
+  ;; CHECK:      (func $keep-subtype-tail-block-undropped-br-if (type $11) (param $x (ref any)) (result anyref)
+  ;; CHECK-NEXT:  block $tail (result (ref any))
+  ;; CHECK-NEXT:   local.get $x
+  ;; CHECK-NEXT:   i32.const 1
+  ;; CHECK-NEXT:   br_if $tail
+  ;; CHECK-NEXT:  end
+  ;; CHECK-NEXT: )
+  (func $keep-subtype-tail-block-undropped-br-if (param $x (ref any)) (result anyref)
+    (block $tail (result (ref any))
+      (br_if $tail (local.get $x) (i32.const 1))
+    )
+  )
+
+  ;; Elide blocks immediately followed by an unconditional br or return.
+  ;; CHECK:      (func $elide-unconditional-exit-blocks (type $6) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  local.get $x
+  ;; CHECK-NEXT:  if
+  ;; CHECK-NEXT:   i32.const 10
+  ;; CHECK-NEXT:   local.get $x
+  ;; CHECK-NEXT:   br_if $inner_br
+  ;; CHECK-NEXT:   drop
+  ;; CHECK-NEXT:   i32.const 20
+  ;; CHECK-NEXT:   br $outer
+  ;; CHECK-NEXT:  else
+  ;; CHECK-NEXT:   i32.const 30
+  ;; CHECK-NEXT:   local.get $x
+  ;; CHECK-NEXT:   br_if $inner_ret
+  ;; CHECK-NEXT:   drop
+  ;; CHECK-NEXT:   i32.const 40
+  ;; CHECK-NEXT:   return
+  ;; CHECK-NEXT:  end
+  ;; CHECK-NEXT:  unreachable
+  ;; CHECK-NEXT: )
+  (func $elide-unconditional-exit-blocks (param $x i32) (result i32)
+    (block $outer (result i32)
+      (if (local.get $x)
+        (then
+          (br $outer
+            (block $inner_br (result i32)
+              (drop (br_if $inner_br (i32.const 10) (local.get $x)))
+              (i32.const 20)
+            )
+          )
+        )
+        (else
+          (return
+            (block $inner_ret (result i32)
+              (drop (br_if $inner_ret (i32.const 30) (local.get $x)))
+              (i32.const 40)
+            )
+          )
+        )
+      )
+      (i32.const 50)
     )
   )
 )

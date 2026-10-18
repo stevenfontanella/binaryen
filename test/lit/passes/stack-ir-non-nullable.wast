@@ -871,8 +871,8 @@
  ;; CHECK-NEXT:  (local $temp (ref eq))
  ;; CHECK-NEXT:  local.get $param
  ;; CHECK-NEXT:  local.tee $temp
- ;; CHECK-NEXT:  local.get $temp
  ;; CHECK-NEXT:  drop
+ ;; CHECK-NEXT:  local.get $temp
  ;; CHECK-NEXT:  drop
  ;; CHECK-NEXT: )
  (func $nesting-relevant (param $param (ref eq))
@@ -947,7 +947,6 @@
  ;; CHECK:      (func $nesting-covered-but-ended (type $0) (param $param (ref eq))
  ;; CHECK-NEXT:  (local $temp (ref eq))
  ;; CHECK-NEXT:  local.get $param
- ;; CHECK-NEXT:  local.tee $temp
  ;; CHECK-NEXT:  drop
  ;; CHECK-NEXT:  local.get $param
  ;; CHECK-NEXT:  local.tee $temp

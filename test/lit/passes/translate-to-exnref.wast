@@ -558,12 +558,9 @@
   ;; STACKIR-OPT:      (func $try-single-tag-single (type $2) (result i32)
   ;; STACKIR-OPT-NEXT:  (local $0 i32)
   ;; STACKIR-OPT-NEXT:  block $catch_all2
-  ;; STACKIR-OPT-NEXT:   block $catch1 (result i32)
-  ;; STACKIR-OPT-NEXT:    try_table (result i32) (catch $e-i32 $catch1) (catch_all $catch_all2)
-  ;; STACKIR-OPT-NEXT:     call $foo
-  ;; STACKIR-OPT-NEXT:     i32.const 0
-  ;; STACKIR-OPT-NEXT:    end
-  ;; STACKIR-OPT-NEXT:    br $outer0
+  ;; STACKIR-OPT-NEXT:   try_table (result i32) (catch $e-i32 $catch1) (catch_all $catch_all2)
+  ;; STACKIR-OPT-NEXT:    call $foo
+  ;; STACKIR-OPT-NEXT:    i32.const 0
   ;; STACKIR-OPT-NEXT:   end
   ;; STACKIR-OPT-NEXT:   br $outer0
   ;; STACKIR-OPT-NEXT:  end
@@ -1925,15 +1922,12 @@
   ;; STACKIR-OPT:      (func $delegate-nested-more (type $1)
   ;; STACKIR-OPT-NEXT:  try_table (catch_all $catch_all4)
   ;; STACKIR-OPT-NEXT:   block $l00 (result exnref)
-  ;; STACKIR-OPT-NEXT:    block $outer1
-  ;; STACKIR-OPT-NEXT:     try_table (catch_all $catch_all2)
-  ;; STACKIR-OPT-NEXT:      try_table (catch_all_ref $l00)
-  ;; STACKIR-OPT-NEXT:       call $foo
-  ;; STACKIR-OPT-NEXT:      end
+  ;; STACKIR-OPT-NEXT:    try_table (catch_all $catch_all2)
+  ;; STACKIR-OPT-NEXT:     try_table (catch_all_ref $l00)
+  ;; STACKIR-OPT-NEXT:      call $foo
   ;; STACKIR-OPT-NEXT:     end
-  ;; STACKIR-OPT-NEXT:     br $outer1
   ;; STACKIR-OPT-NEXT:    end
-  ;; STACKIR-OPT-NEXT:    br $outer3
+  ;; STACKIR-OPT-NEXT:    br $outer1
   ;; STACKIR-OPT-NEXT:   end
   ;; STACKIR-OPT-NEXT:   throw_ref
   ;; STACKIR-OPT-NEXT:  end
@@ -1979,19 +1973,16 @@
   ;; CHECK-NEXT: )
   ;; STACKIR-OPT:      (func $delegate-target-outer-try-delegate (type $1)
   ;; STACKIR-OPT-NEXT:  block $__binaryen_delegate_caller_target0 (result exnref)
-  ;; STACKIR-OPT-NEXT:   block $outer2
-  ;; STACKIR-OPT-NEXT:    try_table (catch_all_ref $__binaryen_delegate_caller_target0)
-  ;; STACKIR-OPT-NEXT:     block $l01 (result exnref)
-  ;; STACKIR-OPT-NEXT:      try_table (catch_all_ref $l01)
-  ;; STACKIR-OPT-NEXT:       call $foo
-  ;; STACKIR-OPT-NEXT:      end
-  ;; STACKIR-OPT-NEXT:      br $outer2
+  ;; STACKIR-OPT-NEXT:   try_table (catch_all_ref $__binaryen_delegate_caller_target0)
+  ;; STACKIR-OPT-NEXT:    block $l01 (result exnref)
+  ;; STACKIR-OPT-NEXT:     try_table (catch_all_ref $l01)
+  ;; STACKIR-OPT-NEXT:      call $foo
   ;; STACKIR-OPT-NEXT:     end
-  ;; STACKIR-OPT-NEXT:     throw_ref
+  ;; STACKIR-OPT-NEXT:     br $outer2
   ;; STACKIR-OPT-NEXT:    end
-  ;; STACKIR-OPT-NEXT:    unreachable
+  ;; STACKIR-OPT-NEXT:    throw_ref
   ;; STACKIR-OPT-NEXT:   end
-  ;; STACKIR-OPT-NEXT:   return
+  ;; STACKIR-OPT-NEXT:   unreachable
   ;; STACKIR-OPT-NEXT:  end
   ;; STACKIR-OPT-NEXT:  throw_ref
   ;; STACKIR-OPT-NEXT: )
@@ -2035,20 +2026,17 @@
   ;; CHECK-NEXT: )
   ;; STACKIR-OPT:      (func $delegate-target-outer-try-delegate-concrete (type $2) (result i32)
   ;; STACKIR-OPT-NEXT:  block $__binaryen_delegate_caller_target0 (result exnref)
-  ;; STACKIR-OPT-NEXT:   block $outer2 (result i32)
-  ;; STACKIR-OPT-NEXT:    try_table (catch_all_ref $__binaryen_delegate_caller_target0)
-  ;; STACKIR-OPT-NEXT:     block $l01 (result exnref)
-  ;; STACKIR-OPT-NEXT:      try_table (result i32) (catch_all_ref $l01)
-  ;; STACKIR-OPT-NEXT:       call $foo
-  ;; STACKIR-OPT-NEXT:       i32.const 0
-  ;; STACKIR-OPT-NEXT:      end
-  ;; STACKIR-OPT-NEXT:      br $outer2
+  ;; STACKIR-OPT-NEXT:   try_table (catch_all_ref $__binaryen_delegate_caller_target0)
+  ;; STACKIR-OPT-NEXT:    block $l01 (result exnref)
+  ;; STACKIR-OPT-NEXT:     try_table (result i32) (catch_all_ref $l01)
+  ;; STACKIR-OPT-NEXT:      call $foo
+  ;; STACKIR-OPT-NEXT:      i32.const 0
   ;; STACKIR-OPT-NEXT:     end
-  ;; STACKIR-OPT-NEXT:     throw_ref
+  ;; STACKIR-OPT-NEXT:     br $outer2
   ;; STACKIR-OPT-NEXT:    end
-  ;; STACKIR-OPT-NEXT:    unreachable
+  ;; STACKIR-OPT-NEXT:    throw_ref
   ;; STACKIR-OPT-NEXT:   end
-  ;; STACKIR-OPT-NEXT:   return
+  ;; STACKIR-OPT-NEXT:   unreachable
   ;; STACKIR-OPT-NEXT:  end
   ;; STACKIR-OPT-NEXT:  throw_ref
   ;; STACKIR-OPT-NEXT: )
