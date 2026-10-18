@@ -41,6 +41,9 @@
 #include <optional>
 #include <unordered_set>
 
+#include "ir/effects.h"
+#include "ir/iteration.h"
+#include "ir/manipulation.h"
 #include "ir/module-utils.h"
 #include "ir/names.h"
 #include "pass.h"
@@ -295,8 +298,34 @@ struct CompressDataSegments : public Pass {
     }
     LZHuffman::makeDecoder(*module, coded, options);
     makeGetter();
+    std::unordered_set<Name> runtimeFuncs = {decodeFuncName, getFuncName};
+    if (options.symbols.func.is()) {
+      runtimeFuncs.insert(options.symbols.func);
+    }
+    eliminateReadOnlyI8Slices(runtimeFuncs);
+    InsertOrderedSet<HeapType> remainingTypes;
+    for (auto& fn : module->functions) {
+      if (fn->imported() || runtimeFuncs.count(fn->name)) {
+        continue;
+      }
+      struct TypeFinder : public PostWalker<TypeFinder> {
+        CompressDataSegments& parent;
+        InsertOrderedSet<HeapType>& remainingTypes;
+        TypeFinder(CompressDataSegments& parent,
+                   InsertOrderedSet<HeapType>& remainingTypes)
+          : parent(parent), remainingTypes(remainingTypes) {}
+        void visitArrayNewData(ArrayNewData* curr) {
+          if (parent.compressed.count(curr->segment)) {
+            remainingTypes.insert(curr->type.getHeapType());
+          }
+        }
+      } finder(*this, remainingTypes);
+      finder.walk(fn->body);
+    }
     for (auto type : types) {
-      makeSlice(type);
+      if (remainingTypes.count(type)) {
+        makeSlice(type);
+      }
     }
 
     // Rewrite the uses and remove the segments.
@@ -648,6 +677,949 @@ struct CompressDataSegments : public Pass {
       Signature(Type::none, Type(i8ArrayType, NonNullable)),
       {},
       body));
+  }
+
+  static Expression*
+  addOffset(Expression* idx, Expression* offsetExpr, Builder& builder) {
+    if (auto* cOff = offsetExpr->dynCast<Const>()) {
+      int32_t delta = cOff->value.geti32();
+      if (delta == 0) {
+        return idx;
+      }
+      if (auto* cIdx = idx->dynCast<Const>()) {
+        cIdx->value = Literal(int32_t(cIdx->value.geti32() + delta));
+        return idx;
+      }
+      if (auto* bin = idx->dynCast<Binary>()) {
+        if (bin->op == AddInt32) {
+          if (auto* cRight = bin->right->dynCast<Const>()) {
+            cRight->value = Literal(int32_t(cRight->value.geti32() + delta));
+            return idx;
+          }
+          if (auto* cLeft = bin->left->dynCast<Const>()) {
+            cLeft->value = Literal(int32_t(cLeft->value.geti32() + delta));
+            return idx;
+          }
+        }
+      }
+      return builder.makeBinary(AddInt32, idx, builder.makeConst(delta));
+    }
+    if (auto* cIdx = idx->dynCast<Const>()) {
+      if (cIdx->value.geti32() == 0) {
+        return offsetExpr;
+      }
+    }
+    return builder.makeBinary(AddInt32, idx, offsetExpr);
+  }
+
+  void
+  eliminateReadOnlyI8Slices(const std::unordered_set<Name>& runtimeFuncs) {
+    Builder builder(*module);
+    Type i8Ref(i8ArrayType, NonNullable);
+
+    // Step 1: Un-outline 4-param multi-slice paramFuncs returning an i8
+    // ArrayNewData on a compressed segment (such as RollRepeatedCalls /
+    // RollConstantTables column pair initializers).
+    for (Name pfName : paramFuncs) {
+      if (escapedParamFuncs.count(pfName) || runtimeFuncs.count(pfName)) {
+        continue;
+      }
+      Function* pf = module->getFunctionOrNull(pfName);
+      if (!pf || pf->imported() || pf->getNumParams() != 4 ||
+          !pf->vars.empty() || !pf->body) {
+        continue;
+      }
+      auto* b = pf->body->dynCast<Block>();
+      if (!b || b->list.size() != 2) {
+        continue;
+      }
+      auto* gs = b->list[0]->dynCast<GlobalSet>();
+      auto* ad1 = b->list[1]->dynCast<ArrayNewData>();
+      auto* ad2 = gs ? gs->value->dynCast<ArrayNewData>() : nullptr;
+      if (!gs || !ad1 || !ad2 || ad1->type.getHeapType() != i8ArrayType ||
+          !compressed.count(ad1->segment)) {
+        continue;
+      }
+      auto* off1 = ad1->offset->dynCast<LocalGet>();
+      auto* len1 = ad1->size->dynCast<LocalGet>();
+      auto* off2 = ad2->offset->dynCast<LocalGet>();
+      auto* len2 = ad2->size->dynCast<LocalGet>();
+      if (!off1 || !len1 || !off2 || !len2) {
+        continue;
+      }
+      std::unordered_set<Index> pSet = {
+        off1->index, len1->index, off2->index, len2->index};
+      if (pSet.size() != 4) {
+        continue;
+      }
+      auto itCalls = paramFuncCalls.find(pfName);
+      if (itCalls == paramFuncCalls.end() || itCalls->second.empty()) {
+        continue;
+      }
+      bool allPureArgs = true;
+      for (auto* c : itCalls->second) {
+        if (c->operands.size() != 4) {
+          allPureArgs = false;
+          break;
+        }
+        for (auto* op : c->operands) {
+          if (!op->is<Const>() && !op->is<GlobalGet>()) {
+            allPureArgs = false;
+            break;
+          }
+        }
+        if (!allPureArgs) {
+          break;
+        }
+      }
+      if (!allPureArgs) {
+        continue;
+      }
+
+      Index replacedCalls = 0;
+      for (auto& fnPtr : module->functions) {
+        Function* fn = fnPtr.get();
+        if (fn->imported() || fn == pf || runtimeFuncs.count(fn->name) ||
+            !fn->body) {
+          continue;
+        }
+        struct CallerCounter : public PostWalker<CallerCounter> {
+          Name pfName;
+          Name gsName;
+          Index pfCalls = 0;
+          Index gsGets = 0;
+          CallerCounter(Name pfName, Name gsName)
+            : pfName(pfName), gsName(gsName) {}
+          void visitCall(Call* curr) {
+            if (curr->target == pfName) {
+              pfCalls++;
+            }
+          }
+          void visitGlobalGet(GlobalGet* curr) {
+            if (curr->name == gsName) {
+              gsGets++;
+            }
+          }
+        } counter(pfName, gs->name);
+        counter.walk(fn->body);
+        if (counter.pfCalls == 0) {
+          continue;
+        }
+        struct BlockInliner : public PostWalker<BlockInliner> {
+          CompressDataSegments& parent;
+          Builder& builder;
+          Name pfName;
+          Name gsName;
+          ArrayNewData* ad1;
+          ArrayNewData* ad2;
+          Index off1, len1, off2, len2;
+          bool canEliminateGlobal;
+          Index& replacedCalls;
+          BlockInliner(CompressDataSegments& parent,
+                       Builder& builder,
+                       Name pfName,
+                       Name gsName,
+                       ArrayNewData* ad1,
+                       ArrayNewData* ad2,
+                       Index off1,
+                       Index len1,
+                       Index off2,
+                       Index len2,
+                       bool canEliminateGlobal,
+                       Index& replacedCalls)
+            : parent(parent), builder(builder), pfName(pfName), gsName(gsName),
+              ad1(ad1), ad2(ad2), off1(off1), len1(len1), off2(off2),
+              len2(len2), canEliminateGlobal(canEliminateGlobal),
+              replacedCalls(replacedCalls) {}
+          void visitBlock(Block* curr) {
+            for (Index i = 0; i < curr->list.size(); i++) {
+              auto* ls = curr->list[i]->dynCast<LocalSet>();
+              if (!ls || ls->isTee()) {
+                continue;
+              }
+              auto* c = ls->value->dynCast<Call>();
+              if (!c || c->target != pfName) {
+                continue;
+              }
+              auto* newAd1 = builder.makeArrayNewData(
+                ad1->type.getHeapType(),
+                ad1->segment,
+                ExpressionManipulator::copy(c->operands[off1], *parent.module),
+                ExpressionManipulator::copy(c->operands[len1], *parent.module));
+              newAd1->type = ad1->type;
+              auto* newAd2 = builder.makeArrayNewData(
+                ad2->type.getHeapType(),
+                ad2->segment,
+                ExpressionManipulator::copy(c->operands[off2], *parent.module),
+                ExpressionManipulator::copy(c->operands[len2], *parent.module));
+              newAd2->type = ad2->type;
+              replacedCalls++;
+              if (canEliminateGlobal && i + 1 < curr->list.size()) {
+                if (auto* ls2 = curr->list[i + 1]->dynCast<LocalSet>()) {
+                  if (!ls2->isTee()) {
+                    if (auto* gg = ls2->value->dynCast<GlobalGet>()) {
+                      if (gg->name == gsName) {
+                        ls->value = newAd1;
+                        ls2->value = newAd2;
+                        continue;
+                      }
+                    }
+                  }
+                }
+              }
+              ls->value = newAd1;
+              curr->list[i] =
+                builder.makeBlock({builder.makeGlobalSet(gsName, newAd2), ls});
+            }
+          }
+        } inliner(*this,
+                  builder,
+                  pfName,
+                  gs->name,
+                  ad1,
+                  ad2,
+                  off1->index,
+                  len1->index,
+                  off2->index,
+                  len2->index,
+                  counter.pfCalls == 1 && counter.gsGets == 1,
+                  replacedCalls);
+        inliner.walk(fn->body);
+      }
+      if (replacedCalls == itCalls->second.size()) {
+        pf->body = builder.makeUnreachable();
+      }
+    }
+
+    // Step 2: Build AST parent/slot maps and symbol tables.
+    struct ParentInfo {
+      Expression* parent = nullptr;
+      Expression** slot = nullptr;
+      bool inLoop = false;
+    };
+    struct FuncAnalysis {
+      std::unordered_map<Expression*, ParentInfo> parents;
+      std::unordered_map<Expression*, Index> postOrder;
+      Index counter = 0;
+      std::unordered_map<Index, std::vector<LocalGet*>> localGets;
+      std::unordered_map<Index, std::vector<LocalSet*>> localSets;
+      std::vector<ArrayNewData*> i8News;
+    };
+    std::unordered_map<Function*, FuncAnalysis> funcData;
+    std::unordered_map<Name, std::vector<std::pair<Function*, GlobalGet*>>>
+      globalGets;
+    std::unordered_map<Name, std::vector<std::pair<Function*, GlobalSet*>>>
+      globalSets;
+    std::unordered_map<Name, std::vector<std::pair<Function*, Call*>>> allCalls;
+    std::unordered_set<Name> escapedFuncs;
+    std::unordered_set<Name> exportedGlobals;
+
+    for (auto& exp : module->exports) {
+      if (exp->kind == ExternalKind::Function) {
+        escapedFuncs.insert(*exp->getInternalName());
+      } else if (exp->kind == ExternalKind::Global) {
+        exportedGlobals.insert(*exp->getInternalName());
+      }
+    }
+
+    struct GlobalRefScanner : public PostWalker<GlobalRefScanner> {
+      std::unordered_set<Name>& escapedFuncs;
+      std::unordered_map<Name, std::vector<std::pair<Function*, GlobalGet*>>>&
+        globalGets;
+      GlobalRefScanner(
+        std::unordered_set<Name>& escapedFuncs,
+        std::unordered_map<Name, std::vector<std::pair<Function*, GlobalGet*>>>&
+          globalGets)
+        : escapedFuncs(escapedFuncs), globalGets(globalGets) {}
+      void visitRefFunc(RefFunc* curr) { escapedFuncs.insert(curr->func); }
+      void visitGlobalGet(GlobalGet* curr) {
+        globalGets[curr->name].push_back({nullptr, curr});
+      }
+    } globalRefScanner(escapedFuncs, globalGets);
+
+    for (auto& g : module->globals) {
+      if (!g->imported() && g->init) {
+        globalRefScanner.walk(g->init);
+      }
+    }
+    for (auto& seg : module->elementSegments) {
+      if (seg->offset) {
+        globalRefScanner.walk(seg->offset);
+      }
+      for (auto* init : seg->data) {
+        globalRefScanner.walk(init);
+      }
+    }
+
+    std::function<void(
+      Expression**, Expression*, bool, Function*, FuncAnalysis&)>
+      walkAST = [&](Expression** slot,
+                    Expression* parent,
+                    bool inLoop,
+                    Function* fn,
+                    FuncAnalysis& fa) {
+        Expression* curr = *slot;
+        fa.parents[curr] = {parent, slot, inLoop};
+        bool childInLoop = inLoop || curr->is<Loop>();
+        for (Expression*& child : ChildIterator(curr)) {
+          walkAST(&child, curr, childInLoop, fn, fa);
+        }
+        fa.postOrder[curr] = fa.counter++;
+        if (auto* lg = curr->dynCast<LocalGet>()) {
+          fa.localGets[lg->index].push_back(lg);
+        } else if (auto* ls = curr->dynCast<LocalSet>()) {
+          fa.localSets[ls->index].push_back(ls);
+        } else if (auto* gg = curr->dynCast<GlobalGet>()) {
+          globalGets[gg->name].push_back({fn, gg});
+        } else if (auto* gs = curr->dynCast<GlobalSet>()) {
+          globalSets[gs->name].push_back({fn, gs});
+        } else if (auto* call = curr->dynCast<Call>()) {
+          allCalls[call->target].push_back({fn, call});
+        } else if (auto* rf = curr->dynCast<RefFunc>()) {
+          escapedFuncs.insert(rf->func);
+        } else if (auto* ad = curr->dynCast<ArrayNewData>()) {
+          if (ad->type.getHeapType() == i8ArrayType &&
+              compressed.count(ad->segment)) {
+            fa.i8News.push_back(ad);
+          }
+        }
+      };
+
+    for (auto& fnPtr : module->functions) {
+      Function* fn = fnPtr.get();
+      if (fn->imported() || !fn->body) {
+        continue;
+      }
+      walkAST(&fn->body, nullptr, false, fn, funcData[fn]);
+    }
+
+    auto unwrapUpwardsI8Ref =
+      [&](Expression* start, const FuncAnalysis& fa) -> Expression* {
+      Expression* cur = start;
+      while (true) {
+        auto it = fa.parents.find(cur);
+        if (it == fa.parents.end() || !it->second.parent) {
+          break;
+        }
+        Expression* p = it->second.parent;
+        if (auto* ra = p->dynCast<RefAs>()) {
+          if (ra->op == RefAsNonNull && ra->value == cur) {
+            cur = ra;
+            continue;
+          }
+        }
+        if (auto* rc = p->dynCast<RefCast>()) {
+          if (rc->ref == cur && rc->type.isRef() &&
+              rc->type.getHeapType() == i8ArrayType) {
+            cur = rc;
+            continue;
+          }
+        }
+        break;
+      }
+      return cur;
+    };
+
+    auto unwrapDownwardsI8Ref = [&](Expression* e) -> Expression* {
+      while (true) {
+        if (auto* ra = e->dynCast<RefAs>()) {
+          if (ra->op == RefAsNonNull) {
+            e = ra->value;
+            continue;
+          }
+        }
+        if (auto* rc = e->dynCast<RefCast>()) {
+          if (rc->type.isRef() && rc->type.getHeapType() == i8ArrayType) {
+            e = rc->ref;
+            continue;
+          }
+        }
+        break;
+      }
+      return e;
+    };
+
+    // Step 3: Discover Kind-1 and Kind-2 i8 reader helpers.
+    struct Kind1Helper {
+      Function* func = nullptr;
+      Index pArr = 0;
+      Index pIdx = 0;
+      Expression** topRefSlot = nullptr;
+    };
+    struct Kind2Helper {
+      Function* func = nullptr;
+      Index pArr = 0;
+      Expression** topRefSlot = nullptr;
+      Expression** innerIndexPtr = nullptr;
+    };
+    std::unordered_map<Name, Kind1Helper> kind1Helpers;
+    std::unordered_map<Name, Kind2Helper> kind2Helpers;
+
+    for (int pass = 0; pass < 2; pass++) {
+      for (auto& fnPtr : module->functions) {
+        Function* fn = fnPtr.get();
+        if (fn->imported() || !fn->body || escapedFuncs.count(fn->name) ||
+            runtimeFuncs.count(fn->name) || kind1Helpers.count(fn->name) ||
+            kind2Helpers.count(fn->name) || allCalls[fn->name].empty()) {
+          continue;
+        }
+        const auto& fa = funcData.at(fn);
+        for (Index pArr = 0; pArr < fn->getNumParams(); pArr++) {
+          if (!fn->getLocalType(pArr).isRef()) {
+            continue;
+          }
+          auto itGets = fa.localGets.find(pArr);
+          if (itGets == fa.localGets.end() || itGets->second.size() != 1 ||
+              fa.localSets.count(pArr)) {
+            continue;
+          }
+          LocalGet* arrGet = itGets->second[0];
+          Expression* topRef = unwrapUpwardsI8Ref(arrGet, fa);
+          const auto& topP = fa.parents.at(topRef);
+          if (!topP.parent) {
+            continue;
+          }
+          Expression* readOp = nullptr;
+          Expression** innerIndexPtr = nullptr;
+          if (auto* ag = topP.parent->dynCast<ArrayGet>()) {
+            if (ag->ref == topRef && ag->ref->type.isRef() &&
+                ag->ref->type.getHeapType() == i8ArrayType) {
+              readOp = ag;
+              innerIndexPtr = &ag->index;
+            }
+          } else if (auto* call = topP.parent->dynCast<Call>()) {
+            auto itH = kind1Helpers.find(call->target);
+            if (itH != kind1Helpers.end() &&
+                itH->second.pArr < call->operands.size() &&
+                call->operands[itH->second.pArr] == topRef) {
+              readOp = call;
+              innerIndexPtr = &call->operands[itH->second.pIdx];
+            }
+          }
+          if (!readOp || !innerIndexPtr) {
+            continue;
+          }
+          Expression* idxExpr = *innerIndexPtr;
+          std::vector<LocalGet*> candGets;
+          if (auto* lg = idxExpr->dynCast<LocalGet>()) {
+            candGets.push_back(lg);
+          } else if (auto* add = idxExpr->dynCast<Binary>()) {
+            if (add->op == AddInt32) {
+              if (auto* lgR = add->right->dynCast<LocalGet>()) {
+                candGets.push_back(lgR);
+              }
+              if (auto* lgL = add->left->dynCast<LocalGet>()) {
+                candGets.push_back(lgL);
+              }
+            }
+          }
+          bool foundKind1 = false;
+          for (LocalGet* candGet : candGets) {
+            Index cand = candGet->index;
+            if (cand >= fn->getNumParams() || cand == pArr ||
+                fn->getLocalType(cand) != Type::i32) {
+              continue;
+            }
+            const auto& cGets = fa.localGets.at(cand);
+            auto itCSets = fa.localSets.find(cand);
+            bool noSets =
+              (itCSets == fa.localSets.end() || itCSets->second.empty());
+            if (cGets.size() == 1 && noSets) {
+              kind1Helpers[fn->name] = {fn, pArr, cand, topP.slot};
+              foundKind1 = true;
+              break;
+            }
+            if (idxExpr == candGet && !fa.parents.at(readOp).inLoop &&
+                cGets[0] == candGet && !noSets &&
+                itCSets->second[0]->value == readOp &&
+                fa.parents.at(readOp).parent == itCSets->second[0]) {
+              kind1Helpers[fn->name] = {fn, pArr, cand, topP.slot};
+              foundKind1 = true;
+              break;
+            }
+          }
+          if (foundKind1) {
+            break;
+          }
+          if (pass == 1 && !fa.parents.at(readOp).inLoop) {
+            kind2Helpers[fn->name] = {fn, pArr, topP.slot, innerIndexPtr};
+            break;
+          }
+        }
+      }
+    }
+
+    struct ReadOnlyUse {
+      Expression** refPtr = nullptr;
+      Expression** indexPtr = nullptr;
+      bool isKind2 = false;
+    };
+
+    std::unordered_map<Name, Kind2Helper> activeKind2Helpers;
+
+    auto isReadOnlyI8Use = [&](Expression* expr,
+                               const FuncAnalysis& fa,
+                               ReadOnlyUse& out,
+                               bool allowAllKind2 = false) -> bool {
+      Expression* topRef = unwrapUpwardsI8Ref(expr, fa);
+      auto it = fa.parents.find(topRef);
+      if (it == fa.parents.end() || !it->second.parent) {
+        return false;
+      }
+      Expression* parent = it->second.parent;
+      if (auto* ag = parent->dynCast<ArrayGet>()) {
+        if (ag->ref == topRef && ag->ref->type.isRef() &&
+            ag->ref->type.getHeapType() == i8ArrayType) {
+          out = {it->second.slot, &ag->index, false};
+          return true;
+        }
+      } else if (auto* call = parent->dynCast<Call>()) {
+        auto it1 = kind1Helpers.find(call->target);
+        if (it1 != kind1Helpers.end() &&
+            it1->second.pArr < call->operands.size() &&
+            call->operands[it1->second.pArr] == topRef) {
+          out = {&call->operands[it1->second.pArr],
+                 &call->operands[it1->second.pIdx],
+                 false};
+          return true;
+        }
+        const auto& k2Map = allowAllKind2 ? kind2Helpers : activeKind2Helpers;
+        auto it2 = k2Map.find(call->target);
+        if (it2 != k2Map.end() && it2->second.pArr < call->operands.size() &&
+            call->operands[it2->second.pArr] == topRef) {
+          out = {&call->operands[it2->second.pArr], nullptr, true};
+          return true;
+        }
+      }
+      return false;
+    };
+
+    // Verify which Kind-2 helpers have all callers passing a read-only i8
+    // slice from a compressed segment.
+    for (auto& [hName, h] : kind2Helpers) {
+      const auto& calls = allCalls[hName];
+      if (calls.empty()) {
+        continue;
+      }
+      bool allValid = true;
+      for (auto& [callerFn, call] : calls) {
+        if (!callerFn || h.pArr >= call->operands.size()) {
+          allValid = false;
+          break;
+        }
+        const auto& callerFa = funcData.at(callerFn);
+        Expression* arg = unwrapDownwardsI8Ref(call->operands[h.pArr]);
+        if (auto* ad = arg->dynCast<ArrayNewData>()) {
+          if (ad->type.getHeapType() != i8ArrayType ||
+              !compressed.count(ad->segment) || !ad->offset->is<Const>() ||
+              EffectAnalyzer(getPassOptions(), *module, ad->size)
+                .hasSideEffects()) {
+            allValid = false;
+            break;
+          }
+        } else if (auto* lg = arg->dynCast<LocalGet>()) {
+          if (callerFn->isParam(lg->index)) {
+            allValid = false;
+            break;
+          }
+          auto itS = callerFa.localSets.find(lg->index);
+          if (itS == callerFa.localSets.end() || itS->second.size() != 1 ||
+              itS->second[0]->isTee()) {
+            allValid = false;
+            break;
+          }
+          auto* adL = itS->second[0]->value->dynCast<ArrayNewData>();
+          if (!adL || adL->type.getHeapType() != i8ArrayType ||
+              !compressed.count(adL->segment)) {
+            allValid = false;
+            break;
+          }
+          for (LocalGet* otherGet : callerFa.localGets.at(lg->index)) {
+            ReadOnlyUse dummy;
+            if (!isReadOnlyI8Use(otherGet, callerFa, dummy, true)) {
+              allValid = false;
+              break;
+            }
+          }
+          if (!allValid) {
+            break;
+          }
+        } else {
+          allValid = false;
+          break;
+        }
+      }
+      if (allValid) {
+        activeKind2Helpers[hName] = h;
+      }
+    }
+
+    // Step 4: Eliminate lazy-init i8 table globals (Pattern a).
+    struct LazyGlobalInfo {
+      Name name;
+      Function* initFunc = nullptr;
+      If* iff = nullptr;
+      GlobalSet* gs = nullptr;
+      int32_t totalOffset = 0;
+      GlobalGet* condGet = nullptr;
+      std::vector<ReadOnlyUse> uses;
+    };
+    std::vector<LazyGlobalInfo> lazyGlobals;
+    std::unordered_set<Name> lazyGlobalNames;
+
+    for (auto& gPtr : module->globals) {
+      Global* g = gPtr.get();
+      if (g->imported() || !g->mutable_ || exportedGlobals.count(g->name) ||
+          g->type != Type(i8ArrayType, Nullable) || !g->init ||
+          !g->init->is<RefNull>()) {
+        continue;
+      }
+      auto itSets = globalSets.find(g->name);
+      auto itGets = globalGets.find(g->name);
+      if (itSets == globalSets.end() || itSets->second.size() != 1 ||
+          itGets == globalGets.end() || itGets->second.size() < 2) {
+        continue;
+      }
+      auto [initFn, gs] = itSets->second[0];
+      if (!initFn) {
+        continue;
+      }
+      auto* ad = gs->value->dynCast<ArrayNewData>();
+      if (!ad || ad->type.getHeapType() != i8ArrayType ||
+          !compressed.count(ad->segment) || !ad->offset->is<Const>() ||
+          EffectAnalyzer(getPassOptions(), *module, ad->size)
+            .hasSideEffects()) {
+        continue;
+      }
+      const auto& initFa = funcData.at(initFn);
+      Expression* gsParent = initFa.parents.at(gs).parent;
+      If* iff = gsParent ? gsParent->dynCast<If>() : nullptr;
+      if (!iff && gsParent && gsParent->is<Block>()) {
+        Expression* blkParent = initFa.parents.at(gsParent).parent;
+        iff = blkParent ? blkParent->dynCast<If>() : nullptr;
+      }
+      if (!iff || iff->ifFalse) {
+        continue;
+      }
+      auto* rn = iff->condition->dynCast<RefIsNull>();
+      auto* condGet = rn ? rn->value->dynCast<GlobalGet>() : nullptr;
+      if (!condGet || condGet->name != g->name) {
+        continue;
+      }
+      std::vector<ReadOnlyUse> roUses;
+      bool allReadsOk = true;
+      for (auto [useFn, gg] : itGets->second) {
+        if (!useFn) {
+          allReadsOk = false;
+          break;
+        }
+        if (gg == condGet) {
+          continue;
+        }
+        ReadOnlyUse u;
+        if (!isReadOnlyI8Use(gg, funcData.at(useFn), u)) {
+          allReadsOk = false;
+          break;
+        }
+        roUses.push_back(u);
+      }
+      if (!allReadsOk || roUses.empty()) {
+        continue;
+      }
+      int32_t totalOffset = ad->offset->cast<Const>()->value.geti32() +
+                            int32_t(compressed.at(ad->segment).base);
+      lazyGlobals.push_back(
+        {g->name, initFn, iff, gs, totalOffset, condGet, std::move(roUses)});
+      lazyGlobalNames.insert(g->name);
+    }
+
+    for (auto& lg : lazyGlobals) {
+      const auto& initFa = funcData.at(lg.initFunc);
+      for (auto& u : lg.uses) {
+        if (u.isKind2) {
+          *u.refPtr = builder.makeConst(lg.totalOffset);
+        } else {
+          *u.refPtr = builder.makeCall(getFuncName, {}, i8Ref);
+          *u.indexPtr = addOffset(
+            *u.indexPtr, builder.makeConst(lg.totalOffset), builder);
+        }
+      }
+      GlobalSet* nextGs = nullptr;
+      if (auto* tb = lg.iff->ifTrue->dynCast<Block>()) {
+        for (Expression* stmt : tb->list) {
+          if (auto* otherGs = stmt->dynCast<GlobalSet>()) {
+            if (otherGs != lg.gs && !lazyGlobalNames.count(otherGs->name)) {
+              Global* otherG = module->getGlobalOrNull(otherGs->name);
+              if (otherG && !otherG->imported() && otherG->mutable_ &&
+                  otherG->type.isRef() && otherG->type.isNullable() &&
+                  otherG->init && otherG->init->is<RefNull>()) {
+                nextGs = otherGs;
+                break;
+              }
+            }
+          }
+        }
+      }
+      if (nextGs) {
+        *initFa.parents.at(lg.gs).slot = builder.makeNop();
+        lg.condGet->name = nextGs->name;
+        lg.condGet->type = module->getGlobal(nextGs->name)->type;
+      } else {
+        *initFa.parents.at(lg.iff).slot = builder.makeNop();
+      }
+      module->removeGlobal(lg.name);
+    }
+
+    // Step 5: Eliminate local and inline read-only i8 slices (Pattern b).
+    for (auto& fnPtr : module->functions) {
+      Function* fn = fnPtr.get();
+      if (fn->imported() || !fn->body || runtimeFuncs.count(fn->name)) {
+        continue;
+      }
+      auto& fa = funcData.at(fn);
+      for (ArrayNewData* ad : fa.i8News) {
+        auto itP = fa.parents.find(ad);
+        if (itP == fa.parents.end() || !itP->second.parent) {
+          continue;
+        }
+        Expression* p = itP->second.parent;
+        int32_t base = int32_t(compressed.at(ad->segment).base);
+        bool sizeHasEffects =
+          EffectAnalyzer(getPassOptions(), *module, ad->size).hasSideEffects();
+
+        // Case 5a: Assigned to a local via (local.set $col (array.new_data ..))
+        if (auto* ls = p->dynCast<LocalSet>()) {
+          if (ls->isTee() || ls->value != ad) {
+            continue;
+          }
+          Index localIdx = ls->index;
+          std::vector<LocalGet*> targetGets;
+          const auto& allSets = fa.localSets.at(localIdx);
+          auto itAllGets = fa.localGets.find(localIdx);
+          if (itAllGets == fa.localGets.end() || itAllGets->second.empty()) {
+            continue;
+          }
+          if (!fn->isParam(localIdx) && allSets.size() == 1) {
+            targetGets = itAllGets->second;
+          } else if (auto* topBlk = fn->body->dynCast<Block>()) {
+            if (fa.parents.at(ls).parent == topBlk && allSets.back() == ls) {
+              Index lsPO = fa.postOrder.at(ls);
+              for (LocalGet* g : itAllGets->second) {
+                if (fa.postOrder.at(g) > lsPO) {
+                  targetGets.push_back(g);
+                }
+              }
+            }
+          }
+          if (targetGets.empty()) {
+            continue;
+          }
+          std::vector<ReadOnlyUse> roUses;
+          bool allOk = true;
+          for (LocalGet* g : targetGets) {
+            ReadOnlyUse u;
+            if (!isReadOnlyI8Use(g, fa, u)) {
+              allOk = false;
+              break;
+            }
+            roUses.push_back(u);
+          }
+          if (!allOk) {
+            continue;
+          }
+          Expression** lsSlot = fa.parents.at(ls).slot;
+          if (auto* cOff = ad->offset->dynCast<Const>();
+              cOff && !sizeHasEffects) {
+            int32_t totalOffset = cOff->value.geti32() + base;
+            *lsSlot = builder.makeNop();
+            for (auto& u : roUses) {
+              if (u.isKind2) {
+                *u.refPtr = builder.makeConst(totalOffset);
+              } else {
+                *u.refPtr = builder.makeCall(getFuncName, {}, i8Ref);
+                *u.indexPtr = addOffset(
+                  *u.indexPtr, builder.makeConst(totalOffset), builder);
+              }
+            }
+          } else {
+            Index offLocal = Builder::addVar(fn, Type::i32);
+            Expression* totalOffExpr = ad->offset;
+            if (base != 0) {
+              totalOffExpr = builder.makeBinary(
+                AddInt32, totalOffExpr, builder.makeConst(base));
+            }
+            Expression* setOff = builder.makeLocalSet(offLocal, totalOffExpr);
+            if (sizeHasEffects) {
+              *lsSlot = builder.makeBlock({setOff, builder.makeDrop(ad->size)});
+            } else {
+              *lsSlot = setOff;
+            }
+            for (auto& u : roUses) {
+              if (u.isKind2) {
+                *u.refPtr = builder.makeLocalGet(offLocal, Type::i32);
+              } else {
+                *u.refPtr = builder.makeCall(getFuncName, {}, i8Ref);
+                *u.indexPtr =
+                  addOffset(*u.indexPtr,
+                            builder.makeLocalGet(offLocal, Type::i32),
+                            builder);
+              }
+            }
+          }
+          continue;
+        }
+
+        // Case 5b: Inline read-only i8 ArrayNewData.
+        if (p->is<GlobalSet>()) {
+          continue;
+        }
+        auto* cOff = ad->offset->dynCast<Const>();
+        if (!cOff || sizeHasEffects) {
+          continue;
+        }
+        ReadOnlyUse u;
+        if (!isReadOnlyI8Use(ad, fa, u)) {
+          continue;
+        }
+        int32_t totalOffset = cOff->value.geti32() + base;
+        if (u.isKind2) {
+          *u.refPtr = builder.makeConst(totalOffset);
+        } else {
+          *u.refPtr = builder.makeCall(getFuncName, {}, i8Ref);
+          *u.indexPtr =
+            addOffset(*u.indexPtr, builder.makeConst(totalOffset), builder);
+        }
+      }
+    }
+
+    // Finalize active Kind-2 helpers whose callers now pass i32 byte offsets.
+    for (auto& [hName, h] : activeKind2Helpers) {
+      bool allCallersI32 = true;
+      for (auto& [_, call] : allCalls[hName]) {
+        if (h.pArr >= call->operands.size() ||
+            call->operands[h.pArr]->type != Type::i32) {
+          allCallersI32 = false;
+          break;
+        }
+      }
+      if (!allCallersI32) {
+        continue;
+      }
+      auto paramsType = h.func->getParams();
+      std::vector<Type> params(paramsType.begin(), paramsType.end());
+      params[h.pArr] = Type::i32;
+      h.func->setParams(Type(params));
+      *h.topRefSlot = builder.makeCall(getFuncName, {}, i8Ref);
+      *h.innerIndexPtr = addOffset(
+        *h.innerIndexPtr, builder.makeLocalGet(h.pArr, Type::i32), builder);
+    }
+
+    // Step 6: Sink (call $segments$get) into Kind-1 helpers when 100% of their
+    // callers pass (call $segments$get) as pArr, and remove parameter pArr.
+    std::unordered_set<Name> sunkKind1;
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (auto& [hName, h] : kind1Helpers) {
+        if (sunkKind1.count(hName)) {
+          continue;
+        }
+        auto& calls = allCalls[hName];
+        if (calls.empty()) {
+          continue;
+        }
+        Index getterCalls = 0;
+        std::vector<size_t> nonGetterIdxs;
+        for (size_t ci = 0; ci < calls.size(); ci++) {
+          auto* call = calls[ci].second;
+          if (h.pArr < call->operands.size()) {
+            if (auto* argCall = call->operands[h.pArr]->dynCast<Call>()) {
+              if (argCall->target == getFuncName) {
+                getterCalls++;
+                continue;
+              }
+            }
+          }
+          nonGetterIdxs.push_back(ci);
+        }
+        if (!nonGetterIdxs.empty() && getterCalls >= 2 &&
+            nonGetterIdxs.size() <= 2 && h.pArr == 0 &&
+            h.func->getNumParams() == 3) {
+          if (auto* ag = h.func->body->dynCast<ArrayGet>()) {
+            if (auto* add = ag->index->dynCast<Binary>()) {
+              auto* lg1 = add->left->dynCast<LocalGet>();
+              auto* lg2 = add->right->dynCast<LocalGet>();
+              if (add->op == AddInt32 && lg1 && lg2 && lg1->index == 1 &&
+                  lg2->index == 2) {
+                bool canInlineAll = true;
+                for (size_t ci : nonGetterIdxs) {
+                  Function* cFn = calls[ci].first;
+                  Call* c = calls[ci].second;
+                  if (!cFn || !funcData.count(cFn) ||
+                      !funcData.at(cFn).parents.count(c)) {
+                    canInlineAll = false;
+                    break;
+                  }
+                }
+                if (canInlineAll) {
+                  for (auto it = nonGetterIdxs.rbegin();
+                       it != nonGetterIdxs.rend();
+                       ++it) {
+                    Function* cFn = calls[*it].first;
+                    Call* c = calls[*it].second;
+                    Expression* arrArg = c->operands[0];
+                    if (!arrArg->type.isRef() ||
+                        arrArg->type.getHeapType() != i8ArrayType) {
+                      arrArg = builder.makeRefCast(
+                        arrArg, Type(i8ArrayType, Nullable));
+                    }
+                    Expression* inlined = builder.makeArrayGet(
+                      arrArg,
+                      builder.makeBinary(
+                        AddInt32, c->operands[1], c->operands[2]),
+                      ag->order,
+                      ag->type,
+                      ag->signed_);
+                    *funcData.at(cFn).parents.at(c).slot = inlined;
+                    calls.erase(calls.begin() + *it);
+                  }
+                  nonGetterIdxs.clear();
+                }
+              }
+            }
+          }
+        }
+        if (!nonGetterIdxs.empty() || calls.empty()) {
+          continue;
+        }
+        *h.topRefSlot = builder.makeCall(getFuncName, {}, i8Ref);
+        struct LocalShift : public PostWalker<LocalShift> {
+          Index removed;
+          LocalShift(Index removed) : removed(removed) {}
+          void visitLocalGet(LocalGet* curr) {
+            if (curr->index > removed) {
+              curr->index--;
+            }
+          }
+          void visitLocalSet(LocalSet* curr) {
+            if (curr->index > removed) {
+              curr->index--;
+            }
+          }
+        } shifter(h.pArr);
+        shifter.walk(h.func->body);
+        auto paramsType = h.func->getParams();
+        std::vector<Type> params(paramsType.begin(), paramsType.end());
+        params.erase(params.begin() + h.pArr);
+        h.func->setParams(Type(params));
+        Builder::clearLocalNames(h.func);
+        for (auto& [_, call] : calls) {
+          call->operands.erase(call->operands.begin() + h.pArr);
+        }
+        sunkKind1.insert(hName);
+        changed = true;
+      }
+    }
   }
 
   // The slice helper of an array type, which builds an array of n elements

@@ -884,3 +884,477 @@
     (array.new_data $i8 $bytes (i32.const 0) (i32.const 3))
   )
 )
+
+;; Read-only i8 slices (lazy-init table globals, local slices, and inline
+;; array.get of array.new_data) read directly from (call $segments$get) at the
+;; adjusted offset without allocating or copying a slice array.
+(module
+  ;; CHECK:      (type $i8 (array (mut i8)))
+  ;; MODEL:      (type $i8 (array (mut i8)))
+  (type $i8 (array (mut i8)))
+
+  ;; MODEL:      (type $1 (func (param i32) (result i32)))
+
+  ;; MODEL:      (global $tbl (mut (ref null $i8)) (ref.null none))
+
+  ;; MODEL:      (data $a "0123456789abcdef")
+  (data $a "0123456789abcdef")
+  ;; MODEL:      (data $b "fedcba9876543210")
+  (data $b "fedcba9876543210")
+
+  (global $tbl (mut (ref null $i8)) (ref.null none))
+
+  ;; CHECK:      (type $1 (func (param i32) (result i32)))
+
+  ;; CHECK:      (type $2 (func (param (ref $i8) i32) (result i32)))
+
+  ;; CHECK:      (type $3 (func))
+
+  ;; CHECK:      (type $4 (func (result (ref $i8))))
+
+  ;; CHECK:      (global $segments$data (mut (ref null $i8)) (ref.null none))
+
+  ;; CHECK:      (global $lz$bits (mut i32) (i32.const 376))
+
+  ;; CHECK:      (data $segments "\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\80\00\00\00\10\00\00\00\00\00\00\00\00\00\00\000123456789abcdef\00\89E\cd#\abg\ef\ffv\ba2\dcT\98\10\00")
+
+  ;; CHECK:      (func $read-global (type $1) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (nop)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (array.get_u $i8
+  ;; CHECK-NEXT:    (call $segments$get)
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:     (i32.const 20)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (array.get_s $i8
+  ;; CHECK-NEXT:    (call $segments$get)
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:     (i32.const 21)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; MODEL:      (func $read-global (type $1) (param $x i32) (result i32)
+  ;; MODEL-NEXT:  (if
+  ;; MODEL-NEXT:   (ref.is_null
+  ;; MODEL-NEXT:    (global.get $tbl)
+  ;; MODEL-NEXT:   )
+  ;; MODEL-NEXT:   (then
+  ;; MODEL-NEXT:    (global.set $tbl
+  ;; MODEL-NEXT:     (array.new_data $i8 $b
+  ;; MODEL-NEXT:      (i32.const 4)
+  ;; MODEL-NEXT:      (i32.const 8)
+  ;; MODEL-NEXT:     )
+  ;; MODEL-NEXT:    )
+  ;; MODEL-NEXT:   )
+  ;; MODEL-NEXT:  )
+  ;; MODEL-NEXT:  (i32.add
+  ;; MODEL-NEXT:   (array.get_u $i8
+  ;; MODEL-NEXT:    (global.get $tbl)
+  ;; MODEL-NEXT:    (local.get $x)
+  ;; MODEL-NEXT:   )
+  ;; MODEL-NEXT:   (array.get_s $i8
+  ;; MODEL-NEXT:    (global.get $tbl)
+  ;; MODEL-NEXT:    (i32.add
+  ;; MODEL-NEXT:     (local.get $x)
+  ;; MODEL-NEXT:     (i32.const 1)
+  ;; MODEL-NEXT:    )
+  ;; MODEL-NEXT:   )
+  ;; MODEL-NEXT:  )
+  ;; MODEL-NEXT: )
+  (func $read-global (param $x i32) (result i32)
+    (if
+      (ref.is_null (global.get $tbl))
+      (then
+        (global.set $tbl
+          (array.new_data $i8 $b (i32.const 4) (i32.const 8))
+        )
+      )
+    )
+    (i32.add
+      (array.get_u $i8
+        (global.get $tbl)
+        (local.get $x)
+      )
+      (array.get_s $i8
+        (global.get $tbl)
+        (i32.add (local.get $x) (i32.const 1))
+      )
+    )
+  )
+
+  ;; CHECK:      (func $read-local-and-inline (type $1) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (local $col (ref null $i8))
+  ;; CHECK-NEXT:  (nop)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (array.get_u $i8
+  ;; CHECK-NEXT:    (call $segments$get)
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:     (i32.const 5)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (array.get_u $i8
+  ;; CHECK-NEXT:    (call $segments$get)
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:     (i32.const 16)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; MODEL:      (func $read-local-and-inline (type $1) (param $x i32) (result i32)
+  ;; MODEL-NEXT:  (local $col (ref null $i8))
+  ;; MODEL-NEXT:  (local.set $col
+  ;; MODEL-NEXT:   (array.new_data $i8 $a
+  ;; MODEL-NEXT:    (i32.const 2)
+  ;; MODEL-NEXT:    (i32.const 6)
+  ;; MODEL-NEXT:   )
+  ;; MODEL-NEXT:  )
+  ;; MODEL-NEXT:  (i32.add
+  ;; MODEL-NEXT:   (array.get_u $i8
+  ;; MODEL-NEXT:    (local.get $col)
+  ;; MODEL-NEXT:    (i32.add
+  ;; MODEL-NEXT:     (local.get $x)
+  ;; MODEL-NEXT:     (i32.const 3)
+  ;; MODEL-NEXT:    )
+  ;; MODEL-NEXT:   )
+  ;; MODEL-NEXT:   (array.get_u $i8
+  ;; MODEL-NEXT:    (array.new_data $i8 $b
+  ;; MODEL-NEXT:     (i32.const 0)
+  ;; MODEL-NEXT:     (i32.const 4)
+  ;; MODEL-NEXT:    )
+  ;; MODEL-NEXT:    (local.get $x)
+  ;; MODEL-NEXT:   )
+  ;; MODEL-NEXT:  )
+  ;; MODEL-NEXT: )
+  (func $read-local-and-inline (param $x i32) (result i32)
+    (local $col (ref null $i8))
+    (local.set $col
+      (array.new_data $i8 $a (i32.const 2) (i32.const 6))
+    )
+    (i32.add
+      (array.get_u $i8
+        (local.get $col)
+        (i32.add (local.get $x) (i32.const 3))
+      )
+      (array.get_u $i8
+        (array.new_data $i8 $b (i32.const 0) (i32.const 4))
+        (local.get $x)
+      )
+    )
+  )
+)
+;; CHECK:      (func $lz$symbol (type $2) (param $0 (ref $i8)) (param $1 i32) (result i32)
+;; CHECK-NEXT:  (local $2 i32)
+;; CHECK-NEXT:  (local $3 i32)
+;; CHECK-NEXT:  (local $4 i32)
+;; CHECK-NEXT:  (local $5 i32)
+;; CHECK-NEXT:  (local $6 i32)
+;; CHECK-NEXT:  (local.set $2
+;; CHECK-NEXT:   (global.get $lz$bits)
+;; CHECK-NEXT:  )
+;; CHECK-NEXT:  (local.set $5
+;; CHECK-NEXT:   (i32.add
+;; CHECK-NEXT:    (local.get $1)
+;; CHECK-NEXT:    (i32.const 15)
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:  )
+;; CHECK-NEXT:  (loop $next
+;; CHECK-NEXT:   (local.set $3
+;; CHECK-NEXT:    (i32.or
+;; CHECK-NEXT:     (i32.shl
+;; CHECK-NEXT:      (local.get $3)
+;; CHECK-NEXT:      (i32.const 1)
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:     (i32.and
+;; CHECK-NEXT:      (i32.shr_u
+;; CHECK-NEXT:       (array.get_u $i8
+;; CHECK-NEXT:        (local.get $0)
+;; CHECK-NEXT:        (i32.shr_u
+;; CHECK-NEXT:         (local.get $2)
+;; CHECK-NEXT:         (i32.const 3)
+;; CHECK-NEXT:        )
+;; CHECK-NEXT:       )
+;; CHECK-NEXT:       (i32.and
+;; CHECK-NEXT:        (local.get $2)
+;; CHECK-NEXT:        (i32.const 7)
+;; CHECK-NEXT:       )
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:      (i32.const 1)
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (local.set $2
+;; CHECK-NEXT:    (i32.add
+;; CHECK-NEXT:     (local.get $2)
+;; CHECK-NEXT:     (i32.const 1)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (if
+;; CHECK-NEXT:    (i32.lt_s
+;; CHECK-NEXT:     (local.get $1)
+;; CHECK-NEXT:     (i32.const 0)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:    (then
+;; CHECK-NEXT:     (br_if $next
+;; CHECK-NEXT:      (local.tee $1
+;; CHECK-NEXT:       (i32.add
+;; CHECK-NEXT:        (local.get $1)
+;; CHECK-NEXT:        (i32.const 1)
+;; CHECK-NEXT:       )
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:     (global.set $lz$bits
+;; CHECK-NEXT:      (local.get $2)
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:     (return
+;; CHECK-NEXT:      (local.get $3)
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (local.set $6
+;; CHECK-NEXT:    (array.get_u $i8
+;; CHECK-NEXT:     (local.get $0)
+;; CHECK-NEXT:     (local.get $1)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (local.set $1
+;; CHECK-NEXT:    (i32.add
+;; CHECK-NEXT:     (local.get $1)
+;; CHECK-NEXT:     (i32.const 1)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (if
+;; CHECK-NEXT:    (i32.lt_u
+;; CHECK-NEXT:     (local.get $3)
+;; CHECK-NEXT:     (i32.add
+;; CHECK-NEXT:      (local.get $4)
+;; CHECK-NEXT:      (local.get $6)
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:    (then
+;; CHECK-NEXT:     (global.set $lz$bits
+;; CHECK-NEXT:      (local.get $2)
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:     (return
+;; CHECK-NEXT:      (array.get_u $i8
+;; CHECK-NEXT:       (local.get $0)
+;; CHECK-NEXT:       (i32.add
+;; CHECK-NEXT:        (local.get $5)
+;; CHECK-NEXT:        (i32.sub
+;; CHECK-NEXT:         (local.get $3)
+;; CHECK-NEXT:         (local.get $4)
+;; CHECK-NEXT:        )
+;; CHECK-NEXT:       )
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (local.set $5
+;; CHECK-NEXT:    (i32.add
+;; CHECK-NEXT:     (local.get $5)
+;; CHECK-NEXT:     (local.get $6)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (local.set $4
+;; CHECK-NEXT:    (i32.shl
+;; CHECK-NEXT:     (i32.add
+;; CHECK-NEXT:      (local.get $4)
+;; CHECK-NEXT:      (local.get $6)
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:     (i32.const 1)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (br $next)
+;; CHECK-NEXT:  )
+;; CHECK-NEXT: )
+
+;; CHECK:      (func $segments$decode (type $3)
+;; CHECK-NEXT:  (local $0 (ref $i8))
+;; CHECK-NEXT:  (local $1 (ref $i8))
+;; CHECK-NEXT:  (local $2 i32)
+;; CHECK-NEXT:  (local $3 i32)
+;; CHECK-NEXT:  (local $4 i32)
+;; CHECK-NEXT:  (local $5 i32)
+;; CHECK-NEXT:  (local $6 i32)
+;; CHECK-NEXT:  (local.set $0
+;; CHECK-NEXT:   (array.new_data $i8 $segments
+;; CHECK-NEXT:    (i32.const 0)
+;; CHECK-NEXT:    (i32.const 64)
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:  )
+;; CHECK-NEXT:  (local.set $1
+;; CHECK-NEXT:   (array.new_default $i8
+;; CHECK-NEXT:    (i32.const 32)
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:  )
+;; CHECK-NEXT:  (loop $next
+;; CHECK-NEXT:   (local.set $4
+;; CHECK-NEXT:    (call $lz$symbol
+;; CHECK-NEXT:     (local.get $0)
+;; CHECK-NEXT:     (i32.const 0)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (local.set $5
+;; CHECK-NEXT:    (i32.shr_u
+;; CHECK-NEXT:     (local.get $4)
+;; CHECK-NEXT:     (i32.const 2)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (if
+;; CHECK-NEXT:    (i32.eq
+;; CHECK-NEXT:     (local.get $5)
+;; CHECK-NEXT:     (i32.const 63)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:    (then
+;; CHECK-NEXT:     (local.set $5
+;; CHECK-NEXT:      (i32.add
+;; CHECK-NEXT:       (i32.const 63)
+;; CHECK-NEXT:       (call $lz$symbol
+;; CHECK-NEXT:        (local.get $0)
+;; CHECK-NEXT:        (i32.const 0)
+;; CHECK-NEXT:       )
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (local.set $4
+;; CHECK-NEXT:    (i32.and
+;; CHECK-NEXT:     (local.get $4)
+;; CHECK-NEXT:     (i32.const 3)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (if
+;; CHECK-NEXT:    (i32.lt_u
+;; CHECK-NEXT:     (local.get $4)
+;; CHECK-NEXT:     (i32.const 2)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:    (then
+;; CHECK-NEXT:     (loop $lit
+;; CHECK-NEXT:      (array.set $i8
+;; CHECK-NEXT:       (local.get $1)
+;; CHECK-NEXT:       (local.get $3)
+;; CHECK-NEXT:       (call $lz$symbol
+;; CHECK-NEXT:        (local.get $0)
+;; CHECK-NEXT:        (i32.const 16)
+;; CHECK-NEXT:       )
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:      (local.set $3
+;; CHECK-NEXT:       (i32.add
+;; CHECK-NEXT:        (local.get $3)
+;; CHECK-NEXT:        (i32.const 1)
+;; CHECK-NEXT:       )
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:      (br_if $lit
+;; CHECK-NEXT:       (local.tee $5
+;; CHECK-NEXT:        (i32.sub
+;; CHECK-NEXT:         (local.get $5)
+;; CHECK-NEXT:         (i32.const 1)
+;; CHECK-NEXT:        )
+;; CHECK-NEXT:       )
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:    (else
+;; CHECK-NEXT:     (if
+;; CHECK-NEXT:      (i32.eq
+;; CHECK-NEXT:       (local.get $4)
+;; CHECK-NEXT:       (i32.const 3)
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:      (then
+;; CHECK-NEXT:       (local.set $6
+;; CHECK-NEXT:        (i32.or
+;; CHECK-NEXT:         (call $lz$symbol
+;; CHECK-NEXT:          (local.get $0)
+;; CHECK-NEXT:          (i32.const 0)
+;; CHECK-NEXT:         )
+;; CHECK-NEXT:         (i32.shl
+;; CHECK-NEXT:          (call $lz$symbol
+;; CHECK-NEXT:           (local.get $0)
+;; CHECK-NEXT:           (i32.const 0)
+;; CHECK-NEXT:          )
+;; CHECK-NEXT:          (i32.const 8)
+;; CHECK-NEXT:         )
+;; CHECK-NEXT:        )
+;; CHECK-NEXT:       )
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:      (else
+;; CHECK-NEXT:       (local.set $6
+;; CHECK-NEXT:        (call $lz$symbol
+;; CHECK-NEXT:         (local.get $0)
+;; CHECK-NEXT:         (i32.const 0)
+;; CHECK-NEXT:        )
+;; CHECK-NEXT:       )
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:     (local.set $6
+;; CHECK-NEXT:      (i32.add
+;; CHECK-NEXT:       (local.get $6)
+;; CHECK-NEXT:       (i32.const 1)
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:     (local.set $5
+;; CHECK-NEXT:      (i32.add
+;; CHECK-NEXT:       (local.get $5)
+;; CHECK-NEXT:       (i32.const 2)
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:     (loop $copy
+;; CHECK-NEXT:      (array.set $i8
+;; CHECK-NEXT:       (local.get $1)
+;; CHECK-NEXT:       (local.get $3)
+;; CHECK-NEXT:       (array.get_u $i8
+;; CHECK-NEXT:        (local.get $1)
+;; CHECK-NEXT:        (i32.sub
+;; CHECK-NEXT:         (local.get $3)
+;; CHECK-NEXT:         (local.get $6)
+;; CHECK-NEXT:        )
+;; CHECK-NEXT:       )
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:      (local.set $3
+;; CHECK-NEXT:       (i32.add
+;; CHECK-NEXT:        (local.get $3)
+;; CHECK-NEXT:        (i32.const 1)
+;; CHECK-NEXT:       )
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:      (br_if $copy
+;; CHECK-NEXT:       (local.tee $5
+;; CHECK-NEXT:        (i32.sub
+;; CHECK-NEXT:         (local.get $5)
+;; CHECK-NEXT:         (i32.const 1)
+;; CHECK-NEXT:        )
+;; CHECK-NEXT:       )
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (br_if $next
+;; CHECK-NEXT:    (i32.lt_u
+;; CHECK-NEXT:     (local.get $3)
+;; CHECK-NEXT:     (i32.const 32)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:  )
+;; CHECK-NEXT:  (data.drop $segments)
+;; CHECK-NEXT:  (global.set $segments$data
+;; CHECK-NEXT:   (local.get $1)
+;; CHECK-NEXT:  )
+;; CHECK-NEXT: )
+
+;; CHECK:      (func $segments$get (type $4) (result (ref $i8))
+;; CHECK-NEXT:  (if
+;; CHECK-NEXT:   (ref.is_null
+;; CHECK-NEXT:    (global.get $segments$data)
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (then
+;; CHECK-NEXT:    (call $segments$decode)
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:  )
+;; CHECK-NEXT:  (ref.as_non_null
+;; CHECK-NEXT:   (global.get $segments$data)
+;; CHECK-NEXT:  )
+;; CHECK-NEXT: )

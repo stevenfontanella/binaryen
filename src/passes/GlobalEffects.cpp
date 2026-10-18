@@ -582,7 +582,8 @@ void propagateEffects(
     return false;
   };
 
-  auto isCachedFactoryFunc = [&](Function* f) -> bool {
+  auto isCachedFactoryFunc =
+    [&](Function* f, std::unordered_set<Name>& restoredGlobals) -> bool {
     if (!f->getResults().isRef() || !f->body) {
       return false;
     }
@@ -592,6 +593,22 @@ void propagateEffects(
       return false;
     }
     if (!b->name.is()) {
+      if (f->getNumParams() == 0 && b->list.size() == 2) {
+        auto* iff = b->list[0]->dynCast<If>();
+        auto* retGlobal = unwrapRefAsNonNull(b->list[1])->dynCast<GlobalGet>();
+        if (iff && !iff->ifFalse && retGlobal) {
+          if (auto* rn = iff->condition->dynCast<RefIsNull>()) {
+            if (auto* condGlobal = rn->value->dynCast<GlobalGet>()) {
+              auto* cg = module.getGlobalOrNull(retGlobal->name);
+              if (condGlobal->name == retGlobal->name && cg &&
+                  !cg->imported() && cg->mutable_ && cg->init->is<RefNull>() &&
+                  mutableGlobalFuncCount[retGlobal->name] <= 2) {
+                return true;
+              }
+            }
+          }
+        }
+      }
       Expression* last = unwrapRefAsNonNull(b->list.back());
       auto* inner = last->dynCast<Block>();
       if (!inner) {
@@ -611,12 +628,13 @@ void propagateEffects(
     if (!brOn || brOn->op != BrOnNonNull || brOn->name != b->name) {
       return false;
     }
-    auto* retGet = unwrapRefAsNonNull(b->list.back())->dynCast<LocalGet>();
-    if (!retGet) {
-      return false;
-    }
+    Expression* retExpr = unwrapRefAsNonNull(b->list.back());
+    auto* retGet = retExpr->dynCast<LocalGet>();
     Expression* setStmt = b->list[b->list.size() - 2];
     if (f->getNumParams() == 1 && f->getParams() == Type::i32) {
+      if (!retGet) {
+        return false;
+      }
       Expression* agRef = nullptr;
       Expression* agIdx = nullptr;
       auto* as = setStmt->dynCast<ArraySet>();
@@ -638,17 +656,70 @@ void propagateEffects(
     }
     if (f->getNumParams() == 0) {
       auto* gg1 = brOn->ref->dynCast<GlobalGet>();
-      auto* gs = setStmt->dynCast<GlobalSet>();
-      if (!gg1 || !gs || gg1->name != gs->name) {
+      if (!gg1) {
         return false;
       }
-      auto* lt = gs->value->dynCast<LocalSet>();
       auto* cg = module.getGlobalOrNull(gg1->name);
-      return lt && lt->isTee() && lt->index == retGet->index && cg &&
-             !cg->imported() && cg->mutable_ && cg->init->is<RefNull>() &&
-             mutableGlobalFuncCount[gg1->name] == 1;
+      if (!cg || cg->imported() || !cg->mutable_ || !cg->init->is<RefNull>() ||
+          mutableGlobalFuncCount[gg1->name] != 1) {
+        return false;
+      }
+      if (retGet) {
+        auto* gs = setStmt->dynCast<GlobalSet>();
+        if (!gs || gg1->name != gs->name) {
+          return false;
+        }
+        auto* lt = gs->value->dynCast<LocalSet>();
+        return lt && lt->isTee() && lt->index == retGet->index;
+      }
+      if (auto* retGlobal = retExpr->dynCast<GlobalGet>()) {
+        if (retGlobal->name != gg1->name) {
+          return false;
+        }
+        Index gsIdx = 0;
+        for (Index i = 1; i + 1 < b->list.size(); i++) {
+          if (auto* gs = b->list[i]->dynCast<GlobalSet>()) {
+            if (gs->name == gg1->name) {
+              gsIdx = i;
+            }
+          }
+        }
+        if (gsIdx == 0) {
+          return false;
+        }
+        for (Index k = gsIdx + 1; k + 1 < b->list.size(); k++) {
+          auto* restoreGs = b->list[k]->dynCast<GlobalSet>();
+          auto* restoreLg =
+            restoreGs ? restoreGs->value->dynCast<LocalGet>() : nullptr;
+          if (!restoreGs || !restoreLg) {
+            return false;
+          }
+          bool foundSave = false;
+          for (Index j = 1; j < gsIdx; j++) {
+            if (auto* saveLs = b->list[j]->dynCast<LocalSet>()) {
+              if (saveLs->index == restoreLg->index) {
+                if (auto* saveGg = saveLs->value->dynCast<GlobalGet>()) {
+                  if (saveGg->name == restoreGs->name) {
+                    foundSave = true;
+                    break;
+                  }
+                }
+              }
+            }
+          }
+          if (!foundSave) {
+            return false;
+          }
+          restoredGlobals.insert(restoreGs->name);
+        }
+        return true;
+      }
+      return false;
     }
     if (f->getNumParams() == 2 && b->list.size() >= 3) {
+      if (!retGet) {
+        return false;
+      }
       for (Index i = 1; i + 2 < b->list.size(); i++) {
         if (!b->list[i]->is<If>()) {
           return false;
@@ -910,54 +981,71 @@ void propagateEffects(
           ccEffects->generative = false;
           ccEffects->isIdempotent = true;
         }
-        bool onlyArrayOrGlobalWrites =
-          !ccEffects->writesMemory && !ccEffects->writesSharedMemory &&
-          !ccEffects->writesTable && !ccEffects->writesStruct &&
-          !ccEffects->writesSharedStruct && !ccEffects->writesSharedArray &&
-          !ccEffects->throws() && !ccEffects->suspends && !ccEffects->calls &&
-          !ccEffects->mayNotReturn && !ccEffects->danglingPop &&
-          !ccEffects->hasSynchronization();
-        if (onlyArrayOrGlobalWrites) {
-          if (!ccEffects->hasNonTrapSideEffects() && !ccEffects->generative &&
-              !ccEffects->readsMutableGlobalState()) {
-            ccEffects->isIdempotent = true;
-            ccEffects->onlyTouchesInitGlobals = true;
-          } else if (isCachedFactoryFunc(f)) {
-            bool allPrivateGlobals = !hasUnknownFuncEffects;
-            auto isPrivateOrLazyGlobal = [&](Name g) {
-              if (mutableGlobalFuncCount[g] == 1) {
-                return true;
-              }
-              auto* glob = module.getGlobalOrNull(g);
-              return glob && !glob->imported() && glob->mutable_ &&
-                     glob->init && glob->init->is<RefNull>();
-            };
-            for (Name g : ccEffects->globalsWritten) {
-              if (!isPrivateOrLazyGlobal(g)) {
-                allPrivateGlobals = false;
-                break;
-              }
+        bool onlyArrayOrGlobalWritesOrColdLoop =
+          (!ccEffects->writesMemory || module.memories.empty()) &&
+          !ccEffects->writesSharedMemory && !ccEffects->writesTable &&
+          !ccEffects->writesStruct && !ccEffects->writesSharedStruct &&
+          !ccEffects->writesSharedArray && !ccEffects->throws() &&
+          !ccEffects->suspends && !ccEffects->calls &&
+          !ccEffects->danglingPop && !ccEffects->hasSynchronization();
+        bool onlyArrayOrGlobalWrites = onlyArrayOrGlobalWritesOrColdLoop &&
+                                       !ccEffects->writesMemory &&
+                                       !ccEffects->mayNotReturn;
+        std::unordered_set<Name> restoredGlobals;
+        if (onlyArrayOrGlobalWrites && !ccEffects->hasNonTrapSideEffects() &&
+            !ccEffects->generative && !ccEffects->readsMutableGlobalState()) {
+          ccEffects->isIdempotent = true;
+          ccEffects->onlyTouchesInitGlobals = true;
+        } else if (onlyArrayOrGlobalWritesOrColdLoop &&
+                   isCachedFactoryFunc(f, restoredGlobals)) {
+          bool allPrivateGlobals = !hasUnknownFuncEffects;
+          auto isPrivateOrLazyGlobal = [&](Name g) {
+            if (mutableGlobalFuncCount[g] == 1 ||
+                restoredGlobals.contains(g)) {
+              return true;
             }
-            for (Name g : ccEffects->mutableGlobalsRead) {
-              if (!isPrivateOrLazyGlobal(g)) {
-                allPrivateGlobals = false;
-                break;
-              }
+            auto* glob = module.getGlobalOrNull(g);
+            if (!glob || glob->imported() || !glob->mutable_ || !glob->init) {
+              return false;
             }
-            if (allPrivateGlobals && f->getNumParams() <= 2) {
-              ccEffects->writesArray = false;
-              ccEffects->readsMutableArray = false;
-              ccEffects->globalsWritten.clear();
-              ccEffects->mutableGlobalsRead.clear();
+            if (glob->init->is<RefNull>()) {
+              return true;
             }
-            ccEffects->generative = false;
-            ccEffects->isIdempotent = true;
-            ccEffects->onlyTouchesInitGlobals = true;
-          } else if (isLazyInitOrOnceFunc(f, *ccEffects)) {
-            ccEffects->generative = false;
-            ccEffects->isIdempotent = true;
-            ccEffects->onlyTouchesInitGlobals = true;
+            const auto& localEffects = funcInfos.at(f).effects;
+            return glob->init->is<Const>() && localEffects &&
+                   !localEffects->globalsWritten.contains(g) &&
+                   !localEffects->mutableGlobalsRead.contains(g);
+          };
+          for (Name g : ccEffects->globalsWritten) {
+            if (!isPrivateOrLazyGlobal(g)) {
+              allPrivateGlobals = false;
+              break;
+            }
           }
+          for (Name g : ccEffects->mutableGlobalsRead) {
+            if (!isPrivateOrLazyGlobal(g)) {
+              allPrivateGlobals = false;
+              break;
+            }
+          }
+          if (allPrivateGlobals && f->getNumParams() <= 2) {
+            ccEffects->writesArray = false;
+            ccEffects->readsMutableArray = false;
+            if (module.memories.empty()) {
+              ccEffects->writesMemory = false;
+            }
+            ccEffects->mayNotReturn = false;
+            ccEffects->globalsWritten.clear();
+            ccEffects->mutableGlobalsRead.clear();
+          }
+          ccEffects->generative = false;
+          ccEffects->isIdempotent = true;
+          ccEffects->onlyTouchesInitGlobals = true;
+        } else if (onlyArrayOrGlobalWrites &&
+                   isLazyInitOrOnceFunc(f, *ccEffects)) {
+          ccEffects->generative = false;
+          ccEffects->isIdempotent = true;
+          ccEffects->onlyTouchesInitGlobals = true;
         }
       }
     }
