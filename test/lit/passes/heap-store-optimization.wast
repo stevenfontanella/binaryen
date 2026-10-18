@@ -822,7 +822,7 @@
     )
   )
 
-  ;; CHECK:      (func $helper-i32 (type $7) (param $x i32) (result i32)
+  ;; CHECK:      (func $helper-i32 (type $8) (param $x i32) (result i32)
   ;; CHECK-NEXT:  (i32.const 42)
   ;; CHECK-NEXT: )
   (func $helper-i32 (param $x i32) (result i32)
@@ -1613,7 +1613,7 @@
     (i32.const 1337)
   )
 
-  ;; CHECK:      (func $multi-control-flow-in-set-value-sequence-no (type $8) (result anyref)
+  ;; CHECK:      (func $multi-control-flow-in-set-value-sequence-no (type $9) (result anyref)
   ;; CHECK-NEXT:  (local $ref (ref null $struct))
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (block $out (result i32)
@@ -1746,5 +1746,136 @@
       (local.get $ref)
       (i32.const 99)
     )
+  )
+
+  ;; CHECK:      (func $alloc-helper (type $10) (param $a i32) (result (ref $struct3))
+  ;; CHECK-NEXT:  (struct.new $struct3
+  ;; CHECK-NEXT:   (local.get $a)
+  ;; CHECK-NEXT:   (i32.const 20)
+  ;; CHECK-NEXT:   (i32.const 0)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $alloc-helper (param $a i32) (result (ref $struct3))
+    (struct.new $struct3
+      (local.get $a)
+      (i32.const 20)
+      (i32.const 0)
+    )
+  )
+
+  ;; CHECK:      (func $use-alloc-helper (type $11) (result (ref null $struct3))
+  ;; CHECK-NEXT:  (local $ref (ref null $struct3))
+  ;; CHECK-NEXT:  (local.set $ref
+  ;; CHECK-NEXT:   (call $alloc-helper
+  ;; CHECK-NEXT:    (i32.const 11)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (nop)
+  ;; CHECK-NEXT:  (nop)
+  ;; CHECK-NEXT:  (nop)
+  ;; CHECK-NEXT:  (local.get $ref)
+  ;; CHECK-NEXT: )
+  (func $use-alloc-helper (result (ref null $struct3))
+    (local $ref (ref null $struct3))
+    (local.set $ref
+      (call $alloc-helper
+        (i32.const 10)
+      )
+    )
+    ;; Folded into the call's parameter hole (field 0).
+    (struct.set $struct3 0
+      (local.get $ref)
+      (i32.const 11)
+    )
+    ;; Eliminated because field 1 is already 20 in $alloc-helper.
+    (struct.set $struct3 1
+      (local.get $ref)
+      (i32.const 20)
+    )
+    ;; Eliminated because field 2 is default (0) in $alloc-helper.
+    (struct.set $struct3 2
+      (local.get $ref)
+      (i32.const 0)
+    )
+    (local.get $ref)
+  )
+
+  ;; CHECK:      (func $init-fresh-ctor (type $7) (param $self (ref $struct3))
+  ;; CHECK-NEXT:  (nop)
+  ;; CHECK-NEXT:  (struct.set $struct3 1
+  ;; CHECK-NEXT:   (local.get $self)
+  ;; CHECK-NEXT:   (i32.const 0)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $init-fresh-ctor (param $self (ref $struct3))
+    ;; Field 2 is 0 across all callers, so this default store is redundant.
+    (struct.set $struct3 2
+      (local.get $self)
+      (i32.const 0)
+    )
+    ;; Field 1 is 20 in callers, so storing 0 is not redundant.
+    (struct.set $struct3 1
+      (local.get $self)
+      (i32.const 0)
+    )
+  )
+
+  ;; CHECK:      (func $init-escaped-ctor (type $7) (param $self (ref $struct3))
+  ;; CHECK-NEXT:  (struct.set $struct3 2
+  ;; CHECK-NEXT:   (local.get $self)
+  ;; CHECK-NEXT:   (i32.const 0)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $init-escaped-ctor (export "escaped_ctor") (param $self (ref $struct3))
+    ;; Exported function: cannot assume $self has fresh default fields.
+    (struct.set $struct3 2
+      (local.get $self)
+      (i32.const 0)
+    )
+  )
+
+  ;; CHECK:      (func $call-fresh-ctors (type $12) (result (ref $struct3))
+  ;; CHECK-NEXT:  (local $ref (ref $struct3))
+  ;; CHECK-NEXT:  (local.set $ref
+  ;; CHECK-NEXT:   (call $alloc-helper
+  ;; CHECK-NEXT:    (i32.const 1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (call $init-fresh-ctor
+  ;; CHECK-NEXT:   (local.get $ref)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (call $init-fresh-ctor
+  ;; CHECK-NEXT:   (struct.new $struct3
+  ;; CHECK-NEXT:    (i32.const 5)
+  ;; CHECK-NEXT:    (i32.const 20)
+  ;; CHECK-NEXT:    (i32.const 0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (call $init-escaped-ctor
+  ;; CHECK-NEXT:   (local.get $ref)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.get $ref)
+  ;; CHECK-NEXT: )
+  (func $call-fresh-ctors (result (ref $struct3))
+    (local $ref (ref $struct3))
+    (local.set $ref
+      (call $alloc-helper
+        (i32.const 1)
+      )
+    )
+    (call $init-fresh-ctor
+      (local.get $ref)
+    )
+    (call $init-fresh-ctor
+      (struct.new $struct3
+        (i32.const 5)
+        (i32.const 20)
+        (i32.const 0)
+      )
+    )
+    (call $init-escaped-ctor
+      (local.get $ref)
+    )
+    (local.get $ref)
   )
 )

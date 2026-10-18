@@ -120,7 +120,7 @@ struct CompressDataSegments : public Pass {
   InsertOrderedMap<Name, Compressed> compressed;
   // The slice helper for each array type.
   std::unordered_map<HeapType, Name> sliceFuncs;
-  std::unordered_set<Name> paramFuncs;
+  InsertOrderedSet<Name> paramFuncs;
   std::unordered_set<Name> escapedParamFuncs;
   std::unordered_map<Name, std::vector<Call*>> paramFuncCalls;
 
@@ -148,8 +148,8 @@ struct CompressDataSegments : public Pass {
         }
       });
     FunctionUses uses;
-    for (auto& [_, funcUses] : analysis.map) {
-      merge(funcUses, uses);
+    for (auto& func : module->functions) {
+      merge(analysis.map[func.get()], uses);
     }
     // Any mention of a segment in module-level code pins it.
     FunctionUses moduleUses;
@@ -471,7 +471,8 @@ struct CompressDataSegments : public Pass {
           RefScanner(*this, info.escaped, &info.calls).walk(func->body);
         }
       });
-    for (auto& [_, info] : callAnalysis.map) {
+    for (auto& func : module->functions) {
+      auto& info = callAnalysis.map[func.get()];
       escapedParamFuncs.insert(info.escaped.begin(), info.escaped.end());
       for (auto& [target, vec] : info.calls) {
         auto& dst = paramFuncCalls[target];
@@ -1052,8 +1053,8 @@ struct CompressDataSegments : public Pass {
       Expression** topRefSlot = nullptr;
       Expression** innerIndexPtr = nullptr;
     };
-    std::unordered_map<Name, Kind1Helper> kind1Helpers;
-    std::unordered_map<Name, Kind2Helper> kind2Helpers;
+    InsertOrderedMap<Name, Kind1Helper> kind1Helpers;
+    InsertOrderedMap<Name, Kind2Helper> kind2Helpers;
 
     for (int pass = 0; pass < 2; pass++) {
       for (auto& fnPtr : module->functions) {
@@ -1155,7 +1156,7 @@ struct CompressDataSegments : public Pass {
       bool isKind2 = false;
     };
 
-    std::unordered_map<Name, Kind2Helper> activeKind2Helpers;
+    InsertOrderedMap<Name, Kind2Helper> activeKind2Helpers;
 
     auto isReadOnlyI8Use = [&](Expression* expr,
                                const FuncAnalysis& fa,
@@ -1518,6 +1519,7 @@ struct CompressDataSegments : public Pass {
     // callers pass (call $segments$get) as pArr, and remove parameter pArr.
     std::unordered_set<Name> sunkKind1;
     bool changed = true;
+    bool allowInliningIntoKind1 = false;
     while (changed) {
       changed = false;
       for (auto& [hName, h] : kind1Helpers) {
@@ -1560,6 +1562,11 @@ struct CompressDataSegments : public Pass {
                     canInlineAll = false;
                     break;
                   }
+                  if (!allowInliningIntoKind1 && kind1Helpers.count(cFn->name) &&
+                      !sunkKind1.count(cFn->name)) {
+                    canInlineAll = false;
+                    break;
+                  }
                 }
                 if (canInlineAll) {
                   for (auto it = nonGetterIdxs.rbegin();
@@ -1568,12 +1575,14 @@ struct CompressDataSegments : public Pass {
                     Function* cFn = calls[*it].first;
                     Call* c = calls[*it].second;
                     Expression* arrArg = c->operands[0];
+                    RefCast* rc = nullptr;
                     if (!arrArg->type.isRef() ||
                         arrArg->type.getHeapType() != i8ArrayType) {
-                      arrArg = builder.makeRefCast(
+                      rc = builder.makeRefCast(
                         arrArg, Type(i8ArrayType, Nullable));
+                      arrArg = rc;
                     }
-                    Expression* inlined = builder.makeArrayGet(
+                    auto* inlined = builder.makeArrayGet(
                       arrArg,
                       builder.makeBinary(
                         AddInt32, c->operands[1], c->operands[2]),
@@ -1581,6 +1590,12 @@ struct CompressDataSegments : public Pass {
                       ag->type,
                       ag->signed_);
                     *funcData.at(cFn).parents.at(c).slot = inlined;
+                    auto itCallerH1 = kind1Helpers.find(cFn->name);
+                    if (itCallerH1 != kind1Helpers.end() &&
+                        itCallerH1->second.topRefSlot == &c->operands[0]) {
+                      itCallerH1->second.topRefSlot =
+                        rc ? &rc->ref : &inlined->ref;
+                    }
                     calls.erase(calls.begin() + *it);
                   }
                   nonGetterIdxs.clear();
@@ -1617,6 +1632,10 @@ struct CompressDataSegments : public Pass {
           call->operands.erase(call->operands.begin() + h.pArr);
         }
         sunkKind1.insert(hName);
+        changed = true;
+      }
+      if (!changed && !allowInliningIntoKind1) {
+        allowInliningIntoKind1 = true;
         changed = true;
       }
     }
