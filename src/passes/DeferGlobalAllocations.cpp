@@ -1175,6 +1175,7 @@ private:
     InvalidSelectPred,
     SelectDirectIdx,
     SelectEqConst,
+    SelectEq2Const,
     SelectRangeLtU,
     SelectRangeGeU,
     SelectRangeMid,
@@ -1229,6 +1230,13 @@ private:
       if (k1.size() == 1) {
         Index c = k1[0];
         tryPlan(SelectEqConst, c, 0, (c == 0) ? 1 : (2 + getSLEBSize(c)));
+      }
+      if (k1.size() == 2) {
+        Index c0 = k1[0];
+        Index c1 = k1[1];
+        Index cost0 = (c0 == 0) ? 1 : (2 + getSLEBSize(c0));
+        Index cost1 = 2 + 2 + getSLEBSize(c1);
+        tryPlan(SelectEq2Const, c0, c1, cost0 + cost1 + 1);
       }
       if (k1Max < fMin[mask]) {
         Index bestLim = k1Max + 1;
@@ -1352,6 +1360,22 @@ private:
       }
       return builder.makeBinary(
         EqInt32, idxExpr, builder.makeConst(int32_t(p.param1)));
+    }
+    if (p.mode == SelectEq2Const) {
+      Expression* idxExpr2 = nullptr;
+      if (auto* ls = idxExpr->dynCast<LocalSet>()) {
+        idxExpr2 = builder.makeLocalGet(ls->index, ls->type);
+      } else {
+        idxExpr2 = ExpressionManipulator::copy(idxExpr, *module);
+      }
+      Expression* cmp0 =
+        (p.param1 == 0)
+          ? static_cast<Expression*>(builder.makeUnary(EqZInt32, idxExpr))
+          : static_cast<Expression*>(builder.makeBinary(
+              EqInt32, idxExpr, builder.makeConst(int32_t(p.param1))));
+      Expression* cmp1 = builder.makeBinary(
+        EqInt32, idxExpr2, builder.makeConst(int32_t(p.param2)));
+      return builder.makeBinary(OrInt32, cmp0, cmp1);
     }
     if (p.mode == SelectRangeLtU) {
       return builder.makeBinary(
@@ -1494,7 +1518,8 @@ private:
   ColumnCosts computeColumnCosts(const Group& group,
                                  const std::vector<Candidate*>& members,
                                  const std::vector<Index>& varying,
-                                 bool hasSecArrays) {
+                                 bool hasSecArrays,
+                                 bool forFinalCosts = false) {
     ColumnCosts costs;
     Index N = members.size();
     if (N == 0) {
@@ -1516,6 +1541,10 @@ private:
     }
     auto& leafFields = group.leafFields;
     bool canUseData = module->features.hasBulkMemory();
+    bool hasNestedStruct =
+      std::any_of(members[0]->init->operands.begin(),
+                  members[0]->init->operands.end(),
+                  isNestedNew);
     std::vector<Index> uniqueVarying;
     std::vector<Index> prevI32Cols;
     std::unordered_map<Index, Index> i32ColWidths;
@@ -1755,6 +1784,28 @@ private:
           hasW1Col = true;
           continue;
         }
+        if (forFinalCosts && !hasNestedStruct && N >= 4 && N <= 15 && ok &&
+            D >= 2 && D <= 5 && D < N && D == effD) {
+          Index uncompressedTableCost =
+            9 + getLEBSize(U32LEB(N)) + elemBytesSum + 6;
+          Index selectCodeCost = Index(-1);
+          if (tryPlanSelectChain(distinct,
+                                 distinctIndices,
+                                 N,
+                                 field.type,
+                                 0,
+                                 nullptr,
+                                 &selectCodeCost) &&
+              selectCodeCost <= uncompressedTableCost) {
+            for (auto* m : members) {
+              costs.memberTableBytes[m] += 1;
+            }
+            Index extraStepCost = 2 * (D - 1);
+            paletteOverhead +=
+              (selectCodeCost > N ? selectCodeCost - N : 0) + extraStepCost;
+            continue;
+          }
+        }
       }
       for (auto* m : members) {
         costs.memberTableBytes[m] += getOperandBytes(m->leaves[i]);
@@ -1971,62 +2022,127 @@ private:
       return;
     }
     // Recompute the columns and exact savings over the chosen members only.
-    std::vector<Candidate> chosenMembers;
-    for (auto* member : chosen) {
-      chosenMembers.push_back(*member);
-    }
-    varying = getVaryingColumns(chosenMembers, numLeaves);
-    auto finalCosts = computeColumnCosts(
-      group, chosen, varying, !group.secondaryArrays.empty());
-    if (!preservedThunk) {
-      saving = secArraysBonus;
-      for (Index idxInChosen = 0; idxInChosen < chosen.size(); idxInChosen++) {
-        auto* member = chosen[idxInChosen];
-        Index tableBytes = finalCosts.memberTableBytes[member];
-        Index getBytes =
-          1 + getLEBSize(U32LEB(globalIndexes[member->global->name]));
-        if (member->absorbedIndex != Index(-1) &&
-            (!group.primaryArrays.empty() || !group.secondaryArrays.empty())) {
-          Index index = member->absorbedIndex;
-          Index directUses = member->uses - 1;
-          int64_t siteDelta =
-            int64_t(callBytes + 1 + getSLEBSize(index)) - int64_t(getBytes);
-          int64_t elemBonus = directUses > 0 ? int64_t(getBytes) : 0;
-          saving += int64_t(member->initBytes) + int64_t(member->bonus) +
-                    elemBonus - int64_t(tableBytes) -
-                    int64_t(directUses) * siteDelta;
-        } else {
-          Index index = idxInChosen % MaxChunkSize;
-          int64_t siteDelta =
-            int64_t(callBytes + 1 + getSLEBSize(index)) - int64_t(getBytes);
-          saving += int64_t(member->initBytes) + int64_t(member->bonus) -
-                    int64_t(tableBytes) - int64_t(member->uses) * siteDelta;
+    auto evaluateChosen = [&](const std::vector<Candidate*>& curChosen,
+                              std::vector<Index>& outVarying,
+                              ColumnCosts& outCosts,
+                              int64_t& outSaving,
+                              Index& outOverhead) {
+      std::vector<Candidate> curMembers;
+      curMembers.reserve(curChosen.size());
+      for (auto* member : curChosen) {
+        curMembers.push_back(*member);
+      }
+      outVarying = getVaryingColumns(curMembers, numLeaves);
+      outCosts = computeColumnCosts(group,
+                                    curChosen,
+                                    outVarying,
+                                    !group.secondaryArrays.empty(),
+                                    /*forFinalCosts=*/true);
+      outSaving = saving;
+      if (!preservedThunk) {
+        outSaving = secArraysBonus;
+        for (Index idxInChosen = 0; idxInChosen < curChosen.size();
+             idxInChosen++) {
+          auto* member = curChosen[idxInChosen];
+          Index tableBytes = outCosts.memberTableBytes[member];
+          Index getBytes =
+            1 + getLEBSize(U32LEB(globalIndexes[member->global->name]));
+          if (member->absorbedIndex != Index(-1) &&
+              (!group.primaryArrays.empty() ||
+               !group.secondaryArrays.empty())) {
+            Index index = member->absorbedIndex;
+            Index directUses = member->uses - 1;
+            int64_t siteDelta =
+              int64_t(callBytes + 1 + getSLEBSize(index)) - int64_t(getBytes);
+            int64_t elemBonus = directUses > 0 ? int64_t(getBytes) : 0;
+            outSaving += int64_t(member->initBytes) + int64_t(member->bonus) +
+                         elemBonus - int64_t(tableBytes) -
+                         int64_t(directUses) * siteDelta;
+          } else {
+            Index index = idxInChosen % MaxChunkSize;
+            int64_t siteDelta =
+              int64_t(callBytes + 1 + getSLEBSize(index)) - int64_t(getBytes);
+            outSaving += int64_t(member->initBytes) + int64_t(member->bonus) -
+                         int64_t(tableBytes) -
+                         int64_t(member->uses) * siteDelta;
+          }
         }
       }
-    }
 
-    bool allOnceSingleUse =
-      !preservedThunk &&
-      std::all_of(chosen.begin(), chosen.end(), [](Candidate* c) {
-        return c->uses == 1 && c->onceUses == 1;
-      });
-    // Fixed costs per chunk: the factory function (code, function section
-    // entry, type), the cache global and its type (unless cacheless), the
-    // fixed template instructions inside the factory, and per table column the
-    // global, its type, and the read in the factory.
-    Index varyingInitBytes = 0;
-    for (auto i : varying) {
-      varyingInitBytes += getOperandBytes(chosen[0]->leaves[i]);
+      bool allOnceSingleUse =
+        !preservedThunk &&
+        std::all_of(curChosen.begin(), curChosen.end(), [](Candidate* c) {
+          return c->uses == 1 && c->onceUses == 1;
+        });
+      // Fixed costs per chunk: the factory function (code, function section
+      // entry, type), the cache global and its type (unless cacheless), the
+      // fixed template instructions inside the factory, and per table column
+      // the global, its type, and the read in the factory.
+      Index varyingInitBytes = 0;
+      for (auto i : outVarying) {
+        varyingInitBytes += getOperandBytes(curChosen[0]->leaves[i]);
+      }
+      Index fixedTemplateBytes =
+        curChosen[0]->initBytes > 9 + varyingInitBytes
+          ? curChosen[0]->initBytes - 9 - varyingInitBytes
+          : 0;
+      Index numChunks = (curChosen.size() + MaxChunkSize - 1) / MaxChunkSize;
+      Index baseFixed = allOnceSingleUse ? 16 : 53;
+      outOverhead =
+        numChunks *
+        (baseFixed + fixedTemplateBytes + outCosts.chunkColumnOverhead);
+    };
+
+    ColumnCosts finalCosts;
+    Index overhead = 0;
+    evaluateChosen(chosen, varying, finalCosts, saving, overhead);
+    bool hasNestedStruct =
+      std::any_of(chosen[0]->init->operands.begin(),
+                  chosen[0]->init->operands.end(),
+                  isNestedNew);
+    while (!always && !preservedThunk && !hasNestedStruct &&
+           saving <= int64_t(overhead) && group.primaryArrays.empty() &&
+           group.secondaryArrays.empty() && chosen.size() > 4 &&
+           chosen.size() <= 15) {
+      Index bestDropIdx = Index(-1);
+      int64_t bestNetGain = saving - int64_t(overhead);
+      std::vector<Index> bestVarying;
+      ColumnCosts bestCosts;
+      int64_t bestSaving = 0;
+      Index bestOverhead = 0;
+      for (Index dropIdx = 0; dropIdx < chosen.size(); dropIdx++) {
+        std::vector<Candidate*> trialChosen;
+        trialChosen.reserve(chosen.size() - 1);
+        for (Index j = 0; j < chosen.size(); j++) {
+          if (j != dropIdx) {
+            trialChosen.push_back(chosen[j]);
+          }
+        }
+        std::vector<Index> trialVarying;
+        ColumnCosts trialCosts;
+        int64_t trialSaving = 0;
+        Index trialOverhead = 0;
+        evaluateChosen(
+          trialChosen, trialVarying, trialCosts, trialSaving, trialOverhead);
+        int64_t trialNetGain = trialSaving - int64_t(trialOverhead);
+        if (trialNetGain > bestNetGain) {
+          bestNetGain = trialNetGain;
+          bestDropIdx = dropIdx;
+          bestVarying = std::move(trialVarying);
+          bestCosts = std::move(trialCosts);
+          bestSaving = trialSaving;
+          bestOverhead = trialOverhead;
+        }
+      }
+      if (bestDropIdx == Index(-1)) {
+        break;
+      }
+      chosen.erase(chosen.begin() + bestDropIdx);
+      varying = std::move(bestVarying);
+      finalCosts = std::move(bestCosts);
+      saving = bestSaving;
+      overhead = bestOverhead;
     }
-    Index fixedTemplateBytes =
-      chosen[0]->initBytes > 9 + varyingInitBytes
-        ? chosen[0]->initBytes - 9 - varyingInitBytes
-        : 0;
-    Index numChunks = (chosen.size() + MaxChunkSize - 1) / MaxChunkSize;
-    Index baseFixed = allOnceSingleUse ? 16 : 53;
-    Index overhead =
-      numChunks *
-      (baseFixed + fixedTemplateBytes + finalCosts.chunkColumnOverhead);
     if (!always && saving <= int64_t(overhead)) {
       return;
     }
@@ -2044,6 +2160,7 @@ private:
       }
       return a->firstUse < b->firstUse;
     });
+    Index numChunks = (chosen.size() + MaxChunkSize - 1) / MaxChunkSize;
     for (Index chunk = 0; chunk < numChunks; chunk++) {
       Index begin = chunk * MaxChunkSize;
       Index end = std::min(Index(chosen.size()), begin + MaxChunkSize);
@@ -8885,20 +9002,22 @@ private:
               getOperandBytes(distinct[d]) + p.condExtra + armOpBytes;
           }
           Index M = steps.size();
+          bool multiIdxUse =
+            M > 1 || (M == 1 && steps[0].second.mode == SelectEq2Const);
           Index costAfter = 0;
           for (auto& [_, site] : sites) {
             auto* ag = (*site)->cast<ArrayGet>();
             Index idxExtra =
-              (M <= 1) ? 0
-                       : (ag->index->is<LocalGet>() ? (2 * (M - 1))
-                                                    : (4 + 2 * (M - 1)));
+              !multiIdxUse ? 0
+                           : (ag->index->is<LocalGet>() ? (2 * (M - 1))
+                                                        : (4 + 2 * (M - 1)));
             costAfter += baseSiteCost + idxExtra;
           }
           if (costAfter <= costBefore) {
             for (auto& [fn, site] : sites) {
               auto* ag = (*site)->cast<ArrayGet>();
               Index scratchLoc = Index(-1);
-              if (M > 1 && !ag->index->is<LocalGet>()) {
+              if (multiIdxUse && !ag->index->is<LocalGet>()) {
                 scratchLoc = Builder::addVar(fn, Type::i32);
               }
               Index teeStep = hasStructAllocElem ? (M - 1) : 0;
@@ -8907,7 +9026,7 @@ private:
                 Index d = steps[m].first;
                 const SelectArmPlan& p = steps[m].second;
                 Expression* idxExpr = nullptr;
-                if (M == 1 || ag->index->is<LocalGet>()) {
+                if (!multiIdxUse || ag->index->is<LocalGet>()) {
                   idxExpr =
                     (m == 0) ? ag->index
                              : ExpressionManipulator::copy(ag->index, *module);

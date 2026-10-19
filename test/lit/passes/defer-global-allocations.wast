@@ -2203,6 +2203,11 @@
     (array.get $msg_arr (global.get $arr2) (local.get $i))
   )
 )
+
+;; Small group (N = 5 -> 4 after outlier pruning) with D = 2 select-chain
+;; ref.func columns (unblocked by moving tryPlanSelectChain outside the w1 gate
+;; in computeColumnCosts) and greedy leave-one-out outlier pruning dropping
+;; $v_outlier.
 ;; CHECK:      (func $defer$msg (type $3) (param $0 i32) (result (ref $msg))
 ;; CHECK-NEXT:  (local $1 (ref $msg))
 ;; CHECK-NEXT:  (block $cached (result (ref $msg))
@@ -2237,6 +2242,240 @@
 ;; CHECK-NEXT:      (i32.const 1)
 ;; CHECK-NEXT:      (i32.const 2)
 ;; CHECK-NEXT:      (i32.const 3)
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (local.get $1)
+;; CHECK-NEXT:  )
+;; CHECK-NEXT: )
+(module
+  ;; CHECK:      (type $fn (func))
+  (type $fn (func))
+  ;; CHECK:      (type $vt (struct (field (ref $fn)) (field (ref $fn)) (field (ref $fn)) (field (ref $fn)) (field (ref $fn)) (field (ref $fn)) (field (ref $fn)) (field (ref $fn)) (field (ref $fn)) (field (ref $fn)) (field (ref $fn)) (field (ref $fn))))
+  (type $vt (struct
+    (field (ref $fn)) (field (ref $fn)) (field (ref $fn)) (field (ref $fn))
+    (field (ref $fn)) (field (ref $fn)) (field (ref $fn)) (field (ref $fn))
+    (field (ref $fn)) (field (ref $fn)) (field (ref $fn)) (field (ref $fn))
+  ))
+
+  ;; CHECK:      (type $2 (array (mut (ref null $vt))))
+
+  ;; CHECK:      (type $3 (func (param i32) (result (ref $vt))))
+
+  ;; CHECK:      (global $v_outlier (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (ref.func $f1)
+  ;; CHECK-NEXT:  (ref.func $f2)
+  ;; CHECK-NEXT:  (ref.func $f3)
+  ;; CHECK-NEXT:  (ref.func $f4)
+  ;; CHECK-NEXT:  (ref.func $f5)
+  ;; CHECK-NEXT:  (ref.func $f6)
+  ;; CHECK-NEXT:  (ref.func $f7)
+  ;; CHECK-NEXT:  (ref.func $f8)
+  ;; CHECK-NEXT:  (ref.func $f9)
+  ;; CHECK-NEXT:  (ref.func $f10)
+  ;; CHECK-NEXT:  (ref.func $f11)
+  ;; CHECK-NEXT:  (ref.func $f2)
+  ;; CHECK-NEXT: ))
+
+  ;; CHECK:      (global $defer$vt$cache (ref $2) (array.new_default $2
+  ;; CHECK-NEXT:  (i32.const 4)
+  ;; CHECK-NEXT: ))
+
+  ;; CHECK:      (elem declare func $f0 $f1)
+
+  ;; CHECK:      (export "use" (func $use))
+
+  ;; CHECK:      (func $f0 (type $fn)
+  ;; CHECK-NEXT: )
+  (func $f0 (type $fn))
+  ;; CHECK:      (func $f1 (type $fn)
+  ;; CHECK-NEXT: )
+  (func $f1 (type $fn))
+  ;; CHECK:      (func $f2 (type $fn)
+  ;; CHECK-NEXT: )
+  (func $f2 (type $fn))
+  ;; CHECK:      (func $f3 (type $fn)
+  ;; CHECK-NEXT: )
+  (func $f3 (type $fn))
+  ;; CHECK:      (func $f4 (type $fn)
+  ;; CHECK-NEXT: )
+  (func $f4 (type $fn))
+  ;; CHECK:      (func $f5 (type $fn)
+  ;; CHECK-NEXT: )
+  (func $f5 (type $fn))
+  ;; CHECK:      (func $f6 (type $fn)
+  ;; CHECK-NEXT: )
+  (func $f6 (type $fn))
+  ;; CHECK:      (func $f7 (type $fn)
+  ;; CHECK-NEXT: )
+  (func $f7 (type $fn))
+  ;; CHECK:      (func $f8 (type $fn)
+  ;; CHECK-NEXT: )
+  (func $f8 (type $fn))
+  ;; CHECK:      (func $f9 (type $fn)
+  ;; CHECK-NEXT: )
+  (func $f9 (type $fn))
+  ;; CHECK:      (func $f10 (type $fn)
+  ;; CHECK-NEXT: )
+  (func $f10 (type $fn))
+  ;; CHECK:      (func $f11 (type $fn)
+  ;; CHECK-NEXT: )
+  (func $f11 (type $fn))
+
+  (global $v0 (ref $vt) (struct.new $vt
+    (ref.func $f0) (ref.func $f1) (ref.func $f0) (ref.func $f0)
+    (ref.func $f0) (ref.func $f0) (ref.func $f0) (ref.func $f0)
+    (ref.func $f0) (ref.func $f0) (ref.func $f0) (ref.func $f0)
+  ))
+  (global $v1 (ref $vt) (struct.new $vt
+    (ref.func $f0) (ref.func $f0) (ref.func $f1) (ref.func $f0)
+    (ref.func $f0) (ref.func $f0) (ref.func $f0) (ref.func $f0)
+    (ref.func $f0) (ref.func $f0) (ref.func $f0) (ref.func $f0)
+  ))
+  (global $v2 (ref $vt) (struct.new $vt
+    (ref.func $f0) (ref.func $f0) (ref.func $f0) (ref.func $f1)
+    (ref.func $f0) (ref.func $f0) (ref.func $f0) (ref.func $f0)
+    (ref.func $f0) (ref.func $f0) (ref.func $f0) (ref.func $f0)
+  ))
+  (global $v3 (ref $vt) (struct.new $vt
+    (ref.func $f0) (ref.func $f0) (ref.func $f0) (ref.func $f0)
+    (ref.func $f1) (ref.func $f0) (ref.func $f0) (ref.func $f0)
+    (ref.func $f0) (ref.func $f0) (ref.func $f0) (ref.func $f0)
+  ))
+  (global $v_outlier (ref $vt) (struct.new $vt
+    (ref.func $f1) (ref.func $f2) (ref.func $f3) (ref.func $f4)
+    (ref.func $f5) (ref.func $f6) (ref.func $f7) (ref.func $f8)
+    (ref.func $f9) (ref.func $f10) (ref.func $f11) (ref.func $f2)
+  ))
+
+  ;; CHECK:      (func $use (type $3) (param $x i32) (result (ref $vt))
+  ;; CHECK-NEXT:  (if (result (ref $vt))
+  ;; CHECK-NEXT:   (i32.eqz
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (call $defer$vt
+  ;; CHECK-NEXT:     (i32.const 0)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (else
+  ;; CHECK-NEXT:    (if (result (ref $vt))
+  ;; CHECK-NEXT:     (i32.eq
+  ;; CHECK-NEXT:      (local.get $x)
+  ;; CHECK-NEXT:      (i32.const 1)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (then
+  ;; CHECK-NEXT:      (call $defer$vt
+  ;; CHECK-NEXT:       (i32.const 1)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (else
+  ;; CHECK-NEXT:      (if (result (ref $vt))
+  ;; CHECK-NEXT:       (i32.eq
+  ;; CHECK-NEXT:        (local.get $x)
+  ;; CHECK-NEXT:        (i32.const 2)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:       (then
+  ;; CHECK-NEXT:        (call $defer$vt
+  ;; CHECK-NEXT:         (i32.const 2)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:       (else
+  ;; CHECK-NEXT:        (if (result (ref $vt))
+  ;; CHECK-NEXT:         (i32.eq
+  ;; CHECK-NEXT:          (local.get $x)
+  ;; CHECK-NEXT:          (i32.const 3)
+  ;; CHECK-NEXT:         )
+  ;; CHECK-NEXT:         (then
+  ;; CHECK-NEXT:          (call $defer$vt
+  ;; CHECK-NEXT:           (i32.const 3)
+  ;; CHECK-NEXT:          )
+  ;; CHECK-NEXT:         )
+  ;; CHECK-NEXT:         (else
+  ;; CHECK-NEXT:          (global.get $v_outlier)
+  ;; CHECK-NEXT:         )
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $use (export "use") (param $x i32) (result (ref $vt))
+    (if (result (ref $vt)) (i32.eqz (local.get $x))
+      (then (global.get $v0))
+      (else
+        (if (result (ref $vt)) (i32.eq (local.get $x) (i32.const 1))
+          (then (global.get $v1))
+          (else
+            (if (result (ref $vt)) (i32.eq (local.get $x) (i32.const 2))
+              (then (global.get $v2))
+              (else
+                (if (result (ref $vt)) (i32.eq (local.get $x) (i32.const 3))
+                  (then (global.get $v3))
+                  (else (global.get $v_outlier))
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+;; CHECK:      (func $defer$vt (type $3) (param $0 i32) (result (ref $vt))
+;; CHECK-NEXT:  (local $1 (ref $vt))
+;; CHECK-NEXT:  (block $cached (result (ref $vt))
+;; CHECK-NEXT:   (br_on_non_null $cached
+;; CHECK-NEXT:    (array.get $2
+;; CHECK-NEXT:     (global.get $defer$vt$cache)
+;; CHECK-NEXT:     (local.get $0)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (array.set $2
+;; CHECK-NEXT:    (global.get $defer$vt$cache)
+;; CHECK-NEXT:    (local.get $0)
+;; CHECK-NEXT:    (local.tee $1
+;; CHECK-NEXT:     (struct.new $vt
+;; CHECK-NEXT:      (ref.func $f0)
+;; CHECK-NEXT:      (select (result (ref (exact $fn)))
+;; CHECK-NEXT:       (ref.func $f0)
+;; CHECK-NEXT:       (ref.func $f1)
+;; CHECK-NEXT:       (local.get $0)
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:      (select (result (ref (exact $fn)))
+;; CHECK-NEXT:       (ref.func $f1)
+;; CHECK-NEXT:       (ref.func $f0)
+;; CHECK-NEXT:       (i32.eq
+;; CHECK-NEXT:        (local.get $0)
+;; CHECK-NEXT:        (i32.const 1)
+;; CHECK-NEXT:       )
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:      (select (result (ref (exact $fn)))
+;; CHECK-NEXT:       (ref.func $f1)
+;; CHECK-NEXT:       (ref.func $f0)
+;; CHECK-NEXT:       (i32.eq
+;; CHECK-NEXT:        (local.get $0)
+;; CHECK-NEXT:        (i32.const 2)
+;; CHECK-NEXT:       )
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:      (select (result (ref (exact $fn)))
+;; CHECK-NEXT:       (ref.func $f1)
+;; CHECK-NEXT:       (ref.func $f0)
+;; CHECK-NEXT:       (i32.eq
+;; CHECK-NEXT:        (local.get $0)
+;; CHECK-NEXT:        (i32.const 3)
+;; CHECK-NEXT:       )
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:      (ref.func $f0)
+;; CHECK-NEXT:      (ref.func $f0)
+;; CHECK-NEXT:      (ref.func $f0)
+;; CHECK-NEXT:      (ref.func $f0)
+;; CHECK-NEXT:      (ref.func $f0)
+;; CHECK-NEXT:      (ref.func $f0)
+;; CHECK-NEXT:      (ref.func $f0)
 ;; CHECK-NEXT:     )
 ;; CHECK-NEXT:    )
 ;; CHECK-NEXT:   )
