@@ -96,7 +96,8 @@ const Index GlobalGetBytes = 3;
 const Index ArrayGetBytes = 3;
 const Index MaxDepth = 64;
 // The largest function body we inline while scanning.
-const Index MaxInlinedNodes = 12;
+const Index MaxInlinedNodes = 18;
+const Index MaxInlineDepth = 5;
 
 int getSLEBSize(int64_t value) {
   int size = 0;
@@ -166,14 +167,25 @@ Index getShallowBytes(Expression* curr) {
     case Expression::RefI31Id:
     case Expression::I31GetId:
       return 2;
+    case Expression::BlockId:
+      return 0;
     default:
       return 2;
   }
 }
 
+Index getTreeBytes(Expression* curr) {
+  Index total = getShallowBytes(curr);
+  for (auto* child : ChildIterator(curr)) {
+    total += getTreeBytes(child);
+  }
+  return total;
+}
+
 // Const: a numeric constant (or a global.get of an immutable global that is
 //        initialized to one).
-// Global: a global.get of an immutable reference global.
+// Global: a global.get of an immutable reference global (or a closed local-free
+//         reference expression).
 // IndexedCall: a call of a function on an i32 constant, returning a reference.
 enum class LeafKind { Const, Global, IndexedCall };
 
@@ -192,7 +204,19 @@ struct Leaf {
   Index bytes;
   // Whether the leaf comes from an inlined call (see Statement::inlined).
   bool inlined = false;
+  // For a closed local-free reference expression leaf (LeafKind::Global).
+  Expression* refExpr = nullptr;
 };
+
+bool sameGlobalLeaf(const Leaf& a, const Leaf& b) {
+  if ((a.refExpr != nullptr) != (b.refExpr != nullptr)) {
+    return false;
+  }
+  if (a.refExpr) {
+    return ExpressionAnalyzer::equal(a.refExpr, b.refExpr);
+  }
+  return a.global == b.global;
+}
 
 struct Statement {
   Expression* expr = nullptr;
@@ -305,6 +329,12 @@ struct HolePlan {
   // Table: the index of the table in the function state.
   Index table = 0;
   std::vector<Name> newGlobals;
+  // Dictionary-indexed column (e.g. I8 index column into an I32 dictionary).
+  bool hasDict = false;
+  ColumnKind dictColumn = ColumnKind::I32;
+  std::vector<uint8_t> dictData;
+  Index dictCount = 0;
+  Index dictOffset = 0;
 };
 
 struct RunPlan {
@@ -322,13 +352,17 @@ struct RunPlan {
   bool hasGaps = false;
   // The expression that replaced the run.
   Expression* replacement = nullptr;
+  int saved = 0;
 };
 
 struct Table {
   Type elemType;
   std::vector<Name> globals;
+  std::vector<Expression*> exprs;
   std::map<Name, Index> indexes;
   Name globalName;
+  Index localIndex = 0;
+  bool hasExprs = false;
 };
 
 struct FuncState {
@@ -342,6 +376,9 @@ struct FuncState {
   std::unordered_map<Type, Index> tablesByType;
   std::vector<RunPlan> plans;
   std::set<Name> scopeNames;
+  std::unordered_set<Block*> plannedBlocks;
+  std::unordered_map<Type, Index> scratchLocals;
+  bool inArrayNewFixed = false;
 };
 
 void appendLE(std::vector<uint8_t>& data, uint64_t value, Index width) {
@@ -354,11 +391,31 @@ struct RollRepeatedCalls : public Pass {
   Module* module = nullptr;
   std::vector<char> segmentData;
   Name segmentName;
+  std::map<std::pair<Name, Name>, Name> composedWrappers;
 
   void run(Module* module_) override {
     module = module_;
     if (!module->features.hasGC() || !module->features.hasBulkMemory()) {
       return;
+    }
+    for (auto& f : module->functions) {
+      if (!f->imported() && f->getNumParams() == 1 && f->getNumVars() == 0 &&
+          f->getParams() == Type::i32 && f->getResults().isRef()) {
+        if (auto* c1 = f->body->dynCast<Call>()) {
+          if (!c1->isReturn && c1->operands.size() == 1) {
+            if (auto* c2 = c1->operands[0]->dynCast<Call>()) {
+              if (!c2->isReturn && c2->operands.size() == 1) {
+                if (auto* lg = c2->operands[0]->dynCast<LocalGet>()) {
+                  if (lg->index == 0) {
+                    composedWrappers.emplace(
+                      std::make_pair(c1->target, c2->target), f->name);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     }
     DataSegment* existingSegment = module->getDataSegmentOrNull("roll");
     if (existingSegment && existingSegment->isPassive()) {
@@ -388,14 +445,15 @@ struct RollRepeatedCalls : public Pass {
     Statement& stmt;
     RollRepeatedCalls& pass;
     Function* func;
-    // Whether we are inside an inlined call (we only inline one level).
-    bool inInlined = false;
+    FuncState* state = nullptr;
+    Index inlineDepth = 0;
 
     Scanner(Module& wasm,
             Statement& stmt,
             RollRepeatedCalls& pass,
-            Function* func)
-      : wasm(wasm), stmt(stmt), pass(pass), func(func) {}
+            Function* func,
+            FuncState* state = nullptr)
+      : wasm(wasm), stmt(stmt), pass(pass), func(func), state(state) {}
 
     void push(size_t value) {
       stmt.key.push_back(value);
@@ -428,6 +486,246 @@ struct RollRepeatedCalls : public Pass {
         }
       }
       return false;
+    }
+
+    bool isClosedRefExpr(Expression* e, Index d = 0) {
+      if (d > 5 || e->type == Type::unreachable) {
+        return false;
+      }
+      switch (e->_id) {
+        case Expression::ConstId:
+        case Expression::RefNullId:
+          return true;
+        case Expression::GlobalGetId: {
+          auto* g = wasm.getGlobal(e->cast<GlobalGet>()->name);
+          return !g->mutable_;
+        }
+        case Expression::ArrayNewId:
+        case Expression::ArrayNewFixedId: {
+          for (auto* child : ChildIterator(e)) {
+            if (!isClosedRefExpr(child, d + 1)) {
+              return false;
+            }
+          }
+          return true;
+        }
+        case Expression::CallId: {
+          auto* c = e->cast<Call>();
+          if (c->isReturn || !c->type.isRef()) {
+            return false;
+          }
+          for (auto* op : c->operands) {
+            if (!isClosedRefExpr(op, d + 1)) {
+              return false;
+            }
+          }
+          return true;
+        }
+        default:
+          return false;
+      }
+    }
+
+    bool isSideEffectFreeArg(Expression* e) {
+      if (e->type == Type::unreachable) {
+        return false;
+      }
+      switch (e->_id) {
+        case Expression::ConstId:
+        case Expression::RefNullId:
+        case Expression::LocalGetId:
+          return true;
+        case Expression::GlobalGetId: {
+          auto* g = wasm.getGlobal(e->cast<GlobalGet>()->name);
+          return !g->mutable_;
+        }
+        case Expression::RefCastId:
+        case Expression::StructNewId:
+        case Expression::ArrayNewId:
+        case Expression::ArrayNewFixedId: {
+          for (auto* child : ChildIterator(e)) {
+            if (!isSideEffectFreeArg(child)) {
+              return false;
+            }
+          }
+          return true;
+        }
+        case Expression::LocalSetId: {
+          auto* ls = e->cast<LocalSet>();
+          if (!ls->isTee() || !state) {
+            return false;
+          }
+          auto it = state->scratchLocals.find(func->getLocalType(ls->index));
+          return it != state->scratchLocals.end() && it->second == ls->index &&
+                 isSideEffectFreeArg(ls->value);
+        }
+        case Expression::CallId: {
+          auto* c = e->cast<Call>();
+          if (c->isReturn || !c->type.isRef()) {
+            return false;
+          }
+          for (auto* op : c->operands) {
+            if (!isSideEffectFreeArg(op)) {
+              return false;
+            }
+          }
+          return true;
+        }
+        default:
+          return false;
+      }
+    }
+
+    void substInCopy(Expression** p,
+                     const ExpressionList& args,
+                     Index scratchIdx,
+                     Index callerScratch) {
+      Expression* e = *p;
+      if (auto* lg = e->dynCast<LocalGet>()) {
+        if (lg->index < args.size()) {
+          *p = ExpressionManipulator::copy(args[lg->index], wasm);
+        } else if (lg->index == scratchIdx) {
+          lg->index = callerScratch;
+          lg->type = func->getLocalType(callerScratch);
+        }
+        return;
+      }
+      if (auto* ls = e->dynCast<LocalSet>()) {
+        if (ls->index == scratchIdx) {
+          ls->index = callerScratch;
+          if (ls->isTee()) {
+            ls->type = func->getLocalType(callerScratch);
+          }
+        }
+      }
+      ChildIterator it(e);
+      for (Index i = 0; i < it.getNumChildren(); i++) {
+        substInCopy(it.children[i], args, scratchIdx, callerScratch);
+      }
+      if (auto* rc = (*p)->dynCast<RefCast>()) {
+        if (Type::isSubType(rc->ref->type, rc->type)) {
+          *p = rc->ref;
+        }
+      }
+      if (auto* b = (*p)->dynCast<Block>()) {
+        if (!b->name.is() && !b->list.empty() && b->type.isRef()) {
+          b->type = b->list.back()->type;
+        }
+      }
+      if (auto* cr = (*p)->dynCast<CallRef>()) {
+        if (!cr->isReturn) {
+          Expression* t = cr->target;
+          while (auto* rc = t->dynCast<RefCast>()) {
+            t = rc->ref;
+          }
+          if (auto* rf = t->dynCast<RefFunc>()) {
+            Builder builder(wasm);
+            *p = builder.makeCall(
+              rf->func,
+              std::vector<Expression*>(cr->operands.begin(), cr->operands.end()),
+              cr->type);
+          }
+        }
+      }
+    }
+
+    Expression* tryInlineCall(Call* call) {
+      if (call->target == func->name) {
+        return nullptr;
+      }
+      auto* callee = wasm.getFunction(call->target);
+      if (callee->imported() || callee->getNumVars() > 1) {
+        return nullptr;
+      }
+      Index numParams = callee->getNumParams();
+      if (call->operands.size() != numParams) {
+        return nullptr;
+      }
+      if (!(state && state->inArrayNewFixed)) {
+        if (numParams > 0 || callee->getNumVars() > 0) {
+          return nullptr;
+        }
+      }
+      Index scratchIdx = numParams;
+      Index callerScratch = 0;
+      if (callee->getNumVars() == 1) {
+        if (!state) {
+          return nullptr;
+        }
+        Type varType = callee->getLocalType(scratchIdx);
+        auto* b = callee->body->dynCast<Block>();
+        if (!b || b->name.is() || b->list.size() != 2) {
+          return nullptr;
+        }
+        auto* endGet = b->list[1]->dynCast<LocalGet>();
+        if (!endGet || endGet->index != scratchIdx) {
+          return nullptr;
+        }
+        Index scratchGets = 0;
+        Index scratchTees = 0;
+        Index scratchSets = 0;
+        LocalSet* scratchTee = nullptr;
+        for (auto* lg : FindAll<LocalGet>(b->list[0]).list) {
+          if (lg->index == scratchIdx) {
+            scratchGets++;
+          }
+        }
+        for (auto* ls : FindAll<LocalSet>(b->list[0]).list) {
+          if (ls->index == scratchIdx) {
+            scratchSets++;
+            if (ls->isTee()) {
+              scratchTees++;
+              scratchTee = ls;
+            }
+          }
+        }
+        if (scratchGets != 0 || scratchSets != 1 || scratchTees != 1 ||
+            !scratchTee) {
+          return nullptr;
+        }
+        Type bestType = Type::none;
+        bool foundScratch = false;
+        for (auto& [candType, candIdx] : state->scratchLocals) {
+          if (Type::isSubType(scratchTee->value->type, candType) &&
+              Type::isSubType(candType, varType)) {
+            if (!foundScratch || Type::isSubType(candType, bestType)) {
+              bestType = candType;
+              callerScratch = candIdx;
+              foundScratch = true;
+            }
+          }
+        }
+        if (!foundScratch) {
+          return nullptr;
+        }
+      }
+      if (Measurer::measure(callee->body) > MaxInlinedNodes) {
+        return nullptr;
+      }
+      std::vector<Index> paramGets(numParams, 0);
+      for (auto* lg : FindAll<LocalGet>(callee->body).list) {
+        if (lg->index < numParams) {
+          paramGets[lg->index]++;
+        }
+      }
+      for (auto* ls : FindAll<LocalSet>(callee->body).list) {
+        if (ls->index < numParams) {
+          return nullptr;
+        }
+      }
+      for (Index i = 0; i < numParams; i++) {
+        Expression* arg = call->operands[i];
+        if (!isSideEffectFreeArg(arg)) {
+          return nullptr;
+        }
+        if (paramGets[i] > 1 && !arg->is<Const>() && !arg->is<GlobalGet>() &&
+            !arg->is<RefNull>() && !arg->is<RefFunc>()) {
+          return nullptr;
+        }
+      }
+      Expression* copy = ExpressionManipulator::copy(callee->body, wasm);
+      substInCopy(&copy, call->operands, scratchIdx, callerScratch);
+      return copy;
     }
 
     bool scan(Expression** ptr, Index depth) {
@@ -510,8 +808,70 @@ struct RollRepeatedCalls : public Pass {
           stmt.fixedBytes += GlobalGetBytes;
           return true;
         }
+        case Expression::RefCastId: {
+          auto* rc = curr->cast<RefCast>();
+          if (state && state->inArrayNewFixed &&
+              Type::isSubType(rc->ref->type, rc->type)) {
+            stmt.inlined.push_back({ptr, curr});
+            *ptr = rc->ref;
+            return scan(ptr, depth);
+          }
+          break;
+        }
+        case Expression::BlockId: {
+          auto* block = curr->cast<Block>();
+          if (!state || !state->inArrayNewFixed || block->name.is() ||
+              state->plannedBlocks.count(block)) {
+            return false;
+          }
+          if (block->list.size() == 2) {
+            if (auto* endGet = block->list[1]->dynCast<LocalGet>()) {
+              Type curType = func->getLocalType(endGet->index);
+              auto it = state->scratchLocals.find(curType);
+              if (it != state->scratchLocals.end() &&
+                  it->second == endGet->index) {
+                LocalSet* scratchTee = nullptr;
+                for (auto* ls : FindAll<LocalSet>(block->list[0]).list) {
+                  if (ls->index == endGet->index && ls->isTee()) {
+                    scratchTee = ls;
+                    break;
+                  }
+                }
+                if (scratchTee) {
+                  Type bestType = curType;
+                  Index bestIdx = endGet->index;
+                  for (auto& [candType, candIdx] : state->scratchLocals) {
+                    if (Type::isSubType(scratchTee->value->type, candType) &&
+                        Type::isSubType(candType, bestType) &&
+                        candType != bestType) {
+                      bestType = candType;
+                      bestIdx = candIdx;
+                    }
+                  }
+                  if (bestIdx != endGet->index) {
+                    auto* copy =
+                      ExpressionManipulator::copy(block, wasm)->cast<Block>();
+                    for (auto* ls : FindAll<LocalSet>(copy->list[0]).list) {
+                      if (ls->index == endGet->index && ls->isTee()) {
+                        ls->index = bestIdx;
+                        ls->type = bestType;
+                      }
+                    }
+                    auto* copyGet = copy->list[1]->cast<LocalGet>();
+                    copyGet->index = bestIdx;
+                    copyGet->type = bestType;
+                    copy->type = bestType;
+                    stmt.inlined.push_back({ptr, curr});
+                    *ptr = copy;
+                    curr = copy;
+                  }
+                }
+              }
+            }
+          }
+          break;
+        }
         // Control flow and anything that must not be moved into a loop body.
-        case Expression::BlockId:
         case Expression::IfId:
         case Expression::LoopId:
         case Expression::BreakId:
@@ -537,27 +897,6 @@ struct RollRepeatedCalls : public Pass {
           if (call->isReturn) {
             return false;
           }
-          if (call->operands.empty() && call->type.isRef() && !inInlined &&
-              call->target != func->name && pass.canInline(call->target)) {
-            auto* copy = ExpressionManipulator::copy(
-              wasm.getFunction(call->target)->body, wasm);
-            stmt.inlined.push_back({ptr, curr});
-            *ptr = copy;
-            Index leavesBefore = stmt.leaves.size();
-            Index fixedBefore = stmt.fixedBytes;
-            inInlined = true;
-            bool ok = scan(ptr, depth);
-            inInlined = false;
-            if (!ok) {
-              return false;
-            }
-            stmt.inlinedAdjust +=
-              int(CallBytes) - int(stmt.fixedBytes - fixedBefore);
-            for (Index i = leavesBefore; i < stmt.leaves.size(); i++) {
-              stmt.leaves[i].inlined = true;
-            }
-            return true;
-          }
           if (call->operands.size() == 1 && call->type.isRef()) {
             Literal val;
             Index argBytes = 0;
@@ -572,6 +911,75 @@ struct RollRepeatedCalls : public Pass {
                                      call->target,
                                      call->type,
                                      CallBytes + argBytes});
+              return true;
+            }
+            if (auto* innerCall = call->operands[0]->dynCast<Call>()) {
+              if (!innerCall->isReturn && innerCall->operands.size() == 1 &&
+                  getConstI32(innerCall->operands[0], val, argBytes)) {
+                auto it = pass.composedWrappers.find(
+                  {call->target, innerCall->target});
+                if (it != pass.composedWrappers.end()) {
+                  Name wrapper = it->second;
+                  size_t digest = hash(curr->_id);
+                  rehash(digest, wrapper);
+                  pushRefLeaf(digest);
+                  stmt.leaves.push_back(
+                    {ptr,
+                     LeafKind::IndexedCall,
+                     val,
+                     Name(),
+                     wrapper,
+                     wasm.getFunction(wrapper)->getResults(),
+                     CallBytes + CallBytes + argBytes});
+                  return true;
+                }
+              }
+            }
+          }
+          if (state && state->inArrayNewFixed && depth >= 2 &&
+              call->type.isRef() && !call->operands.empty()) {
+            bool allRefArgs = true;
+            for (auto* op : call->operands) {
+              if (!op->type.isRef()) {
+                allRefArgs = false;
+                break;
+              }
+            }
+            if (allRefArgs && isClosedRefExpr(call)) {
+              size_t digest = hash(Expression::GlobalGetId);
+              rehash(digest, size_t(2));
+              pushRefLeaf(digest);
+              stmt.leaves.push_back({ptr,
+                                     LeafKind::Global,
+                                     Literal(),
+                                     Name(),
+                                     Name(),
+                                     call->type,
+                                     getTreeBytes(call),
+                                     false,
+                                     call});
+              return true;
+            }
+          }
+          if (inlineDepth < MaxInlineDepth) {
+            if (Expression* inlinedBody = tryInlineCall(call)) {
+              Index origBytes = getTreeBytes(curr);
+              stmt.inlined.push_back({ptr, curr});
+              *ptr = inlinedBody;
+              Index leavesBefore = stmt.leaves.size();
+              Index fixedBefore = stmt.fixedBytes;
+              int adjustBefore = stmt.inlinedAdjust;
+              inlineDepth++;
+              bool ok = scan(ptr, depth);
+              inlineDepth--;
+              if (!ok) {
+                return false;
+              }
+              for (Index i = leavesBefore; i < stmt.leaves.size(); i++) {
+                stmt.leaves[i].inlined = true;
+              }
+              stmt.inlinedAdjust =
+                adjustBefore + int(origBytes) - int(stmt.fixedBytes - fixedBefore);
               return true;
             }
           }
@@ -604,47 +1012,89 @@ struct RollRepeatedCalls : public Pass {
     }
   };
 
-  Statement scanStatement(Function* func, Expression** ptr) {
+  Statement scanStatement(FuncState& state, Expression** ptr) {
     Statement stmt;
     stmt.expr = *ptr;
     if (stmt.expr->type != Type::none) {
       return stmt;
     }
-    Scanner scanner(*module, stmt, *this, func);
+    Scanner scanner(*module, stmt, *this, state.func, &state);
     stmt.valid = scanner.scan(ptr, 0);
+    stmt.expr = *ptr;
+    if (!stmt.valid) {
+      for (auto it = stmt.inlined.rbegin(); it != stmt.inlined.rend(); ++it) {
+        *it->first = it->second;
+      }
+      stmt.inlined.clear();
+      stmt.expr = *ptr;
+    }
     return stmt;
-  }
-
-  // Whether calls to a function may be replaced by its body while scanning:
-  // it must have no locals and a small body that the scanner accepts.
-  std::unordered_map<Name, bool> inlinable;
-
-  bool canInline(Name target) {
-    auto iter = inlinable.find(target);
-    if (iter != inlinable.end()) {
-      return iter->second;
-    }
-    auto* func = module->getFunction(target);
-    bool ok = false;
-    if (!func->imported() && func->getNumLocals() == 0 &&
-        Measurer::measure(func->body) <= MaxInlinedNodes) {
-      Statement stmt;
-      Scanner scanner(*module, stmt, *this, func);
-      scanner.inInlined = true;
-      // Scan a copy, as scanning may inline (it does not here, but be safe
-      // about pointers into the body).
-      Expression* copy = ExpressionManipulator::copy(func->body, *module);
-      ok = scanner.scan(&copy, 1);
-    }
-    inlinable[target] = ok;
-    return ok;
   }
 
   // Planning.
 
+  void findScratchLocals(FuncState& state) {
+    auto* func = state.func;
+    Index numParams = func->getNumParams();
+    Index numLocals = func->getNumLocals();
+    if (numLocals <= numParams) {
+      return;
+    }
+    std::vector<Index> totalGets(numLocals, 0);
+    std::vector<Index> totalSets(numLocals, 0);
+    std::vector<Index> validBlockUses(numLocals, 0);
+    for (auto* lg : FindAll<LocalGet>(func->body).list) {
+      totalGets[lg->index]++;
+    }
+    for (auto* ls : FindAll<LocalSet>(func->body).list) {
+      totalSets[ls->index]++;
+    }
+    for (auto* b : FindAll<Block>(func->body).list) {
+      if (!b->name.is() &&
+          (b->list.size() == 2 ||
+           (b->list.size() == 3 && isLazyInitPrefix(b->list[0])))) {
+        Expression* bodyStmt = b->list[b->list.size() - 2];
+        if (auto* endGet = b->list.back()->dynCast<LocalGet>()) {
+          Index idx = endGet->index;
+          if (idx >= numParams) {
+            Index getsIn0 = 0;
+            Index teesIn0 = 0;
+            Index setsIn0 = 0;
+            for (auto* lg : FindAll<LocalGet>(bodyStmt).list) {
+              if (lg->index == idx) {
+                getsIn0++;
+              }
+            }
+            for (auto* ls : FindAll<LocalSet>(bodyStmt).list) {
+              if (ls->index == idx) {
+                setsIn0++;
+                if (ls->isTee()) {
+                  teesIn0++;
+                }
+              }
+            }
+            if (getsIn0 == 0 && setsIn0 == 1 && teesIn0 == 1) {
+              validBlockUses[idx]++;
+            }
+          }
+        }
+      }
+    }
+    for (Index idx = numParams; idx < numLocals; idx++) {
+      if (totalGets[idx] == validBlockUses[idx] &&
+          totalSets[idx] == validBlockUses[idx]) {
+        Type t = func->getLocalType(idx);
+        if (!state.scratchLocals.count(t)) {
+          state.scratchLocals[t] = idx;
+        }
+      }
+    }
+  }
+
   void processFunction(Function* func) {
     FuncState state;
     state.func = func;
+    findScratchLocals(state);
     for (auto* block : FindAll<Block>(func->body).list) {
       planBlock(state, block);
     }
@@ -661,7 +1111,7 @@ struct RollRepeatedCalls : public Pass {
     std::vector<Statement> stmts;
     stmts.reserve(list.size());
     for (Index i = 0; i < list.size(); i++) {
-      stmts.push_back(scanStatement(state.func, &list[i]));
+      stmts.push_back(scanStatement(state, &list[i]));
     }
     Index plansBefore = state.plans.size();
     int totalSaved = 0;
@@ -717,6 +1167,9 @@ struct RollRepeatedCalls : public Pass {
         totalSaved += strictSaved;
       }
     });
+    if (state.plans.size() > plansBefore) {
+      state.plannedBlocks.insert(block);
+    }
     // Undo the inlining in the statements we do not keep.
     std::set<Expression*> kept;
     for (Index p = plansBefore; p < state.plans.size(); p++) {
@@ -724,8 +1177,8 @@ struct RollRepeatedCalls : public Pass {
     }
     for (auto& stmt : stmts) {
       if (!kept.count(stmt.expr)) {
-        for (auto& [ptr, original] : stmt.inlined) {
-          *ptr = original;
+        for (auto it = stmt.inlined.rbegin(); it != stmt.inlined.rend(); ++it) {
+          *it->first = it->second;
         }
       }
     }
@@ -773,7 +1226,7 @@ struct RollRepeatedCalls : public Pass {
         bool stepOk = true;
         for (Index h = 0; h < numLeaves; h++) {
           if (stmts[a].leaves[h].kind == LeafKind::Global &&
-              stmts[a + 1].leaves[h].global != stmts[a].leaves[h].global) {
+              !sameGlobalLeaf(stmts[a + 1].leaves[h], stmts[a].leaves[h])) {
             stepOk = false;
             break;
           }
@@ -788,13 +1241,14 @@ struct RollRepeatedCalls : public Pass {
             auto& la = stmts[a].leaves[h];
             auto& lb = stmts[b].leaves[h];
             if (la.kind == LeafKind::Global) {
-              if (lb.global != la.global) {
+              if (!sameGlobalLeaf(lb, la)) {
                 ok = false;
                 break;
               }
             } else {
               uint32_t base = la.value.geti32();
-              uint32_t step = uint32_t(stmts[a + 1].leaves[h].value.geti32()) - base;
+              uint32_t step =
+                uint32_t(stmts[a + 1].leaves[h].value.geti32()) - base;
               if (uint32_t(lb.value.geti32()) != base + step * (b - a)) {
                 ok = false;
                 break;
@@ -851,6 +1305,25 @@ struct RollRepeatedCalls : public Pass {
 
   enum PlanResult { Rolled, NotWorthIt, Mismatch };
 
+  bool findTableEntry(const Table& table, const Leaf& leaf, Index& outIdx) {
+    if (leaf.refExpr) {
+      for (Index i = 0; i < table.exprs.size(); i++) {
+        if (table.exprs[i] &&
+            ExpressionAnalyzer::equal(table.exprs[i], leaf.refExpr)) {
+          outIdx = i;
+          return true;
+        }
+      }
+      return false;
+    }
+    auto it = table.indexes.find(leaf.global);
+    if (it != table.indexes.end()) {
+      outIdx = it->second;
+      return true;
+    }
+    return false;
+  }
+
   PlanResult planRun(FuncState& state,
                      Block* block,
                      std::vector<Statement>& stmts,
@@ -881,27 +1354,44 @@ struct RollRepeatedCalls : public Pass {
         return newIter->second;
       }
       Index tableIndex = tempTables.size();
-      tempTables.push_back(Table{lub, {}, {}, Name()});
+      tempTables.push_back(Table{lub, {}, {}, {}, Name()});
       newTables[lub] = tableIndex;
-      newBytes += TableBytes;
       return tableIndex;
     };
-    auto getTableIndex = [&](Table& table, HolePlan& plan, Name name) {
-      auto indexIter = table.indexes.find(name);
-      if (indexIter == table.indexes.end()) {
-        indexIter =
-          table.indexes.insert({name, Index(table.globals.size())}).first;
-        table.globals.push_back(name);
-        plan.newGlobals.push_back(name);
-        newBytes += TableEntryBytes;
+    auto getTableIndex =
+      [&](Table& table, HolePlan& plan, const Leaf& other) -> Index {
+      Index idx = 0;
+      if (findTableEntry(table, other, idx)) {
+        return idx;
       }
-      return indexIter->second;
+      idx = table.globals.size();
+      Name name = other.refExpr ? Name("$expr$" + std::to_string(idx))
+                                : other.global;
+      table.indexes[name] = idx;
+      table.globals.push_back(name);
+      table.exprs.push_back(other.refExpr);
+      if (other.refExpr) {
+        table.hasExprs = true;
+      }
+      plan.newGlobals.push_back(name);
+      Index entryBytes = other.refExpr ? other.bytes : TableEntryBytes;
+      if (idx == 1) {
+        Index firstBytes = table.exprs[0] ? getTreeBytes(table.exprs[0])
+                                          : TableEntryBytes;
+        newBytes += TableBytes + firstBytes + entryBytes;
+      } else if (idx > 1) {
+        newBytes += entryBytes;
+      }
+      return idx;
     };
     auto useColumn = [&](HolePlan& plan) {
       if (!state.usedKinds.count(plan.column)) {
         newKinds.insert(plan.column);
       }
-      newBytes += plan.data.size() + getReadBytes(plan);
+      if (plan.hasDict && !state.usedKinds.count(plan.dictColumn)) {
+        newKinds.insert(plan.dictColumn);
+      }
+      newBytes += plan.data.size() + plan.dictData.size() + getReadBytes(plan);
     };
 
     for (Index h = 0; h < numLeaves; h++) {
@@ -932,7 +1422,7 @@ struct RollRepeatedCalls : public Pass {
             return Mismatch;
           }
           hasGlobal = true;
-          if (other.kind != leaf.kind || other.global != leaf.global) {
+          if (other.kind != leaf.kind || !sameGlobalLeaf(other, leaf)) {
             varies = true;
           }
         } else {
@@ -1005,7 +1495,7 @@ struct RollRepeatedCalls : public Pass {
           std::vector<uint32_t> indexes;
           for (Index k = 0; k < size; k++) {
             indexes.push_back(
-              getTableIndex(table, plan, stmts[start + k].leaves[h].global));
+              getTableIndex(table, plan, stmts[start + k].leaves[h]));
           }
           if (table.globals.size() > 65536) {
             return Mismatch;
@@ -1023,7 +1513,7 @@ struct RollRepeatedCalls : public Pass {
         for (Index k = 0; k < size; k++) {
           auto& other = stmts[start + k].leaves[h];
           if (other.kind == LeafKind::Global) {
-            getTableIndex(table, plan, other.global);
+            getTableIndex(table, plan, other);
           }
         }
         if (table.globals.size() > 65536) {
@@ -1100,9 +1590,9 @@ struct RollRepeatedCalls : public Pass {
       uint32_t maxIndex = 0;
       for (Index k = 0; k < size; k++) {
         auto& other = stmts[start + k].leaves[h];
-        uint32_t index;
+        uint32_t index = 0;
         if (other.kind == LeafKind::Global) {
-          index = tempTables[tableIndex].indexes[other.global];
+          findTableEntry(tempTables[tableIndex], other, index);
         } else {
           Index c = 0;
           while (callees[c].name != other.callee) {
@@ -1131,8 +1621,9 @@ struct RollRepeatedCalls : public Pass {
     if (newBytes >= oldBytes) {
       return NotWorthIt;
     }
+    int saved = oldBytes - newBytes;
     if (savedOut) {
-      *savedOut = oldBytes - newBytes;
+      *savedOut = saved;
     }
     // Commit.
     state.tables = std::move(tempTables);
@@ -1144,6 +1635,12 @@ struct RollRepeatedCalls : public Pass {
       state.kindOrder.push_back(kind);
     }
     for (auto& plan : holes) {
+      if (plan.hasDict) {
+        auto& dData = state.arrayData[plan.dictColumn];
+        plan.dictOffset = state.arrayCounts[plan.dictColumn];
+        state.arrayCounts[plan.dictColumn] += plan.dictCount;
+        dData.insert(dData.end(), plan.dictData.begin(), plan.dictData.end());
+      }
       if (plan.kind == HolePlan::Column || plan.kind == HolePlan::Delta ||
           plan.kind == HolePlan::Table || plan.kind == HolePlan::Mixed) {
         auto& data = state.arrayData[plan.column];
@@ -1152,7 +1649,18 @@ struct RollRepeatedCalls : public Pass {
         data.insert(data.end(), plan.data.begin(), plan.data.end());
       }
     }
-    state.plans.push_back(RunPlan{block, start, size, first, std::move(holes)});
+    state.plans.push_back(RunPlan{block,
+                                  start,
+                                  size,
+                                  first,
+                                  std::move(holes),
+                                  nullptr,
+                                  nullptr,
+                                  0,
+                                  Name(),
+                                  false,
+                                  nullptr,
+                                  saved});
     return Rolled;
   }
 
@@ -1203,6 +1711,43 @@ struct RollRepeatedCalls : public Pass {
         plan.signed_ = true;
       } else {
         plan.column = ColumnKind::I32;
+      }
+      if (plan.column == ColumnKind::I32 && size >= 8) {
+        std::vector<uint32_t> distinct;
+        std::unordered_map<uint32_t, uint32_t> valToIdx;
+        std::vector<uint32_t> idxs;
+        idxs.reserve(size);
+        bool okDict = true;
+        for (auto& value : values) {
+          uint32_t v = uint32_t(value.geti32());
+          auto it = valToIdx.find(v);
+          if (it == valToIdx.end()) {
+            if (distinct.size() >= 256) {
+              okDict = false;
+              break;
+            }
+            uint32_t idx = distinct.size();
+            valToIdx[v] = idx;
+            distinct.push_back(v);
+            idxs.push_back(idx);
+          } else {
+            idxs.push_back(it->second);
+          }
+        }
+        if (okDict && 4 * distinct.size() + size + 10 < 4 * size) {
+          plan.hasDict = true;
+          plan.dictColumn = ColumnKind::I32;
+          plan.column = ColumnKind::I8;
+          plan.signed_ = false;
+          plan.dictCount = distinct.size();
+          for (uint32_t v : distinct) {
+            appendLE(plan.dictData, v, 4);
+          }
+          for (uint32_t idx : idxs) {
+            appendLE(plan.data, idx, 1);
+          }
+          return true;
+        }
       }
       for (auto& value : values) {
         appendLE(
@@ -1356,8 +1901,8 @@ struct RollRepeatedCalls : public Pass {
     auto cleanup = [&]() {
       if (!committed) {
         for (auto& s : armStmts) {
-          for (auto& [ptr, original] : s.inlined) {
-            *ptr = original;
+          for (auto it = s.inlined.rbegin(); it != s.inlined.rend(); ++it) {
+            *it->first = it->second;
           }
         }
       }
@@ -1415,7 +1960,7 @@ struct RollRepeatedCalls : public Pass {
       }
       Statement stmt;
       stmt.fixedBytes = armFixed;
-      Scanner scanner(*module, stmt, *this, state.func);
+      Scanner scanner(*module, stmt, *this, state.func, &state);
       stmt.valid = scanner.scan(valPtr, 0);
       stmt.expr = *valPtr;
       armStmts.push_back(std::move(stmt));
@@ -1459,27 +2004,44 @@ struct RollRepeatedCalls : public Pass {
         return newIter->second;
       }
       Index tableIndex = tempTables.size();
-      tempTables.push_back(Table{lub, {}, {}, Name()});
+      tempTables.push_back(Table{lub, {}, {}, {}, Name()});
       newTables[lub] = tableIndex;
-      newBytes += TableBytes;
       return tableIndex;
     };
-    auto getTableIndex = [&](Table& table, HolePlan& plan, Name name) {
-      auto indexIter = table.indexes.find(name);
-      if (indexIter == table.indexes.end()) {
-        indexIter =
-          table.indexes.insert({name, Index(table.globals.size())}).first;
-        table.globals.push_back(name);
-        plan.newGlobals.push_back(name);
-        newBytes += TableEntryBytes;
+    auto getTableIndex =
+      [&](Table& table, HolePlan& plan, const Leaf& other) -> Index {
+      Index idx = 0;
+      if (findTableEntry(table, other, idx)) {
+        return idx;
       }
-      return indexIter->second;
+      idx = table.globals.size();
+      Name name = other.refExpr ? Name("$expr$" + std::to_string(idx))
+                                : other.global;
+      table.indexes[name] = idx;
+      table.globals.push_back(name);
+      table.exprs.push_back(other.refExpr);
+      if (other.refExpr) {
+        table.hasExprs = true;
+      }
+      plan.newGlobals.push_back(name);
+      Index entryBytes = other.refExpr ? other.bytes : TableEntryBytes;
+      if (idx == 1) {
+        Index firstBytes = table.exprs[0] ? getTreeBytes(table.exprs[0])
+                                          : TableEntryBytes;
+        newBytes += TableBytes + firstBytes + entryBytes;
+      } else if (idx > 1) {
+        newBytes += entryBytes;
+      }
+      return idx;
     };
     auto useColumn = [&](HolePlan& plan) {
       if (!state.usedKinds.count(plan.column)) {
         newKinds.insert(plan.column);
       }
-      newBytes += plan.data.size() + getReadBytes(plan);
+      if (plan.hasDict && !state.usedKinds.count(plan.dictColumn)) {
+        newKinds.insert(plan.dictColumn);
+      }
+      newBytes += plan.data.size() + plan.dictData.size() + getReadBytes(plan);
     };
 
     bool foundGapHole = !hasGaps;
@@ -1506,7 +2068,7 @@ struct RollRepeatedCalls : public Pass {
             return;
           }
           hasGlobal = true;
-          if (other.kind != leaf.kind || other.global != leaf.global) {
+          if (other.kind != leaf.kind || !sameGlobalLeaf(other, leaf)) {
             varies = true;
           }
         } else {
@@ -1628,7 +2190,7 @@ struct RollRepeatedCalls : public Pass {
         auto& table = tempTables[tableIndex];
         if (callees.empty()) {
           for (auto& s : armStmts) {
-            getTableIndex(table, plan, s.leaves[h].global);
+            getTableIndex(table, plan, s.leaves[h]);
           }
           if (!foundGapHole) {
             plan.isGapHole = true;
@@ -1643,13 +2205,12 @@ struct RollRepeatedCalls : public Pass {
           indexes.reserve(M);
           uint32_t maxIndex = 0;
           for (Index i = 0; i < M; i++) {
-            uint32_t idx =
-              targetEffK[i] == 0
-                ? 0
-                : table.indexes[armStmts[effKToArmIdx[targetEffK[i]]]
-                                  .leaves[h]
-                                  .global] +
-                    plan.gapOffset;
+            uint32_t idx = 0;
+            if (targetEffK[i] != 0) {
+              findTableEntry(
+                table, armStmts[effKToArmIdx[targetEffK[i]]].leaves[h], idx);
+              idx += plan.gapOffset;
+            }
             maxIndex = std::max(maxIndex, idx);
             indexes.push_back(idx);
           }
@@ -1665,7 +2226,7 @@ struct RollRepeatedCalls : public Pass {
         for (auto& s : armStmts) {
           auto& other = s.leaves[h];
           if (other.kind == LeafKind::Global) {
-            getTableIndex(table, plan, other.global);
+            getTableIndex(table, plan, other);
           }
         }
       }
@@ -1758,8 +2319,8 @@ struct RollRepeatedCalls : public Pass {
         if (targetEffK[i] != 0) {
           auto& other = armStmts[effKToArmIdx[targetEffK[i]]].leaves[h];
           if (other.kind == LeafKind::Global) {
-            index =
-              tempTables[tableIndex].indexes[other.global] + plan.gapOffset;
+            findTableEntry(tempTables[tableIndex], other, index);
+            index += plan.gapOffset;
           } else {
             Index c = 0;
             while (callees[c].name != other.callee) {
@@ -1805,6 +2366,12 @@ struct RollRepeatedCalls : public Pass {
       state.kindOrder.push_back(kind);
     }
     for (auto& plan : holes) {
+      if (plan.hasDict) {
+        auto& dData = state.arrayData[plan.dictColumn];
+        plan.dictOffset = state.arrayCounts[plan.dictColumn];
+        state.arrayCounts[plan.dictColumn] += plan.dictCount;
+        dData.insert(dData.end(), plan.dictData.begin(), plan.dictData.end());
+      }
       if (plan.kind == HolePlan::Column || plan.kind == HolePlan::Table ||
           plan.kind == HolePlan::Mixed) {
         auto& data = state.arrayData[plan.column];
@@ -1875,11 +2442,65 @@ struct RollRepeatedCalls : public Pass {
     }
   }
 
+  bool isHoistableInit(Expression* e) {
+    if (!e || e->type == Type::unreachable) {
+      return false;
+    }
+    switch (e->_id) {
+      case Expression::LocalGetId:
+      case Expression::ConstId:
+      case Expression::RefNullId:
+      case Expression::RefFuncId:
+        return true;
+      case Expression::GlobalGetId:
+        return !module->getGlobal(e->cast<GlobalGet>()->name)->mutable_;
+      case Expression::RefCastId:
+        return isHoistableInit(e->cast<RefCast>()->ref);
+      case Expression::CallId: {
+        auto* c = e->cast<Call>();
+        if (c->isReturn || c->operands.size() != 1 ||
+            !isHoistableInit(c->operands[0])) {
+          return false;
+        }
+        auto* callee = module->getFunction(c->target);
+        if (callee->imported() || callee->getNumParams() != 1 ||
+            callee->getNumVars() != 0) {
+          return false;
+        }
+        if (auto* rc = callee->body->dynCast<RefCast>()) {
+          if (auto* lg = rc->ref->dynCast<LocalGet>()) {
+            return lg->index == 0;
+          }
+        }
+        return false;
+      }
+      default:
+        return false;
+    }
+  }
+
+  bool isLazyInitPrefix(Expression* e) {
+    if (auto* iff = e->dynCast<If>()) {
+      return !iff->ifFalse && iff->type == Type::none;
+    }
+    if (auto* c = e->dynCast<Call>()) {
+      if (!c->isReturn && c->operands.empty() && c->type == Type::none) {
+        auto* callee = module->getFunction(c->target);
+        if (!callee->imported() && callee->getNumLocals() == 0) {
+          if (auto* iff = callee->body->dynCast<If>()) {
+            return !iff->ifFalse && iff->type == Type::none;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
   void planOneArrayNewFixed(FuncState& state,
                             ArrayNewFixed* anf,
                             ChildPtrFinder& finder,
                             const std::unordered_set<Expression*>& covered) {
-    const Index MinArrayNewFixed = 8;
+    const Index MinArrayNewFixed = MinRun;
     const int WrapperOverhead = 8;
     Index N = anf->values.size();
     if (N < MinArrayNewFixed || anf->type == Type::unreachable ||
@@ -1950,18 +2571,85 @@ struct RollRepeatedCalls : public Pass {
       }
     }
 
+    LocalSet* nestedTee = nullptr;
+    Expression** nestedTeePtr = nullptr;
+    if (!unwrappedTee) {
+      for (auto* set : FindAll<LocalSet>(anf->values[0]).list) {
+        if (!set->isTee() || !isHoistableInit(set->value)) {
+          continue;
+        }
+        auto pIt = finder.parentPtrs.find(set);
+        if (pIt == finder.parentPtrs.end()) {
+          continue;
+        }
+        Index localIdx = set->index;
+        Index getsIn0 = 0;
+        for (auto* lg : FindAll<LocalGet>(anf->values[0]).list) {
+          if (lg->index == localIdx) {
+            getsIn0++;
+          }
+        }
+        if (getsIn0 != 0) {
+          continue;
+        }
+        Index setsInAnf = 0;
+        Index getsInAnf = 0;
+        for (auto* ls : FindAll<LocalSet>(anf).list) {
+          if (ls->index == localIdx) {
+            setsInAnf++;
+          }
+        }
+        for (auto* lg : FindAll<LocalGet>(anf).list) {
+          if (lg->index == localIdx) {
+            getsInAnf++;
+          }
+        }
+        if (setsInAnf == 1 && getsInAnf > 0) {
+          nestedTee = set;
+          nestedTeePtr = pIt->second;
+          break;
+        }
+      }
+    }
+
     Builder builder(*module);
-    Type arrRefType(arrHeapType, NonNullable);
+    if (nestedTee) {
+      *nestedTeePtr = builder.makeLocalGet(
+        nestedTee->index, state.func->getLocalType(nestedTee->index));
+    }
+
+    std::vector<Expression*> hoistedPrefixes;
+    Type arrRefType = anf->type;
     Index placeholderLocal = state.func->getNumLocals();
     Block* arrBlock = builder.makeBlock();
     std::vector<LocalGet*> arrGets;
     arrGets.reserve(N);
+    std::vector<Index> stmtToElemIdx;
+    stmtToElemIdx.reserve(N);
+    std::vector<int> stmtPenalty;
+    stmtPenalty.reserve(N);
     int defaultSaved = 0;
     int unrolledPenalty = 0;
     Index teeStmtIdx = N;
     for (Index k = 0; k < N; k++) {
       Expression* val =
         (k == teeElemIdx) ? unwrappedTee->value : anf->values[k];
+      if (k != teeElemIdx) {
+        if (auto* b = val->dynCast<Block>()) {
+          if (!b->name.is() && b->list.size() == 2 &&
+              b->list[0]->type == Type::none && !b->list[1]->is<LocalGet>() &&
+              isLazyInitPrefix(b->list[0])) {
+            hoistedPrefixes.push_back(b->list[0]);
+            val = b->list[1];
+          } else if (!b->name.is() && b->list.size() == 3 &&
+                     b->list[0]->type == Type::none &&
+                     b->list[2]->is<LocalGet>() &&
+                     isLazyInitPrefix(b->list[0])) {
+            hoistedPrefixes.push_back(b->list[0]);
+            val = builder.makeBlock({b->list[1], b->list[2]}, b->type);
+          }
+        }
+      }
       Index defBytes = 0;
       if (k != teeElemIdx && isDefaultValue(val, defBytes)) {
         defaultSaved += int(defBytes);
@@ -1972,17 +2660,25 @@ struct RollRepeatedCalls : public Pass {
       }
       auto* arrGet = builder.makeLocalGet(placeholderLocal, arrRefType);
       arrGets.push_back(arrGet);
+      stmtToElemIdx.push_back(k);
+      int pen = 5 + int(getConstBytes(Literal(int32_t(k))));
+      stmtPenalty.push_back(pen);
       arrBlock->list.push_back(builder.makeArraySet(
         arrGet, builder.makeConst(int32_t(k)), val, MemoryOrder::Unordered));
-      unrolledPenalty += 5 + int(getConstBytes(Literal(int32_t(k))));
+      unrolledPenalty += pen;
     }
     if (arrBlock->list.size() < MinRun) {
+      if (nestedTee) {
+        *nestedTeePtr = nestedTee;
+      }
       return;
     }
 
     FuncState tentativeState = state;
+    tentativeState.inArrayNewFixed = true;
     Index plansBefore = tentativeState.plans.size();
     int totalBlockSaved = planBlock(tentativeState, arrBlock);
+    tentativeState.inArrayNewFixed = false;
 
     bool teeRolled = false;
     int teePenalty = 0;
@@ -1999,14 +2695,99 @@ struct RollRepeatedCalls : public Pass {
       }
     }
 
-    int netSaved = totalBlockSaved + defaultSaved - unrolledPenalty -
-                   teePenalty - WrapperOverhead;
-    if (netSaved <= 0 || tentativeState.plans.size() == plansBefore) {
+    Index totalRolled = 0;
+    bool hasInnerBlock = false;
+    for (Index p = plansBefore; p < tentativeState.plans.size(); p++) {
+      totalRolled += tentativeState.plans[p].size;
+      if (!FindAll<Block>(tentativeState.plans[p].first.expr).list.empty()) {
+        hasInnerBlock = true;
+      }
+    }
+    bool allowSplit = !hasInnerBlock ||
+                      (tentativeState.plans.size() - plansBefore == 1 &&
+                       totalRolled == N);
+
+    int nestedTeeOverhead = nestedTee ? 2 : 0;
+    int netSaved1 = (!allowSplit || (N >= 64 && totalRolled * 4 < N * 3))
+                      ? -1
+                      : totalBlockSaved + defaultSaved - unrolledPenalty -
+                          teePenalty - WrapperOverhead - nestedTeeOverhead;
+
+    bool canPartial = allowSplit && !unwrappedTee && !nestedTee &&
+                      hoistedPrefixes.empty() &&
+                      tentativeState.plans.size() > plansBefore &&
+                      (N < 64 || totalRolled * 4 >= N * 3);
+    int rolledPenalty = 0;
+    Index rolledCount = 0;
+    if (canPartial) {
       for (Index p = plansBefore; p < tentativeState.plans.size(); p++) {
-        for (auto& [ptr, original] : tentativeState.plans[p].first.inlined) {
-          *ptr = original;
+        auto& plan = tentativeState.plans[p];
+        int pPen = 0;
+        for (Index s = plan.start; s < plan.start + plan.size; s++) {
+          pPen += stmtPenalty[s];
+        }
+        if (plan.saved <= pPen + 2 * int(plan.size)) {
+          canPartial = false;
+          break;
+        }
+        rolledPenalty += pPen;
+        rolledCount += plan.size;
+      }
+      if (rolledCount == N) {
+        canPartial = false;
+      }
+    }
+    int netSaved2 = canPartial ? (totalBlockSaved - rolledPenalty) -
+                                   2 * int(rolledCount) - 5 - nestedTeeOverhead
+                               : -1;
+
+    if ((netSaved1 <= 0 && netSaved2 <= 0) ||
+        tentativeState.plans.size() == plansBefore) {
+      for (Index p = plansBefore; p < tentativeState.plans.size(); p++) {
+        for (auto it = tentativeState.plans[p].first.inlined.rbegin();
+             it != tentativeState.plans[p].first.inlined.rend();
+             ++it) {
+          *it->first = it->second;
         }
       }
+      if (nestedTee) {
+        *nestedTeePtr = nestedTee;
+      }
+      return;
+    }
+
+    Index arrLocal = Builder::addVar(state.func, arrRefType);
+    for (auto* get : arrGets) {
+      get->index = arrLocal;
+    }
+
+    if (canPartial && netSaved2 > netSaved1) {
+      auto makeDefaultElem = [&]() -> Expression* {
+        if (field.type.isRef()) {
+          return builder.makeRefNull(field.type.getHeapType().getBottom());
+        }
+        return builder.makeConst(Literal::makeZero(field.type));
+      };
+      std::vector<Expression*> fullList;
+      if (nestedTee) {
+        nestedTee->makeSet();
+        fullList.push_back(nestedTee);
+      }
+      fullList.push_back(builder.makeLocalSet(arrLocal, anf));
+      for (Index p = plansBefore; p < tentativeState.plans.size(); p++) {
+        auto& plan = tentativeState.plans[p];
+        Index newStart = fullList.size();
+        for (Index s = plan.start; s < plan.start + plan.size; s++) {
+          anf->values[stmtToElemIdx[s]] = makeDefaultElem();
+          fullList.push_back(arrBlock->list[s]);
+        }
+        plan.start = newStart;
+      }
+      fullList.push_back(builder.makeLocalGet(arrLocal, arrRefType));
+      arrBlock->list.set(fullList);
+      arrBlock->type = anf->type;
+      *ptrIt->second = arrBlock;
+      state = std::move(tentativeState);
       return;
     }
 
@@ -2015,15 +2796,19 @@ struct RollRepeatedCalls : public Pass {
       unwrappedTee->value = setStmt->value;
       setStmt->value = unwrappedTee;
     }
-    Index arrLocal = Builder::addVar(state.func, arrRefType);
-    for (auto* get : arrGets) {
-      get->index = arrLocal;
-    }
     std::vector<Expression*> fullList;
-    fullList.reserve(arrBlock->list.size() + 3);
+    fullList.reserve(arrBlock->list.size() + hoistedPrefixes.size() + 4);
+    if (nestedTee) {
+      nestedTee->makeSet();
+      fullList.push_back(nestedTee);
+    }
+    for (auto* prefix : hoistedPrefixes) {
+      fullList.push_back(prefix);
+    }
     fullList.push_back(builder.makeLocalSet(
       arrLocal,
       builder.makeArrayNew(arrHeapType, builder.makeConst(int32_t(N)))));
+    Index prefixCount = fullList.size();
     for (auto* expr : arrBlock->list) {
       fullList.push_back(expr);
     }
@@ -2039,7 +2824,7 @@ struct RollRepeatedCalls : public Pass {
     arrBlock->list.set(fullList);
     arrBlock->type = anf->type;
     for (Index p = plansBefore; p < tentativeState.plans.size(); p++) {
-      tentativeState.plans[p].start += 1;
+      tentativeState.plans[p].start += prefixCount;
     }
     *ptrIt->second = arrBlock;
     state = std::move(tentativeState);
@@ -2099,6 +2884,9 @@ struct RollRepeatedCalls : public Pass {
       case HolePlan::Mixed: {
         // The offset is not known yet; assume a short one is needed.
         Index bytes = ArrayGetBytes + LocalGetBytes + LocalGetBytes + 1 + 2;
+        if (plan.hasDict) {
+          bytes += ArrayGetBytes + LocalGetBytes;
+        }
         if (plan.kind == HolePlan::Delta) {
           // tee, add, get, and the initialization of the accumulator.
           bytes +=
@@ -2109,7 +2897,9 @@ struct RollRepeatedCalls : public Pass {
           Index numBranches =
             (plan.tableSize > 0 ? 1 : 0) + plan.callees.size();
           bytes += (numBranches - 1) * (3 + 1 + LocalGetBytes + 3);
-          if (plan.tableSize > 0) {
+          if (plan.tableSize == 1) {
+            bytes += GlobalGetBytes;
+          } else if (plan.tableSize > 1) {
             bytes += ArrayGetBytes + GlobalGetBytes + LocalGetBytes;
           }
           for (auto& callee : plan.callees) {
@@ -2162,11 +2952,21 @@ struct RollRepeatedCalls : public Pass {
         Builder::addVar(func, Type(getColumnHeapType(kind), NonNullable));
     }
 
-    // Create the table globals.
+    // Create the table globals or locals (skip 1-element tables).
+    std::vector<Expression*> tableSetups;
     for (auto& table : state.tables) {
+      if (table.globals.size() <= 1) {
+        continue;
+      }
       HeapType arrayType(Array(Field(table.elemType, Immutable)));
       std::vector<Expression*> gets;
-      for (auto name : table.globals) {
+      gets.reserve(table.globals.size());
+      for (Index i = 0; i < table.globals.size(); i++) {
+        if (i < table.exprs.size() && table.exprs[i]) {
+          gets.push_back(ExpressionManipulator::copy(table.exprs[i], *module));
+          continue;
+        }
+        auto name = table.globals[i];
         if (name.is()) {
           gets.push_back(
             builder.makeGlobalGet(name, module->getGlobal(name)->type));
@@ -2175,12 +2975,19 @@ struct RollRepeatedCalls : public Pass {
             builder.makeRefNull(table.elemType.getHeapType().getBottom()));
         }
       }
-      table.globalName = Names::getValidGlobalName(*module, "roll$table");
-      module->addGlobal(
-        builder.makeGlobal(table.globalName,
-                           Type(arrayType, NonNullable),
-                           builder.makeArrayNewFixed(arrayType, gets),
-                           Builder::Immutable));
+      if (table.hasExprs) {
+        table.localIndex =
+          Builder::addVar(func, Type(arrayType, NonNullable));
+        tableSetups.push_back(builder.makeLocalSet(
+          table.localIndex, builder.makeArrayNewFixed(arrayType, gets)));
+      } else {
+        table.globalName = Names::getValidGlobalName(*module, "roll$table");
+        module->addGlobal(
+          builder.makeGlobal(table.globalName,
+                             Type(arrayType, NonNullable),
+                             builder.makeArrayNewFixed(arrayType, gets),
+                             Builder::Immutable));
+      }
     }
 
     // Replace the runs, last first so that earlier indexes stay valid.
@@ -2202,24 +3009,54 @@ struct RollRepeatedCalls : public Pass {
         return builder.makeBinary(
           AddInt32, getCounter(), builder.makeConst(int32_t(offset)));
       };
-      auto readColumn = [&](const HolePlan& hole) {
+      auto readColumn = [&](const HolePlan& hole) -> Expression* {
         auto heapType = getColumnHeapType(hole.column);
-        return builder.makeArrayGet(
+        Expression* rawRead = builder.makeArrayGet(
           builder.makeLocalGet(state.arrayLocals[hole.column],
                                Type(heapType, NonNullable)),
           getIndex(hole.offset),
           MemoryOrder::Unordered,
           getColumnValueType(hole.column),
           hole.signed_);
-      };
-      auto readTable = [&](const HolePlan& hole, Expression* index) {
-        auto& table = state.tables[hole.table];
-        HeapType arrayType(Array(Field(table.elemType, Immutable)));
+        if (!hole.hasDict) {
+          return rawRead;
+        }
+        auto dictHeapType = getColumnHeapType(hole.dictColumn);
+        Expression* dictIdx =
+          hole.dictOffset == 0
+            ? rawRead
+            : builder.makeBinary(
+                AddInt32, rawRead, builder.makeConst(int32_t(hole.dictOffset)));
         return builder.makeArrayGet(
-          builder.makeGlobalGet(table.globalName, Type(arrayType, NonNullable)),
-          index,
+          builder.makeLocalGet(state.arrayLocals[hole.dictColumn],
+                               Type(dictHeapType, NonNullable)),
+          dictIdx,
           MemoryOrder::Unordered,
-          table.elemType);
+          getColumnValueType(hole.dictColumn),
+          false);
+      };
+      auto readTable = [&](const HolePlan& hole,
+                           Expression* index) -> Expression* {
+        auto& table = state.tables[hole.table];
+        if (table.globals.size() == 1) {
+          if (!table.exprs.empty() && table.exprs[0]) {
+            return ExpressionManipulator::copy(table.exprs[0], *module);
+          }
+          Name name = table.globals[0];
+          if (name.is()) {
+            return builder.makeGlobalGet(name, module->getGlobal(name)->type);
+          }
+          return builder.makeRefNull(table.elemType.getHeapType().getBottom());
+        }
+        HeapType arrayType(Array(Field(table.elemType, Immutable)));
+        Expression* tableRef =
+          table.hasExprs
+            ? static_cast<Expression*>(builder.makeLocalGet(
+                table.localIndex, Type(arrayType, NonNullable)))
+            : static_cast<Expression*>(builder.makeGlobalGet(
+                table.globalName, Type(arrayType, NonNullable)));
+        return builder.makeArrayGet(
+          tableRef, index, MemoryOrder::Unordered, table.elemType);
       };
       auto makeMixed = [&](const HolePlan& hole,
                            Expression* firstRaw,
@@ -2234,7 +3071,7 @@ struct RollRepeatedCalls : public Pass {
         std::vector<Branch> branches;
         if (hole.tableSize > 0) {
           Expression* tableIdx =
-            hole.gapOffset == 0
+            (hole.tableSize == 1 || hole.gapOffset == 0)
               ? getRaw()
               : builder.makeBinary(SubInt32,
                                    getRaw(),
@@ -2422,7 +3259,7 @@ struct RollRepeatedCalls : public Pass {
 
     // Lay out the arrays in the segment and load them in the innermost block
     // that contains all the runs.
-    std::vector<Expression*> setups;
+    std::vector<Expression*> setups = std::move(tableSetups);
     for (auto& [kind, data] : state.arrayData) {
       Index offset = segmentData.size();
       segmentData.insert(segmentData.end(), data.begin(), data.end());

@@ -1365,21 +1365,19 @@
   ;; CHECK:      (type $arr (array (mut (ref null $str))))
   (type $arr (array (mut (ref null $str))))
 
-  ;; CHECK:      (type $2 (array (ref $str)))
+  ;; CHECK:      (type $2 (array (mut i8)))
 
-  ;; CHECK:      (type $3 (array (mut i8)))
+  ;; CHECK:      (type $3 (func (param i32) (result (ref $str))))
 
-  ;; CHECK:      (type $4 (func (param i32) (result (ref $str))))
+  ;; CHECK:      (type $4 (func (param (ref $arr) (ref null $str))))
 
-  ;; CHECK:      (type $5 (func (param (ref $arr) (ref null $str))))
+  ;; CHECK:      (type $5 (func (result (ref $str))))
 
-  ;; CHECK:      (type $6 (func (result (ref $str))))
+  ;; CHECK:      (type $6 (func))
 
-  ;; CHECK:      (type $7 (func))
+  ;; CHECK:      (type $7 (func (result (ref $arr))))
 
-  ;; CHECK:      (type $8 (func (result (ref $arr))))
-
-  ;; CHECK:      (import "env" "use" (func $use (type $5) (param (ref $arr) (ref null $str))))
+  ;; CHECK:      (import "env" "use" (func $use (type $4) (param (ref $arr) (ref null $str))))
   (import "env" "use" (func $use (param (ref $arr) (ref null $str))))
 
   ;; CHECK:      (global $g (ref $str) (struct.new $str
@@ -1387,13 +1385,9 @@
   ;; CHECK-NEXT: ))
   (global $g (ref $str) (struct.new $str (i32.const 99)))
 
-  ;; CHECK:      (global $roll$table (ref $2) (array.new_fixed $2 1
-  ;; CHECK-NEXT:  (global.get $g)
-  ;; CHECK-NEXT: ))
-
   ;; CHECK:      (data $roll "j\e5\00xN\ebh\00\f1z\e4ni\ea\00wN\e9g\00\ee~\e6q\ect\e7u")
 
-  ;; CHECK:      (func $f1 (type $4) (param $i i32) (result (ref $str))
+  ;; CHECK:      (func $f1 (type $3) (param $i i32) (result (ref $str))
   ;; CHECK-NEXT:  (struct.new $str
   ;; CHECK-NEXT:   (local.get $i)
   ;; CHECK-NEXT:  )
@@ -1401,7 +1395,7 @@
   (func $f1 (param $i i32) (result (ref $str))
     (struct.new $str (local.get $i))
   )
-  ;; CHECK:      (func $f2 (type $4) (param $i i32) (result (ref $str))
+  ;; CHECK:      (func $f2 (type $3) (param $i i32) (result (ref $str))
   ;; CHECK-NEXT:  (struct.new $str
   ;; CHECK-NEXT:   (i32.add
   ;; CHECK-NEXT:    (local.get $i)
@@ -1412,7 +1406,7 @@
   (func $f2 (param $i i32) (result (ref $str))
     (struct.new $str (i32.add (local.get $i) (i32.const 100)))
   )
-  ;; CHECK:      (func $thunk (type $6) (result (ref $str))
+  ;; CHECK:      (func $thunk (type $5) (result (ref $str))
   ;; CHECK-NEXT:  (call $f1
   ;; CHECK-NEXT:   (i32.const 77)
   ;; CHECK-NEXT:  )
@@ -1421,14 +1415,14 @@
     (call $f1 (i32.const 77))
   )
 
-  ;; CHECK:      (func $array-strict-ap-with-tee (type $7)
+  ;; CHECK:      (func $array-strict-ap-with-tee (type $6)
   ;; CHECK-NEXT:  (local $saved (ref null $str))
   ;; CHECK-NEXT:  (local $a (ref $arr))
-  ;; CHECK-NEXT:  (local $2 (ref $arr))
+  ;; CHECK-NEXT:  (local $2 (ref (exact $arr)))
   ;; CHECK-NEXT:  (local $3 i32)
   ;; CHECK-NEXT:  (local $4 i32)
   ;; CHECK-NEXT:  (local.set $a
-  ;; CHECK-NEXT:   (block (result (ref $arr))
+  ;; CHECK-NEXT:   (block (result (ref (exact $arr)))
   ;; CHECK-NEXT:    (local.set $2
   ;; CHECK-NEXT:     (array.new_default $arr
   ;; CHECK-NEXT:      (i32.const 24)
@@ -1549,9 +1543,9 @@
     (call $use (local.get $a) (local.get $saved))
   )
 
-  ;; CHECK:      (func $array-mixed (type $8) (result (ref $arr))
-  ;; CHECK-NEXT:  (local $0 (ref $arr))
-  ;; CHECK-NEXT:  (local $1 (ref $3))
+  ;; CHECK:      (func $array-mixed (type $7) (result (ref $arr))
+  ;; CHECK-NEXT:  (local $0 (ref (exact $arr)))
+  ;; CHECK-NEXT:  (local $1 (ref $2))
   ;; CHECK-NEXT:  (local $2 i32)
   ;; CHECK-NEXT:  (local $3 i32)
   ;; CHECK-NEXT:  (local.set $0
@@ -1560,7 +1554,7 @@
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT:  (local.set $1
-  ;; CHECK-NEXT:   (array.new_data $3 $roll
+  ;; CHECK-NEXT:   (array.new_data $2 $roll
   ;; CHECK-NEXT:    (i32.const 0)
   ;; CHECK-NEXT:    (i32.const 28)
   ;; CHECK-NEXT:   )
@@ -1576,7 +1570,7 @@
   ;; CHECK-NEXT:     (if (result (ref $str))
   ;; CHECK-NEXT:      (i32.lt_u
   ;; CHECK-NEXT:       (local.tee $3
-  ;; CHECK-NEXT:        (array.get_u $3
+  ;; CHECK-NEXT:        (array.get_u $2
   ;; CHECK-NEXT:         (local.get $1)
   ;; CHECK-NEXT:         (local.get $2)
   ;; CHECK-NEXT:        )
@@ -1584,10 +1578,7 @@
   ;; CHECK-NEXT:       (i32.const 1)
   ;; CHECK-NEXT:      )
   ;; CHECK-NEXT:      (then
-  ;; CHECK-NEXT:       (array.get $2
-  ;; CHECK-NEXT:        (global.get $roll$table)
-  ;; CHECK-NEXT:        (local.get $3)
-  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:       (global.get $g)
   ;; CHECK-NEXT:      )
   ;; CHECK-NEXT:      (else
   ;; CHECK-NEXT:       (if (result (ref $str))
