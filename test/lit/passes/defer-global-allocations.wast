@@ -1821,3 +1821,59 @@
     )
   )
 )
+
+(module
+  ;; CHECK:      (type $box (struct (field i32)))
+  (type $box (struct (field i32)))
+
+  ;; CHECK:      (type $1 (func (result (ref null $box))))
+
+  ;; CHECK:      (type $2 (func))
+
+  (global $br_flag (mut i32) (i32.const 0))
+  ;; CHECK:      (global $g_base (mut (ref null $box)) (ref.null none))
+  (global $g_base (mut (ref null $box)) (ref.null none))
+  (global $g_alias (mut (ref null $box)) (ref.null none))
+
+  ;; CHECK:      (export "read_alias" (func $read_alias))
+
+  ;; CHECK:      (func $init_br (type $2)
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (ref.is_null
+  ;; CHECK-NEXT:    (global.get $g_base)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (global.set $g_base
+  ;; CHECK-NEXT:     (struct.new $box
+  ;; CHECK-NEXT:      (i32.const 99)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $init_br
+    (block $out
+      (br_if $out (global.get $br_flag))
+      (global.set $br_flag (i32.const 1))
+      (global.set $g_base (struct.new $box (i32.const 99)))
+      (global.set $g_alias (global.get $g_base))
+    )
+  )
+
+  ;; CHECK:      (func $callee_after_init (type $1) (result (ref null $box))
+  ;; CHECK-NEXT:  (call $init_br)
+  ;; CHECK-NEXT:  (global.get $g_base)
+  ;; CHECK-NEXT: )
+  (func $callee_after_init (result (ref null $box))
+    (call $init_br)
+    (global.get $g_alias)
+  )
+
+  ;; CHECK:      (func $read_alias (type $1) (result (ref null $box))
+  ;; CHECK-NEXT:  (call $callee_after_init)
+  ;; CHECK-NEXT: )
+  (func $read_alias (export "read_alias") (result (ref null $box))
+    (call $init_br)
+    (call $callee_after_init)
+  )
+)
