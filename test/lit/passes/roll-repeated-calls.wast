@@ -1779,3 +1779,191 @@
     )
   )
 )
+
+;; Two functions with HolePlan::Mixed runs over overlapping globals of type $vt
+;; and factory calls to $make share a single $roll$table global and unified bound.
+(module
+  ;; CHECK:      (type $vt (struct (field i32)))
+  (type $vt (struct (field i32)))
+  ;; CHECK:      (type $1 (array (mut i8)))
+
+  ;; CHECK:      (type $2 (array (ref $vt)))
+
+  ;; CHECK:      (type $3 (func))
+
+  ;; CHECK:      (type $4 (func (param i32) (result (ref $vt))))
+
+  ;; CHECK:      (type $5 (func (param (ref $vt) i32 i32 i32 i32)))
+
+  ;; CHECK:      (import "env" "make" (func $make (type $4) (param i32) (result (ref $vt))))
+  (import "env" "make" (func $make (param i32) (result (ref $vt))))
+  ;; CHECK:      (import "env" "sink" (func $sink (type $5) (param (ref $vt) i32 i32 i32 i32)))
+  (import "env" "sink" (func $sink (param (ref $vt) i32 i32 i32 i32)))
+  ;; CHECK:      (global $v0 (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 0)
+  ;; CHECK-NEXT: ))
+  (global $v0 (ref $vt) (struct.new $vt (i32.const 0)))
+  ;; CHECK:      (global $v1 (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 1)
+  ;; CHECK-NEXT: ))
+  (global $v1 (ref $vt) (struct.new $vt (i32.const 1)))
+  ;; CHECK:      (global $v2 (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 2)
+  ;; CHECK-NEXT: ))
+  (global $v2 (ref $vt) (struct.new $vt (i32.const 2)))
+  ;; CHECK:      (global $v3 (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 3)
+  ;; CHECK-NEXT: ))
+  (global $v3 (ref $vt) (struct.new $vt (i32.const 3)))
+
+  ;; CHECK:      (global $roll$table (ref $2) (array.new_fixed $2 4
+  ;; CHECK-NEXT:  (global.get $v1)
+  ;; CHECK-NEXT:  (global.get $v2)
+  ;; CHECK-NEXT:  (global.get $v3)
+  ;; CHECK-NEXT:  (global.get $v0)
+  ;; CHECK-NEXT: ))
+
+  ;; CHECK:      (data $roll "\03\00\04\05\01\06\03\07\00\01\07\02\08\t\00\n")
+
+  ;; CHECK:      (func $mixed-a (type $3)
+  ;; CHECK-NEXT:  (local $0 (ref $1))
+  ;; CHECK-NEXT:  (local $1 i32)
+  ;; CHECK-NEXT:  (local $2 i32)
+  ;; CHECK-NEXT:  (local.set $0
+  ;; CHECK-NEXT:   (array.new_data $1 $roll
+  ;; CHECK-NEXT:    (i32.const 0)
+  ;; CHECK-NEXT:    (i32.const 8)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (block
+  ;; CHECK-NEXT:   (local.set $1
+  ;; CHECK-NEXT:    (i32.const 0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (loop $roll
+  ;; CHECK-NEXT:    (call $sink
+  ;; CHECK-NEXT:     (if (result (ref $vt))
+  ;; CHECK-NEXT:      (i32.lt_u
+  ;; CHECK-NEXT:       (local.tee $2
+  ;; CHECK-NEXT:        (array.get_u $1
+  ;; CHECK-NEXT:         (local.get $0)
+  ;; CHECK-NEXT:         (local.get $1)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:       (i32.const 4)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (then
+  ;; CHECK-NEXT:       (array.get $2
+  ;; CHECK-NEXT:        (global.get $roll$table)
+  ;; CHECK-NEXT:        (local.get $2)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (else
+  ;; CHECK-NEXT:       (call $make
+  ;; CHECK-NEXT:        (i32.sub
+  ;; CHECK-NEXT:         (local.get $2)
+  ;; CHECK-NEXT:         (i32.const 4)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.const 1)
+  ;; CHECK-NEXT:     (i32.const 2)
+  ;; CHECK-NEXT:     (i32.const 3)
+  ;; CHECK-NEXT:     (i32.const 4)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (br_if $roll
+  ;; CHECK-NEXT:     (i32.lt_u
+  ;; CHECK-NEXT:      (local.tee $1
+  ;; CHECK-NEXT:       (i32.add
+  ;; CHECK-NEXT:        (local.get $1)
+  ;; CHECK-NEXT:        (i32.const 1)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (i32.const 8)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $mixed-a
+    (call $sink (global.get $v0) (i32.const 1) (i32.const 2) (i32.const 3) (i32.const 4))
+    (call $sink (global.get $v1) (i32.const 1) (i32.const 2) (i32.const 3) (i32.const 4))
+    (call $sink (call $make (i32.const 0)) (i32.const 1) (i32.const 2) (i32.const 3) (i32.const 4))
+    (call $sink (call $make (i32.const 1)) (i32.const 1) (i32.const 2) (i32.const 3) (i32.const 4))
+    (call $sink (global.get $v2) (i32.const 1) (i32.const 2) (i32.const 3) (i32.const 4))
+    (call $sink (call $make (i32.const 2)) (i32.const 1) (i32.const 2) (i32.const 3) (i32.const 4))
+    (call $sink (global.get $v0) (i32.const 1) (i32.const 2) (i32.const 3) (i32.const 4))
+    (call $sink (call $make (i32.const 3)) (i32.const 1) (i32.const 2) (i32.const 3) (i32.const 4))
+  )
+
+  ;; CHECK:      (func $mixed-b (type $3)
+  ;; CHECK-NEXT:  (local $0 (ref $1))
+  ;; CHECK-NEXT:  (local $1 i32)
+  ;; CHECK-NEXT:  (local $2 i32)
+  ;; CHECK-NEXT:  (local.set $0
+  ;; CHECK-NEXT:   (array.new_data $1 $roll
+  ;; CHECK-NEXT:    (i32.const 8)
+  ;; CHECK-NEXT:    (i32.const 8)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (block
+  ;; CHECK-NEXT:   (local.set $1
+  ;; CHECK-NEXT:    (i32.const 0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (loop $roll
+  ;; CHECK-NEXT:    (call $sink
+  ;; CHECK-NEXT:     (if (result (ref $vt))
+  ;; CHECK-NEXT:      (i32.lt_u
+  ;; CHECK-NEXT:       (local.tee $2
+  ;; CHECK-NEXT:        (array.get_u $1
+  ;; CHECK-NEXT:         (local.get $0)
+  ;; CHECK-NEXT:         (local.get $1)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:       (i32.const 4)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (then
+  ;; CHECK-NEXT:       (array.get $2
+  ;; CHECK-NEXT:        (global.get $roll$table)
+  ;; CHECK-NEXT:        (local.get $2)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (else
+  ;; CHECK-NEXT:       (call $make
+  ;; CHECK-NEXT:        (i32.sub
+  ;; CHECK-NEXT:         (local.get $2)
+  ;; CHECK-NEXT:         (i32.const 4)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.const 1)
+  ;; CHECK-NEXT:     (i32.const 2)
+  ;; CHECK-NEXT:     (i32.const 3)
+  ;; CHECK-NEXT:     (i32.const 4)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (br_if $roll
+  ;; CHECK-NEXT:     (i32.lt_u
+  ;; CHECK-NEXT:      (local.tee $1
+  ;; CHECK-NEXT:       (i32.add
+  ;; CHECK-NEXT:        (local.get $1)
+  ;; CHECK-NEXT:        (i32.const 1)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (i32.const 8)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $mixed-b
+    (call $sink (global.get $v1) (i32.const 1) (i32.const 2) (i32.const 3) (i32.const 4))
+    (call $sink (global.get $v2) (i32.const 1) (i32.const 2) (i32.const 3) (i32.const 4))
+    (call $sink (call $make (i32.const 3)) (i32.const 1) (i32.const 2) (i32.const 3) (i32.const 4))
+    (call $sink (global.get $v3) (i32.const 1) (i32.const 2) (i32.const 3) (i32.const 4))
+    (call $sink (call $make (i32.const 4)) (i32.const 1) (i32.const 2) (i32.const 3) (i32.const 4))
+    (call $sink (call $make (i32.const 5)) (i32.const 1) (i32.const 2) (i32.const 3) (i32.const 4))
+    (call $sink (global.get $v1) (i32.const 1) (i32.const 2) (i32.const 3) (i32.const 4))
+    (call $sink (call $make (i32.const 6)) (i32.const 1) (i32.const 2) (i32.const 3) (i32.const 4))
+  )
+)

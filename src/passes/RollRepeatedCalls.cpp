@@ -320,6 +320,7 @@ struct HolePlan {
   Name callee;
   // Mixed.
   Index tableSize = 0;
+  uint32_t maxIndex = 0;
   Type mixedType;
   std::vector<CalleePlan> callees;
   // Column (and the index column of a Table).
@@ -431,10 +432,15 @@ struct RollRepeatedCalls : public Pass {
       existingSegment = nullptr;
       segmentName = Names::getValidDataSegmentName(*module, "roll");
     }
+    std::vector<FuncState> states;
     for (auto& func : module->functions) {
       if (!func->imported()) {
-        processFunction(func.get());
+        processFunction(func.get(), states);
       }
+    }
+    mergeMixedTables(states);
+    for (auto& state : states) {
+      applyPlans(state);
     }
     if (existingSegment) {
       existingSegment->data = std::move(segmentData);
@@ -1097,7 +1103,7 @@ struct RollRepeatedCalls : public Pass {
     }
   }
 
-  void processFunction(Function* func) {
+  void processFunction(Function* func, std::vector<FuncState>& states) {
     FuncState state;
     state.func = func;
     findScratchLocals(state);
@@ -1109,7 +1115,7 @@ struct RollRepeatedCalls : public Pass {
     if (state.plans.empty()) {
       return;
     }
-    applyPlans(state);
+    states.push_back(std::move(state));
   }
 
   int planBlock(FuncState& state, Block* block) {
@@ -1495,9 +1501,9 @@ struct RollRepeatedCalls : public Pass {
             return Mismatch;
           }
         }
-        tableIndex = getTable(lub);
-        auto& table = tempTables[tableIndex];
         if (callees.empty()) {
+          tableIndex = getTable(lub);
+          auto& table = tempTables[tableIndex];
           std::vector<uint32_t> indexes;
           for (Index k = 0; k < size; k++) {
             indexes.push_back(
@@ -1532,6 +1538,9 @@ struct RollRepeatedCalls : public Pass {
           useColumn(plan);
           continue;
         }
+        tableIndex = tempTables.size();
+        tempTables.push_back(Table{lub, {}, {}, {}, Name()});
+        auto& table = tempTables[tableIndex];
         for (Index k = 0; k < size; k++) {
           auto& other = stmts[start + k].leaves[h];
           if (other.kind == LeafKind::Global) {
@@ -1629,6 +1638,7 @@ struct RollRepeatedCalls : public Pass {
       plan.kind = HolePlan::Mixed;
       plan.table = tableIndex;
       plan.tableSize = tableSize;
+      plan.maxIndex = maxIndex;
       plan.callees = std::move(callees);
       plan.mixedType = mixedType;
       plan.column = maxIndex <= 255     ? ColumnKind::I8
@@ -2209,9 +2219,9 @@ struct RollRepeatedCalls : public Pass {
             return;
           }
         }
-        tableIndex = getTable(lub);
-        auto& table = tempTables[tableIndex];
         if (callees.empty()) {
+          tableIndex = getTable(lub);
+          auto& table = tempTables[tableIndex];
           for (auto& s : armStmts) {
             getTableIndex(table, plan, s.leaves[h]);
           }
@@ -2239,6 +2249,24 @@ struct RollRepeatedCalls : public Pass {
           }
           plan.kind = HolePlan::Table;
           plan.table = tableIndex;
+          if (!plan.isGapHole) {
+            uint32_t base = indexes[0];
+            uint32_t step = indexes[1] - base;
+            bool isProgression = true;
+            for (Index i = 0; i < M; i++) {
+              if (indexes[i] != base + step * i) {
+                isProgression = false;
+                break;
+              }
+            }
+            if (isProgression) {
+              plan.column = ColumnKind::Count;
+              plan.base = base;
+              plan.step = step;
+              newBytes += getReadBytes(plan);
+              continue;
+            }
+          }
           plan.column = maxIndex <= 255 ? ColumnKind::I8 : ColumnKind::I16;
           for (auto index : indexes) {
             appendLE(plan.data, index, getColumnWidth(plan.column));
@@ -2246,6 +2274,9 @@ struct RollRepeatedCalls : public Pass {
           useColumn(plan);
           continue;
         }
+        tableIndex = tempTables.size();
+        tempTables.push_back(Table{lub, {}, {}, {}, Name()});
+        auto& table = tempTables[tableIndex];
         for (auto& s : armStmts) {
           auto& other = s.leaves[h];
           if (other.kind == LeafKind::Global) {
@@ -2359,6 +2390,7 @@ struct RollRepeatedCalls : public Pass {
       plan.kind = HolePlan::Mixed;
       plan.table = tableIndex;
       plan.tableSize = tableSize;
+      plan.maxIndex = maxIndex;
       plan.callees = std::move(callees);
       plan.mixedType = mixedType;
       plan.column = maxIndex <= 255     ? ColumnKind::I8
@@ -2395,7 +2427,8 @@ struct RollRepeatedCalls : public Pass {
         state.arrayCounts[plan.dictColumn] += plan.dictCount;
         dData.insert(dData.end(), plan.dictData.begin(), plan.dictData.end());
       }
-      if (plan.kind == HolePlan::Column || plan.kind == HolePlan::Table ||
+      if (plan.kind == HolePlan::Column ||
+          (plan.kind == HolePlan::Table && plan.column != ColumnKind::Count) ||
           plan.kind == HolePlan::Mixed) {
         auto& data = state.arrayData[plan.column];
         plan.offset = state.arrayCounts[plan.column];
@@ -2980,6 +3013,290 @@ struct RollRepeatedCalls : public Pass {
     }
   };
 
+  void remapHoleTable(FuncState& state,
+                      RunPlan& run,
+                      HolePlan& hole,
+                      const std::vector<Index>& oldToNewIdx,
+                      Index newTableSize) {
+    Index oldTableSize = hole.tableSize;
+    Index gapOffset = hole.gapOffset;
+    Index width = getColumnWidth(hole.column);
+    auto& colData = state.arrayData[hole.column];
+    Index byteOffset = hole.offset * width;
+    for (Index i = 0; i < run.size; i++) {
+      Index pos = byteOffset + i * width;
+      uint32_t val = 0;
+      for (Index b = 0; b < width; b++) {
+        val |= uint32_t(colData[pos + b]) << (8 * b);
+      }
+      uint32_t newVal = val;
+      if (val >= gapOffset && val < oldTableSize + gapOffset) {
+        newVal = uint32_t(oldToNewIdx[val - gapOffset]) + gapOffset;
+      } else if (val >= oldTableSize + gapOffset) {
+        newVal =
+          uint32_t(int64_t(val) + int64_t(newTableSize) - int64_t(oldTableSize));
+      }
+      for (Index b = 0; b < width; b++) {
+        uint8_t byte = uint8_t(newVal >> (8 * b));
+        colData[pos + b] = byte;
+        hole.data[i * width + b] = byte;
+      }
+    }
+    for (auto& c : hole.callees) {
+      c.bound =
+        Index(int64_t(c.bound) + int64_t(newTableSize) - int64_t(oldTableSize));
+    }
+    hole.tableSize = newTableSize;
+  }
+
+  void mergeMixedTables(std::vector<FuncState>& states) {
+    struct MixedSite {
+      FuncState* state;
+      RunPlan* run;
+      HolePlan* hole;
+      Table* table;
+      uint32_t maxAllowedTableSize;
+      Index minRequiredTableSize = 0;
+      std::vector<Index> oldToNewIdx;
+    };
+    std::vector<MixedSite> sites;
+    for (auto& state : states) {
+      for (auto& run : state.plans) {
+        for (auto& hole : run.holes) {
+          if (hole.kind != HolePlan::Mixed || hole.tableSize <= 1 ||
+              hole.column == ColumnKind::Count) {
+            continue;
+          }
+          auto& table = state.tables[hole.table];
+          if (table.hasExprs || table.globalName.is()) {
+            continue;
+          }
+          uint32_t maxVal = hole.column == ColumnKind::I8    ? 255
+                            : hole.column == ColumnKind::I16 ? 65535
+                                                             : 0x7fffffff;
+          if (hole.maxIndex > maxVal || hole.gapOffset >= 65536) {
+            continue;
+          }
+          uint64_t allowed = std::min<uint64_t>(
+            65536 - hole.gapOffset,
+            uint64_t(hole.tableSize) + (maxVal - hole.maxIndex));
+          sites.push_back(
+            {&state, &run, &hole, &table, uint32_t(allowed), 0, {}});
+        }
+      }
+    }
+    if (sites.empty()) {
+      return;
+    }
+
+    struct ExistingTable {
+      Name globalName;
+      Type elemType;
+      Index size;
+      std::unordered_map<Name, Index> indexes;
+    };
+    std::vector<ExistingTable> existingTables;
+    for (auto& g : module->globals) {
+      if (g->imported() || g->mutable_ || !g->init || !g->type.isRef() ||
+          !g->type.getHeapType().isArray()) {
+        continue;
+      }
+      Field elemField = g->type.getHeapType().getArray().element;
+      if (elemField.mutable_ != Immutable ||
+          elemField.packedType != Field::NotPacked || !elemField.type.isRef()) {
+        continue;
+      }
+      auto* anf = g->init->dynCast<ArrayNewFixed>();
+      if (!anf || anf->values.size() <= 1 || anf->values.size() > 65535) {
+        continue;
+      }
+      ExistingTable et{g->name, elemField.type, Index(anf->values.size()), {}};
+      bool ok = true;
+      for (Index i = 0; i < anf->values.size(); i++) {
+        if (auto* gg = anf->values[i]->dynCast<GlobalGet>()) {
+          et.indexes.try_emplace(gg->name, i);
+        } else if (anf->values[i]->is<RefNull>()) {
+          et.indexes.try_emplace(Name(), i);
+        } else {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) {
+        existingTables.push_back(std::move(et));
+      }
+    }
+
+    std::vector<HeapType> groupOrder;
+    std::unordered_map<HeapType, std::vector<MixedSite*>> groups;
+    for (auto& site : sites) {
+      const ExistingTable* bestEt = nullptr;
+      std::vector<Index> bestMap;
+      Index bestMaxIdx = 0;
+      for (auto& et : existingTables) {
+        if (!Type::isSubType(et.elemType, site.hole->mixedType)) {
+          continue;
+        }
+        std::vector<Index> curMap;
+        curMap.reserve(site.table->globals.size());
+        Index maxUsedIdx = 0;
+        bool allFound = true;
+        for (Name name : site.table->globals) {
+          auto it = et.indexes.find(name);
+          if (it == et.indexes.end()) {
+            allFound = false;
+            break;
+          }
+          maxUsedIdx = std::max(maxUsedIdx, it->second);
+          curMap.push_back(it->second);
+        }
+        if (!allFound || maxUsedIdx + 1 > site.maxAllowedTableSize) {
+          continue;
+        }
+        if (!bestEt || et.size < bestEt->size) {
+          bestEt = &et;
+          bestMap = std::move(curMap);
+          bestMaxIdx = maxUsedIdx;
+        }
+      }
+      if (bestEt) {
+        Index newTableSize = (bestEt->size <= site.maxAllowedTableSize)
+                               ? bestEt->size
+                               : (bestMaxIdx + 1);
+        remapHoleTable(
+          *site.state, *site.run, *site.hole, bestMap, newTableSize);
+        site.table->globalName = bestEt->globalName;
+        site.table->elemType = bestEt->elemType;
+        continue;
+      }
+      HeapType ht = site.table->elemType.getHeapType();
+      auto& vec = groups[ht];
+      if (vec.empty()) {
+        groupOrder.push_back(ht);
+      }
+      vec.push_back(&site);
+    }
+
+    struct MergedGroup {
+      Type elemType;
+      std::vector<Name> globals;
+      std::unordered_map<Name, Index> indexes;
+      std::vector<MixedSite*> members;
+    };
+    Builder builder(*module);
+    for (HeapType ht : groupOrder) {
+      auto& group = groups[ht];
+      if (group.size() < 2) {
+        continue;
+      }
+      std::stable_sort(group.begin(),
+                       group.end(),
+                       [](const MixedSite* a, const MixedSite* b) {
+                         if (a->maxAllowedTableSize != b->maxAllowedTableSize) {
+                           return a->maxAllowedTableSize <
+                                  b->maxAllowedTableSize;
+                         }
+                         return a->hole->tableSize > b->hole->tableSize;
+                       });
+      std::vector<MergedGroup> mergedGroups;
+      for (auto* site : group) {
+        bool placed = false;
+        for (auto& mg : mergedGroups) {
+          Type newElemType =
+            Type::getLeastUpperBound(mg.elemType, site->table->elemType);
+          if (newElemType == Type::none ||
+              !Type::isSubType(newElemType, site->hole->mixedType)) {
+            continue;
+          }
+          bool membersOk = true;
+          for (auto* mem : mg.members) {
+            if (!Type::isSubType(newElemType, mem->hole->mixedType)) {
+              membersOk = false;
+              break;
+            }
+          }
+          if (!membersOk) {
+            continue;
+          }
+          Index nextIdx = mg.globals.size();
+          Index maxUsedIdx = 0;
+          std::vector<Index> oldToNew;
+          oldToNew.reserve(site->table->globals.size());
+          for (Name name : site->table->globals) {
+            auto it = mg.indexes.find(name);
+            Index idx = (it != mg.indexes.end()) ? it->second : nextIdx++;
+            maxUsedIdx = std::max(maxUsedIdx, idx);
+            oldToNew.push_back(idx);
+          }
+          if (maxUsedIdx + 1 > site->maxAllowedTableSize || nextIdx > 65535) {
+            continue;
+          }
+          mg.elemType = newElemType;
+          for (Index i = 0; i < site->table->globals.size(); i++) {
+            Name name = site->table->globals[i];
+            if (mg.indexes.try_emplace(name, oldToNew[i]).second) {
+              mg.globals.push_back(name);
+            }
+          }
+          site->minRequiredTableSize = maxUsedIdx + 1;
+          site->oldToNewIdx = std::move(oldToNew);
+          mg.members.push_back(site);
+          placed = true;
+          break;
+        }
+        if (!placed) {
+          MergedGroup mg;
+          mg.elemType = site->table->elemType;
+          mg.globals = site->table->globals;
+          site->oldToNewIdx.resize(mg.globals.size());
+          for (Index i = 0; i < mg.globals.size(); i++) {
+            mg.indexes[mg.globals[i]] = i;
+            site->oldToNewIdx[i] = i;
+          }
+          site->minRequiredTableSize = mg.globals.size();
+          mg.members.push_back(site);
+          mergedGroups.push_back(std::move(mg));
+        }
+      }
+      for (auto& mg : mergedGroups) {
+        if (mg.members.size() < 2) {
+          continue;
+        }
+        HeapType arrayType(Array(Field(mg.elemType, Immutable)));
+        std::vector<Expression*> gets;
+        gets.reserve(mg.globals.size());
+        for (Name name : mg.globals) {
+          if (name.is()) {
+            gets.push_back(
+              builder.makeGlobalGet(name, module->getGlobal(name)->type));
+          } else {
+            gets.push_back(
+              builder.makeRefNull(mg.elemType.getHeapType().getBottom()));
+          }
+        }
+        Name sharedName = Names::getValidGlobalName(*module, "roll$table");
+        module->addGlobal(
+          builder.makeGlobal(sharedName,
+                             Type(arrayType, NonNullable),
+                             builder.makeArrayNewFixed(arrayType, gets),
+                             Builder::Immutable));
+        Index totalMergedSize = mg.globals.size();
+        for (auto* site : mg.members) {
+          Index newTableSize = (totalMergedSize <= site->maxAllowedTableSize)
+                                 ? totalMergedSize
+                                 : site->minRequiredTableSize;
+          remapHoleTable(*site->state,
+                         *site->run,
+                         *site->hole,
+                         site->oldToNewIdx,
+                         newTableSize);
+          site->table->globalName = sharedName;
+          site->table->elemType = mg.elemType;
+        }
+      }
+    }
+  }
+
   void applyPlans(FuncState& state) {
     auto* func = state.func;
     Builder builder(*module);
@@ -2993,7 +3310,8 @@ struct RollRepeatedCalls : public Pass {
     // Create the table globals or locals (skip 1-element tables).
     std::vector<Expression*> tableSetups;
     for (auto& table : state.tables) {
-      if (table.globals.size() <= 1) {
+      if (table.globals.size() <= 1 ||
+          (!table.hasExprs && table.globalName.is())) {
         continue;
       }
       HeapType arrayType(Array(Field(table.elemType, Immutable)));
@@ -3076,7 +3394,7 @@ struct RollRepeatedCalls : public Pass {
       auto readTable = [&](const HolePlan& hole,
                            Expression* index) -> Expression* {
         auto& table = state.tables[hole.table];
-        if (table.globals.size() == 1) {
+        if (table.globals.size() == 1 && !table.globalName.is()) {
           if (!table.exprs.empty() && table.exprs[0]) {
             return ExpressionManipulator::copy(table.exprs[0], *module);
           }
@@ -3086,13 +3404,17 @@ struct RollRepeatedCalls : public Pass {
           }
           return builder.makeRefNull(table.elemType.getHeapType().getBottom());
         }
+        if (!table.hasExprs && table.globalName.is()) {
+          auto* g = module->getGlobal(table.globalName);
+          Type elemType = g->type.getHeapType().getArray().element.type;
+          return builder.makeArrayGet(builder.makeGlobalGet(g->name, g->type),
+                                      index,
+                                      MemoryOrder::Unordered,
+                                      elemType);
+        }
         HeapType arrayType(Array(Field(table.elemType, Immutable)));
         Expression* tableRef =
-          table.hasExprs
-            ? static_cast<Expression*>(builder.makeLocalGet(
-                table.localIndex, Type(arrayType, NonNullable)))
-            : static_cast<Expression*>(builder.makeGlobalGet(
-                table.globalName, Type(arrayType, NonNullable)));
+          builder.makeLocalGet(table.localIndex, Type(arrayType, NonNullable));
         return builder.makeArrayGet(
           tableRef, index, MemoryOrder::Unordered, table.elemType);
       };

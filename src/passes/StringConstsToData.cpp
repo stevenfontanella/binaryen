@@ -1345,10 +1345,15 @@ private:
               fieldIdx >= lub.getHeapType().getStruct().fields.size()) {
             break;
           }
-          if (firstHop &&
-              hop->type !=
-                lub.getHeapType().getStruct().fields[fieldIdx].type) {
-            break;
+          if (firstHop) {
+            Type hopFieldType =
+              lub.getHeapType().getStruct().fields[fieldIdx].type;
+            if (!hopFieldType.isRef() ||
+                !hopFieldType.getHeapType().isStruct() ||
+                firstSs->index >=
+                  hopFieldType.getHeapType().getStruct().fields.size()) {
+              break;
+            }
           }
           elemType = lub;
           j++;
@@ -1382,10 +1387,10 @@ private:
                                  MemoryOrder::Unordered,
                                  elemType);
           if (firstHop) {
-            target = builder.makeStructGet(firstHop->index,
-                                           target,
-                                           MemoryOrder::Unordered,
-                                           firstHop->type);
+            Type hopFieldType =
+              elemType.getHeapType().getStruct().fields[firstHop->index].type;
+            target = builder.makeStructGet(
+              firstHop->index, target, MemoryOrder::Unordered, hopFieldType);
           }
           auto* set = builder.makeStructSet(
             firstSs->index, target, next(), MemoryOrder::Unordered);
