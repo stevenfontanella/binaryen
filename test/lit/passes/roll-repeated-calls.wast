@@ -1355,3 +1355,311 @@
     )
   )
 )
+
+;; Function-body array.new_fixed lowering into array.new_default + rolled
+;; array.set loops (including local.tee unwrapping, default element skipping,
+;; and loose-vs-strict sub-run cost comparison).
+(module
+  ;; CHECK:      (type $str (struct (field i32)))
+  (type $str (struct (field i32)))
+  ;; CHECK:      (type $arr (array (mut (ref null $str))))
+  (type $arr (array (mut (ref null $str))))
+
+  ;; CHECK:      (type $2 (array (ref $str)))
+
+  ;; CHECK:      (type $3 (array (mut i8)))
+
+  ;; CHECK:      (type $4 (func (param i32) (result (ref $str))))
+
+  ;; CHECK:      (type $5 (func (param (ref $arr) (ref null $str))))
+
+  ;; CHECK:      (type $6 (func (result (ref $str))))
+
+  ;; CHECK:      (type $7 (func))
+
+  ;; CHECK:      (type $8 (func (result (ref $arr))))
+
+  ;; CHECK:      (import "env" "use" (func $use (type $5) (param (ref $arr) (ref null $str))))
+  (import "env" "use" (func $use (param (ref $arr) (ref null $str))))
+
+  ;; CHECK:      (global $g (ref $str) (struct.new $str
+  ;; CHECK-NEXT:  (i32.const 99)
+  ;; CHECK-NEXT: ))
+  (global $g (ref $str) (struct.new $str (i32.const 99)))
+
+  ;; CHECK:      (global $roll$table (ref $2) (array.new_fixed $2 1
+  ;; CHECK-NEXT:  (global.get $g)
+  ;; CHECK-NEXT: ))
+
+  ;; CHECK:      (data $roll "j\e5\00xN\ebh\00\f1z\e4ni\ea\00wN\e9g\00\ee~\e6q\ect\e7u")
+
+  ;; CHECK:      (func $f1 (type $4) (param $i i32) (result (ref $str))
+  ;; CHECK-NEXT:  (struct.new $str
+  ;; CHECK-NEXT:   (local.get $i)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $f1 (param $i i32) (result (ref $str))
+    (struct.new $str (local.get $i))
+  )
+  ;; CHECK:      (func $f2 (type $4) (param $i i32) (result (ref $str))
+  ;; CHECK-NEXT:  (struct.new $str
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (local.get $i)
+  ;; CHECK-NEXT:    (i32.const 100)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $f2 (param $i i32) (result (ref $str))
+    (struct.new $str (i32.add (local.get $i) (i32.const 100)))
+  )
+  ;; CHECK:      (func $thunk (type $6) (result (ref $str))
+  ;; CHECK-NEXT:  (call $f1
+  ;; CHECK-NEXT:   (i32.const 77)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $thunk (result (ref $str))
+    (call $f1 (i32.const 77))
+  )
+
+  ;; CHECK:      (func $array-strict-ap-with-tee (type $7)
+  ;; CHECK-NEXT:  (local $saved (ref null $str))
+  ;; CHECK-NEXT:  (local $a (ref $arr))
+  ;; CHECK-NEXT:  (local $2 (ref $arr))
+  ;; CHECK-NEXT:  (local $3 i32)
+  ;; CHECK-NEXT:  (local $4 i32)
+  ;; CHECK-NEXT:  (local.set $a
+  ;; CHECK-NEXT:   (block (result (ref $arr))
+  ;; CHECK-NEXT:    (local.set $2
+  ;; CHECK-NEXT:     (array.new_default $arr
+  ;; CHECK-NEXT:      (i32.const 24)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (block
+  ;; CHECK-NEXT:     (local.set $4
+  ;; CHECK-NEXT:      (i32.const 0)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (loop $roll_1
+  ;; CHECK-NEXT:      (array.set $arr
+  ;; CHECK-NEXT:       (local.get $2)
+  ;; CHECK-NEXT:       (i32.add
+  ;; CHECK-NEXT:        (local.get $4)
+  ;; CHECK-NEXT:        (i32.const 1)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:       (call $f1
+  ;; CHECK-NEXT:        (i32.add
+  ;; CHECK-NEXT:         (local.get $4)
+  ;; CHECK-NEXT:         (i32.const 10)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (br_if $roll_1
+  ;; CHECK-NEXT:       (i32.lt_u
+  ;; CHECK-NEXT:        (local.tee $4
+  ;; CHECK-NEXT:         (i32.add
+  ;; CHECK-NEXT:          (local.get $4)
+  ;; CHECK-NEXT:          (i32.const 1)
+  ;; CHECK-NEXT:         )
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:        (i32.const 11)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (array.set $arr
+  ;; CHECK-NEXT:     (local.get $2)
+  ;; CHECK-NEXT:     (i32.const 12)
+  ;; CHECK-NEXT:     (call $f2
+  ;; CHECK-NEXT:      (i32.const 0)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (block
+  ;; CHECK-NEXT:     (local.set $3
+  ;; CHECK-NEXT:      (i32.const 0)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (loop $roll
+  ;; CHECK-NEXT:      (array.set $arr
+  ;; CHECK-NEXT:       (local.get $2)
+  ;; CHECK-NEXT:       (i32.add
+  ;; CHECK-NEXT:        (local.get $3)
+  ;; CHECK-NEXT:        (i32.const 13)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:       (call $f1
+  ;; CHECK-NEXT:        (i32.add
+  ;; CHECK-NEXT:         (local.get $3)
+  ;; CHECK-NEXT:         (i32.const 21)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (br_if $roll
+  ;; CHECK-NEXT:       (i32.lt_u
+  ;; CHECK-NEXT:        (local.tee $3
+  ;; CHECK-NEXT:         (i32.add
+  ;; CHECK-NEXT:          (local.get $3)
+  ;; CHECK-NEXT:          (i32.const 1)
+  ;; CHECK-NEXT:         )
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:        (i32.const 11)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (local.set $saved
+  ;; CHECK-NEXT:     (array.get $arr
+  ;; CHECK-NEXT:      (local.get $2)
+  ;; CHECK-NEXT:      (i32.const 3)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (local.get $2)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (call $use
+  ;; CHECK-NEXT:   (local.get $a)
+  ;; CHECK-NEXT:   (local.get $saved)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $array-strict-ap-with-tee (local $saved (ref null $str)) (local $a (ref $arr))
+    (local.set $a
+      (array.new_fixed $arr 24
+        (ref.null none)
+        (call $f1 (i32.const 10))
+        (call $f1 (i32.const 11))
+        (local.tee $saved (call $f1 (i32.const 12)))
+        (call $f1 (i32.const 13))
+        (call $f1 (i32.const 14))
+        (call $f1 (i32.const 15))
+        (call $f1 (i32.const 16))
+        (call $f1 (i32.const 17))
+        (call $f1 (i32.const 18))
+        (call $f1 (i32.const 19))
+        (call $f1 (i32.const 20))
+        (call $f2 (i32.const 0))
+        (call $f1 (i32.const 21))
+        (call $f1 (i32.const 22))
+        (call $f1 (i32.const 23))
+        (call $f1 (i32.const 24))
+        (call $f1 (i32.const 25))
+        (call $f1 (i32.const 26))
+        (call $f1 (i32.const 27))
+        (call $f1 (i32.const 28))
+        (call $f1 (i32.const 29))
+        (call $f1 (i32.const 30))
+        (call $f1 (i32.const 31))
+      )
+    )
+    (call $use (local.get $a) (local.get $saved))
+  )
+
+  ;; CHECK:      (func $array-mixed (type $8) (result (ref $arr))
+  ;; CHECK-NEXT:  (local $0 (ref $arr))
+  ;; CHECK-NEXT:  (local $1 (ref $3))
+  ;; CHECK-NEXT:  (local $2 i32)
+  ;; CHECK-NEXT:  (local $3 i32)
+  ;; CHECK-NEXT:  (local.set $0
+  ;; CHECK-NEXT:   (array.new_default $arr
+  ;; CHECK-NEXT:    (i32.const 28)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $1
+  ;; CHECK-NEXT:   (array.new_data $3 $roll
+  ;; CHECK-NEXT:    (i32.const 0)
+  ;; CHECK-NEXT:    (i32.const 28)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (block
+  ;; CHECK-NEXT:   (local.set $2
+  ;; CHECK-NEXT:    (i32.const 0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (loop $roll
+  ;; CHECK-NEXT:    (array.set $arr
+  ;; CHECK-NEXT:     (local.get $0)
+  ;; CHECK-NEXT:     (local.get $2)
+  ;; CHECK-NEXT:     (if (result (ref $str))
+  ;; CHECK-NEXT:      (i32.lt_u
+  ;; CHECK-NEXT:       (local.tee $3
+  ;; CHECK-NEXT:        (array.get_u $3
+  ;; CHECK-NEXT:         (local.get $1)
+  ;; CHECK-NEXT:         (local.get $2)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:       (i32.const 1)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (then
+  ;; CHECK-NEXT:       (array.get $2
+  ;; CHECK-NEXT:        (global.get $roll$table)
+  ;; CHECK-NEXT:        (local.get $3)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (else
+  ;; CHECK-NEXT:       (if (result (ref $str))
+  ;; CHECK-NEXT:        (i32.lt_u
+  ;; CHECK-NEXT:         (local.get $3)
+  ;; CHECK-NEXT:         (i32.const 127)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:        (then
+  ;; CHECK-NEXT:         (call $f1
+  ;; CHECK-NEXT:          (i32.sub
+  ;; CHECK-NEXT:           (local.get $3)
+  ;; CHECK-NEXT:           (i32.const 1)
+  ;; CHECK-NEXT:          )
+  ;; CHECK-NEXT:         )
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:        (else
+  ;; CHECK-NEXT:         (call $f2
+  ;; CHECK-NEXT:          (i32.sub
+  ;; CHECK-NEXT:           (local.get $3)
+  ;; CHECK-NEXT:           (i32.const 127)
+  ;; CHECK-NEXT:          )
+  ;; CHECK-NEXT:         )
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (br_if $roll
+  ;; CHECK-NEXT:     (i32.lt_u
+  ;; CHECK-NEXT:      (local.tee $2
+  ;; CHECK-NEXT:       (i32.add
+  ;; CHECK-NEXT:        (local.get $2)
+  ;; CHECK-NEXT:        (i32.const 1)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (i32.const 28)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.get $0)
+  ;; CHECK-NEXT: )
+  (func $array-mixed (result (ref $arr))
+    (array.new_fixed $arr 28
+      (call $f1 (i32.const 105))
+      (call $f2 (i32.const 102))
+      (global.get $g)
+      (call $f1 (i32.const 119))
+      (call $thunk)
+      (call $f2 (i32.const 108))
+      (call $f1 (i32.const 103))
+      (global.get $g)
+      (call $f2 (i32.const 114))
+      (call $f1 (i32.const 121))
+      (call $f2 (i32.const 101))
+      (call $f1 (i32.const 109))
+      (call $f1 (i32.const 104))
+      (call $f2 (i32.const 107))
+      (global.get $g)
+      (call $f1 (i32.const 118))
+      (call $thunk)
+      (call $f2 (i32.const 106))
+      (call $f1 (i32.const 102))
+      (global.get $g)
+      (call $f2 (i32.const 111))
+      (call $f1 (i32.const 125))
+      (call $f2 (i32.const 103))
+      (call $f1 (i32.const 112))
+      (call $f2 (i32.const 109))
+      (call $f1 (i32.const 115))
+      (call $f2 (i32.const 104))
+      (call $f1 (i32.const 116))
+    )
+  )
+)

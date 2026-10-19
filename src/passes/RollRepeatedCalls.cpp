@@ -59,6 +59,7 @@
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "ir/branch-utils.h"
 #include "ir/find_all.h"
@@ -333,6 +334,8 @@ struct Table {
 struct FuncState {
   Function* func = nullptr;
   std::map<ColumnKind, Index> arrayLocals;
+  std::set<ColumnKind> usedKinds;
+  std::vector<ColumnKind> kindOrder;
   std::map<ColumnKind, std::vector<uint8_t>> arrayData;
   std::map<ColumnKind, Index> arrayCounts;
   std::vector<Table> tables;
@@ -646,13 +649,14 @@ struct RollRepeatedCalls : public Pass {
       planBlock(state, block);
     }
     planSwitchLadders(state);
+    planArrayNewFixed(state);
     if (state.plans.empty()) {
       return;
     }
     applyPlans(state);
   }
 
-  void planBlock(FuncState& state, Block* block) {
+  int planBlock(FuncState& state, Block* block) {
     auto& list = block->list;
     std::vector<Statement> stmts;
     stmts.reserve(list.size());
@@ -660,6 +664,7 @@ struct RollRepeatedCalls : public Pass {
       stmts.push_back(scanStatement(state.func, &list[i]));
     }
     Index plansBefore = state.plans.size();
+    int totalSaved = 0;
     auto findRuns = [&](Index from, Index to, bool strict, auto onRun) {
       Index i = from;
       while (i < to) {
@@ -681,14 +686,35 @@ struct RollRepeatedCalls : public Pass {
       }
     };
     findRuns(0, list.size(), false, [&](Index i, Index j) {
-      if (planRun(state, block, stmts, i, j - i) != Rolled) {
-        // The reference leaves do not mix, or mixing them does not pay off;
-        // try the strict runs inside.
-        findRuns(i, j, true, [&](Index si, Index sj) {
-          if (si != i || sj != j) {
-            planRun(state, block, stmts, si, sj - si);
-          }
-        });
+      bool isStrict = true;
+      for (Index k = i + 1; k < j; k++) {
+        if (stmts[k].strictKey != stmts[i].strictKey) {
+          isStrict = false;
+          break;
+        }
+      }
+      if (isStrict) {
+        totalSaved += planStrictRun(state, block, stmts, i, j);
+        return;
+      }
+      FuncState looseState = state;
+      int looseSaved = 0;
+      if (planRun(looseState, block, stmts, i, j - i, &looseSaved) != Rolled) {
+        looseSaved = 0;
+      }
+      FuncState strictState = state;
+      int strictSaved = 0;
+      findRuns(i, j, true, [&](Index si, Index sj) {
+        if (si != i || sj != j) {
+          strictSaved += planStrictRun(strictState, block, stmts, si, sj);
+        }
+      });
+      if (looseSaved > 0 && looseSaved >= strictSaved) {
+        state = std::move(looseState);
+        totalSaved += looseSaved;
+      } else if (strictSaved > 0) {
+        state = std::move(strictState);
+        totalSaved += strictSaved;
       }
     });
     // Undo the inlining in the statements we do not keep.
@@ -703,6 +729,124 @@ struct RollRepeatedCalls : public Pass {
         }
       }
     }
+    return totalSaved;
+  }
+
+  int planStrictRun(FuncState& state,
+                    Block* block,
+                    std::vector<Statement>& stmts,
+                    Index si,
+                    Index sj) {
+    FuncState fullState = state;
+    int fullSaved = 0;
+    if (planRun(fullState, block, stmts, si, sj - si, &fullSaved) != Rolled) {
+      fullSaved = 0;
+    } else {
+      bool allProg = true;
+      for (auto& h : fullState.plans.back().holes) {
+        if (h.kind != HolePlan::Fixed && h.kind != HolePlan::Progression) {
+          allProg = false;
+          break;
+        }
+      }
+      if (allProg) {
+        state = std::move(fullState);
+        return fullSaved;
+      }
+    }
+
+    Index numLeaves = stmts[si].leaves.size();
+    bool canSplitAP = numLeaves > 0;
+    for (Index h = 0; h < numLeaves && canSplitAP; h++) {
+      auto& leaf = stmts[si].leaves[h];
+      if (leaf.kind == LeafKind::Const && leaf.value.type != Type::i32) {
+        canSplitAP = false;
+      }
+    }
+    int splitSaved = 0;
+    FuncState splitState = state;
+    if (canSplitAP) {
+      std::vector<std::pair<Index, Index>> apRuns;
+      Index a = si;
+      while (a + MinRun <= sj) {
+        Index b = a + 2;
+        bool stepOk = true;
+        for (Index h = 0; h < numLeaves; h++) {
+          if (stmts[a].leaves[h].kind == LeafKind::Global &&
+              stmts[a + 1].leaves[h].global != stmts[a].leaves[h].global) {
+            stepOk = false;
+            break;
+          }
+        }
+        if (!stepOk) {
+          a++;
+          continue;
+        }
+        while (b < sj) {
+          bool ok = true;
+          for (Index h = 0; h < numLeaves; h++) {
+            auto& la = stmts[a].leaves[h];
+            auto& lb = stmts[b].leaves[h];
+            if (la.kind == LeafKind::Global) {
+              if (lb.global != la.global) {
+                ok = false;
+                break;
+              }
+            } else {
+              uint32_t base = la.value.geti32();
+              uint32_t step = uint32_t(stmts[a + 1].leaves[h].value.geti32()) - base;
+              if (uint32_t(lb.value.geti32()) != base + step * (b - a)) {
+                ok = false;
+                break;
+              }
+            }
+          }
+          if (!ok) {
+            break;
+          }
+          b++;
+        }
+        if (b - a >= MinRun) {
+          apRuns.push_back({a, b});
+          a = b;
+        } else {
+          a++;
+        }
+      }
+      if (!apRuns.empty()) {
+        Index cur = si;
+        for (auto [apA, apB] : apRuns) {
+          if (apA - cur >= MinRun) {
+            int s = 0;
+            if (planRun(splitState, block, stmts, cur, apA - cur, &s) ==
+                Rolled) {
+              splitSaved += s;
+            }
+          }
+          int s = 0;
+          if (planRun(splitState, block, stmts, apA, apB - apA, &s) == Rolled) {
+            splitSaved += s;
+          }
+          cur = apB;
+        }
+        if (sj - cur >= MinRun) {
+          int s = 0;
+          if (planRun(splitState, block, stmts, cur, sj - cur, &s) == Rolled) {
+            splitSaved += s;
+          }
+        }
+      }
+    }
+
+    if (fullSaved > 0 && fullSaved >= splitSaved) {
+      state = std::move(fullState);
+      return fullSaved;
+    }
+    if (splitSaved > 0) {
+      state = std::move(splitState);
+      return splitSaved;
+    }
+    return 0;
   }
 
   enum PlanResult { Rolled, NotWorthIt, Mismatch };
@@ -711,7 +855,8 @@ struct RollRepeatedCalls : public Pass {
                      Block* block,
                      std::vector<Statement>& stmts,
                      Index start,
-                     Index size) {
+                     Index size,
+                     int* savedOut = nullptr) {
     auto& first = stmts[start];
     Index numLeaves = first.leaves.size();
     std::vector<HolePlan> holes(numLeaves);
@@ -753,7 +898,7 @@ struct RollRepeatedCalls : public Pass {
       return indexIter->second;
     };
     auto useColumn = [&](HolePlan& plan) {
-      if (!state.arrayLocals.count(plan.column)) {
+      if (!state.usedKinds.count(plan.column)) {
         newKinds.insert(plan.column);
       }
       newBytes += plan.data.size() + getReadBytes(plan);
@@ -986,14 +1131,17 @@ struct RollRepeatedCalls : public Pass {
     if (newBytes >= oldBytes) {
       return NotWorthIt;
     }
+    if (savedOut) {
+      *savedOut = oldBytes - newBytes;
+    }
     // Commit.
     state.tables = std::move(tempTables);
     for (auto& [type, index] : newTables) {
       state.tablesByType[type] = index;
     }
     for (auto kind : newKinds) {
-      state.arrayLocals[kind] =
-        Builder::addVar(state.func, Type(getColumnHeapType(kind), NonNullable));
+      state.usedKinds.insert(kind);
+      state.kindOrder.push_back(kind);
     }
     for (auto& plan : holes) {
       if (plan.kind == HolePlan::Column || plan.kind == HolePlan::Delta ||
@@ -1004,8 +1152,7 @@ struct RollRepeatedCalls : public Pass {
         data.insert(data.end(), plan.data.begin(), plan.data.end());
       }
     }
-    state.plans.push_back(
-      RunPlan{block, start, size, std::move(first), std::move(holes)});
+    state.plans.push_back(RunPlan{block, start, size, first, std::move(holes)});
     return Rolled;
   }
 
@@ -1329,7 +1476,7 @@ struct RollRepeatedCalls : public Pass {
       return indexIter->second;
     };
     auto useColumn = [&](HolePlan& plan) {
-      if (!state.arrayLocals.count(plan.column)) {
+      if (!state.usedKinds.count(plan.column)) {
         newKinds.insert(plan.column);
       }
       newBytes += plan.data.size() + getReadBytes(plan);
@@ -1654,8 +1801,8 @@ struct RollRepeatedCalls : public Pass {
       state.tablesByType[type] = index;
     }
     for (auto kind : newKinds) {
-      state.arrayLocals[kind] =
-        Builder::addVar(state.func, Type(getColumnHeapType(kind), NonNullable));
+      state.usedKinds.insert(kind);
+      state.kindOrder.push_back(kind);
     }
     for (auto& plan : holes) {
       if (plan.kind == HolePlan::Column || plan.kind == HolePlan::Table ||
@@ -1679,6 +1826,223 @@ struct RollRepeatedCalls : public Pass {
                                   switchKind,
                                   effectiveExitLabel,
                                   hasGaps});
+  }
+
+  bool isDefaultValue(Expression* expr, Index& bytesOut) {
+    if (expr->is<RefNull>()) {
+      bytesOut = 2;
+      return true;
+    }
+    if (auto* c = expr->dynCast<Const>()) {
+      if (c->value.isZero()) {
+        bytesOut = getConstBytes(c->value);
+        return true;
+      }
+    }
+    if (auto* get = expr->dynCast<GlobalGet>()) {
+      auto* global = module->getGlobal(get->name);
+      if (!global->mutable_ && !global->imported()) {
+        Index unused = 0;
+        if (isDefaultValue(global->init, unused)) {
+          bytesOut = GlobalGetBytes;
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  void planArrayNewFixed(FuncState& state) {
+    auto anfs = FindAll<ArrayNewFixed>(state.func->body).list;
+    if (anfs.empty()) {
+      return;
+    }
+    ChildPtrFinder finder;
+    finder.parentPtrs[state.func->body] = &state.func->body;
+    finder.walk(state.func->body);
+    std::unordered_set<Expression*> coveredRoots;
+    for (auto& plan : state.plans) {
+      if (plan.block) {
+        for (Index k = 0; k < plan.size; k++) {
+          coveredRoots.insert(plan.block->list[plan.start + k]);
+        }
+      } else if (plan.switchPtr) {
+        coveredRoots.insert(*plan.switchPtr);
+      }
+    }
+    for (auto* anf : anfs) {
+      planOneArrayNewFixed(state, anf, finder, coveredRoots);
+    }
+  }
+
+  void planOneArrayNewFixed(FuncState& state,
+                            ArrayNewFixed* anf,
+                            ChildPtrFinder& finder,
+                            const std::unordered_set<Expression*>& covered) {
+    const Index MinArrayNewFixed = 8;
+    const int WrapperOverhead = 8;
+    Index N = anf->values.size();
+    if (N < MinArrayNewFixed || anf->type == Type::unreachable ||
+        !anf->type.isRef() || !anf->type.getHeapType().isArray()) {
+      return;
+    }
+    auto ptrIt = finder.parentPtrs.find(anf);
+    if (ptrIt == finder.parentPtrs.end()) {
+      return;
+    }
+    Expression* cur = anf;
+    while (cur) {
+      if (covered.count(cur)) {
+        return;
+      }
+      auto pIt = finder.parents.find(cur);
+      cur = pIt != finder.parents.end() ? pIt->second : nullptr;
+    }
+    HeapType arrHeapType = anf->type.getHeapType();
+    Field field = arrHeapType.getArray().element;
+    if (field.mutable_ != Mutable || !field.type.isDefaultable()) {
+      return;
+    }
+    for (auto* v : anf->values) {
+      if (v->type == Type::unreachable) {
+        return;
+      }
+    }
+
+    Index teeElemIdx = N;
+    LocalSet* unwrappedTee = nullptr;
+    for (Index k = 0; k < N; k++) {
+      if (auto* set = anf->values[k]->dynCast<LocalSet>()) {
+        if (set->isTee()) {
+          if (unwrappedTee) {
+            unwrappedTee = nullptr;
+            teeElemIdx = N;
+            break;
+          }
+          unwrappedTee = set;
+          teeElemIdx = k;
+        }
+      }
+    }
+    if (unwrappedTee &&
+        (field.packedType != Field::NotPacked ||
+         !Type::isSubType(field.type,
+                          state.func->getLocalType(unwrappedTee->index)))) {
+      unwrappedTee = nullptr;
+      teeElemIdx = N;
+    }
+    if (unwrappedTee) {
+      Index teeLocal = unwrappedTee->index;
+      Index uses = 0;
+      for (auto* get : FindAll<LocalGet>(anf).list) {
+        if (get->index == teeLocal) {
+          uses++;
+        }
+      }
+      for (auto* set : FindAll<LocalSet>(anf).list) {
+        if (set->index == teeLocal) {
+          uses++;
+        }
+      }
+      if (uses != 1) {
+        unwrappedTee = nullptr;
+        teeElemIdx = N;
+      }
+    }
+
+    Builder builder(*module);
+    Type arrRefType(arrHeapType, NonNullable);
+    Index placeholderLocal = state.func->getNumLocals();
+    Block* arrBlock = builder.makeBlock();
+    std::vector<LocalGet*> arrGets;
+    arrGets.reserve(N);
+    int defaultSaved = 0;
+    int unrolledPenalty = 0;
+    Index teeStmtIdx = N;
+    for (Index k = 0; k < N; k++) {
+      Expression* val =
+        (k == teeElemIdx) ? unwrappedTee->value : anf->values[k];
+      Index defBytes = 0;
+      if (k != teeElemIdx && isDefaultValue(val, defBytes)) {
+        defaultSaved += int(defBytes);
+        continue;
+      }
+      if (k == teeElemIdx) {
+        teeStmtIdx = arrBlock->list.size();
+      }
+      auto* arrGet = builder.makeLocalGet(placeholderLocal, arrRefType);
+      arrGets.push_back(arrGet);
+      arrBlock->list.push_back(builder.makeArraySet(
+        arrGet, builder.makeConst(int32_t(k)), val, MemoryOrder::Unordered));
+      unrolledPenalty += 5 + int(getConstBytes(Literal(int32_t(k))));
+    }
+    if (arrBlock->list.size() < MinRun) {
+      return;
+    }
+
+    FuncState tentativeState = state;
+    Index plansBefore = tentativeState.plans.size();
+    int totalBlockSaved = planBlock(tentativeState, arrBlock);
+
+    bool teeRolled = false;
+    int teePenalty = 0;
+    if (unwrappedTee) {
+      for (Index p = plansBefore; p < tentativeState.plans.size(); p++) {
+        auto& plan = tentativeState.plans[p];
+        if (teeStmtIdx >= plan.start && teeStmtIdx < plan.start + plan.size) {
+          teeRolled = true;
+          break;
+        }
+      }
+      if (teeRolled) {
+        teePenalty = 5 + int(getConstBytes(Literal(int32_t(teeElemIdx))));
+      }
+    }
+
+    int netSaved = totalBlockSaved + defaultSaved - unrolledPenalty -
+                   teePenalty - WrapperOverhead;
+    if (netSaved <= 0 || tentativeState.plans.size() == plansBefore) {
+      for (Index p = plansBefore; p < tentativeState.plans.size(); p++) {
+        for (auto& [ptr, original] : tentativeState.plans[p].first.inlined) {
+          *ptr = original;
+        }
+      }
+      return;
+    }
+
+    if (unwrappedTee && !teeRolled) {
+      auto* setStmt = arrBlock->list[teeStmtIdx]->cast<ArraySet>();
+      unwrappedTee->value = setStmt->value;
+      setStmt->value = unwrappedTee;
+    }
+    Index arrLocal = Builder::addVar(state.func, arrRefType);
+    for (auto* get : arrGets) {
+      get->index = arrLocal;
+    }
+    std::vector<Expression*> fullList;
+    fullList.reserve(arrBlock->list.size() + 3);
+    fullList.push_back(builder.makeLocalSet(
+      arrLocal,
+      builder.makeArrayNew(arrHeapType, builder.makeConst(int32_t(N)))));
+    for (auto* expr : arrBlock->list) {
+      fullList.push_back(expr);
+    }
+    if (unwrappedTee && teeRolled) {
+      fullList.push_back(builder.makeLocalSet(
+        unwrappedTee->index,
+        builder.makeArrayGet(builder.makeLocalGet(arrLocal, arrRefType),
+                             builder.makeConst(int32_t(teeElemIdx)),
+                             MemoryOrder::Unordered,
+                             field.type)));
+    }
+    fullList.push_back(builder.makeLocalGet(arrLocal, arrRefType));
+    arrBlock->list.set(fullList);
+    arrBlock->type = anf->type;
+    for (Index p = plansBefore; p < tentativeState.plans.size(); p++) {
+      tentativeState.plans[p].start += 1;
+    }
+    *ptrIt->second = arrBlock;
+    state = std::move(tentativeState);
   }
 
   // Plans a column of byte differences, if the values are close to their
@@ -1792,6 +2156,11 @@ struct RollRepeatedCalls : public Pass {
     auto* func = state.func;
     Builder builder(*module);
     ScopeNameFinder(state.scopeNames).walk(func->body);
+
+    for (auto kind : state.kindOrder) {
+      state.arrayLocals[kind] =
+        Builder::addVar(func, Type(getColumnHeapType(kind), NonNullable));
+    }
 
     // Create the table globals.
     for (auto& table : state.tables) {
