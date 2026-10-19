@@ -5969,19 +5969,17 @@ struct LocalCSE : public WalkerPass<PostWalker<LocalCSE>> {
     OnceCallOptimizer opt(*module, getPassOptions());
     opt.analyze();
     if (!opt.onceFuncs.empty()) {
-      ModuleUtils::ParallelFunctionAnalysis<bool> runner1(
-        *module, [&](Function* func, bool& changed) {
-          if (!func->imported()) {
-            changed = opt.optimizeFunction(func, false);
-          }
-        });
+      for (auto& func : module->functions) {
+        if (!func->imported()) {
+          opt.optimizeFunction(func.get(), false);
+        }
+      }
       opt.computeEntryActiveOnce();
-      ModuleUtils::ParallelFunctionAnalysis<bool> runner2(
-        *module, [&](Function* func, bool& changed) {
-          if (!func->imported()) {
-            changed = opt.optimizeFunction(func, true);
-          }
-        });
+      for (auto& func : module->functions) {
+        if (!func->imported()) {
+          opt.optimizeFunction(func.get(), true);
+        }
+      }
     }
   }
 

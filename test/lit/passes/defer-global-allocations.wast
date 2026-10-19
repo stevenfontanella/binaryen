@@ -1973,3 +1973,165 @@
     )
   )
 )
+
+;; Bit-packed i64 lookup, affine-shift ((idx + 1) >> 1) compaction, and
+;; cached-factory StructNew palette if-folding.
+(module
+  ;; CHECK:      (type $leaf (struct (field i32)))
+  (type $leaf (struct (field i32)))
+  ;; CHECK:      (type $node (struct (field (ref null $leaf))))
+  (type $node (struct (field (ref null $leaf))))
+  ;; CHECK:      (type $node_cache (array (mut (ref null $node))))
+  (type $node_cache (array (mut (ref null $node))))
+  ;; CHECK:      (type $arr_i32 (array i32))
+  (type $arr_i32 (array i32))
+  (type $arr_i16 (array (mut i16)))
+  (type $leaf_pal (array (ref null $leaf)))
+
+  ;; CHECK:      (type $4 (func (param i32) (result i32)))
+
+  ;; CHECK:      (type $5 (func (param i32) (result (ref null $node))))
+
+  (global $g_bitpack (ref $arr_i16) (array.new_fixed $arr_i16 16
+    (i32.const 0)
+    (i32.const 1)
+    (i32.const 2)
+    (i32.const 2)
+    (i32.const 3)
+    (i32.const 3)
+    (i32.const 4)
+    (i32.const 5)
+    (i32.const 5)
+    (i32.const 6)
+    (i32.const 7)
+    (i32.const 7)
+    (i32.const 8)
+    (i32.const 8)
+    (i32.const 9)
+    (i32.const 0)
+  ))
+
+  ;; CHECK:      (global $g_affine (ref $arr_i32) (array.new_fixed $arr_i32 6
+  ;; CHECK-NEXT:  (i32.const 10)
+  ;; CHECK-NEXT:  (i32.const 20)
+  ;; CHECK-NEXT:  (i32.const 30)
+  ;; CHECK-NEXT:  (i32.const 40)
+  ;; CHECK-NEXT:  (i32.const 50)
+  ;; CHECK-NEXT:  (i32.const 60)
+  ;; CHECK-NEXT: ))
+  (global $g_affine (ref $arr_i32) (array.new_fixed $arr_i32 10
+    (i32.const 10)
+    (i32.const 20)
+    (i32.const 20)
+    (i32.const 30)
+    (i32.const 30)
+    (i32.const 40)
+    (i32.const 40)
+    (i32.const 50)
+    (i32.const 50)
+    (i32.const 60)
+  ))
+
+  ;; CHECK:      (global $cache (ref $node_cache) (array.new_default $node_cache
+  ;; CHECK-NEXT:  (i32.const 4)
+  ;; CHECK-NEXT: ))
+  (global $cache (ref $node_cache) (array.new_default $node_cache (i32.const 4)))
+  (global $g_struct_pal (ref $leaf_pal) (array.new_fixed $leaf_pal 4
+    (ref.null none)
+    (struct.new $leaf (i32.const 42))
+    (struct.new $leaf (i32.const 42))
+    (struct.new $leaf (i32.const 42))
+  ))
+
+  ;; CHECK:      (export "fold_bitpack" (func $fold_bitpack))
+
+  ;; CHECK:      (export "fold_affine" (func $fold_affine))
+
+  ;; CHECK:      (export "cached_factory" (func $cached_factory))
+
+  ;; CHECK:      (func $fold_bitpack (type $4) (param $i i32) (result i32)
+  ;; CHECK-NEXT:  (i32.and
+  ;; CHECK-NEXT:   (i32.wrap_i64
+  ;; CHECK-NEXT:    (i64.shr_u
+  ;; CHECK-NEXT:     (i64.const 686930220262040080)
+  ;; CHECK-NEXT:     (i64.extend_i32_u
+  ;; CHECK-NEXT:      (i32.shl
+  ;; CHECK-NEXT:       (local.get $i)
+  ;; CHECK-NEXT:       (i32.const 2)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.const 15)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $fold_bitpack (export "fold_bitpack") (param $i i32) (result i32)
+    (array.get_s $arr_i16 (global.get $g_bitpack) (local.get $i))
+  )
+
+  ;; CHECK:      (func $fold_affine (type $4) (param $i i32) (result i32)
+  ;; CHECK-NEXT:  (array.get $arr_i32
+  ;; CHECK-NEXT:   (global.get $g_affine)
+  ;; CHECK-NEXT:   (i32.shr_u
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (local.get $i)
+  ;; CHECK-NEXT:     (i32.const 1)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.const 1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $fold_affine (export "fold_affine") (param $i i32) (result i32)
+    (array.get $arr_i32 (global.get $g_affine) (local.get $i))
+  )
+
+  ;; CHECK:      (func $cached_factory (type $5) (param $0 i32) (result (ref null $node))
+  ;; CHECK-NEXT:  (local $1 (ref null $node))
+  ;; CHECK-NEXT:  (block $label (result (ref null $node))
+  ;; CHECK-NEXT:   (br_on_non_null $label
+  ;; CHECK-NEXT:    (array.get $node_cache
+  ;; CHECK-NEXT:     (global.get $cache)
+  ;; CHECK-NEXT:     (local.get $0)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (array.set $node_cache
+  ;; CHECK-NEXT:    (global.get $cache)
+  ;; CHECK-NEXT:    (local.get $0)
+  ;; CHECK-NEXT:    (local.tee $1
+  ;; CHECK-NEXT:     (struct.new $node
+  ;; CHECK-NEXT:      (if (result (ref null (exact $leaf)))
+  ;; CHECK-NEXT:       (local.get $0)
+  ;; CHECK-NEXT:       (then
+  ;; CHECK-NEXT:        (struct.new $leaf
+  ;; CHECK-NEXT:         (i32.const 42)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:       (else
+  ;; CHECK-NEXT:        (ref.null none)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.get $1)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $cached_factory (export "cached_factory") (param $0 i32) (result (ref null $node))
+    (local $1 (ref null $node))
+    (block $label (result (ref null $node))
+      (br_on_non_null $label
+        (array.get $node_cache (global.get $cache) (local.get $0))
+      )
+      (array.set $node_cache
+        (global.get $cache)
+        (local.get $0)
+        (local.tee $1
+          (struct.new $node
+            (array.get $leaf_pal (global.get $g_struct_pal) (local.get $0))
+          )
+        )
+      )
+      (local.get $1)
+    )
+  )
+)

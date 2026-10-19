@@ -74,10 +74,12 @@ static bool isSameConstantOrDefaultValue(Expression* a,
 
 struct AllocHelperInfo {
   Function* func = nullptr;
-  StructNew* sn = nullptr;
   HeapType ht;
+  bool isWithDefault = false;
   uint64_t defaultFieldsMask = 0;
   std::vector<int> holeParamIndex;
+  std::vector<Expression*> constOperands;
+  std::optional<EffectAnalyzer> snEffects;
 };
 
 enum class EdgeResultUsage {
@@ -1110,10 +1112,11 @@ void ModuleStoreInfo::analyze(const PassOptions& options,
           sn->type.getHeapType().isStruct() && !sn->desc) {
         AllocHelperInfo helper;
         helper.func = f.get();
-        helper.sn = sn;
         helper.ht = sn->type.getHeapType();
+        helper.isWithDefault = sn->isWithDefault();
         auto& fields = helper.ht.getStruct().fields;
         helper.holeParamIndex.assign(fields.size(), -1);
+        helper.constOperands.assign(fields.size(), nullptr);
 
         EffectAnalyzer snEff(options, module, sn);
         std::vector<Index> paramReads(f->getNumParams(), 0);
@@ -1139,6 +1142,10 @@ void ModuleStoreInfo::analyze(const PassOptions& options,
             if (idx < 64 && isDefaultFieldValue(op, fields[idx].type)) {
               helper.defaultFieldsMask |= (uint64_t(1) << idx);
             }
+            if (op->is<Const>() || op->is<RefNull>() || op->is<RefFunc>()) {
+              helper.constOperands[idx] =
+                ExpressionManipulator::copy(op, module);
+            }
             if (snEff.localsWritten.empty()) {
               if (auto* lg = op->dynCast<LocalGet>()) {
                 if (lg->index < f->getNumParams() &&
@@ -1149,6 +1156,9 @@ void ModuleStoreInfo::analyze(const PassOptions& options,
             }
           }
         }
+        snEff.localsRead.clear();
+        snEff.localsWritten.clear();
+        helper.snEffects.emplace(std::move(snEff));
         allocHelpers.emplace(f->name, std::move(helper));
         continue;
       }
@@ -2087,14 +2097,15 @@ struct HeapStoreOptimization
     Type fieldType = fields[index].type;
 
     bool isRedundantStore = false;
-    if (helper.sn->isWithDefault()) {
+    if (helper.isWithDefault) {
       isRedundantStore = isDefaultFieldValue(set->value, fieldType);
     } else if (holeParam >= 0 && Index(holeParam) < call->operands.size()) {
       isRedundantStore = isSameConstantOrDefaultValue(
         call->operands[holeParam], set->value, fieldType);
-    } else if (index < helper.sn->operands.size()) {
+    } else if (index < helper.constOperands.size() &&
+               helper.constOperands[index]) {
       isRedundantStore = isSameConstantOrDefaultValue(
-        helper.sn->operands[index], set->value, fieldType);
+        helper.constOperands[index], set->value, fieldType);
     }
 
     if (isRedundantStore) {
@@ -2128,13 +2139,18 @@ struct HeapStoreOptimization
         if (f2 >= fields.size()) {
           return false;
         }
-        if (helper.sn->isWithDefault()) {
+        if (helper.isWithDefault) {
           continue;
         }
         int hole2 = helper.holeParamIndex[f2];
-        Expression* op2 = (hole2 >= 0 && Index(hole2) < call->operands.size())
-                            ? call->operands[hole2]
-                            : helper.sn->operands[f2];
+        Expression* op2 =
+          (hole2 >= 0 && Index(hole2) < call->operands.size())
+            ? call->operands[hole2]
+            : (f2 < helper.constOperands.size() ? helper.constOperands[f2]
+                                                : nullptr);
+        if (!op2) {
+          return false;
+        }
         if (op2->is<Const>() || op2->is<RefNull>() || op2->is<RefFunc>()) {
           continue;
         }
@@ -2169,10 +2185,7 @@ struct HeapStoreOptimization
       }
     }
 
-    EffectAnalyzer helperSnEffects(getPassOptions(), *getModule(), helper.sn);
-    helperSnEffects.localsRead.clear();
-    helperSnEffects.localsWritten.clear();
-    if (helperSnEffects.orderedBefore(setValueEffects)) {
+    if (helper.snEffects && helper.snEffects->orderedBefore(setValueEffects)) {
       return false;
     }
 
@@ -2187,13 +2200,13 @@ struct HeapStoreOptimization
         Index f2 = get->index;
         int hole2 = helper.holeParamIndex[f2];
         Expression* op2 =
-          helper.sn->isWithDefault()
+          helper.isWithDefault
             ? nullptr
             : ((hole2 >= 0 && Index(hole2) < call->operands.size())
                  ? call->operands[hole2]
-                 : helper.sn->operands[f2]);
-        *getp = makeSelfGetReplacement(
-          op2, helper.sn->isWithDefault(), get, fields[f2]);
+                 : helper.constOperands[f2]);
+        *getp =
+          makeSelfGetReplacement(op2, helper.isWithDefault, get, fields[f2]);
       }
     }
 
