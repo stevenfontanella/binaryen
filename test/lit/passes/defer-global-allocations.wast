@@ -2425,6 +2425,10 @@
   )
 )
 
+
+;; Cross-palette u8-indexed palette pooling through outlined i8 reader helpers,
+;; flat StructNew palette element compaction, and non-u8 defer$pal$ prefix
+;; deduplication.
 ;; CHECK:      (func $defer$vt (type $3) (param $0 i32) (result (ref $vt))
 ;; CHECK-NEXT:  (local $1 (ref $vt))
 ;; CHECK-NEXT:  (block $cached (result (ref $vt))
@@ -2482,3 +2486,218 @@
 ;; CHECK-NEXT:   (local.get $1)
 ;; CHECK-NEXT:  )
 ;; CHECK-NEXT: )
+(module
+  ;; CHECK:      (type $item (struct (field i32)))
+  (type $item (struct (field i32)))
+  ;; CHECK:      (type $mut_item_arr (array (mut (ref null $item))))
+
+  ;; CHECK:      (type $u8_arr (array (mut i8)))
+
+  ;; CHECK:      (type $item_arr (array (ref null $item)))
+  (type $item_arr (array (ref null $item)))
+  (type $mut_item_arr (array (mut (ref null $item))))
+  (type $u8_arr (array (mut i8)))
+
+  ;; CHECK:      (type $4 (func (param (ref null $u8_arr) i32 i32) (result i32)))
+
+  ;; CHECK:      (type $5 (func (param (ref $mut_item_arr) i32) (result (ref $item))))
+
+  ;; CHECK:      (type $6 (func (param i32) (result (ref null $item))))
+
+  ;; CHECK:      (global $a (ref $item) (struct.new $item
+  ;; CHECK-NEXT:  (i32.const 10)
+  ;; CHECK-NEXT: ))
+  (global $a (ref $item) (struct.new $item (i32.const 10)))
+  ;; CHECK:      (global $b (ref $item) (struct.new $item
+  ;; CHECK-NEXT:  (i32.const 20)
+  ;; CHECK-NEXT: ))
+  (global $b (ref $item) (struct.new $item (i32.const 20)))
+  ;; CHECK:      (global $c (ref $item) (struct.new $item
+  ;; CHECK-NEXT:  (i32.const 30)
+  ;; CHECK-NEXT: ))
+  (global $c (ref $item) (struct.new $item (i32.const 30)))
+
+  ;; CHECK:      (global $pal1 (ref $item_arr) (array.new_fixed $item_arr 4
+  ;; CHECK-NEXT:  (ref.null none)
+  ;; CHECK-NEXT:  (global.get $a)
+  ;; CHECK-NEXT:  (struct.new $item
+  ;; CHECK-NEXT:   (i32.const 99)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (global.get $b)
+  ;; CHECK-NEXT: ))
+  (global $pal1 (ref $item_arr) (array.new_fixed $item_arr 4
+    (ref.null none)
+    (global.get $a)
+    (struct.new $item (i32.const 99))
+    (struct.new $item (i32.const 99))
+  ))
+  (global $pal2 (ref $item_arr) (array.new_fixed $item_arr 3
+    (ref.null none)
+    (global.get $a)
+    (global.get $b)
+  ))
+
+  ;; CHECK:      (global $pal_non_u8_long (ref $mut_item_arr) (array.new_fixed $mut_item_arr 3
+  ;; CHECK-NEXT:  (global.get $a)
+  ;; CHECK-NEXT:  (ref.null none)
+  ;; CHECK-NEXT:  (global.get $c)
+  ;; CHECK-NEXT: ))
+  (global $pal_non_u8_long (ref $mut_item_arr) (array.new_fixed $mut_item_arr 3
+    (global.get $a)
+    (ref.null none)
+    (global.get $c)
+  ))
+  (global $pal_non_u8_short (ref $mut_item_arr) (array.new_fixed $mut_item_arr 2
+    (global.get $a)
+    (ref.null none)
+  ))
+
+  ;; CHECK:      (global $cache (ref $mut_item_arr) (array.new_default $mut_item_arr
+  ;; CHECK-NEXT:  (i32.const 4)
+  ;; CHECK-NEXT: ))
+  (global $cache (ref $mut_item_arr) (array.new_default $mut_item_arr (i32.const 4)))
+  ;; CHECK:      (global $u8_table (mut (ref null $u8_arr)) (ref.null none))
+  (global $u8_table (mut (ref null $u8_arr)) (ref.null none))
+
+  ;; CHECK:      (data $prev_data "\00\01\02\02\00\01\03\00")
+  (data $prev_data "\00\01\02\03\00\01\02\00")
+
+  ;; CHECK:      (export "use_palettes" (func $use_palettes))
+
+  ;; CHECK:      (func $read_u8 (type $4) (param $arr (ref null $u8_arr)) (param $idx i32) (param $off i32) (result i32)
+  ;; CHECK-NEXT:  (array.get_u $u8_arr
+  ;; CHECK-NEXT:   (local.get $arr)
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (local.get $idx)
+  ;; CHECK-NEXT:    (local.get $off)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $read_u8 (param $arr (ref null $u8_arr)) (param $idx i32) (param $off i32) (result i32)
+    (array.get_u $u8_arr
+      (local.get $arr)
+      (i32.add (local.get $idx) (local.get $off))
+    )
+  )
+
+  ;; CHECK:      (func $defer$pal$item (type $5) (param $arr (ref $mut_item_arr)) (param $idx i32) (result (ref $item))
+  ;; CHECK-NEXT:  (local $tmp (ref $item))
+  ;; CHECK-NEXT:  (block $cached (result (ref $item))
+  ;; CHECK-NEXT:   (br_on_non_null $cached
+  ;; CHECK-NEXT:    (array.get $mut_item_arr
+  ;; CHECK-NEXT:     (local.get $arr)
+  ;; CHECK-NEXT:     (local.get $idx)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (array.set $mut_item_arr
+  ;; CHECK-NEXT:    (local.get $arr)
+  ;; CHECK-NEXT:    (local.get $idx)
+  ;; CHECK-NEXT:    (local.tee $tmp
+  ;; CHECK-NEXT:     (struct.new $item
+  ;; CHECK-NEXT:      (i32.const 77)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.get $tmp)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $defer$pal$item (param $arr (ref $mut_item_arr)) (param $idx i32) (result (ref $item))
+    (local $tmp (ref $item))
+    (block $cached (result (ref $item))
+      (br_on_non_null $cached
+        (array.get $mut_item_arr (local.get $arr) (local.get $idx))
+      )
+      (array.set $mut_item_arr
+        (local.get $arr)
+        (local.get $idx)
+        (local.tee $tmp (struct.new $item (i32.const 77)))
+      )
+      (local.get $tmp)
+    )
+  )
+
+  ;; CHECK:      (func $use_palettes (type $6) (param $0 i32) (result (ref null $item))
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (ref.is_null
+  ;; CHECK-NEXT:    (global.get $u8_table)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (global.set $u8_table
+  ;; CHECK-NEXT:     (array.new_data $u8_arr $prev_data
+  ;; CHECK-NEXT:      (i32.const 0)
+  ;; CHECK-NEXT:      (i32.const 8)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (array.set $mut_item_arr
+  ;; CHECK-NEXT:   (global.get $cache)
+  ;; CHECK-NEXT:   (local.get $0)
+  ;; CHECK-NEXT:   (array.get $item_arr
+  ;; CHECK-NEXT:    (global.get $pal1)
+  ;; CHECK-NEXT:    (call $read_u8
+  ;; CHECK-NEXT:     (global.get $u8_table)
+  ;; CHECK-NEXT:     (local.get $0)
+  ;; CHECK-NEXT:     (i32.const 0)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (array.get $item_arr
+  ;; CHECK-NEXT:    (global.get $pal1)
+  ;; CHECK-NEXT:    (call $read_u8
+  ;; CHECK-NEXT:     (global.get $u8_table)
+  ;; CHECK-NEXT:     (local.get $0)
+  ;; CHECK-NEXT:     (i32.const 4)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$pal$item
+  ;; CHECK-NEXT:    (global.get $pal_non_u8_long)
+  ;; CHECK-NEXT:    (local.get $0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$pal$item
+  ;; CHECK-NEXT:    (global.get $pal_non_u8_long)
+  ;; CHECK-NEXT:    (local.get $0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $a)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $b)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (global.get $c)
+  ;; CHECK-NEXT: )
+  (func $use_palettes (export "use_palettes") (param $0 i32) (result (ref null $item))
+    (if (ref.is_null (global.get $u8_table))
+      (then
+        (global.set $u8_table
+          (array.new_data $u8_arr $prev_data (i32.const 0) (i32.const 8))
+        )
+      )
+    )
+    (array.set $mut_item_arr
+      (global.get $cache)
+      (local.get $0)
+      (array.get $item_arr
+        (global.get $pal1)
+        (call $read_u8 (global.get $u8_table) (local.get $0) (i32.const 0))
+      )
+    )
+    (drop
+      (array.get $item_arr
+        (global.get $pal2)
+        (call $read_u8 (global.get $u8_table) (local.get $0) (i32.const 4))
+      )
+    )
+    (drop (call $defer$pal$item (global.get $pal_non_u8_long) (local.get $0)))
+    (drop (call $defer$pal$item (global.get $pal_non_u8_short) (local.get $0)))
+    (drop (global.get $a))
+    (drop (global.get $b))
+    (global.get $c)
+  )
+)

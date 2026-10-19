@@ -4148,9 +4148,8 @@ private:
       return false;
     };
 
-    auto evalElemOffset = [&](Expression* idxExpr,
-                              Function* fn,
-                              Index& elemOffsetOut) -> bool {
+    std::function<bool(Expression*, Function*, Index&)> evalElemOffset =
+      [&](Expression* idxExpr, Function* fn, Index& elemOffsetOut) -> bool {
       if (auto* lg = idxExpr->dynCast<LocalGet>()) {
         if (lg->index == 0) {
           elemOffsetOut = 0;
@@ -4160,24 +4159,125 @@ private:
       }
       if (auto* bin = idxExpr->dynCast<Binary>()) {
         uint32_t cval = 0;
+        Index subOff = 0;
         if (bin->op == AddInt32) {
-          if (auto* lg = bin->left->dynCast<LocalGet>();
-              lg && lg->index == 0 && evalConstI32(bin->right, fn, cval)) {
-            elemOffsetOut = Index(cval);
+          if (evalElemOffset(bin->left, fn, subOff) &&
+              evalConstI32(bin->right, fn, cval)) {
+            elemOffsetOut = Index(uint32_t(subOff) + cval);
             return true;
           }
-          if (auto* lg = bin->right->dynCast<LocalGet>();
-              lg && lg->index == 0 && evalConstI32(bin->left, fn, cval)) {
-            elemOffsetOut = Index(cval);
+          if (evalElemOffset(bin->right, fn, subOff) &&
+              evalConstI32(bin->left, fn, cval)) {
+            elemOffsetOut = Index(uint32_t(subOff) + cval);
             return true;
           }
         } else if (bin->op == SubInt32) {
-          if (auto* lg = bin->left->dynCast<LocalGet>();
-              lg && lg->index == 0 && evalConstI32(bin->right, fn, cval)) {
-            elemOffsetOut = Index(uint32_t(-int32_t(cval)));
+          if (evalElemOffset(bin->left, fn, subOff) &&
+              evalConstI32(bin->right, fn, cval)) {
+            elemOffsetOut = Index(uint32_t(subOff) - cval);
             return true;
           }
         }
+      }
+      return false;
+    };
+
+    auto resolveI8SliceRead = [&](Expression* rawExpr,
+                                  Function* fn,
+                                  Name& tableGlobalOut,
+                                  ArrayNewData*& inlineAndOut,
+                                  Index& elemOffsetOut) -> bool {
+      tableGlobalOut = Name();
+      inlineAndOut = nullptr;
+      elemOffsetOut = 0;
+      Expression* expr = rawExpr;
+      for (int depth = 0; depth < 3; depth++) {
+        while (auto* b = expr->dynCast<Block>()) {
+          if (b->list.size() == 1) {
+            expr = b->list[0];
+          } else {
+            break;
+          }
+        }
+        auto* c = expr->dynCast<Call>();
+        if (!c) {
+          break;
+        }
+        auto* callee = module->getFunctionOrNull(c->target);
+        if (!callee || callee->imported() || !callee->body ||
+            callee->getNumVars() != 0 ||
+            c->operands.size() != callee->getNumParams()) {
+          return false;
+        }
+        Expression* copyBody =
+          ExpressionManipulator::copy(callee->body, *module);
+        struct ParamSubst : public PostWalker<ParamSubst> {
+          Module& wasm;
+          const ExpressionList& args;
+          bool ok = true;
+          ParamSubst(Module& wasm, const ExpressionList& args)
+            : wasm(wasm), args(args) {}
+          void visitLocalSet(LocalSet*) { ok = false; }
+          void visitLocalGet(LocalGet* curr) {
+            if (curr->index >= args.size()) {
+              ok = false;
+              return;
+            }
+            replaceCurrent(
+              ExpressionManipulator::copy(args[curr->index], wasm));
+          }
+        } subst(*module, c->operands);
+        subst.walk(copyBody);
+        if (!subst.ok) {
+          return false;
+        }
+        expr = copyBody;
+      }
+      while (auto* b = expr->dynCast<Block>()) {
+        if (b->list.size() == 1) {
+          expr = b->list[0];
+        } else {
+          break;
+        }
+      }
+      auto* idxAg = expr->dynCast<ArrayGet>();
+      if (!idxAg || idxAg->order != MemoryOrder::Unordered || idxAg->signed_) {
+        return false;
+      }
+      Expression* refExpr = idxAg->ref;
+      while (true) {
+        if (auto* rc = refExpr->dynCast<RefCast>()) {
+          refExpr = rc->ref;
+        } else if (auto* ra = refExpr->dynCast<RefAs>()) {
+          refExpr = ra->value;
+        } else {
+          break;
+        }
+      }
+      if (auto* gg = refExpr->dynCast<GlobalGet>()) {
+        tableGlobalOut = gg->name;
+        return evalElemOffset(idxAg->index, fn, elemOffsetOut);
+      }
+      if (auto* and_ = refExpr->dynCast<ArrayNewData>()) {
+        inlineAndOut = and_;
+        elemOffsetOut = 0;
+        return true;
+      }
+      return false;
+    };
+
+    auto isPaletteElem = [&](Expression* val) -> bool {
+      if (isValidLeaf(val)) {
+        return true;
+      }
+      if (auto* sn = val->dynCast<StructNew>();
+          sn && !sn->desc && sn->type.isRef()) {
+        for (auto* op : sn->operands) {
+          if (!isValidLeaf(op)) {
+            return false;
+          }
+        }
+        return true;
       }
       return false;
     };
@@ -4204,24 +4304,42 @@ private:
       return false;
     };
 
-    // Compact any palette array.new_fixed global whose elements now contain
-    // duplicate entries (such as multiple ref.null slots after nullification)
-    // when all of its uses are accounted for by paletteSlices or by
-    // array.new_data index tables from earlier invocations, and remap the
-    // corresponding u8 index slices.
+    // Compact and pool u8-indexed palette array.new_fixed globals sharing the
+    // same array type and access pattern (direct ArrayGet on immutable arrays,
+    // or calls to the same defer$pal$ helper) when their combined unique
+    // elements fit in <= 256 slots, and remap the corresponding u8 index
+    // slices.
+    struct VerifiedSlice {
+      std::vector<char>* data;
+      Index offset;
+      Index length;
+      bool isCurrentSegment;
+    };
+    struct VerifiedPalette {
+      Global* global;
+      ArrayNewFixed* anf;
+      Name helperTarget;
+      std::vector<GlobalGet*> globalGetRefs;
+      std::vector<VerifiedSlice> slices;
+    };
+    std::vector<VerifiedPalette> verifiedPalettes;
+    std::vector<VerifiedSlice> allVerifiedExtSlices;
+    std::unordered_set<Name> verifiedPaletteNames;
+
     for (auto& g : module->globals) {
       if (g->imported() || g->mutable_ || !g->init ||
           nonCodeUses.count(g->name) || initGlobalUses[g->name] > 0) {
         continue;
       }
       auto* anf = g->init->dynCast<ArrayNewFixed>();
-      if (!anf || anf->values.size() < 2 || anf->values.size() > 256) {
+      if (!anf || anf->values.empty() || anf->values.size() > 256 ||
+          !g->type.isRef() || g->type.isNullable() ||
+          !g->type.getHeapType().isArray()) {
         continue;
       }
       bool allLeaves = true;
       for (auto* val : anf->values) {
-        if (!val->is<RefNull>() && !val->is<GlobalGet>() &&
-            !val->is<RefFunc>()) {
+        if (!isPaletteElem(val)) {
           allLeaves = false;
           break;
         }
@@ -4229,158 +4347,198 @@ private:
       if (!allLeaves) {
         continue;
       }
-      std::vector<Expression*> compacted;
-      std::vector<uint8_t> remap(anf->values.size());
-      for (Index oldIdx = 0; oldIdx < anf->values.size(); oldIdx++) {
-        Expression* val = anf->values[oldIdx];
-        Index newIdx = 0;
-        while (newIdx < compacted.size() &&
-               !sameRefLeaf(compacted[newIdx], val)) {
-          newIdx++;
-        }
-        if (newIdx == compacted.size()) {
-          compacted.push_back(val);
-        }
-        remap[oldIdx] = uint8_t(newIdx);
-      }
-      if (compacted.size() >= anf->values.size()) {
-        continue;
-      }
-      auto palIt = paletteSlices.find(g->name);
-      if (palIt != paletteSlices.end()) {
-        if (codeGlobalGets[g->name] != palIt->second.size()) {
-          continue;
-        }
-        anf->values.set(compacted);
-        for (auto& slice : palIt->second) {
-          for (Index j = 0; j < slice.length; j++) {
-            uint8_t oldIdx = uint8_t(segmentData[slice.offset + j]);
-            assert(oldIdx < remap.size());
-            segmentData[slice.offset + j] = char(remap[oldIdx]);
-          }
-        }
-        continue;
-      }
-
       Index totalGets = codeGlobalGets[g->name];
       if (totalGets == 0) {
         continue;
       }
+      Name helperTarget;
+      std::vector<GlobalGet*> globalGetRefs;
       std::vector<std::pair<Function*, Expression**>> idxSlots;
       auto& palCalls = allPalCalls[g->name];
       if (palCalls.size() == totalGets) {
+        helperTarget = palCalls[0].second->target;
+        bool sameHelper = true;
         for (auto& [fn, call] : palCalls) {
+          auto* gg = call->operands[0]->dynCast<GlobalGet>();
+          if (call->target != helperTarget || !gg || gg->name != g->name) {
+            sameHelper = false;
+            break;
+          }
+          globalGetRefs.push_back(gg);
           idxSlots.push_back({fn, &call->operands[1]});
         }
+        if (!sameHelper) {
+          continue;
+        }
       } else if (palCalls.empty() &&
-                 arrayGetSites[g->name].size() == totalGets) {
+                 arrayGetSites[g->name].size() == totalGets &&
+                 !g->type.getHeapType().getArray().element.mutable_) {
+        bool validRefs = true;
         for (auto& [fn, site] : arrayGetSites[g->name]) {
-          idxSlots.push_back({fn, &(*site)->cast<ArrayGet>()->index});
+          auto* ag = (*site)->cast<ArrayGet>();
+          auto* gg = ag->ref->dynCast<GlobalGet>();
+          if (!gg || gg->name != g->name) {
+            validRefs = false;
+            break;
+          }
+          globalGetRefs.push_back(gg);
+          idxSlots.push_back({fn, &ag->index});
+        }
+        if (!validRefs) {
+          continue;
         }
       } else {
         continue;
       }
 
-      struct ExternalSlice {
-        DataSegment* seg;
-        Index offset;
-        Index length;
-      };
-      std::vector<ExternalSlice> extSlices;
+      std::vector<VerifiedSlice> slices;
+      auto palIt = paletteSlices.find(g->name);
+      if (palIt != paletteSlices.end()) {
+        if (palIt->second.size() != totalGets) {
+          continue;
+        }
+        bool ok = true;
+        for (auto& slice : palIt->second) {
+          if (slice.length == 0 ||
+              uint64_t(slice.offset) + uint64_t(slice.length) >
+                segmentData.size()) {
+            ok = false;
+            break;
+          }
+          for (Index j = 0; j < slice.length; j++) {
+            if (uint8_t(segmentData[slice.offset + j]) >= anf->values.size()) {
+              ok = false;
+              break;
+            }
+          }
+          if (!ok) {
+            break;
+          }
+          slices.push_back({&segmentData, slice.offset, slice.length, true});
+        }
+        if (!ok) {
+          continue;
+        }
+        verifiedPaletteNames.insert(g->name);
+        verifiedPalettes.push_back({g.get(),
+                                    anf,
+                                    helperTarget,
+                                    std::move(globalGetRefs),
+                                    std::move(slices)});
+        continue;
+      }
+
       bool slicesOk = true;
       for (auto& [fn, idxSlot] : idxSlots) {
-        auto* idxAg = (*idxSlot)->dynCast<ArrayGet>();
-        if (!idxAg || idxAg->order != MemoryOrder::Unordered ||
-            idxAg->signed_) {
-          slicesOk = false;
-          break;
-        }
-        auto* tableGG = idxAg->ref->dynCast<GlobalGet>();
-        if (!tableGG) {
-          slicesOk = false;
-          break;
-        }
-        Name tname = tableGG->name;
-        auto* tg = module->getGlobalOrNull(tname);
-        if (!tg || tg->imported() || !tg->mutable_ || !tg->init ||
-            !tg->init->is<RefNull>() || nonCodeUses.count(tname) ||
-            initGlobalUses[tname] > 0) {
-          slicesOk = false;
-          break;
-        }
-        auto& tSets = allGlobalSets[tname];
-        if (tSets.size() != 1 || tSets[0].first != fn) {
-          slicesOk = false;
-          break;
-        }
-        auto* and_ = tSets[0].second->value->dynCast<ArrayNewData>();
-        if (!and_ || and_->segment == segmentName) {
-          slicesOk = false;
-          break;
-        }
-        DataSegment* seg = module->getDataSegmentOrNull(and_->segment);
-        uint32_t segStartOffset = 0, totalElems = 0;
-        if (!seg || !evalConstI32(and_->offset, fn, segStartOffset) ||
-            !evalConstI32(and_->size, fn, totalElems)) {
-          slicesOk = false;
-          break;
-        }
-        auto& tAgSites = arrayGetSites[tname];
-        if (allRefIsNullGets[tname] + tAgSites.size() !=
-            codeGlobalGets[tname]) {
-          slicesOk = false;
-          break;
-        }
-        for (auto& [agFn, _] : tAgSites) {
-          if (agFn != fn) {
-            slicesOk = false;
-            break;
-          }
-        }
-        if (!slicesOk) {
-          break;
-        }
+        Name tname;
+        ArrayNewData* inlineAnd = nullptr;
         Index elemOffset = 0;
-        if (!evalElemOffset(idxAg->index, fn, elemOffset)) {
+        if (!resolveI8SliceRead(*idxSlot, fn, tname, inlineAnd, elemOffset)) {
           slicesOk = false;
           break;
         }
+        DataSegment* seg = nullptr;
+        Index absOffset = 0;
         Index sliceLen = 0;
-        if (!getFactoryRowCount(fn, sliceLen)) {
-          if (tAgSites.size() == 1 && elemOffset == 0) {
-            sliceLen = Index(totalElems);
-          } else {
+        if (inlineAnd) {
+          if (inlineAnd->segment == segmentName) {
             slicesOk = false;
             break;
           }
-        }
-        if (sliceLen == 0 ||
-            uint64_t(elemOffset) + uint64_t(sliceLen) > uint64_t(totalElems) ||
-            uint64_t(segStartOffset) + uint64_t(elemOffset) +
-                uint64_t(sliceLen) >
-              seg->data.size()) {
-          slicesOk = false;
-          break;
-        }
-        for (auto& [_, otherSite] : tAgSites) {
-          auto* otherAg = (*otherSite)->cast<ArrayGet>();
-          if (otherAg == idxAg) {
-            continue;
-          }
-          Index otherOffset = 0;
-          if (!evalElemOffset(otherAg->index, fn, otherOffset) ||
-              !(uint64_t(otherOffset) + uint64_t(sliceLen) <=
-                  uint64_t(elemOffset) ||
-                uint64_t(elemOffset) + uint64_t(sliceLen) <=
-                  uint64_t(otherOffset))) {
+          seg = module->getDataSegmentOrNull(inlineAnd->segment);
+          uint32_t segStartOffset = 0, totalElems = 0;
+          if (!seg || !evalConstI32(inlineAnd->offset, fn, segStartOffset) ||
+              !evalConstI32(inlineAnd->size, fn, totalElems) ||
+              totalElems == 0 ||
+              uint64_t(segStartOffset) + uint64_t(totalElems) >
+                seg->data.size()) {
             slicesOk = false;
             break;
           }
+          absOffset = Index(segStartOffset);
+          sliceLen = Index(totalElems);
+        } else {
+          auto* tg = module->getGlobalOrNull(tname);
+          if (!tg || tg->imported() || !tg->mutable_ || !tg->init ||
+              !tg->init->is<RefNull>() || nonCodeUses.count(tname) ||
+              initGlobalUses[tname] > 0) {
+            slicesOk = false;
+            break;
+          }
+          auto& tSets = allGlobalSets[tname];
+          if (tSets.size() != 1 || tSets[0].first != fn) {
+            slicesOk = false;
+            break;
+          }
+          auto* and_ = tSets[0].second->value->dynCast<ArrayNewData>();
+          if (!and_ || and_->segment == segmentName) {
+            slicesOk = false;
+            break;
+          }
+          seg = module->getDataSegmentOrNull(and_->segment);
+          uint32_t segStartOffset = 0, totalElems = 0;
+          if (!seg || !evalConstI32(and_->offset, fn, segStartOffset) ||
+              !evalConstI32(and_->size, fn, totalElems)) {
+            slicesOk = false;
+            break;
+          }
+          auto& tAgSites = arrayGetSites[tname];
+          bool directTableReads =
+            (allRefIsNullGets[tname] + tAgSites.size() ==
+             codeGlobalGets[tname]);
+          if (directTableReads) {
+            for (auto& [agFn, _] : tAgSites) {
+              if (agFn != fn) {
+                slicesOk = false;
+                break;
+              }
+            }
+            if (!slicesOk) {
+              break;
+            }
+          }
+          if (!getFactoryRowCount(fn, sliceLen)) {
+            if (directTableReads && tAgSites.size() == 1 && elemOffset == 0) {
+              sliceLen = Index(totalElems);
+            } else {
+              slicesOk = false;
+              break;
+            }
+          }
+          if (sliceLen == 0 ||
+              uint64_t(elemOffset) + uint64_t(sliceLen) >
+                uint64_t(totalElems) ||
+              uint64_t(segStartOffset) + uint64_t(elemOffset) +
+                  uint64_t(sliceLen) >
+                seg->data.size()) {
+            slicesOk = false;
+            break;
+          }
+          if (directTableReads) {
+            auto* idxAg = (*idxSlot)->dynCast<ArrayGet>();
+            for (auto& [_, otherSite] : tAgSites) {
+              auto* otherAg = (*otherSite)->cast<ArrayGet>();
+              if (otherAg == idxAg) {
+                continue;
+              }
+              Index otherOffset = 0;
+              if (!evalElemOffset(otherAg->index, fn, otherOffset) ||
+                  !(uint64_t(otherOffset) + uint64_t(sliceLen) <=
+                      uint64_t(elemOffset) ||
+                    uint64_t(elemOffset) + uint64_t(sliceLen) <=
+                      uint64_t(otherOffset))) {
+                slicesOk = false;
+                break;
+              }
+            }
+          } else if (elemOffset % sliceLen != 0) {
+            slicesOk = false;
+          }
+          if (!slicesOk) {
+            break;
+          }
+          absOffset = Index(segStartOffset) + elemOffset;
         }
-        if (!slicesOk) {
-          break;
-        }
-        Index absOffset = Index(segStartOffset) + elemOffset;
         for (Index j = 0; j < sliceLen; j++) {
           if (uint8_t(seg->data[absOffset + j]) >= anf->values.size()) {
             slicesOk = false;
@@ -4390,8 +4548,18 @@ private:
         if (!slicesOk) {
           break;
         }
-        for (auto& prev : extSlices) {
-          if (prev.seg == seg &&
+        for (auto& prev : slices) {
+          if (prev.data == &seg->data &&
+              !(uint64_t(prev.offset) + uint64_t(prev.length) <=
+                  uint64_t(absOffset) ||
+                uint64_t(absOffset) + uint64_t(sliceLen) <=
+                  uint64_t(prev.offset))) {
+            slicesOk = false;
+            break;
+          }
+        }
+        for (auto& prev : allVerifiedExtSlices) {
+          if (prev.data == &seg->data &&
               !(uint64_t(prev.offset) + uint64_t(prev.length) <=
                   uint64_t(absOffset) ||
                 uint64_t(absOffset) + uint64_t(sliceLen) <=
@@ -4403,18 +4571,278 @@ private:
         if (!slicesOk) {
           break;
         }
-        extSlices.push_back({seg, absOffset, sliceLen});
+        slices.push_back({&seg->data, absOffset, sliceLen, false});
       }
-      if (slicesOk && extSlices.size() == idxSlots.size()) {
-        anf->values.set(compacted);
-        for (auto& slice : extSlices) {
+      if (slicesOk && slices.size() == idxSlots.size()) {
+        for (auto& s : slices) {
+          allVerifiedExtSlices.push_back(s);
+        }
+        verifiedPaletteNames.insert(g->name);
+        verifiedPalettes.push_back({g.get(),
+                                    anf,
+                                    helperTarget,
+                                    std::move(globalGetRefs),
+                                    std::move(slices)});
+      }
+    }
+
+    // Step A: Compact each palette individually first.
+    for (auto& vp : verifiedPalettes) {
+      std::vector<Expression*> compacted;
+      std::vector<uint8_t> remap(vp.anf->values.size());
+      for (Index oldIdx = 0; oldIdx < vp.anf->values.size(); oldIdx++) {
+        Expression* val = vp.anf->values[oldIdx];
+        Index newIdx = 0;
+        while (newIdx < compacted.size() &&
+               !sameRefLeaf(compacted[newIdx], val)) {
+          newIdx++;
+        }
+        if (newIdx == compacted.size()) {
+          compacted.push_back(val);
+        }
+        remap[oldIdx] = uint8_t(newIdx);
+      }
+      if (compacted.size() < vp.anf->values.size()) {
+        vp.anf->values.set(compacted);
+        vp.anf->finalize();
+        for (auto& slice : vp.slices) {
           for (Index j = 0; j < slice.length; j++) {
-            uint8_t oldIdx = uint8_t(slice.seg->data[slice.offset + j]);
+            uint8_t oldIdx = uint8_t((*slice.data)[slice.offset + j]);
             assert(oldIdx < remap.size());
-            slice.seg->data[slice.offset + j] = char(remap[oldIdx]);
+            (*slice.data)[slice.offset + j] = char(remap[oldIdx]);
           }
         }
       }
+    }
+
+    // Step B: Pool verified palettes sharing (type, helperTarget) in descending
+    // order of total slice length when shared element savings outweigh the LZH
+    // cost of upward-shifted slice bytes. Skip mutable defer$pal$ palettes from
+    // the current invocation so a subsequent post-unsubtyping invocation can
+    // nullify and compact their remaining sole-use elements first.
+    std::vector<Index> poolOrder;
+    std::vector<Index> totalSliceLen(verifiedPalettes.size(), 0);
+    for (Index i = 0; i < verifiedPalettes.size(); i++) {
+      auto& vp = verifiedPalettes[i];
+      if (vp.helperTarget.is() && !vp.slices.empty() &&
+          vp.slices[0].isCurrentSegment) {
+        continue;
+      }
+      Index lenSum = 0;
+      for (auto& s : vp.slices) {
+        lenSum += s.length;
+      }
+      totalSliceLen[i] = lenSum;
+      poolOrder.push_back(i);
+    }
+    std::stable_sort(poolOrder.begin(), poolOrder.end(), [&](Index a, Index b) {
+      return totalSliceLen[a] > totalSliceLen[b];
+    });
+
+    struct CanonPalette {
+      VerifiedPalette* base;
+      std::vector<Expression*> compacted;
+      bool modified = false;
+    };
+    std::vector<CanonPalette> canonPalettes;
+    std::vector<Name> palGlobalsToRemove;
+    for (Index idx : poolOrder) {
+      auto& vp = verifiedPalettes[idx];
+      CanonPalette* matchedCp = nullptr;
+      std::vector<Expression*> trialCompacted;
+      std::vector<uint8_t> remap(vp.anf->values.size());
+      for (auto& cp : canonPalettes) {
+        if (cp.base->global->type != vp.global->type ||
+            cp.base->helperTarget != vp.helperTarget) {
+          continue;
+        }
+        trialCompacted = cp.compacted;
+        bool fits = true;
+        Index sharedBytes = 0;
+        for (Index oldIdx = 0; oldIdx < vp.anf->values.size(); oldIdx++) {
+          Expression* val = vp.anf->values[oldIdx];
+          Index newIdx = 0;
+          while (newIdx < trialCompacted.size() &&
+                 !sameRefLeaf(trialCompacted[newIdx], val)) {
+            newIdx++;
+          }
+          if (newIdx < cp.compacted.size()) {
+            sharedBytes += getOperandBytes(val);
+          }
+          if (newIdx == trialCompacted.size()) {
+            if (trialCompacted.size() == 256) {
+              fits = false;
+              break;
+            }
+            trialCompacted.push_back(
+              ExpressionManipulator::copy(val, *module));
+          }
+          remap[oldIdx] = uint8_t(newIdx);
+        }
+        if (!fits || sharedBytes == 0) {
+          continue;
+        }
+        Index shiftedUpBytes = 0;
+        for (auto& slice : vp.slices) {
+          for (Index j = 0; j < slice.length; j++) {
+            uint8_t oldIdx = uint8_t((*slice.data)[slice.offset + j]);
+            if (remap[oldIdx] > oldIdx) {
+              shiftedUpBytes++;
+            }
+          }
+        }
+        Index sav =
+          9 + sharedBytes +
+          (vp.helperTarget.is() ? 3 * Index(vp.globalGetRefs.size()) : 0);
+        if (shiftedUpBytes <= 4 * sav) {
+          matchedCp = &cp;
+          break;
+        }
+      }
+      if (matchedCp) {
+        matchedCp->compacted = std::move(trialCompacted);
+        matchedCp->modified = true;
+        for (auto& slice : vp.slices) {
+          for (Index j = 0; j < slice.length; j++) {
+            uint8_t oldIdx = uint8_t((*slice.data)[slice.offset + j]);
+            assert(oldIdx < remap.size());
+            (*slice.data)[slice.offset + j] = char(remap[oldIdx]);
+          }
+        }
+        Name baseName = matchedCp->base->global->name;
+        for (auto* gg : vp.globalGetRefs) {
+          gg->name = baseName;
+        }
+        auto& dstSlices = paletteSlices[baseName];
+        for (auto& slice : vp.slices) {
+          if (slice.isCurrentSegment) {
+            dstSlices.push_back({slice.offset, slice.length});
+          }
+        }
+        paletteSlices.erase(vp.global->name);
+        auto& srcSites = arrayGetSites[vp.global->name];
+        auto& dstSites = arrayGetSites[baseName];
+        dstSites.insert(dstSites.end(), srcSites.begin(), srcSites.end());
+        srcSites.clear();
+        auto& srcCalls = allPalCalls[vp.global->name];
+        auto& dstCalls = allPalCalls[baseName];
+        dstCalls.insert(dstCalls.end(), srcCalls.begin(), srcCalls.end());
+        srcCalls.clear();
+        codeGlobalGets[baseName] += codeGlobalGets[vp.global->name];
+        codeGlobalGets[vp.global->name] = 0;
+        palGlobalsToRemove.push_back(vp.global->name);
+        continue;
+      }
+
+      std::vector<Expression*> compacted(vp.anf->values.begin(),
+                                         vp.anf->values.end());
+      canonPalettes.push_back({&vp, std::move(compacted), false});
+    }
+    for (auto& cp : canonPalettes) {
+      if (cp.modified) {
+        cp.base->anf->values.set(cp.compacted);
+        cp.base->anf->finalize();
+      }
+    }
+
+    // Deduplicate non-u8 defer$pal$ array.new_fixed globals calling the same
+    // helper when one initializer is a prefix of another.
+    std::vector<std::pair<Global*, Name>> nonU8PalGlobals;
+    for (auto& g : module->globals) {
+      if (g->imported() || g->mutable_ || !g->init ||
+          nonCodeUses.count(g->name) || initGlobalUses[g->name] > 0 ||
+          verifiedPaletteNames.count(g->name) ||
+          paletteSlices.count(g->name)) {
+        continue;
+      }
+      auto* anf = g->init->dynCast<ArrayNewFixed>();
+      if (!anf || anf->values.empty() || !g->type.isRef() ||
+          g->type.isNullable() || !g->type.getHeapType().isArray()) {
+        continue;
+      }
+      Index totalGets = codeGlobalGets[g->name];
+      auto& palCalls = allPalCalls[g->name];
+      if (totalGets == 0 || palCalls.size() != totalGets) {
+        continue;
+      }
+      Name helperTarget = palCalls[0].second->target;
+      bool valid = true;
+      for (auto& [_, call] : palCalls) {
+        auto* gg = call->operands[0]->dynCast<GlobalGet>();
+        if (call->target != helperTarget || !gg || gg->name != g->name) {
+          valid = false;
+          break;
+        }
+      }
+      if (!valid) {
+        continue;
+      }
+      bool hasNonNull = false;
+      for (auto* val : anf->values) {
+        if (!isPaletteElem(val)) {
+          valid = false;
+          break;
+        }
+        if (!val->is<RefNull>()) {
+          hasNonNull = true;
+        }
+      }
+      if (valid && hasNonNull) {
+        nonU8PalGlobals.push_back({g.get(), helperTarget});
+      }
+    }
+    std::unordered_set<Name> mergedNonU8Pals;
+    for (size_t i = 0; i < nonU8PalGlobals.size(); i++) {
+      auto [g1, h1] = nonU8PalGlobals[i];
+      if (mergedNonU8Pals.count(g1->name)) {
+        continue;
+      }
+      auto* anf1 = g1->init->cast<ArrayNewFixed>();
+      Index n1 = anf1->values.size();
+      Global* bestG2 = nullptr;
+      Index bestN2 = 0;
+      for (size_t j = 0; j < nonU8PalGlobals.size(); j++) {
+        if (i == j) {
+          continue;
+        }
+        auto [g2, h2] = nonU8PalGlobals[j];
+        if (mergedNonU8Pals.count(g2->name) || g1->type != g2->type ||
+            h1 != h2) {
+          continue;
+        }
+        auto* anf2 = g2->init->cast<ArrayNewFixed>();
+        Index n2 = anf2->values.size();
+        if (n1 > n2 || (n1 == n2 && j > i)) {
+          continue;
+        }
+        bool isPrefix = true;
+        for (Index k = 0; k < n1; k++) {
+          if (!sameRefLeaf(anf1->values[k], anf2->values[k])) {
+            isPrefix = false;
+            break;
+          }
+        }
+        if (isPrefix && (!bestG2 || n2 > bestN2)) {
+          bestG2 = g2;
+          bestN2 = n2;
+        }
+      }
+      if (bestG2) {
+        auto& calls1 = allPalCalls[g1->name];
+        auto& calls2 = allPalCalls[bestG2->name];
+        for (auto& [fn, call] : calls1) {
+          call->operands[0]->cast<GlobalGet>()->name = bestG2->name;
+          calls2.push_back({fn, call});
+        }
+        codeGlobalGets[bestG2->name] += codeGlobalGets[g1->name];
+        codeGlobalGets[g1->name] = 0;
+        calls1.clear();
+        mergedNonU8Pals.insert(g1->name);
+        palGlobalsToRemove.push_back(g1->name);
+      }
+    }
+    for (Name gname : palGlobalsToRemove) {
+      module->removeGlobal(gname);
     }
 
     // Convert any array.new_fixed global initializer whose elements are all
@@ -9120,7 +9548,7 @@ private:
       // read-only reference array.new_fixed globals.
       if (!onceOnly && !preserveThunkTypes && !segmentData.empty() &&
           module->features.hasBulkMemory() && !hasStructAllocElem &&
-          isPaletteCandidate(elemField) && D >= 6 && D <= 256 && D < N) {
+          isPaletteCandidate(elemField) && D >= 6 && D < N && D <= 256) {
         Index palCost = 9 + getLEBSize(U32LEB(D));
         for (auto* expr : distinct) {
           palCost += getOperandBytes(expr);
@@ -9143,6 +9571,7 @@ private:
           for (uint8_t idx : indices) {
             segmentData.push_back(char(idx));
           }
+          paletteSlices[g->name].push_back({startOffset, N});
           auto i8ArrType = HeapTypes::getMutI8Array();
           for (auto& [fn, site] : sites) {
             auto* ag = (*site)->cast<ArrayGet>();
