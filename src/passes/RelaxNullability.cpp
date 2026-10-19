@@ -1677,6 +1677,8 @@ struct ConsumerSite {
   bool isSelfReturn = false;
   HeapType acceptedHT;
   Nullability acceptedNull = NonNullable;
+  Index visitOrder = 0;
+  Index domEndOrder = 0;
 };
 
 struct CallConsumerSite {
@@ -2004,6 +2006,175 @@ void scanFunctionConsumers(Module& wasm,
     }
   } fallback(scanner);
   fallback.walk(func->body);
+
+  bool needDomOrder = false;
+  for (Index i = 0; i < numParams; ++i) {
+    if (out.localWriteCounts[i] == 0 && out.paramSites[i].size() >= 2) {
+      needDomOrder = true;
+      break;
+    }
+  }
+  if (needDomOrder) {
+    struct DomOrderScanner : public PostWalker<DomOrderScanner> {
+      Index numParams;
+      Index curOrder = 0;
+      struct ActiveScope {
+        Index id;
+        Name blockName;
+        bool isConditional;
+        bool hasPreBranch;
+      };
+      std::vector<ActiveScope> scopeStack;
+      std::vector<Index> scopeEndOrder;
+      std::unordered_map<LocalGet*, std::pair<Index, Index>> getDomRecord;
+
+      DomOrderScanner(Index numParams) : numParams(numParams) {
+        scopeEndOrder.push_back(0);
+        scopeStack.push_back({0, Name(), false, false});
+      }
+
+      void beginScope(Name blockName, bool isConditional) {
+        Index id = scopeEndOrder.size();
+        scopeEndOrder.push_back(0);
+        scopeStack.push_back({id, blockName, isConditional, false});
+      }
+
+      static void doBeginCondScope(DomOrderScanner* self, Expression** currp) {
+        self->beginScope(Name(), true);
+      }
+
+      static void doBeginBlockScope(DomOrderScanner* self, Expression** currp) {
+        self->beginScope((*currp)->cast<Block>()->name, false);
+      }
+
+      static void doEndScope(DomOrderScanner* self, Expression** currp) {
+        self->scopeEndOrder[self->scopeStack.back().id] = self->curOrder;
+        self->scopeStack.pop_back();
+      }
+
+      void markBranchTarget(Name target) {
+        if (!target.is()) {
+          return;
+        }
+        for (auto it = scopeStack.rbegin(); it != scopeStack.rend(); ++it) {
+          if (it->blockName == target) {
+            it->hasPreBranch = true;
+            break;
+          }
+        }
+      }
+
+      void visitLocalGet(LocalGet* curr) {
+        if (curr->index < numParams && curr->type.isRef()) {
+          Index order = ++curOrder;
+          Index domId = 0;
+          for (auto it = scopeStack.rbegin(); it != scopeStack.rend(); ++it) {
+            if (it->isConditional || it->hasPreBranch) {
+              domId = it->id;
+              break;
+            }
+          }
+          getDomRecord[curr] = {order, domId};
+        }
+      }
+
+      void visitBreak(Break* curr) { markBranchTarget(curr->name); }
+
+      void visitSwitch(Switch* curr) {
+        for (auto target : curr->targets) {
+          markBranchTarget(target);
+        }
+        markBranchTarget(curr->default_);
+      }
+
+      void visitBrOn(BrOn* curr) { markBranchTarget(curr->name); }
+
+      static void scan(DomOrderScanner* self, Expression** currp) {
+        Expression* curr = *currp;
+        switch (curr->_id) {
+          case Expression::Id::BlockId: {
+            auto* block = curr->cast<Block>();
+            if (block->name.is()) {
+              self->pushTask(DomOrderScanner::doEndScope, currp);
+            }
+            auto& list = block->list;
+            for (int i = int(list.size()) - 1; i >= 0; i--) {
+              self->pushTask(DomOrderScanner::scan, &list[i]);
+            }
+            if (block->name.is()) {
+              doBeginBlockScope(self, currp);
+            }
+            return;
+          }
+          case Expression::Id::IfId: {
+            auto* iff = curr->cast<If>();
+            if (iff->ifFalse) {
+              self->pushTask(DomOrderScanner::doEndScope, currp);
+              self->pushTask(DomOrderScanner::scan, &iff->ifFalse);
+              self->pushTask(DomOrderScanner::doBeginCondScope, currp);
+            }
+            self->pushTask(DomOrderScanner::doEndScope, currp);
+            self->pushTask(DomOrderScanner::scan, &iff->ifTrue);
+            self->pushTask(DomOrderScanner::doBeginCondScope, currp);
+            self->pushTask(DomOrderScanner::scan, &iff->condition);
+            return;
+          }
+          case Expression::Id::LoopId: {
+            auto* loop = curr->cast<Loop>();
+            self->pushTask(DomOrderScanner::doEndScope, currp);
+            self->pushTask(DomOrderScanner::scan, &loop->body);
+            doBeginCondScope(self, currp);
+            return;
+          }
+          case Expression::Id::TryId: {
+            auto* try_ = curr->cast<Try>();
+            auto& list = try_->catchBodies;
+            for (int i = int(list.size()) - 1; i >= 0; i--) {
+              self->pushTask(DomOrderScanner::doEndScope, currp);
+              self->pushTask(DomOrderScanner::scan, &list[i]);
+              self->pushTask(DomOrderScanner::doBeginCondScope, currp);
+            }
+            self->pushTask(DomOrderScanner::doEndScope, currp);
+            self->pushTask(DomOrderScanner::scan, &try_->body);
+            doBeginCondScope(self, currp);
+            return;
+          }
+          case Expression::Id::TryTableId: {
+            auto* tryTable = curr->cast<TryTable>();
+            for (auto dest : tryTable->catchDests) {
+              self->markBranchTarget(dest);
+            }
+            self->pushTask(DomOrderScanner::doEndScope, currp);
+            self->pushTask(DomOrderScanner::scan, &tryTable->body);
+            doBeginCondScope(self, currp);
+            return;
+          }
+          default: {
+            PostWalker<DomOrderScanner>::scan(self, currp);
+            return;
+          }
+        }
+      }
+    } domScanner(numParams);
+    domScanner.walk(func->body);
+    domScanner.scopeEndOrder[0] = domScanner.curOrder;
+    for (Index i = 0; i < numParams; ++i) {
+      if (out.localWriteCounts[i] == 0 && out.paramSites[i].size() >= 2) {
+        for (auto& site : out.paramSites[i]) {
+          auto it = domScanner.getDomRecord.find(site.get);
+          if (it != domScanner.getDomRecord.end()) {
+            site.visitOrder = it->second.first;
+            site.domEndOrder = domScanner.scopeEndOrder[it->second.second];
+          }
+        }
+        std::sort(out.paramSites[i].begin(),
+                  out.paramSites[i].end(),
+                  [](const ConsumerSite& a, const ConsumerSite& b) {
+                    return a.visitOrder < b.visitOrder;
+                  });
+      }
+    }
+  }
 }
 
 struct FieldKey {
@@ -2707,6 +2878,15 @@ struct RelaxNullability : public Pass {
       sigFuncCount[func->getSig()]++;
     }
 
+    std::string modeArg = getArgumentOrDefault("relax-nullability", "");
+    bool mergeSignatures = hasArgument("relax-nullability-merge-signatures") ||
+                           modeArg == "merge-signatures" ||
+                           modeArg == "cache-param-casts";
+    bool cacheParamCasts =
+      modeArg == "cache-param-casts" ||
+      hasArgument("relax-nullability-cache-param-casts") ||
+      !getPassOptions().optimizeLevel;
+
     auto addCanonCandidates = [&](const Signature& origSig,
                                   std::vector<Signature>& out) {
       std::vector<Type> origParams(origSig.params.begin(),
@@ -2759,6 +2939,24 @@ struct RelaxNullability : public Pass {
       for (size_t i = 0; i < origParams.size(); ++i) {
         Type p = origParams[i];
         if (p.isRef() && !p.isExact()) {
+          if (cacheParamCasts) {
+            if (rootParams[i] != p && origParams.size() > 1) {
+              std::vector<Type> singleRoot = origParams;
+              singleRoot[i] = rootParams[i];
+              addParamChoice(Type(singleRoot));
+              std::vector<Type> rootKeepSingle = rootParams;
+              rootKeepSingle[i] = p;
+              addParamChoice(Type(rootKeepSingle));
+            }
+            if (auto superHT = p.getHeapType().getDeclaredSuperType()) {
+              Type sType(*superHT, Nullable);
+              if (sType != p && sType != rootParams[i]) {
+                std::vector<Type> singleSuper = origParams;
+                singleSuper[i] = sType;
+                addParamChoice(Type(singleSuper));
+              }
+            }
+          }
           Type tType(p.getHeapType().getTop(), Nullable);
           if (tType != p) {
             std::vector<Type> singleTop = origParams;
@@ -2817,6 +3015,9 @@ struct RelaxNullability : public Pass {
               ok = false;
               break;
             }
+            int narrowGets = 0;
+            const ConsumerSite* firstNarrow = nullptr;
+            const ConsumerSite* lastNarrow = nullptr;
             for (auto& site : sum.paramSites[i]) {
               Type accType =
                 site.isSelfReturn
@@ -2824,7 +3025,23 @@ struct RelaxNullability : public Pass {
                   : Type(site.acceptedHT, site.acceptedNull);
               if (!site.isFixedConsumer ||
                   !Type::isSubType(candParams[i], accType)) {
-                addedBytes += 3;
+                narrowGets++;
+                if (!firstNarrow) {
+                  firstNarrow = &site;
+                }
+                lastNarrow = &site;
+              }
+            }
+            if (narrowGets == 1) {
+              addedBytes += 3;
+            } else if (narrowGets >= 2) {
+              if (cacheParamCasts && origParams[i].isNullable()) {
+                bool canTee =
+                  firstNarrow && lastNarrow &&
+                  lastNarrow->visitOrder <= firstNarrow->domEndOrder;
+                addedBytes += canTee ? 6 : 7;
+              } else {
+                addedBytes += narrowGets * 3;
               }
             }
           }
@@ -2855,13 +3072,13 @@ struct RelaxNullability : public Pass {
       }
     }
 
-    bool mergeSignatures = hasArgument("relax-nullability-merge-signatures");
     Builder builder(*module);
     std::unordered_set<Function*> modifiedFuncs;
     std::unordered_set<Function*> generalizedFuncs;
     std::unordered_set<HeapType> usedTargetHTs;
     std::unordered_map<Expression*, Type> strippedCastDemands;
     GlobalTypeRewriter::SignatureUpdates genUpdates;
+    std::vector<std::pair<Function*, Expression*>> pendingPrologueSets;
 
     auto getEffectiveType = [&](auto& self, Expression* expr) -> Type {
       while (auto* block = expr->dynCast<Block>()) {
@@ -3196,6 +3413,8 @@ struct RelaxNullability : public Pass {
               break;
             }
             int narrowGets = 0;
+            const ConsumerSite* firstNarrow = nullptr;
+            const ConsumerSite* lastNarrow = nullptr;
             for (auto& site : sum.paramSites[i]) {
               auto sdIt = strippedCastDemands.find(site.get);
               if (sdIt != strippedCastDemands.end()) {
@@ -3212,14 +3431,28 @@ struct RelaxNullability : public Pass {
               if (!site.isFixedConsumer ||
                   !Type::isSubType(candParams[i], accType)) {
                 narrowGets++;
+                if (!firstNarrow) {
+                  firstNarrow = &site;
+                }
+                lastNarrow = &site;
               }
             }
-            if (!possible || narrowGets > 8) {
+            bool canCacheInLocal =
+              cacheParamCasts && narrowGets >= 2 && origParams[i].isNullable();
+            if (!possible || (!canCacheInLocal && narrowGets > 8)) {
               possible = false;
               break;
             }
-            totalNarrowGets = std::max(totalNarrowGets, narrowGets);
-            castsAddedBytes += narrowGets * 3;
+            totalNarrowGets =
+              std::max(totalNarrowGets, canCacheInLocal ? 1 : narrowGets);
+            if (canCacheInLocal) {
+              bool canTee =
+                firstNarrow && lastNarrow &&
+                lastNarrow->visitOrder <= firstNarrow->domEndOrder;
+              castsAddedBytes += canTee ? 6 : 7;
+            } else {
+              castsAddedBytes += narrowGets * 3;
+            }
             auto callIt = allCallsTo.find(f->name);
             if (callIt != allCallsTo.end()) {
               for (auto& [caller, call] : callIt->second) {
@@ -3370,6 +3603,7 @@ struct RelaxNullability : public Pass {
           if (targetParams[i] == origParams[i]) {
             continue;
           }
+          std::vector<ConsumerSite*> narrowSites;
           for (auto& site : sum.paramSites[i]) {
             site.get->type = targetParams[i];
             if (strippedCastDemands.count(site.get)) {
@@ -3388,10 +3622,51 @@ struct RelaxNullability : public Pass {
                 (*site.loc)->type = targetParams[i].with(NonNullable);
               }
             } else {
+              narrowSites.push_back(&site);
+            }
+          }
+          if (narrowSites.size() == 1 ||
+              (narrowSites.size() >= 2 &&
+               (!cacheParamCasts || !origParams[i].isNullable()))) {
+            for (auto* sitePtr : narrowSites) {
+              auto& site = *sitePtr;
               Type castTarget = site.isWrappedInNonNull
                                   ? origParams[i].with(NonNullable)
                                   : origParams[i];
               *site.loc = builder.makeRefCast(site.get, castTarget);
+            }
+          } else if (narrowSites.size() >= 2) {
+            Index scratchLocal = Builder::addVar(f, origParams[i]);
+            bool canTee =
+              narrowSites.back()->visitOrder <= narrowSites.front()->domEndOrder;
+            size_t startIdx = 0;
+            if (canTee) {
+              auto& first = *narrowSites[0];
+              Expression* castExpr =
+                builder.makeRefCast(first.get, origParams[i]);
+              Expression* teeExpr =
+                builder.makeLocalTee(scratchLocal, castExpr, origParams[i]);
+              if (first.isWrappedInNonNull) {
+                (*first.loc)->cast<RefAs>()->value = teeExpr;
+              } else {
+                *first.loc = teeExpr;
+              }
+              startIdx = 1;
+            } else {
+              Expression* castExpr = builder.makeRefCast(
+                builder.makeLocalGet(i, targetParams[i]), origParams[i]);
+              pendingPrologueSets.push_back(
+                {f, builder.makeLocalSet(scratchLocal, castExpr)});
+            }
+            for (size_t k = startIdx; k < narrowSites.size(); ++k) {
+              auto& site = *narrowSites[k];
+              Expression* getScratch =
+                builder.makeLocalGet(scratchLocal, origParams[i]);
+              if (site.isWrappedInNonNull) {
+                (*site.loc)->cast<RefAs>()->value = getScratch;
+              } else {
+                *site.loc = getScratch;
+              }
             }
           }
         }
@@ -3519,6 +3794,10 @@ struct RelaxNullability : public Pass {
           tryGeneralizeGroup(ht, {f}, false);
         }
       }
+    }
+
+    for (auto& [f, prologueSet] : pendingPrologueSets) {
+      f->body = builder.makeSequence(prologueSet, f->body);
     }
 
     GlobalTypeRewriter::updateSignatures(
@@ -4712,13 +4991,16 @@ struct RelaxNullability : public Pass {
       runner.run();
     }
 
+    std::string modeArg = getArgumentOrDefault("relax-nullability", "");
     bool widenTypes =
       getPassOptions().shrinkLevel >= 2 || !getPassOptions().optimizeLevel;
     bool widenFields =
       widenTypes &&
       getPassOptions().worldMode == WorldMode::Closed &&
       (hasArgument("relax-nullability-widen-fields") ||
-       hasArgument("relax-nullability-merge-signatures"));
+       hasArgument("relax-nullability-merge-signatures") ||
+       modeArg == "widen-fields" || modeArg == "merge-signatures" ||
+       modeArg == "cache-param-casts");
 
     // 1 + 2 + 3. Relax and widen function signatures, locals, and casts.
     relaxSignaturesAndLocals(module, widenTypes);
@@ -4737,6 +5019,9 @@ struct RelaxNullability : public Pass {
     // 6. Second pass of field/array widening after signature generalization.
     if (widenFields && widenFieldsAndArrays(module)) {
       FunctionRelaxer(widenTypes).run(getPassRunner(), module);
+      if (modeArg == "cache-param-casts") {
+        runGeneralizeSignatures(module);
+      }
     }
   }
 };
