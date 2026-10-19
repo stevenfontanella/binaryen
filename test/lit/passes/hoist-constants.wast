@@ -440,3 +440,58 @@
     )
   )
 )
+
+;; Test deduplication of existing Const and post-roundtrip inexact RefFunc
+;; globals, plus reuse of existing top-128 globals for single remaining inline
+;; occurrences.
+(module
+  ;; CHECK:      (type $fn (func (result i32)))
+  (type $fn (func (result i32)))
+
+  ;; CHECK:      (type $1 (func (param i32) (result (ref $fn))))
+
+  ;; CHECK:      (global $c1 i32 (i32.const 100))
+  (global $c1 i32 (i32.const 100))
+  (global $c2 i32 (i32.const 100))
+  ;; CHECK:      (global $rf1 (ref (exact $fn)) (ref.func $target))
+  (global $rf1 (ref $fn) (ref.func $target))
+  (global $rf2 (ref $fn) (ref.func $target))
+
+  ;; CHECK:      (func $target (type $fn) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (global.get $c1)
+  ;; CHECK-NEXT:    (global.get $c1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (global.get $c1)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $target (type $fn) (result i32)
+    (i32.add
+      (i32.add
+        (global.get $c1)
+        (global.get $c2)
+      )
+      (i32.const 100)
+    )
+  )
+
+  ;; CHECK:      (func $use-refs (type $1) (param $c i32) (result (ref $fn))
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $rf1)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (select (result (ref (exact $fn)))
+  ;; CHECK-NEXT:   (global.get $rf1)
+  ;; CHECK-NEXT:   (global.get $rf1)
+  ;; CHECK-NEXT:   (local.get $c)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $use-refs (param $c i32) (result (ref $fn))
+    (drop (global.get $rf1))
+    (select (result (ref $fn))
+      (global.get $rf2)
+      (ref.func $target)
+      (local.get $c)
+    )
+  )
+)
