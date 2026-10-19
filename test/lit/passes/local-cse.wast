@@ -567,3 +567,122 @@
     (drop (global.get $glob))
   )
 )
+
+(module
+  ;; CHECK:      (type $0 (func))
+
+  ;; CHECK:      (type $1 (func (param i32) (result i32)))
+
+  ;; CHECK:      (import "a" "effect" (func $effect))
+  (import "a" "effect" (func $effect))
+
+  ;; CHECK:      (global $once_flag (mut i32) (i32.const 0))
+  (global $once_flag (mut i32) (i32.const 0))
+
+  ;; CHECK:      (global $br_flag (mut i32) (i32.const 0))
+  (global $br_flag (mut i32) (i32.const 0))
+
+  ;; CHECK:      (global $pure_g (mut i32) (i32.const 0))
+  (global $pure_g (mut i32) (i32.const 0))
+
+  ;; CHECK:      (func $once_if
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (i32.eqz
+  ;; CHECK-NEXT:    (global.get $once_flag)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (global.set $once_flag
+  ;; CHECK-NEXT:     (i32.const 1)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (call $effect)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $once_if
+    (if
+      (i32.eqz (global.get $once_flag))
+      (then
+        (global.set $once_flag (i32.const 1))
+        (call $effect)
+      )
+    )
+  )
+
+  ;; CHECK:      (func $once_br
+  ;; CHECK-NEXT:  (block $out
+  ;; CHECK-NEXT:   (br_if $out
+  ;; CHECK-NEXT:    (global.get $br_flag)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (global.set $br_flag
+  ;; CHECK-NEXT:    (i32.const 1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (call $effect)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $once_br
+    (block $out
+      (br_if $out (global.get $br_flag))
+      (global.set $br_flag (i32.const 1))
+      (call $effect)
+    )
+  )
+
+  ;; CHECK:      (func $pure_once
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (i32.eqz
+  ;; CHECK-NEXT:    (global.get $pure_g)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (global.set $pure_g
+  ;; CHECK-NEXT:     (i32.const 42)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $pure_once
+    (if
+      (i32.eqz (global.get $pure_g))
+      (then
+        (global.set $pure_g (i32.const 42))
+      )
+    )
+  )
+
+  ;; CHECK:      (func $dedup_and_hoist (param $c i32) (result i32)
+  ;; CHECK-NEXT:  (call $once_if)
+  ;; CHECK-NEXT:  (block (result i32)
+  ;; CHECK-NEXT:   (call $once_br)
+  ;; CHECK-NEXT:   (if (result i32)
+  ;; CHECK-NEXT:    (local.get $c)
+  ;; CHECK-NEXT:    (then
+  ;; CHECK-NEXT:     (call $pure_once)
+  ;; CHECK-NEXT:     (global.get $pure_g)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (else
+  ;; CHECK-NEXT:     (i32.const 7)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $dedup_and_hoist (param $c i32) (result i32)
+    ;; Duplicate calls to $once_if and $once_br are eliminated; common leading
+    ;; calls in if/else are hoisted; vestigial $pure_once call in else (which
+    ;; does not read $pure_g) is eliminated while the needed call in then is kept.
+    (call $once_if)
+    (call $once_if)
+    (if (result i32)
+      (local.get $c)
+      (then
+        (call $once_br)
+        (call $once_if)
+        (call $pure_once)
+        (global.get $pure_g)
+      )
+      (else
+        (call $once_br)
+        (call $pure_once)
+        (i32.const 7)
+      )
+    )
+  )
+)

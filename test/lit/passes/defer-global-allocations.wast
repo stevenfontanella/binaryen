@@ -1739,3 +1739,85 @@
 ;; CHECK-NEXT:   (local.get $2)
 ;; CHECK-NEXT:  )
 ;; CHECK-NEXT: )
+
+(module
+  ;; CHECK:      (type $box (struct (field i32)))
+  (type $box (struct (field i32)))
+
+  ;; CHECK:      (type $1 (func (param i32) (result (ref null $box))))
+
+  ;; CHECK:      (type $2 (func))
+
+  (global $flag (mut i32) (i32.const 0))
+  ;; CHECK:      (global $g_hoisted (ref $box) (struct.new $box
+  ;; CHECK-NEXT:  (i32.const 10)
+  ;; CHECK-NEXT: ))
+  (global $g_hoisted (ref $box) (struct.new $box (i32.const 10)))
+  ;; CHECK:      (global $g_lazy (mut (ref null $box)) (ref.null none))
+  (global $g_lazy (mut (ref null $box)) (ref.null none))
+
+  ;; CHECK:      (export "caller" (func $caller))
+
+  ;; CHECK:      (func $helper (type $1) (param $x i32) (result (ref null $box))
+  ;; CHECK-NEXT:  (struct.new $box
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $helper (param $x i32) (result (ref null $box))
+    (struct.new $box (local.get $x))
+  )
+
+  ;; CHECK:      (func $clinit (type $2)
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (ref.is_null
+  ;; CHECK-NEXT:    (global.get $g_lazy)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (global.set $g_lazy
+  ;; CHECK-NEXT:     (call $helper
+  ;; CHECK-NEXT:      (i32.const 20)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $clinit
+    (if
+      (i32.eqz (global.get $flag))
+      (then
+        (global.set $flag (i32.const 1))
+        (global.set $g_lazy (call $helper (i32.const 20)))
+      )
+    )
+  )
+
+  ;; CHECK:      (func $caller (type $1) (param $c i32) (result (ref null $box))
+  ;; CHECK-NEXT:  (if (result (ref null $box))
+  ;; CHECK-NEXT:   (local.get $c)
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (global.get $g_hoisted)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (else
+  ;; CHECK-NEXT:    (call $clinit)
+  ;; CHECK-NEXT:    (global.get $g_lazy)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $caller (export "caller") (param $c i32) (result (ref null $box))
+    ;; After $g_hoisted is hoisted out of $clinit, the (call $clinit) in the
+    ;; then-branch becomes vestigial and is eliminated, while the duplicate
+    ;; (call $clinit) in the else-branch is deduplicated.
+    (if (result (ref null $box))
+      (local.get $c)
+      (then
+        (call $clinit)
+        (global.get $g_hoisted)
+      )
+      (else
+        (call $clinit)
+        (call $clinit)
+        (global.get $g_lazy)
+      )
+    )
+  )
+)

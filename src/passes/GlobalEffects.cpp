@@ -800,20 +800,29 @@ void propagateEffects(
       }
       if (auto* b = f->body->dynCast<Block>()) {
         if (b->list.size() >= 2) {
-          auto* iff = b->list[0]->dynCast<If>();
           auto* gs = b->list[1]->dynCast<GlobalSet>();
-          if (iff && !iff->ifFalse && gs) {
-            auto* gg = iff->condition->dynCast<GlobalGet>();
-            auto* c = gs->value->dynCast<Const>();
-            bool exits = iff->ifTrue->is<Return>();
-            if (!exits) {
-              if (auto* br = iff->ifTrue->dynCast<Break>()) {
-                exits = !br->condition && br->name == b->name;
+          auto* c = gs ? gs->value->dynCast<Const>() : nullptr;
+          if (gs && c && !c->value.isZero()) {
+            if (auto* iff = b->list[0]->dynCast<If>()) {
+              if (!iff->ifFalse) {
+                auto* gg = iff->condition->dynCast<GlobalGet>();
+                bool exits = iff->ifTrue->is<Return>();
+                if (!exits) {
+                  if (auto* br = iff->ifTrue->dynCast<Break>()) {
+                    exits = !br->condition && br->name == b->name;
+                  }
+                }
+                if (gg && exits && gg->name == gs->name) {
+                  return true;
+                }
               }
-            }
-            if (gg && exits && gg->name == gs->name && c &&
-                !c->value.isZero()) {
-              return true;
+            } else if (auto* br = b->list[0]->dynCast<Break>()) {
+              if (br->condition && !br->value && br->name == b->name) {
+                auto* gg = br->condition->dynCast<GlobalGet>();
+                if (gg && gg->name == gs->name) {
+                  return true;
+                }
+              }
             }
           }
         }

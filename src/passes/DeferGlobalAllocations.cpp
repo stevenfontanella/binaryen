@@ -72,6 +72,7 @@
 #include "ir/effects.h"
 #include "ir/find_all.h"
 #include "ir/iteration.h"
+#include "ir/manipulation.h"
 #include "ir/module-utils.h"
 #include "ir/names.h"
 #include "ir/utils.h"
@@ -4855,6 +4856,1128 @@ private:
 
     for (auto* fn : modifiedFuncs) {
       ReFinalize().walkFunctionInModule(fn, module);
+    }
+
+    if (!onlyArrays) {
+      eliminateRedundantOnceCalls();
+    }
+  }
+
+  void eliminateRedundantOnceCalls() {
+    struct OnceCallOpt {
+      Module& wasm;
+      const PassOptions& options;
+
+      std::unordered_set<Name> onceFuncs;
+      std::unordered_map<Name, std::unordered_set<Name>> impliedOnce;
+      std::unordered_map<Name, std::unordered_set<Name>> onceWrittenGlobals;
+
+      std::unordered_set<Name> pureLazyOnce;
+      std::unordered_set<Name> safePureOnce;
+      std::unordered_map<Name, std::unordered_set<Name>> pureTransitiveGlobals;
+      std::unordered_set<Name> allSafePureGlobals;
+
+      std::unordered_set<Name> nonCodeGlobals;
+      std::unordered_set<Name> resetZeroGlobals;
+      std::unordered_map<Name, std::unordered_set<Name>> funcGets;
+      std::unordered_map<Name, std::unordered_set<Name>> funcSets;
+      std::unordered_map<Name, std::unordered_map<Name, Index>> funcSetCounts;
+      std::unordered_map<Name, std::unordered_set<Name>> funcCalls;
+      std::unordered_map<Name, std::unordered_set<Name>> globalWriterFuncs;
+      std::unordered_map<Name, std::unordered_set<Name>> globalReaderFuncs;
+
+      OnceCallOpt(Module& wasm, const PassOptions& options)
+        : wasm(wasm), options(options) {}
+
+      static bool extractGuardGlobal(Expression* cond, Name& gOut) {
+        if (auto* r = cond->dynCast<RefIsNull>()) {
+          if (auto* gg = r->value->dynCast<GlobalGet>()) {
+            gOut = gg->name;
+            return true;
+          }
+        }
+        if (auto* u = cond->dynCast<Unary>()) {
+          if (u->op == EqZInt32) {
+            if (auto* gg = u->value->dynCast<GlobalGet>()) {
+              gOut = gg->name;
+              return true;
+            }
+          }
+        }
+        return false;
+      }
+
+      static bool isZeroOrNullExpr(Expression* e) {
+        if (!e) {
+          return false;
+        }
+        while (auto* ls = e->dynCast<LocalSet>()) {
+          e = ls->value;
+        }
+        if (e->is<RefNull>()) {
+          return true;
+        }
+        if (auto* c = e->dynCast<Const>()) {
+          return c->value.isZero();
+        }
+        return false;
+      }
+
+      static bool doesNotReturn(Expression* e) {
+        if (!e) {
+          return false;
+        }
+        if (e->type == Type::unreachable || e->is<Return>() ||
+            e->is<Throw>() || e->is<Rethrow>() || e->is<Unreachable>() ||
+            e->is<Switch>()) {
+          return true;
+        }
+        if (auto* br = e->dynCast<Break>()) {
+          return !br->condition;
+        }
+        return false;
+      }
+
+      bool isValidGuardGlobal(Name gName) const {
+        auto* g = wasm.getGlobalOrNull(gName);
+        if (!g || g->imported() || !g->mutable_ || !g->init) {
+          return false;
+        }
+        if (nonCodeGlobals.contains(gName) ||
+            resetZeroGlobals.contains(gName)) {
+          return false;
+        }
+        return isZeroOrNullExpr(g->init);
+      }
+
+      static bool itemMayExitBlockOrFunc(Expression* item, Name blockName) {
+        if (!FindAll<Return>(item).list.empty()) {
+          return true;
+        }
+        if (blockName.is()) {
+          for (auto* br : FindAll<Break>(item).list) {
+            if (br->name == blockName) {
+              return true;
+            }
+          }
+          for (auto* sw : FindAll<Switch>(item).list) {
+            if (sw->default_ == blockName) {
+              return true;
+            }
+            for (auto t : sw->targets) {
+              if (t == blockName) {
+                return true;
+              }
+            }
+          }
+        }
+        return false;
+      }
+
+      bool
+      topLevelSetsGlobal(Expression* body, Name gName, int depth = 0) const {
+        if (!body || depth > 1) {
+          return false;
+        }
+        if (auto* gs = body->dynCast<GlobalSet>()) {
+          return gs->name == gName;
+        }
+        if (auto* c = body->dynCast<Call>()) {
+          if (auto* callee = wasm.getFunctionOrNull(c->target)) {
+            if (!callee->imported() && callee->body) {
+              return topLevelSetsGlobal(callee->body, gName, depth + 1);
+            }
+          }
+          return false;
+        }
+        if (auto* b = body->dynCast<Block>()) {
+          for (auto* item : b->list) {
+            if (topLevelSetsGlobal(item, gName, depth)) {
+              return true;
+            }
+            if (itemMayExitBlockOrFunc(item, b->name)) {
+              return false;
+            }
+          }
+        }
+        return false;
+      }
+
+      bool isPureInitValue(Expression* val) const {
+        struct Validator : public PostWalker<Validator> {
+          const OnceCallOpt& parent;
+          bool ok = true;
+          Validator(const OnceCallOpt& parent) : parent(parent) {}
+          void visitExpression(Expression* curr) {
+            if (!ok) {
+              return;
+            }
+            if (auto* c = curr->dynCast<Call>()) {
+              if (c->isReturn) {
+                ok = false;
+                return;
+              }
+              if (c->type == Type::none) {
+                if (!c->operands.empty() ||
+                    !parent.pureLazyOnce.contains(c->target)) {
+                  ok = false;
+                }
+                return;
+              }
+              auto* targetFn = parent.wasm.getFunctionOrNull(c->target);
+              if (!targetFn || targetFn->imported()) {
+                ok = false;
+                return;
+              }
+              auto sIt = parent.funcSets.find(c->target);
+              if (sIt != parent.funcSets.end()) {
+                for (Name hg : sIt->second) {
+                  auto wIt = parent.globalWriterFuncs.find(hg);
+                  auto rIt = parent.globalReaderFuncs.find(hg);
+                  if ((wIt != parent.globalWriterFuncs.end() &&
+                       wIt->second.size() > 1) ||
+                      (rIt != parent.globalReaderFuncs.end() &&
+                       (rIt->second.size() > 1 ||
+                        (rIt->second.size() == 1 &&
+                         !rIt->second.contains(c->target))))) {
+                    ok = false;
+                    return;
+                  }
+                }
+              }
+              return;
+            }
+            if (curr->is<Const>() || curr->is<RefNull>() ||
+                curr->is<RefFunc>() || curr->is<RefI31>() ||
+                curr->is<StringConst>() || curr->is<GlobalGet>() ||
+                curr->is<StructNew>() || curr->is<ArrayNew>() ||
+                curr->is<ArrayNewData>() || curr->is<ArrayNewElem>() ||
+                curr->is<ArrayNewFixed>() || curr->is<StructGet>() ||
+                curr->is<ArrayGet>() || curr->is<ArrayLen>() ||
+                curr->is<RefCast>() || curr->is<RefTest>() ||
+                curr->is<RefAs>() || curr->is<RefIsNull>() ||
+                curr->is<RefEq>() || curr->is<I31Get>() ||
+                curr->is<Unary>() || curr->is<Binary>() ||
+                curr->is<Select>() || curr->is<Block>()) {
+              return;
+            }
+            ok = false;
+          }
+        } validator(*this);
+        validator.walk(val);
+        return validator.ok;
+      }
+
+      void analyze() {
+        for (auto& exp : wasm.exports) {
+          if (exp->kind == ExternalKind::Global) {
+            nonCodeGlobals.insert(*exp->getInternalName());
+          }
+        }
+        for (auto& g : wasm.globals) {
+          if (!g->imported() && g->init) {
+            for (auto* gg : FindAll<GlobalGet>(g->init).list) {
+              nonCodeGlobals.insert(gg->name);
+            }
+          }
+        }
+        ModuleUtils::iterActiveElementSegments(wasm, [&](ElementSegment* seg) {
+          for (auto* gg : FindAll<GlobalGet>(seg->offset).list) {
+            nonCodeGlobals.insert(gg->name);
+          }
+        });
+        ModuleUtils::iterActiveDataSegments(wasm, [&](DataSegment* seg) {
+          for (auto* gg : FindAll<GlobalGet>(seg->offset).list) {
+            nonCodeGlobals.insert(gg->name);
+          }
+        });
+
+        struct FuncSummary {
+          std::unordered_set<Name> gets;
+          std::unordered_set<Name> sets;
+          std::unordered_map<Name, Index> setCounts;
+          std::unordered_set<Name> calls;
+          std::unordered_set<Name> resetZero;
+        };
+        ModuleUtils::ParallelFunctionAnalysis<FuncSummary> analysis(
+          wasm, [&](Function* func, FuncSummary& summary) {
+            if (func->imported() || !func->body) {
+              return;
+            }
+            struct Scanner : public PostWalker<Scanner> {
+              FuncSummary& summary;
+              Scanner(FuncSummary& summary) : summary(summary) {}
+              void visitGlobalGet(GlobalGet* curr) {
+                summary.gets.insert(curr->name);
+              }
+              void visitGlobalSet(GlobalSet* curr) {
+                summary.sets.insert(curr->name);
+                summary.setCounts[curr->name]++;
+                if (OnceCallOpt::isZeroOrNullExpr(curr->value)) {
+                  summary.resetZero.insert(curr->name);
+                }
+              }
+              void visitCall(Call* curr) { summary.calls.insert(curr->target); }
+            } scanner(summary);
+            scanner.walk(func->body);
+          });
+
+        for (auto& [func, summary] : analysis.map) {
+          if (func->imported()) {
+            continue;
+          }
+          Name fn = func->name;
+          for (Name g : summary.gets) {
+            globalReaderFuncs[g].insert(fn);
+          }
+          for (Name g : summary.sets) {
+            globalWriterFuncs[g].insert(fn);
+          }
+          for (Name g : summary.resetZero) {
+            resetZeroGlobals.insert(g);
+          }
+          funcGets[fn] = std::move(summary.gets);
+          funcSets[fn] = std::move(summary.sets);
+          funcSetCounts[fn] = std::move(summary.setCounts);
+          funcCalls[fn] = std::move(summary.calls);
+        }
+
+        std::unordered_map<Name, std::vector<Name>> directImplied;
+        bool changed = true;
+        while (changed) {
+          changed = false;
+          for (auto& fPtr : wasm.functions) {
+            Function* f = fPtr.get();
+            if (f->imported() || !f->body || f->getNumParams() != 0 ||
+                f->getResults() != Type::none || onceFuncs.contains(f->name)) {
+              continue;
+            }
+            if (auto* b = f->body->dynCast<Block>()) {
+              if (b->list.size() >= 2) {
+                Name guardG;
+                if (auto* br = b->list[0]->dynCast<Break>()) {
+                  if (br->condition && !br->value && br->name == b->name) {
+                    if (auto* gg = br->condition->dynCast<GlobalGet>()) {
+                      guardG = gg->name;
+                    }
+                  }
+                } else if (auto* iff = b->list[0]->dynCast<If>()) {
+                  if (!iff->ifFalse) {
+                    if (auto* gg = iff->condition->dynCast<GlobalGet>()) {
+                      bool exits = iff->ifTrue->is<Return>();
+                      if (!exits) {
+                        if (auto* br = iff->ifTrue->dynCast<Break>()) {
+                          exits = !br->condition && br->name == b->name;
+                        }
+                      }
+                      if (exits) {
+                        guardG = gg->name;
+                      }
+                    }
+                  }
+                }
+                if (guardG.is() && isValidGuardGlobal(guardG)) {
+                  auto* gs = b->list[1]->dynCast<GlobalSet>();
+                  if (gs && gs->name == guardG) {
+                    onceFuncs.insert(f->name);
+                    auto& imp = directImplied[f->name];
+                    for (Index i = 2; i < b->list.size(); i++) {
+                      if (auto* c = b->list[i]->dynCast<Call>()) {
+                        imp.push_back(c->target);
+                      }
+                      if (itemMayExitBlockOrFunc(b->list[i], b->name)) {
+                        break;
+                      }
+                    }
+                    changed = true;
+                    continue;
+                  }
+                }
+              }
+            }
+
+            If* mainIf = f->body->dynCast<If>();
+            std::vector<Name> outerOnceCalls;
+            if (!mainIf) {
+              if (auto* b = f->body->dynCast<Block>()) {
+                bool allValid = true;
+                for (auto* item : b->list) {
+                  if (auto* iff = item->dynCast<If>()) {
+                    if (mainIf) {
+                      allValid = false;
+                      break;
+                    }
+                    mainIf = iff;
+                  } else if (auto* c = item->dynCast<Call>()) {
+                    if (onceFuncs.contains(c->target)) {
+                      outerOnceCalls.push_back(c->target);
+                    } else {
+                      allValid = false;
+                      break;
+                    }
+                  } else {
+                    allValid = false;
+                    break;
+                  }
+                }
+                if (!allValid) {
+                  mainIf = nullptr;
+                }
+              }
+            }
+            if (mainIf && !mainIf->ifFalse) {
+              Name guardG;
+              if (extractGuardGlobal(mainIf->condition, guardG) &&
+                  isValidGuardGlobal(guardG) &&
+                  topLevelSetsGlobal(mainIf->ifTrue, guardG)) {
+                onceFuncs.insert(f->name);
+                auto& imp = directImplied[f->name];
+                for (Name oc : outerOnceCalls) {
+                  imp.push_back(oc);
+                }
+                if (auto* c = mainIf->ifTrue->dynCast<Call>()) {
+                  imp.push_back(c->target);
+                } else if (auto* tb = mainIf->ifTrue->dynCast<Block>()) {
+                  for (auto* item : tb->list) {
+                    if (auto* c = item->dynCast<Call>()) {
+                      imp.push_back(c->target);
+                    }
+                    if (itemMayExitBlockOrFunc(item, tb->name)) {
+                      break;
+                    }
+                  }
+                }
+                changed = true;
+              }
+            }
+          }
+        }
+
+        if (onceFuncs.empty()) {
+          return;
+        }
+
+        for (Name fn : onceFuncs) {
+          auto& impSet = impliedOnce[fn];
+          impSet.insert(fn);
+          std::vector<Name> worklist = {fn};
+          while (!worklist.empty()) {
+            Name cur = worklist.back();
+            worklist.pop_back();
+            auto dIt = directImplied.find(cur);
+            if (dIt != directImplied.end()) {
+              for (Name nxt : dIt->second) {
+                if (onceFuncs.contains(nxt) && impSet.insert(nxt).second) {
+                  worklist.push_back(nxt);
+                }
+              }
+            }
+          }
+
+          auto& written = onceWrittenGlobals[fn];
+          std::unordered_set<Name> visitedCallees = {fn};
+          std::vector<Name> callWorklist = {fn};
+          while (!callWorklist.empty()) {
+            Name cur = callWorklist.back();
+            callWorklist.pop_back();
+            auto sIt = funcSets.find(cur);
+            if (sIt != funcSets.end()) {
+              written.insert(sIt->second.begin(), sIt->second.end());
+            }
+            auto cIt = funcCalls.find(cur);
+            if (cIt != funcCalls.end()) {
+              for (Name callee : cIt->second) {
+                if (visitedCallees.insert(callee).second) {
+                  callWorklist.push_back(callee);
+                }
+              }
+            }
+          }
+        }
+
+        std::unordered_map<Name, std::unordered_set<Name>> pureDirectGlobals;
+        std::unordered_map<Name, std::unordered_set<Name>> pureDirectPrereqs;
+        changed = true;
+        while (changed) {
+          changed = false;
+          for (Name fn : onceFuncs) {
+            if (pureLazyOnce.contains(fn)) {
+              continue;
+            }
+            Function* f = wasm.getFunction(fn);
+            if (!f->vars.empty()) {
+              continue;
+            }
+            auto* iff = f->body->dynCast<If>();
+            Name guardG;
+            if (!iff || iff->ifFalse ||
+                !extractGuardGlobal(iff->condition, guardG)) {
+              continue;
+            }
+            std::vector<Expression*> stmts;
+            if (auto* tb = iff->ifTrue->dynCast<Block>()) {
+              if (tb->name.is()) {
+                continue;
+              }
+              for (auto* item : tb->list) {
+                stmts.push_back(item);
+              }
+            } else {
+              stmts.push_back(iff->ifTrue);
+            }
+
+            std::unordered_set<Name> writtenGs;
+            std::unordered_set<Name> prereqs;
+            bool ok = true;
+            auto scIt = funcSetCounts.find(fn);
+            for (Expression* stmt : stmts) {
+              if (auto* c = stmt->dynCast<Call>()) {
+                if (!c->operands.empty() || !pureLazyOnce.contains(c->target)) {
+                  ok = false;
+                  break;
+                }
+                prereqs.insert(c->target);
+              } else if (auto* gs = stmt->dynCast<GlobalSet>()) {
+                Name wg = gs->name;
+                if (!isValidGuardGlobal(wg)) {
+                  ok = false;
+                  break;
+                }
+                auto wIt = globalWriterFuncs.find(wg);
+                if (wIt == globalWriterFuncs.end() || wIt->second.size() != 1 ||
+                    !wIt->second.contains(fn)) {
+                  ok = false;
+                  break;
+                }
+                if (scIt == funcSetCounts.end() ||
+                    scIt->second.find(wg)->second != 1) {
+                  ok = false;
+                  break;
+                }
+                if (!isPureInitValue(gs->value)) {
+                  ok = false;
+                  break;
+                }
+                for (auto* subCall : FindAll<Call>(gs->value).list) {
+                  if (subCall->type == Type::none &&
+                      pureLazyOnce.contains(subCall->target)) {
+                    prereqs.insert(subCall->target);
+                  }
+                }
+                writtenGs.insert(wg);
+              } else {
+                ok = false;
+                break;
+              }
+            }
+            if (ok && writtenGs.contains(guardG)) {
+              pureLazyOnce.insert(fn);
+              pureDirectGlobals[fn] = std::move(writtenGs);
+              pureDirectPrereqs[fn] = std::move(prereqs);
+              changed = true;
+            }
+          }
+        }
+
+        if (pureLazyOnce.empty()) {
+          return;
+        }
+
+        for (Name fn : pureLazyOnce) {
+          auto& tg = pureTransitiveGlobals[fn];
+          std::unordered_set<Name> visited = {fn};
+          std::vector<Name> worklist = {fn};
+          while (!worklist.empty()) {
+            Name cur = worklist.back();
+            worklist.pop_back();
+            for (Name g : pureDirectGlobals[cur]) {
+              tg.insert(g);
+            }
+            for (Name p : pureDirectPrereqs[cur]) {
+              if (visited.insert(p).second) {
+                worklist.push_back(p);
+              }
+            }
+          }
+        }
+
+        for (Name fn : pureLazyOnce) {
+          const auto& tg = pureTransitiveGlobals[fn];
+          bool allReadersProtected = true;
+          for (Name g : tg) {
+            auto rIt = globalReaderFuncs.find(g);
+            if (rIt == globalReaderFuncs.end()) {
+              continue;
+            }
+            for (Name readerName : rIt->second) {
+              if (pureLazyOnce.contains(readerName) &&
+                  pureTransitiveGlobals[readerName].contains(g)) {
+                continue;
+              }
+              Function* readerFn = wasm.getFunction(readerName);
+              if (!verifyReaderDominatesGlobal(readerFn, g)) {
+                allReadersProtected = false;
+                break;
+              }
+            }
+            if (!allReadersProtected) {
+              break;
+            }
+          }
+          if (allReadersProtected) {
+            safePureOnce.insert(fn);
+          }
+        }
+
+        changed = true;
+        while (changed) {
+          changed = false;
+          for (auto it = safePureOnce.begin(); it != safePureOnce.end();) {
+            bool ok = true;
+            for (Name p : pureDirectPrereqs[*it]) {
+              if (!safePureOnce.contains(p)) {
+                ok = false;
+                break;
+              }
+            }
+            if (!ok) {
+              it = safePureOnce.erase(it);
+              changed = true;
+            } else {
+              ++it;
+            }
+          }
+        }
+
+        for (Name fn : safePureOnce) {
+          for (Name g : pureTransitiveGlobals[fn]) {
+            allSafePureGlobals.insert(g);
+          }
+        }
+      }
+
+      bool verifyReaderDominatesGlobal(Function* readerFn, Name targetG) const {
+        if (!readerFn || !readerFn->body) {
+          return false;
+        }
+        std::unordered_map<Name, std::vector<bool>> breakStates;
+        bool allDominated = true;
+
+        std::function<void(Expression*, bool&)> walk = [&](Expression* curr,
+                                                           bool& isInit) {
+          if (!curr || !allDominated) {
+            return;
+          }
+          if (auto* gg = curr->dynCast<GlobalGet>()) {
+            if (gg->name == targetG && !isInit) {
+              allDominated = false;
+            }
+            return;
+          }
+          if (auto* c = curr->dynCast<Call>()) {
+            for (auto* op : c->operands) {
+              walk(op, isInit);
+            }
+            auto it = pureTransitiveGlobals.find(c->target);
+            if (it != pureTransitiveGlobals.end() &&
+                it->second.contains(targetG)) {
+              isInit = true;
+            }
+            return;
+          }
+          if (auto* iff = curr->dynCast<If>()) {
+            walk(iff->condition, isInit);
+            bool entry = isInit;
+            bool trueInit = entry;
+            walk(iff->ifTrue, trueInit);
+            bool trueReach = !doesNotReturn(iff->ifTrue);
+            if (iff->ifFalse) {
+              bool falseInit = entry;
+              walk(iff->ifFalse, falseInit);
+              bool falseReach = !doesNotReturn(iff->ifFalse);
+              if (trueReach && falseReach) {
+                isInit = trueInit && falseInit;
+              } else if (trueReach) {
+                isInit = trueInit;
+              } else if (falseReach) {
+                isInit = falseInit;
+              }
+            } else {
+              isInit = entry;
+            }
+            return;
+          }
+          if (auto* b = curr->dynCast<Block>()) {
+            if (b->name.is()) {
+              breakStates[b->name].clear();
+            }
+            bool fallthroughReach = true;
+            for (auto* item : b->list) {
+              walk(item, isInit);
+              if (doesNotReturn(item)) {
+                fallthroughReach = false;
+                break;
+              }
+            }
+            if (b->name.is()) {
+              auto& bStates = breakStates[b->name];
+              if (!bStates.empty()) {
+                bool joined = fallthroughReach ? isInit : true;
+                for (bool bs : bStates) {
+                  joined = joined && bs;
+                }
+                isInit = joined;
+              }
+              breakStates.erase(b->name);
+            }
+            return;
+          }
+          if (auto* br = curr->dynCast<Break>()) {
+            if (br->value) {
+              walk(br->value, isInit);
+            }
+            if (br->condition) {
+              walk(br->condition, isInit);
+            }
+            auto it = breakStates.find(br->name);
+            if (it != breakStates.end()) {
+              it->second.push_back(isInit);
+            }
+            return;
+          }
+          if (auto* sw = curr->dynCast<Switch>()) {
+            if (sw->value) {
+              walk(sw->value, isInit);
+            }
+            walk(sw->condition, isInit);
+            for (Name t : sw->targets) {
+              auto it = breakStates.find(t);
+              if (it != breakStates.end()) {
+                it->second.push_back(isInit);
+              }
+            }
+            auto it = breakStates.find(sw->default_);
+            if (it != breakStates.end()) {
+              it->second.push_back(isInit);
+            }
+            return;
+          }
+          if (auto* loop = curr->dynCast<Loop>()) {
+            bool entry = isInit;
+            bool bodyInit = entry;
+            walk(loop->body, bodyInit);
+            isInit = entry;
+            return;
+          }
+          if (auto* tryy = curr->dynCast<Try>()) {
+            bool entry = isInit;
+            bool bodyInit = entry;
+            walk(tryy->body, bodyInit);
+            for (auto* cb : tryy->catchBodies) {
+              bool cbInit = entry;
+              walk(cb, cbInit);
+            }
+            isInit = entry;
+            return;
+          }
+          for (auto* child : ChildIterator(curr)) {
+            walk(child, isInit);
+          }
+        };
+
+        bool init = false;
+        walk(readerFn->body, init);
+        return allDominated;
+      }
+
+      bool optimizeFunction(Function* func) const {
+        if (!func || func->imported() || !func->body || onceFuncs.empty()) {
+          return false;
+        }
+        bool hasOnceCall = false;
+        for (auto* c : FindAll<Call>(func->body).list) {
+          if (onceFuncs.contains(c->target)) {
+            hasOnceCall = true;
+            break;
+          }
+        }
+        if (!hasOnceCall) {
+          return false;
+        }
+
+        bool anyChanged = false;
+
+        struct State {
+          std::unordered_set<Name> activeOnce;
+          std::unordered_map<Name, std::unordered_set<Call*>> activeProviders;
+        };
+
+        auto joinStates = [](const std::vector<State>& states) -> State {
+          State res;
+          if (states.empty()) {
+            return res;
+          }
+          res.activeOnce = states[0].activeOnce;
+          for (size_t i = 1; i < states.size(); i++) {
+            for (auto it = res.activeOnce.begin();
+                 it != res.activeOnce.end();) {
+              if (!states[i].activeOnce.contains(*it)) {
+                it = res.activeOnce.erase(it);
+              } else {
+                ++it;
+              }
+            }
+          }
+          for (const auto& st : states) {
+            for (const auto& [g, calls] : st.activeProviders) {
+              res.activeProviders[g].insert(calls.begin(), calls.end());
+            }
+          }
+          return res;
+        };
+
+        auto runDominatorPass = [&]() -> bool {
+          std::unordered_map<Name, std::vector<State>> breakStates;
+          std::unordered_set<Call*> dominatedCalls;
+          std::unordered_set<Call*> allSafePureCallNodes;
+          std::unordered_set<Call*> neededSafePureCallNodes;
+
+          State initialState;
+          if (onceFuncs.contains(func->name)) {
+            initialState.activeOnce.insert(func->name);
+          }
+
+          std::function<void(Expression*, State&)> walk = [&](Expression* curr,
+                                                              State& state) {
+            if (!curr) {
+              return;
+            }
+            if (auto* gg = curr->dynCast<GlobalGet>()) {
+              if (allSafePureGlobals.contains(gg->name)) {
+                auto pIt = state.activeProviders.find(gg->name);
+                if (pIt != state.activeProviders.end()) {
+                  neededSafePureCallNodes.insert(pIt->second.begin(),
+                                                 pIt->second.end());
+                }
+              }
+              return;
+            }
+            if (auto* c = curr->dynCast<Call>()) {
+              for (auto* op : c->operands) {
+                walk(op, state);
+              }
+              if (onceFuncs.contains(c->target)) {
+                if (state.activeOnce.contains(c->target)) {
+                  dominatedCalls.insert(c);
+                } else {
+                  auto impIt = impliedOnce.find(c->target);
+                  if (impIt != impliedOnce.end()) {
+                    state.activeOnce.insert(impIt->second.begin(),
+                                            impIt->second.end());
+                  } else {
+                    state.activeOnce.insert(c->target);
+                  }
+                  if (safePureOnce.contains(c->target)) {
+                    allSafePureCallNodes.insert(c);
+                    auto tgIt = pureTransitiveGlobals.find(c->target);
+                    if (tgIt != pureTransitiveGlobals.end()) {
+                      for (Name g : tgIt->second) {
+                        auto& prov = state.activeProviders[g];
+                        if (prov.empty()) {
+                          prov.insert(c);
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+              return;
+            }
+            if (auto* iff = curr->dynCast<If>()) {
+              walk(iff->condition, state);
+              State entry = state;
+              State trueState = entry;
+              walk(iff->ifTrue, trueState);
+              bool trueReach = !doesNotReturn(iff->ifTrue);
+              if (iff->ifFalse) {
+                State falseState = entry;
+                walk(iff->ifFalse, falseState);
+                bool falseReach = !doesNotReturn(iff->ifFalse);
+                std::vector<State> branches;
+                if (trueReach) {
+                  branches.push_back(std::move(trueState));
+                }
+                if (falseReach) {
+                  branches.push_back(std::move(falseState));
+                }
+                if (!branches.empty()) {
+                  state = joinStates(branches);
+                }
+              } else {
+                state = std::move(entry);
+              }
+              return;
+            }
+            if (auto* b = curr->dynCast<Block>()) {
+              if (b->name.is()) {
+                breakStates[b->name].clear();
+              }
+              bool fallthroughReach = true;
+              for (auto* item : b->list) {
+                walk(item, state);
+                if (doesNotReturn(item)) {
+                  fallthroughReach = false;
+                  break;
+                }
+              }
+              if (b->name.is()) {
+                auto& bStates = breakStates[b->name];
+                if (!bStates.empty()) {
+                  std::vector<State> branches;
+                  if (fallthroughReach) {
+                    branches.push_back(std::move(state));
+                  }
+                  for (auto& bs : bStates) {
+                    branches.push_back(std::move(bs));
+                  }
+                  state = joinStates(branches);
+                }
+                breakStates.erase(b->name);
+              }
+              return;
+            }
+            if (auto* br = curr->dynCast<Break>()) {
+              if (br->value) {
+                walk(br->value, state);
+              }
+              if (br->condition) {
+                walk(br->condition, state);
+              }
+              auto it = breakStates.find(br->name);
+              if (it != breakStates.end()) {
+                it->second.push_back(state);
+              }
+              return;
+            }
+            if (auto* sw = curr->dynCast<Switch>()) {
+              if (sw->value) {
+                walk(sw->value, state);
+              }
+              walk(sw->condition, state);
+              for (Name t : sw->targets) {
+                auto it = breakStates.find(t);
+                if (it != breakStates.end()) {
+                  it->second.push_back(state);
+                }
+              }
+              auto it = breakStates.find(sw->default_);
+              if (it != breakStates.end()) {
+                it->second.push_back(state);
+              }
+              return;
+            }
+            if (auto* loop = curr->dynCast<Loop>()) {
+              State entry = state;
+              State bodyState = entry;
+              walk(loop->body, bodyState);
+              state = std::move(entry);
+              return;
+            }
+            if (auto* tryy = curr->dynCast<Try>()) {
+              State entry = state;
+              State bodyState = entry;
+              walk(tryy->body, bodyState);
+              for (auto* cb : tryy->catchBodies) {
+                State cbState = entry;
+                walk(cb, cbState);
+              }
+              state = std::move(entry);
+              return;
+            }
+            for (auto* child : ChildIterator(curr)) {
+              walk(child, state);
+            }
+          };
+
+          walk(func->body, initialState);
+
+          bool passChanged = false;
+          bool removeUnusedSafePure = !pureLazyOnce.contains(func->name);
+          for (Call* c : dominatedCalls) {
+            ExpressionManipulator::nop(c);
+            passChanged = true;
+          }
+          if (removeUnusedSafePure) {
+            for (Call* c : allSafePureCallNodes) {
+              if (!neededSafePureCallNodes.contains(c) &&
+                  !dominatedCalls.contains(c)) {
+                ExpressionManipulator::nop(c);
+                passChanged = true;
+              }
+            }
+          }
+          return passChanged;
+        };
+
+        auto cleanNops = [&]() {
+          struct NopCleaner : public PostWalker<NopCleaner> {
+            Module& wasm;
+            const PassOptions& options;
+            NopCleaner(Module& wasm, const PassOptions& options)
+              : wasm(wasm), options(options) {}
+            void visitBlock(Block* curr) {
+              if (curr->list.size() <= 1) {
+                if (curr->list.size() == 1 && curr->list[0]->is<Nop>() &&
+                    !curr->name.is()) {
+                  ExpressionManipulator::nop(curr);
+                }
+                return;
+              }
+              curr->list.erase(
+                std::remove_if(curr->list.begin(),
+                               curr->list.end(),
+                               [](Expression* e) { return e->is<Nop>(); }),
+                curr->list.end());
+              if (curr->list.empty()) {
+                if (!curr->name.is()) {
+                  ExpressionManipulator::nop(curr);
+                } else {
+                  curr->list.push_back(Builder(wasm).makeNop());
+                }
+              }
+            }
+            void visitIf(If* curr) {
+              if (curr->ifFalse && curr->ifFalse->is<Nop>()) {
+                curr->ifFalse = nullptr;
+              }
+              if (!curr->ifFalse && curr->ifTrue->is<Nop>()) {
+                EffectAnalyzer condEff(options, wasm, curr->condition);
+                if (!condEff.hasSideEffects()) {
+                  ExpressionManipulator::nop(curr);
+                }
+              }
+            }
+          } cleaner(wasm, options);
+          cleaner.walk(func->body);
+        };
+
+        if (runDominatorPass()) {
+          cleanNops();
+          anyChanged = true;
+        }
+
+        struct IfHoister : public PostWalker<IfHoister> {
+          const OnceCallOpt& parent;
+          bool changed = false;
+          IfHoister(const OnceCallOpt& parent) : parent(parent) {}
+
+          Name getLeadingOnceCall(Expression* branch) const {
+            if (auto* c = branch->dynCast<Call>()) {
+              if (parent.onceFuncs.contains(c->target)) {
+                return c->target;
+              }
+            } else if (auto* b = branch->dynCast<Block>()) {
+              if (!b->list.empty()) {
+                if (auto* c = b->list[0]->dynCast<Call>()) {
+                  if (parent.onceFuncs.contains(c->target)) {
+                    return c->target;
+                  }
+                }
+              }
+            }
+            return Name();
+          }
+
+          Call* popLeadingOnceCall(Expression*& branch) {
+            if (auto* c = branch->dynCast<Call>()) {
+              branch = Builder(parent.wasm).makeNop();
+              return c;
+            }
+            auto* b = branch->cast<Block>();
+            auto* c = b->list[0]->cast<Call>();
+            if (b->list.size() == 1) {
+              b->list[0] = Builder(parent.wasm).makeNop();
+            } else {
+              b->list.erase(b->list.begin());
+            }
+            return c;
+          }
+
+          void visitIf(If* curr) {
+            if (!curr->ifFalse) {
+              return;
+            }
+            std::vector<Call*> hoistedCalls;
+            while (true) {
+              Name t1 = getLeadingOnceCall(curr->ifTrue);
+              if (!t1.is()) {
+                break;
+              }
+              Name t2 = getLeadingOnceCall(curr->ifFalse);
+              if (t1 != t2) {
+                break;
+              }
+              EffectAnalyzer condEff(
+                parent.options, parent.wasm, curr->condition);
+              if (condEff.transfersControlFlow() || condEff.trap ||
+                  condEff.throws() || condEff.calls ||
+                  !condEff.globalsWritten.empty()) {
+                break;
+              }
+              bool readsWrittenGlobal = false;
+              auto wIt = parent.onceWrittenGlobals.find(t1);
+              if (wIt != parent.onceWrittenGlobals.end()) {
+                for (const auto& g : condEff.mutableGlobalsRead) {
+                  if (wIt->second.contains(g)) {
+                    readsWrittenGlobal = true;
+                    break;
+                  }
+                }
+              }
+              if (readsWrittenGlobal) {
+                break;
+              }
+              Call* keptCall = popLeadingOnceCall(curr->ifTrue);
+              popLeadingOnceCall(curr->ifFalse);
+              hoistedCalls.push_back(keptCall);
+            }
+            if (!hoistedCalls.empty()) {
+              Builder builder(parent.wasm);
+              auto* seq = builder.makeBlock();
+              for (Call* c : hoistedCalls) {
+                seq->list.push_back(c);
+              }
+              seq->list.push_back(curr);
+              seq->finalize(curr->type);
+              replaceCurrent(seq);
+              changed = true;
+            }
+          }
+        } hoister(*this);
+        hoister.walk(func->body);
+        if (hoister.changed) {
+          anyChanged = true;
+          runDominatorPass();
+          cleanNops();
+        }
+
+        if (anyChanged) {
+          ReFinalize().walkFunctionInModule(func, &wasm);
+        }
+
+        return anyChanged;
+      }
+    };
+
+    OnceCallOpt opt(*module, getPassOptions());
+    opt.analyze();
+    if (!opt.onceFuncs.empty()) {
+      ModuleUtils::ParallelFunctionAnalysis<bool> runner(
+        *module, [&](Function* func, bool& changed) {
+          if (!func->imported()) {
+            changed = opt.optimizeFunction(func);
+          }
+        });
     }
   }
 

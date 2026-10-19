@@ -1432,3 +1432,42 @@
     )
   )
 )
+
+(module
+  ;; CHECK:      (type $S (struct (field i32)))
+  ;; SHRINK:      (type $S (struct (field i32)))
+  (type $S (struct (field i32)))
+
+  ;; CHECK:      (type $1 (func (param (ref null $S)) (result i32)))
+
+  ;; CHECK:      (func $two-use-struct-get-cse (type $1) (param $s (ref null $S)) (result i32)
+  ;; CHECK-NEXT:  (local $1 i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (local.tee $1
+  ;; CHECK-NEXT:    (struct.get $S 0
+  ;; CHECK-NEXT:     (local.get $s)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.get $1)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; SHRINK:      (type $1 (func (param (ref null $S)) (result i32)))
+
+  ;; SHRINK:      (func $two-use-struct-get-cse (type $1) (param $s (ref null $S)) (result i32)
+  ;; SHRINK-NEXT:  (local $1 i32)
+  ;; SHRINK-NEXT:  (i32.add
+  ;; SHRINK-NEXT:   (local.tee $1
+  ;; SHRINK-NEXT:    (struct.get $S 0
+  ;; SHRINK-NEXT:     (local.get $s)
+  ;; SHRINK-NEXT:    )
+  ;; SHRINK-NEXT:   )
+  ;; SHRINK-NEXT:   (local.get $1)
+  ;; SHRINK-NEXT:  )
+  ;; SHRINK-NEXT: )
+  (func $two-use-struct-get-cse (param $s (ref null $S)) (result i32)
+    (i32.add
+      (struct.get $S 0 (local.get $s))
+      (struct.get $S 0 (local.get $s))
+    )
+  )
+)
