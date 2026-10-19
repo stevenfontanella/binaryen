@@ -143,7 +143,7 @@ struct DeferGlobalAllocations : public Pass {
     // The field each leaf is stored in.
     std::vector<Field> leafFields;
     std::vector<Candidate> members;
-    Name absorbedArrayGlobal;
+    std::vector<std::pair<Name, Index>> primaryArrays;
     Index absorbedCount = 0;
     Name absorbedFactory;
     std::vector<Name> secondaryArrays;
@@ -404,7 +404,7 @@ struct DeferGlobalAllocations : public Pass {
       }
       if (valid && commonGroup &&
           (!isPreservedThunkGroup(*commonGroup) ||
-           !commonGroup->absorbedArrayGlobal.is())) {
+           commonGroup->primaryArrays.empty())) {
         candidateArrays[global->name] = commonGroup;
         candidateArrayOrder.push_back(global->name);
         if (allDistinct) {
@@ -614,7 +614,7 @@ struct DeferGlobalAllocations : public Pass {
       }
       if (isPreservedThunkGroup(*grp)) {
         for (Name arrName : it->second) {
-          if (grp->absorbedArrayGlobal.is()) {
+          if (!grp->primaryArrays.empty()) {
             break;
           }
           auto* anf = module->getGlobal(arrName)->init->cast<ArrayNewFixed>();
@@ -631,7 +631,7 @@ struct DeferGlobalAllocations : public Pass {
           }
           Index totalGets = totalArrayGlobalGets[arrName];
           bool treatAsOnce = totalArrayGlobalOnceGets[arrName] == totalGets;
-          grp->absorbedArrayGlobal = arrName;
+          grp->primaryArrays.push_back({arrName, 0});
           grp->absorbedCount = anf->values.size();
           for (Index k = 0; k < anf->values.size(); k++) {
             Name elemName = anf->values[k]->cast<GlobalGet>()->name;
@@ -744,20 +744,30 @@ struct DeferGlobalAllocations : public Pass {
         continue;
       }
 
-      Name primaryArr;
+      std::vector<std::pair<Name, Index>> primaryArrays;
       std::vector<Name> secArrays;
       std::unordered_set<Name> distinctAbsorbed;
       std::vector<Name> absorbedOrder;
       bool canUseData = module->features.hasBulkMemory();
       for (Name arrName : filteredArrays) {
         auto* anf = module->getGlobal(arrName)->init->cast<ArrayNewFixed>();
-        if (!primaryArr.is() && allDistinctArrays.count(arrName)) {
-          primaryArr = arrName;
+        bool canBePrimary =
+          allDistinctArrays.count(arrName) &&
+          absorbedOrder.size() + anf->values.size() <= MaxChunkSize;
+        if (canBePrimary) {
+          for (auto* val : anf->values) {
+            if (distinctAbsorbed.count(val->cast<GlobalGet>()->name)) {
+              canBePrimary = false;
+              break;
+            }
+          }
+        }
+        if (canBePrimary) {
+          primaryArrays.push_back({arrName, Index(absorbedOrder.size())});
           for (auto* val : anf->values) {
             Name ename = val->cast<GlobalGet>()->name;
-            if (distinctAbsorbed.insert(ename).second) {
-              absorbedOrder.push_back(ename);
-            }
+            distinctAbsorbed.insert(ename);
+            absorbedOrder.push_back(ename);
           }
         } else if (canUseData) {
           std::vector<Name> newElems;
@@ -782,10 +792,10 @@ struct DeferGlobalAllocations : public Pass {
         continue;
       }
       // Verify that every absorbed element's initializer uses are accounted for
-      // by primaryArr + secArrays.
+      // by primaryArrays + secArrays.
       std::unordered_map<Name, Index> chosenArrElemUses;
-      if (primaryArr.is()) {
-        auto* anf = module->getGlobal(primaryArr)->init->cast<ArrayNewFixed>();
+      for (auto& [pArr, _] : primaryArrays) {
+        auto* anf = module->getGlobal(pArr)->init->cast<ArrayNewFixed>();
         for (auto* val : anf->values) {
           chosenArrElemUses[val->cast<GlobalGet>()->name]++;
         }
@@ -808,10 +818,10 @@ struct DeferGlobalAllocations : public Pass {
       }
 
       bool allArraysOnce = true;
-      if (primaryArr.is() &&
-          totalArrayGlobalOnceGets[primaryArr] !=
-            totalArrayGlobalGets[primaryArr]) {
-        allArraysOnce = false;
+      for (auto& [pArr, _] : primaryArrays) {
+        if (totalArrayGlobalOnceGets[pArr] != totalArrayGlobalGets[pArr]) {
+          allArraysOnce = false;
+        }
       }
       for (Name sArr : secArrays) {
         if (totalArrayGlobalOnceGets[sArr] != totalArrayGlobalGets[sArr]) {
@@ -830,7 +840,7 @@ struct DeferGlobalAllocations : public Pass {
       }
       bool treatAsOnce =
         allArraysOnce || (hasOtherCodeMembers && allOtherCodeMembersOnce);
-      grp->absorbedArrayGlobal = primaryArr;
+      grp->primaryArrays = std::move(primaryArrays);
       grp->secondaryArrays = std::move(secArrays);
       grp->absorbedCount = absorbedOrder.size();
       for (Index k = 0; k < absorbedOrder.size(); k++) {
@@ -940,14 +950,24 @@ struct DeferGlobalAllocations : public Pass {
       if (!group.absorbedFactory.is()) {
         continue;
       }
-      if (group.absorbedArrayGlobal.is()) {
-        for (auto& [fn, site] : allArrayGetSites[group.absorbedArrayGlobal]) {
+      for (auto& [arrGlobal, baseIdx] : group.primaryArrays) {
+        for (auto& [fn, site] : allArrayGetSites[arrGlobal]) {
           auto* ag = (*site)->cast<ArrayGet>();
-          *site = builder.makeCall(
-            group.absorbedFactory, {ag->index}, group.globalType);
+          Expression* idx = ag->index;
+          if (baseIdx != 0) {
+            if (auto* c = idx->dynCast<Const>()) {
+              idx = builder.makeConst(
+                int32_t(uint32_t(c->value.geti32()) + baseIdx));
+            } else {
+              idx = builder.makeBinary(
+                AddInt32, idx, builder.makeConst(int32_t(baseIdx)));
+            }
+          }
+          *site =
+            builder.makeCall(group.absorbedFactory, {idx}, group.globalType);
           refinalizeFuncs.insert(fn);
         }
-        module->removeGlobal(group.absorbedArrayGlobal);
+        module->removeGlobal(arrGlobal);
       }
       for (auto& secInfo : group.secondaryArrayInfos) {
         for (auto& [fn, site] : allArrayGetSites[secInfo.arrGlobal]) {
@@ -1558,7 +1578,7 @@ private:
     int64_t saving = 0;
     int64_t secArraysBonus = 0;
     bool hasAbsorbedArrays =
-      group.absorbedArrayGlobal.is() || !group.secondaryArrays.empty();
+      !group.primaryArrays.empty() || !group.secondaryArrays.empty();
     if (!preservedThunk && hasAbsorbedArrays) {
       std::vector<Candidate*> absMembers;
       int64_t absSaving = 0;
@@ -1593,7 +1613,7 @@ private:
         }
         saving += absSaving;
       } else {
-        group.absorbedArrayGlobal = Name();
+        group.primaryArrays.clear();
         group.secondaryArrays.clear();
         group.absorbedCount = 0;
         secArraysBonus = 0;
@@ -1620,7 +1640,7 @@ private:
         saving += memberSaving;
       }
     }
-    if (preservedThunk && group.absorbedArrayGlobal.is()) {
+    if (preservedThunk && !group.primaryArrays.empty()) {
       Index chosenAbsorbed = 0;
       for (auto* c : chosen) {
         if (c->absorbedIndex != Index(-1)) {
@@ -1634,7 +1654,7 @@ private:
                                       return c->absorbedIndex != Index(-1);
                                     }),
                      chosen.end());
-        group.absorbedArrayGlobal = Name();
+        group.primaryArrays.clear();
         group.absorbedCount = 0;
       }
     }
@@ -1657,7 +1677,7 @@ private:
         Index getBytes =
           1 + getLEBSize(U32LEB(globalIndexes[member->global->name]));
         if (member->absorbedIndex != Index(-1) &&
-            (group.absorbedArrayGlobal.is() || !group.secondaryArrays.empty())) {
+            (!group.primaryArrays.empty() || !group.secondaryArrays.empty())) {
           Index index = member->absorbedIndex;
           Index directUses = member->uses - 1;
           int64_t siteDelta =
@@ -1728,7 +1748,7 @@ private:
       auto factory =
         makeFactory(group, chunkMembers, varying, cacheless, chunk == 0);
       if (chunk == 0 &&
-          (group.absorbedArrayGlobal.is() || !group.secondaryArrays.empty())) {
+          (!group.primaryArrays.empty() || !group.secondaryArrays.empty())) {
         group.absorbedFactory = factory;
       }
       for (Index i = 0; i < chunkMembers.size(); i++) {

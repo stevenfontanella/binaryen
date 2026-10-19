@@ -1654,3 +1654,128 @@
     )
   )
 )
+
+;; When a HolePlan::Table hole's table indices form an arithmetic progression
+;; [0, 1, ..., N-1], index $roll$table directly with the loop counter without
+;; emitting an identity byte column in $roll.
+(module
+  ;; CHECK:      (type $vt (struct (field i32)))
+  (type $vt (struct (field i32)))
+  ;; CHECK:      (type $item (struct (field (ref $vt)) (field i32) (field i32)))
+  (type $item (struct (field (ref $vt)) (field i32) (field i32)))
+  ;; CHECK:      (type $arr (array (mut (ref null $item))))
+  (type $arr (array (mut (ref null $item))))
+
+  ;; CHECK:      (type $3 (array (ref $vt)))
+
+  ;; CHECK:      (type $4 (func (param i32) (result (ref $arr))))
+
+  ;; CHECK:      (global $v0 (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 0)
+  ;; CHECK-NEXT: ))
+  (global $v0 (ref $vt) (struct.new $vt (i32.const 0)))
+  ;; CHECK:      (global $v1 (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 1)
+  ;; CHECK-NEXT: ))
+  (global $v1 (ref $vt) (struct.new $vt (i32.const 1)))
+  ;; CHECK:      (global $v2 (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 2)
+  ;; CHECK-NEXT: ))
+  (global $v2 (ref $vt) (struct.new $vt (i32.const 2)))
+  ;; CHECK:      (global $v3 (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 3)
+  ;; CHECK-NEXT: ))
+  (global $v3 (ref $vt) (struct.new $vt (i32.const 3)))
+  ;; CHECK:      (global $v4 (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 4)
+  ;; CHECK-NEXT: ))
+  (global $v4 (ref $vt) (struct.new $vt (i32.const 4)))
+  ;; CHECK:      (global $v5 (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 5)
+  ;; CHECK-NEXT: ))
+  (global $v5 (ref $vt) (struct.new $vt (i32.const 5)))
+  ;; CHECK:      (global $v6 (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 6)
+  ;; CHECK-NEXT: ))
+  (global $v6 (ref $vt) (struct.new $vt (i32.const 6)))
+  ;; CHECK:      (global $v7 (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 7)
+  ;; CHECK-NEXT: ))
+  (global $v7 (ref $vt) (struct.new $vt (i32.const 7)))
+  ;; CHECK:      (global $v8 (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 8)
+  ;; CHECK-NEXT: ))
+  (global $v8 (ref $vt) (struct.new $vt (i32.const 8)))
+  ;; CHECK:      (global $v9 (ref $vt) (struct.new $vt
+  ;; CHECK-NEXT:  (i32.const 9)
+  ;; CHECK-NEXT: ))
+  (global $v9 (ref $vt) (struct.new $vt (i32.const 9)))
+
+  ;; CHECK:      (global $roll$table (ref $3) (array.new_fixed $3 10
+  ;; CHECK-NEXT:  (global.get $v0)
+  ;; CHECK-NEXT:  (global.get $v1)
+  ;; CHECK-NEXT:  (global.get $v2)
+  ;; CHECK-NEXT:  (global.get $v3)
+  ;; CHECK-NEXT:  (global.get $v4)
+  ;; CHECK-NEXT:  (global.get $v5)
+  ;; CHECK-NEXT:  (global.get $v6)
+  ;; CHECK-NEXT:  (global.get $v7)
+  ;; CHECK-NEXT:  (global.get $v8)
+  ;; CHECK-NEXT:  (global.get $v9)
+  ;; CHECK-NEXT: ))
+
+  ;; CHECK:      (func $table-progression (type $4) (param $x i32) (result (ref $arr))
+  ;; CHECK-NEXT:  (local $1 (ref (exact $arr)))
+  ;; CHECK-NEXT:  (local $2 i32)
+  ;; CHECK-NEXT:  (local.set $1
+  ;; CHECK-NEXT:   (array.new_default $arr
+  ;; CHECK-NEXT:    (i32.const 10)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (block
+  ;; CHECK-NEXT:   (local.set $2
+  ;; CHECK-NEXT:    (i32.const 0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (loop $roll
+  ;; CHECK-NEXT:    (array.set $arr
+  ;; CHECK-NEXT:     (local.get $1)
+  ;; CHECK-NEXT:     (local.get $2)
+  ;; CHECK-NEXT:     (struct.new $item
+  ;; CHECK-NEXT:      (array.get $3
+  ;; CHECK-NEXT:       (global.get $roll$table)
+  ;; CHECK-NEXT:       (local.get $2)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (i32.const 0)
+  ;; CHECK-NEXT:      (local.get $x)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (br_if $roll
+  ;; CHECK-NEXT:     (i32.lt_u
+  ;; CHECK-NEXT:      (local.tee $2
+  ;; CHECK-NEXT:       (i32.add
+  ;; CHECK-NEXT:        (local.get $2)
+  ;; CHECK-NEXT:        (i32.const 1)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (i32.const 10)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.get $1)
+  ;; CHECK-NEXT: )
+  (func $table-progression (param $x i32) (result (ref $arr))
+    (array.new_fixed $arr 10
+      (struct.new $item (global.get $v0) (i32.const 0) (local.get $x))
+      (struct.new $item (global.get $v1) (i32.const 0) (local.get $x))
+      (struct.new $item (global.get $v2) (i32.const 0) (local.get $x))
+      (struct.new $item (global.get $v3) (i32.const 0) (local.get $x))
+      (struct.new $item (global.get $v4) (i32.const 0) (local.get $x))
+      (struct.new $item (global.get $v5) (i32.const 0) (local.get $x))
+      (struct.new $item (global.get $v6) (i32.const 0) (local.get $x))
+      (struct.new $item (global.get $v7) (i32.const 0) (local.get $x))
+      (struct.new $item (global.get $v8) (i32.const 0) (local.get $x))
+      (struct.new $item (global.get $v9) (i32.const 0) (local.get $x))
+    )
+  )
+)

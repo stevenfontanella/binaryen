@@ -1988,9 +1988,6 @@
   (type $arr_i16 (array (mut i16)))
   (type $leaf_pal (array (ref null $leaf)))
 
-  ;; CHECK:      (type $4 (func (param i32) (result i32)))
-
-  ;; CHECK:      (type $5 (func (param i32) (result (ref null $node))))
 
   (global $g_bitpack (ref $arr_i16) (array.new_fixed $arr_i16 16
     (i32.const 0)
@@ -2010,6 +2007,10 @@
     (i32.const 9)
     (i32.const 0)
   ))
+
+  ;; CHECK:      (type $4 (func (param i32) (result i32)))
+
+  ;; CHECK:      (type $5 (func (param i32) (result (ref null $node))))
 
   ;; CHECK:      (global $g_affine (ref $arr_i32) (array.new_fixed $arr_i32 6
   ;; CHECK-NEXT:  (i32.const 10)
@@ -2135,3 +2136,102 @@
     )
   )
 )
+
+;; Multi-primary mutually disjoint allDistinctArrays absorption: both $arr1 and
+;; $arr2 are absorbed as contiguous slices [0..3] and [4..6] at the front of the
+;; factory without needing a secondary remap table or branch in $defer$msg.
+(module
+  ;; CHECK:      (type $msg (struct (field i32) (field i32) (field i32) (field i32)))
+  (type $msg (struct (field i32) (field i32) (field i32) (field i32)))
+  (type $msg_arr (array (ref $msg)))
+
+  (global $m0 (ref $msg) (struct.new $msg (i32.const 1) (i32.const 1) (i32.const 2) (i32.const 3)))
+  (global $m1 (ref $msg) (struct.new $msg (i32.const 2) (i32.const 1) (i32.const 2) (i32.const 3)))
+  (global $m2 (ref $msg) (struct.new $msg (i32.const 3) (i32.const 1) (i32.const 2) (i32.const 3)))
+  (global $m3 (ref $msg) (struct.new $msg (i32.const 4) (i32.const 1) (i32.const 2) (i32.const 3)))
+  (global $m4 (ref $msg) (struct.new $msg (i32.const 5) (i32.const 1) (i32.const 2) (i32.const 3)))
+  (global $m5 (ref $msg) (struct.new $msg (i32.const 6) (i32.const 1) (i32.const 2) (i32.const 3)))
+  (global $m6 (ref $msg) (struct.new $msg (i32.const 7) (i32.const 1) (i32.const 2) (i32.const 3)))
+
+  (global $arr1 (ref $msg_arr) (array.new_fixed $msg_arr 4 (global.get $m0) (global.get $m1) (global.get $m2) (global.get $m3)))
+  (global $arr2 (ref $msg_arr) (array.new_fixed $msg_arr 3 (global.get $m4) (global.get $m5) (global.get $m6)))
+
+  ;; CHECK:      (type $1 (array (mut (ref null $msg))))
+
+  ;; CHECK:      (type $2 (array (mut i8)))
+
+  ;; CHECK:      (type $3 (func (param i32) (result (ref $msg))))
+
+  ;; CHECK:      (global $defer$msg$cache (ref $1) (array.new_default $1
+  ;; CHECK-NEXT:  (i32.const 7)
+  ;; CHECK-NEXT: ))
+
+  ;; CHECK:      (global $defer$msg$table$0 (mut (ref null $2)) (ref.null none))
+
+  ;; CHECK:      (data $defer$data "\01\02\03\04\05\06\07")
+
+  ;; CHECK:      (export "get1" (func $get1))
+
+  ;; CHECK:      (export "get2" (func $get2))
+
+  ;; CHECK:      (func $get1 (type $3) (param $i i32) (result (ref $msg))
+  ;; CHECK-NEXT:  (call $defer$msg
+  ;; CHECK-NEXT:   (local.get $i)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $get1 (export "get1") (param $i i32) (result (ref $msg))
+    (array.get $msg_arr (global.get $arr1) (local.get $i))
+  )
+
+  ;; CHECK:      (func $get2 (type $3) (param $i i32) (result (ref $msg))
+  ;; CHECK-NEXT:  (call $defer$msg
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (local.get $i)
+  ;; CHECK-NEXT:    (i32.const 4)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $get2 (export "get2") (param $i i32) (result (ref $msg))
+    (array.get $msg_arr (global.get $arr2) (local.get $i))
+  )
+)
+;; CHECK:      (func $defer$msg (type $3) (param $0 i32) (result (ref $msg))
+;; CHECK-NEXT:  (local $1 (ref $msg))
+;; CHECK-NEXT:  (block $cached (result (ref $msg))
+;; CHECK-NEXT:   (br_on_non_null $cached
+;; CHECK-NEXT:    (array.get $1
+;; CHECK-NEXT:     (global.get $defer$msg$cache)
+;; CHECK-NEXT:     (local.get $0)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (if
+;; CHECK-NEXT:    (ref.is_null
+;; CHECK-NEXT:     (global.get $defer$msg$table$0)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:    (then
+;; CHECK-NEXT:     (global.set $defer$msg$table$0
+;; CHECK-NEXT:      (array.new_data $2 $defer$data
+;; CHECK-NEXT:       (i32.const 0)
+;; CHECK-NEXT:       (i32.const 7)
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (array.set $1
+;; CHECK-NEXT:    (global.get $defer$msg$cache)
+;; CHECK-NEXT:    (local.get $0)
+;; CHECK-NEXT:    (local.tee $1
+;; CHECK-NEXT:     (struct.new $msg
+;; CHECK-NEXT:      (array.get_u $2
+;; CHECK-NEXT:       (global.get $defer$msg$table$0)
+;; CHECK-NEXT:       (local.get $0)
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:      (i32.const 1)
+;; CHECK-NEXT:      (i32.const 2)
+;; CHECK-NEXT:      (i32.const 3)
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (local.get $1)
+;; CHECK-NEXT:  )
+;; CHECK-NEXT: )

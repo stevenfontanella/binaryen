@@ -240,7 +240,7 @@ struct Statement {
 };
 
 // Element kinds of the column arrays.
-enum class ColumnKind { I8, I16, I32, I64, F32, F64 };
+enum class ColumnKind { I8, I16, I32, I64, F32, F64, Count };
 
 Index getColumnWidth(ColumnKind kind) {
   switch (kind) {
@@ -254,6 +254,8 @@ Index getColumnWidth(ColumnKind kind) {
     case ColumnKind::I64:
     case ColumnKind::F64:
       return 8;
+    case ColumnKind::Count:
+      WASM_UNREACHABLE("bad kind");
   }
   WASM_UNREACHABLE("bad kind");
 }
@@ -272,6 +274,8 @@ HeapType getColumnHeapType(ColumnKind kind) {
       return HeapType(Array(Field(Type::f32, Mutable)));
     case ColumnKind::F64:
       return HeapType(Array(Field(Type::f64, Mutable)));
+    case ColumnKind::Count:
+      WASM_UNREACHABLE("bad kind");
   }
   WASM_UNREACHABLE("bad kind");
 }
@@ -288,6 +292,8 @@ Type getColumnValueType(ColumnKind kind) {
       return Type::f32;
     case ColumnKind::F64:
       return Type::f64;
+    case ColumnKind::Count:
+      WASM_UNREACHABLE("bad kind");
   }
   WASM_UNREACHABLE("bad kind");
 }
@@ -1502,6 +1508,22 @@ struct RollRepeatedCalls : public Pass {
           }
           plan.kind = HolePlan::Table;
           plan.table = tableIndex;
+          uint32_t base = indexes[0];
+          uint32_t step = indexes[1] - base;
+          bool isProgression = true;
+          for (Index k = 0; k < size; k++) {
+            if (indexes[k] != base + step * k) {
+              isProgression = false;
+              break;
+            }
+          }
+          if (isProgression) {
+            plan.column = ColumnKind::Count;
+            plan.base = base;
+            plan.step = step;
+            newBytes += getReadBytes(plan);
+            continue;
+          }
           uint32_t maxIndex = *std::max_element(indexes.begin(), indexes.end());
           plan.column = maxIndex <= 255 ? ColumnKind::I8 : ColumnKind::I16;
           for (auto index : indexes) {
@@ -1642,7 +1664,8 @@ struct RollRepeatedCalls : public Pass {
         dData.insert(dData.end(), plan.dictData.begin(), plan.dictData.end());
       }
       if (plan.kind == HolePlan::Column || plan.kind == HolePlan::Delta ||
-          plan.kind == HolePlan::Table || plan.kind == HolePlan::Mixed) {
+          (plan.kind == HolePlan::Table && plan.column != ColumnKind::Count) ||
+          plan.kind == HolePlan::Mixed) {
         auto& data = state.arrayData[plan.column];
         plan.offset = state.arrayCounts[plan.column];
         state.arrayCounts[plan.column] += size;
@@ -2862,6 +2885,17 @@ struct RollRepeatedCalls : public Pass {
     return true;
   }
 
+  Index getProgressionIndexBytes(uint32_t base, uint32_t step) {
+    Index bytes = LocalGetBytes;
+    if (step != 1) {
+      bytes += 1 + getConstBytes(Literal(int32_t(step)));
+    }
+    if (base != 0) {
+      bytes += 1 + getConstBytes(Literal(int32_t(base)));
+    }
+    return bytes;
+  }
+
   // The bytes of the expression that computes a hole in the loop body.
   Index getReadBytes(const HolePlan& plan) {
     switch (plan.kind) {
@@ -2882,6 +2916,10 @@ struct RollRepeatedCalls : public Pass {
       case HolePlan::Column:
       case HolePlan::Table:
       case HolePlan::Mixed: {
+        if (plan.kind == HolePlan::Table && plan.column == ColumnKind::Count) {
+          return GlobalGetBytes +
+                 getProgressionIndexBytes(plan.base, plan.step) + ArrayGetBytes;
+        }
         // The offset is not known yet; assume a short one is needed.
         Index bytes = ArrayGetBytes + LocalGetBytes + LocalGetBytes + 1 + 2;
         if (plan.hasDict) {
@@ -3186,9 +3224,24 @@ struct RollRepeatedCalls : public Pass {
               i32);
             break;
           }
-          case HolePlan::Table:
-            value = readTable(hole, readColumn(hole));
+          case HolePlan::Table: {
+            Expression* idxExpr = nullptr;
+            if (hole.column == ColumnKind::Count) {
+              idxExpr = getCounter();
+              if (hole.step != 1) {
+                idxExpr = builder.makeBinary(
+                  MulInt32, idxExpr, builder.makeConst(int32_t(hole.step)));
+              }
+              if (hole.base != 0) {
+                idxExpr = builder.makeBinary(
+                  AddInt32, idxExpr, builder.makeConst(int32_t(hole.base)));
+              }
+            } else {
+              idxExpr = readColumn(hole);
+            }
+            value = readTable(hole, idxExpr);
             break;
+          }
           case HolePlan::Mixed: {
             Index temp = Builder::addVar(func, i32);
             value = makeMixed(
