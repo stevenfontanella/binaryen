@@ -513,3 +513,40 @@
   (func $callee (param $x i32)
   )
 )
+
+(module
+  ;; CHECK:      (type $arr (array i32))
+  (type $arr (array i32))
+  ;; CHECK:      (type $1 (func (param i32) (result i32)))
+
+  ;; CHECK:      (global $g (ref $arr) (array.new_fixed $arr 2
+  ;; CHECK-NEXT:  (i32.const 10)
+  ;; CHECK-NEXT:  (i32.const 20)
+  ;; CHECK-NEXT: ))
+  (global $g (ref $arr) (array.new_fixed $arr 2 (i32.const 10) (i32.const 20)))
+
+  ;; CHECK:      (func $preserve_array_get_tee (type $1) (param $i i32) (result i32)
+  ;; CHECK-NEXT:  (local $t i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (local.tee $t
+  ;; CHECK-NEXT:    (array.get $arr
+  ;; CHECK-NEXT:     (global.get $g)
+  ;; CHECK-NEXT:     (local.get $i)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.get $t)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $preserve_array_get_tee (param $i i32) (result i32)
+    (local $t i32)
+    (i32.add
+      (local.tee $t
+        (array.get $arr
+          (global.get $g)
+          (local.get $i)
+        )
+      )
+      (local.get $t)
+    )
+  )
+)

@@ -25,14 +25,12 @@
 
   ;; CHECK:      (type $4 (array externref))
 
-  ;; CHECK:      (type $5 (array i32))
-
   ;; CHECK:      (type $values (array (ref null $enum)))
   (type $values (array (ref null $enum)))
 
-  ;; CHECK:      (type $7 (func (param i32) (result (ref $enum))))
+  ;; CHECK:      (type $6 (func (param i32) (result (ref $enum))))
 
-  ;; CHECK:      (type $8 (func (result (ref $values))))
+  ;; CHECK:      (type $7 (func (result (ref $values))))
 
   ;; CHECK:      (import "env" "s0" (global $import0 externref))
   (import "env" "s0" (global $import0 externref))
@@ -97,17 +95,11 @@
   ;; CHECK-NEXT:  (global.get $import2)
   ;; CHECK-NEXT: ))
 
-  ;; CHECK:      (global $defer$enum$table$5 (ref $5) (array.new_fixed $5 3
-  ;; CHECK-NEXT:  (i32.const 0)
-  ;; CHECK-NEXT:  (i32.const 1)
-  ;; CHECK-NEXT:  (i32.const 2)
-  ;; CHECK-NEXT: ))
-
   ;; CHECK:      (export "values" (func $values))
 
   ;; CHECK:      (export "get" (func $get))
 
-  ;; CHECK:      (func $values (type $8) (result (ref $values))
+  ;; CHECK:      (func $values (type $7) (result (ref $values))
   ;; CHECK-NEXT:  (array.new_fixed $values 4
   ;; CHECK-NEXT:   (call $defer$enum
   ;; CHECK-NEXT:    (i32.const 0)
@@ -130,7 +122,7 @@
     )
   )
 
-  ;; CHECK:      (func $get (type $7) (param $i i32) (result (ref $enum))
+  ;; CHECK:      (func $get (type $6) (param $i i32) (result (ref $enum))
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (global.get $import3)
   ;; CHECK-NEXT:  )
@@ -294,7 +286,7 @@
 
 ;; Vtable-like globals used as struct.new operands are still skipped, even
 ;; when they would get an import bonus.
-;; CHECK:      (func $defer$enum (type $7) (param $0 i32) (result (ref $enum))
+;; CHECK:      (func $defer$enum (type $6) (param $0 i32) (result (ref $enum))
 ;; CHECK-NEXT:  (local $1 (ref $enum))
 ;; CHECK-NEXT:  (block $cached (result (ref $enum))
 ;; CHECK-NEXT:   (br_on_non_null $cached
@@ -318,10 +310,7 @@
 ;; CHECK-NEXT:        (local.get $0)
 ;; CHECK-NEXT:       )
 ;; CHECK-NEXT:      )
-;; CHECK-NEXT:      (array.get $5
-;; CHECK-NEXT:       (global.get $defer$enum$table$5)
-;; CHECK-NEXT:       (local.get $0)
-;; CHECK-NEXT:      )
+;; CHECK-NEXT:      (local.get $0)
 ;; CHECK-NEXT:     )
 ;; CHECK-NEXT:    )
 ;; CHECK-NEXT:   )

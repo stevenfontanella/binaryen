@@ -191,7 +191,9 @@ struct DeferGlobalAllocations : public Pass {
     preserveThunkTypes =
       !getArgumentOrDefault("defer-global-allocations-preserve-thunk-types", "")
          .empty();
+    auto instArg = getArgumentOrDefault("defer-global-allocations", "");
     onceOnly =
+      instArg == "once" || instArg == "once-only" ||
       !getArgumentOrDefault("defer-global-allocations-once-only", "").empty();
     always =
       !getArgumentOrDefault("defer-global-allocations-always", "").empty();
@@ -7848,9 +7850,120 @@ private:
       return false;
     };
 
+    auto resolveConstElem = [&](Expression* e) -> Const* {
+      if (auto* c = e->dynCast<Const>()) {
+        return c;
+      }
+      if (auto* gg = e->dynCast<GlobalGet>()) {
+        auto* cg = module->getGlobalOrNull(gg->name);
+        if (cg && !cg->imported() && !cg->mutable_ && cg->init) {
+          if (auto* c = cg->init->dynCast<Const>()) {
+            return c;
+          }
+        }
+      }
+      return nullptr;
+    };
+
+    auto sameElem = [&](Expression* a,
+                        Expression* b,
+                        const Field* packedField = nullptr) -> bool {
+      auto* ca = resolveConstElem(a);
+      auto* cb = resolveConstElem(b);
+      if (ca && cb) {
+        if (packedField && packedField->isPacked() &&
+            ca->type == Type::i32 && cb->type == Type::i32) {
+          uint32_t mask =
+            (packedField->packedType == Field::i8) ? 0xffu : 0xffffu;
+          return (uint32_t(ca->value.geti32()) & mask) ==
+                 (uint32_t(cb->value.geti32()) & mask);
+        }
+        return ca->value == cb->value;
+      }
+      return sameRefLeaf(a, b);
+    };
+
+    // Prefix/subarray deduplication of read-only array.new_fixed globals.
+    std::vector<Global*> roArrayGlobals;
     for (auto& g : module->globals) {
       if (g->imported() || g->mutable_ || nonCodeUses.count(g->name) ||
           initGlobalUses[g->name] > 0) {
+        continue;
+      }
+      if (!onceOnly && paletteSlices.count(g->name)) {
+        continue;
+      }
+      auto* anf = g->init->dynCast<ArrayNewFixed>();
+      if (!anf || anf->values.empty() || !g->type.isRef() ||
+          g->type.isNullable()) {
+        continue;
+      }
+      HeapType arrHt = g->type.getHeapType();
+      if (!arrHt.isArray() || arrHt.isShared()) {
+        continue;
+      }
+      Index totalGets = codeGlobalGets[g->name];
+      auto& sites = arrayGetSites[g->name];
+      if (totalGets == 0 || totalGets != sites.size()) {
+        continue;
+      }
+      roArrayGlobals.push_back(g.get());
+    }
+    std::unordered_set<Name> prefixMergedGlobals;
+    for (size_t i = 0; i < roArrayGlobals.size(); i++) {
+      Global* g1 = roArrayGlobals[i];
+      if (prefixMergedGlobals.count(g1->name)) {
+        continue;
+      }
+      auto* anf1 = g1->init->cast<ArrayNewFixed>();
+      Field elemField1 = g1->type.getHeapType().getArray().element;
+      Index n1 = anf1->values.size();
+      Global* bestG2 = nullptr;
+      Index bestN2 = 0;
+      for (size_t j = 0; j < roArrayGlobals.size(); j++) {
+        if (i == j) {
+          continue;
+        }
+        Global* g2 = roArrayGlobals[j];
+        if (prefixMergedGlobals.count(g2->name) || g1->type != g2->type) {
+          continue;
+        }
+        auto* anf2 = g2->init->cast<ArrayNewFixed>();
+        Index n2 = anf2->values.size();
+        if (n1 > n2 || (n1 == n2 && j > i)) {
+          continue;
+        }
+        bool isPrefix = true;
+        for (Index k = 0; k < n1; k++) {
+          if (!sameElem(anf1->values[k], anf2->values[k], &elemField1)) {
+            isPrefix = false;
+            break;
+          }
+        }
+        if (isPrefix && (!bestG2 || n2 > bestN2)) {
+          bestG2 = g2;
+          bestN2 = n2;
+        }
+      }
+      if (bestG2) {
+        auto& sites1 = arrayGetSites[g1->name];
+        auto& sites2 = arrayGetSites[bestG2->name];
+        for (auto& [fn, site] : sites1) {
+          auto* ag = (*site)->cast<ArrayGet>();
+          ag->ref->cast<GlobalGet>()->name = bestG2->name;
+          sites2.push_back({fn, site});
+        }
+        codeGlobalGets[bestG2->name] += codeGlobalGets[g1->name];
+        codeGlobalGets[g1->name] = 0;
+        sites1.clear();
+        prefixMergedGlobals.insert(g1->name);
+        globalsToRemove.push_back(g1->name);
+      }
+    }
+
+    for (auto& g : module->globals) {
+      if (g->imported() || g->mutable_ || nonCodeUses.count(g->name) ||
+          initGlobalUses[g->name] > 0 || prefixMergedGlobals.count(g->name)) {
         continue;
       }
       if (!onceOnly && paletteSlices.count(g->name)) {
@@ -7901,20 +8014,78 @@ private:
       std::vector<Expression*> normVals;
       normVals.reserve(N);
       for (auto* v : anf->values) {
-        if (elemField.isPacked() && v->is<Const>()) {
-          int32_t raw = v->cast<Const>()->value.geti32();
-          int32_t norm = 0;
-          if (elemField.packedType == Field::i8) {
-            norm = isSigned ? int32_t(int8_t(uint8_t(raw)))
-                            : int32_t(uint8_t(raw));
-          } else {
-            norm = isSigned ? int32_t(int16_t(uint16_t(raw)))
-                            : int32_t(uint16_t(raw));
+        if (elemField.isPacked()) {
+          if (auto* c = resolveConstElem(v)) {
+            int32_t raw = c->value.geti32();
+            int32_t norm = 0;
+            if (elemField.packedType == Field::i8) {
+              norm = isSigned ? int32_t(int8_t(uint8_t(raw)))
+                              : int32_t(uint8_t(raw));
+            } else {
+              norm = isSigned ? int32_t(int16_t(uint16_t(raw)))
+                              : int32_t(uint16_t(raw));
+            }
+            normVals.push_back(builder.makeConst(norm));
+            continue;
           }
-          normVals.push_back(builder.makeConst(norm));
-        } else {
-          normVals.push_back(v);
         }
+        normVals.push_back(v);
+      }
+
+      Index globalCost = 9;
+      for (auto* v : anf->values) {
+        globalCost += getOperandBytes(v);
+      }
+      Index arrayGetOpCost =
+        3 + 1 + getLEBSize(U32LEB(globalIndexes[g->name]));
+
+      // Constant-index array.get folding on read-only array.new_fixed globals.
+      {
+        bool allConstIdx = true;
+        Index constCostBefore = globalCost;
+        Index constCostAfter = 0;
+        for (auto& [_, site] : sites) {
+          auto* ag = (*site)->cast<ArrayGet>();
+          auto* idxC = resolveConstElem(ag->index);
+          if (!idxC || uint32_t(idxC->value.geti32()) >= N) {
+            allConstIdx = false;
+            break;
+          }
+          Index k = uint32_t(idxC->value.geti32());
+          constCostBefore += arrayGetOpCost + getOperandBytes(ag->index);
+          constCostAfter += getOperandBytes(normVals[k]);
+        }
+        if (allConstIdx && constCostAfter < constCostBefore) {
+          for (auto& [fn, site] : sites) {
+            auto* ag = (*site)->cast<ArrayGet>();
+            Index k = uint32_t(resolveConstElem(ag->index)->value.geti32());
+            *site = ExpressionManipulator::copy(normVals[k], *module);
+            refinalizeFuncs.insert(fn);
+          }
+          globalsToRemove.push_back(g->name);
+          continue;
+        }
+        std::vector<std::pair<Function*, Expression**>> remainingSites;
+        remainingSites.reserve(sites.size());
+        for (auto& [fn, site] : sites) {
+          auto* ag = (*site)->cast<ArrayGet>();
+          auto* idxC = resolveConstElem(ag->index);
+          if (idxC && uint32_t(idxC->value.geti32()) < N) {
+            Index k = uint32_t(idxC->value.geti32());
+            if (getOperandBytes(normVals[k]) <=
+                arrayGetOpCost + getOperandBytes(ag->index)) {
+              *site = ExpressionManipulator::copy(normVals[k], *module);
+              refinalizeFuncs.insert(fn);
+              continue;
+            }
+          }
+          remainingSites.push_back({fn, site});
+        }
+        if (remainingSites.empty()) {
+          globalsToRemove.push_back(g->name);
+          continue;
+        }
+        sites = std::move(remainingSites);
       }
 
       std::vector<Expression*> distinct;
@@ -7922,25 +8093,21 @@ private:
       for (Index k = 0; k < N; k++) {
         Expression* v = normVals[k];
         Index dIdx = 0;
-        while (dIdx < distinct.size() &&
-               !sameRefLeaf(distinct[dIdx], v)) {
+        while (dIdx < distinct.size() && !sameElem(distinct[dIdx], v)) {
           dIdx++;
         }
         if (dIdx == distinct.size()) {
           distinct.push_back(v);
           distinctIndices.push_back({k});
         } else {
+          if (getOperandBytes(v) < getOperandBytes(distinct[dIdx])) {
+            distinct[dIdx] = v;
+          }
           distinctIndices[dIdx].push_back(k);
         }
       }
 
       Index D = distinct.size();
-      Index globalCost = 9;
-      for (auto* v : anf->values) {
-        globalCost += getOperandBytes(v);
-      }
-      Index arrayGetOpCost =
-        3 + 1 + getLEBSize(U32LEB(globalIndexes[g->name]));
       Index costBefore = globalCost + sites.size() * arrayGetOpCost;
       Index selectOpBytes = resType.isRef() ? 4 : 1;
 
@@ -7972,138 +8139,173 @@ private:
         continue;
       }
 
-      if (N > 32) {
-        continue;
-      }
-
-      if (D == 2) {
-        // Choose v1 as the minority value (or index 1 when N == 2).
-        Index minIdx = 1;
-        if (N > 2 && distinctIndices[0].size() < distinctIndices[1].size()) {
-          minIdx = 0;
-        }
-        Expression* v1 = distinct[minIdx];
-        Expression* v0 = distinct[1 - minIdx];
-        auto& k1 = distinctIndices[minIdx];
-        Index vBytes = getOperandBytes(v1) + getOperandBytes(v0) + selectOpBytes;
-        Index condExtra = 0;
-        enum Mode { DirectIdx, EqConst, RangeLtU, RangeGeU, Bitmask } mode;
-        Index paramVal = 0;
-        if (N == 2 && k1.size() == 1 && k1[0] == 1) {
-          mode = DirectIdx;
-          condExtra = 0;
-        } else if (k1.size() == 1) {
-          mode = EqConst;
-          paramVal = k1[0];
-          condExtra = (paramVal == 0) ? 1 : (2 + getSLEBSize(paramVal));
-        } else if (k1.back() - k1.front() + 1 == k1.size() &&
-                   (k1.front() == 0 || k1.back() == N - 1)) {
-          if (k1.front() == 0) {
-            mode = RangeLtU;
-            paramVal = k1.back() + 1;
-          } else {
-            mode = RangeGeU;
-            paramVal = k1.front();
+      // Arithmetic-progression i32 array folding (normVals[k] == base + step*k
+      // with step == 1 or step == -1).
+      if (resType == Type::i32 && N >= 3) {
+        bool allI32Consts = true;
+        std::vector<int32_t> i32Vals(N);
+        for (Index k = 0; k < N; k++) {
+          auto* c = resolveConstElem(normVals[k]);
+          if (!c || c->type != Type::i32) {
+            allI32Consts = false;
+            break;
           }
-          condExtra = 2 + getSLEBSize(paramVal);
-        } else {
-          mode = Bitmask;
-          uint32_t mask = 0;
-          for (Index idx : k1) {
-            mask |= (1u << idx);
-          }
-          paramVal = Index(mask);
-          condExtra = 5 + getSLEBSize(paramVal);
+          i32Vals[k] = c->value.geti32();
         }
-        Index costAfter = sites.size() * (vBytes + condExtra);
-        if (costAfter < costBefore) {
-          for (auto& [fn, site] : sites) {
-            auto* ag = (*site)->cast<ArrayGet>();
-            Expression* cond = nullptr;
-            if (mode == DirectIdx) {
-              cond = ag->index;
-            } else if (mode == EqConst) {
-              if (paramVal == 0) {
-                cond = builder.makeUnary(EqZInt32, ag->index);
-              } else {
-                cond = builder.makeBinary(
-                  EqInt32, ag->index, builder.makeConst(int32_t(paramVal)));
-              }
-            } else if (mode == RangeLtU) {
-              cond = builder.makeBinary(
-                LtUInt32, ag->index, builder.makeConst(int32_t(paramVal)));
-            } else if (mode == RangeGeU) {
-              cond = builder.makeBinary(
-                GeUInt32, ag->index, builder.makeConst(int32_t(paramVal)));
-            } else {
-              cond = builder.makeBinary(
-                AndInt32,
-                builder.makeBinary(ShrUInt32,
-                                   builder.makeConst(int32_t(paramVal)),
-                                   ag->index),
-                builder.makeConst(int32_t(1)));
+        if (allI32Consts) {
+          int32_t step = int32_t(uint32_t(i32Vals[1]) - uint32_t(i32Vals[0]));
+          bool isArithProg = (step == 1 || step == -1);
+          for (Index k = 2; isArithProg && k < N; k++) {
+            if (int32_t(uint32_t(i32Vals[k]) - uint32_t(i32Vals[k - 1])) !=
+                step) {
+              isArithProg = false;
             }
-            *site = builder.makeSelect(
-              cond,
-              ExpressionManipulator::copy(v1, *module),
-              ExpressionManipulator::copy(v0, *module));
-            refinalizeFuncs.insert(fn);
           }
-          globalsToRemove.push_back(g->name);
+          if (isArithProg) {
+            int32_t base = i32Vals[0];
+            Index extraBytes =
+              (step == 1 && base == 0) ? 0 : (2 + getSLEBSize(Index(base)));
+            Index costAfter = sites.size() * extraBytes;
+            if (costAfter < costBefore) {
+              for (auto& [fn, site] : sites) {
+                auto* ag = (*site)->cast<ArrayGet>();
+                if (step == 1) {
+                  *site = (base == 0)
+                            ? ag->index
+                            : static_cast<Expression*>(builder.makeBinary(
+                                AddInt32, ag->index, builder.makeConst(base)));
+                } else {
+                  *site = builder.makeBinary(
+                    SubInt32, builder.makeConst(base), ag->index);
+                }
+                refinalizeFuncs.insert(fn);
+              }
+              globalsToRemove.push_back(g->name);
+              continue;
+            }
+          }
         }
-        continue;
       }
 
-      if (D >= 3 && D <= 5 && N > D) {
-        // Check if D - 1 values are singletons and 1 value is the majority.
-        Index majIdx = Index(-1);
-        bool allOtherSingletons = true;
+      if (D >= 2 && D <= 5) {
+        enum Mode {
+          InvalidMode,
+          DirectIdx,
+          EqConst,
+          RangeLtU,
+          RangeGeU,
+          RangeMid,
+          Bitmask
+        };
+        struct ArmPlan {
+          Mode mode = InvalidMode;
+          Index param1 = 0;
+          Index param2 = 0;
+          Index condExtra = 0;
+        };
+        std::vector<ArmPlan> plans(D);
         for (Index d = 0; d < D; d++) {
-          if (distinctIndices[d].size() > 1) {
-            if (majIdx == Index(-1)) {
-              majIdx = d;
+          auto& k1 = distinctIndices[d];
+          ArmPlan& p = plans[d];
+          if (N == 2 && k1.size() == 1 && k1[0] == 1) {
+            p.mode = DirectIdx;
+            p.condExtra = 0;
+          } else if (k1.size() == 1) {
+            p.mode = EqConst;
+            p.param1 = k1[0];
+            p.condExtra = (p.param1 == 0) ? 1 : (2 + getSLEBSize(p.param1));
+          } else if (k1.back() - k1.front() + 1 == k1.size() &&
+                     (k1.front() == 0 || k1.back() == N - 1)) {
+            if (k1.front() == 0) {
+              p.mode = RangeLtU;
+              p.param1 = k1.back() + 1;
             } else {
-              allOtherSingletons = false;
+              p.mode = RangeGeU;
+              p.param1 = k1.front();
+            }
+            p.condExtra = 2 + getSLEBSize(p.param1);
+          } else if (k1.back() - k1.front() + 1 == k1.size()) {
+            p.mode = RangeMid;
+            p.param1 = k1.front();
+            p.param2 = k1.size();
+            p.condExtra = 4 + getSLEBSize(p.param1) + getSLEBSize(p.param2);
+          } else if (k1.back() < 32) {
+            p.mode = Bitmask;
+            uint32_t mask = 0;
+            for (Index idx : k1) {
+              mask |= (1u << idx);
+            }
+            p.param1 = Index(mask);
+            p.condExtra = 5 + getSLEBSize(p.param1);
+          }
+        }
+
+        Index defaultIdx = Index(-1);
+        Index bestCondSum = Index(-1);
+        Index bestDefaultCount = 0;
+        for (Index candDef = 0; candDef < D; candDef++) {
+          bool allTestable = true;
+          Index condSum = 0;
+          for (Index d = 0; d < D; d++) {
+            if (d == candDef) {
+              continue;
+            }
+            if (plans[d].mode == InvalidMode) {
+              allTestable = false;
               break;
             }
+            condSum += plans[d].condExtra;
           }
-        }
-        if (!allOtherSingletons || majIdx == Index(-1)) {
-          continue;
-        }
-        Expression* vMaj = distinct[majIdx];
-        std::vector<std::pair<Index, Expression*>> singletons;
-        Index singletonsCost = getOperandBytes(vMaj);
-        for (Index d = 0; d < D; d++) {
-          if (d == majIdx) {
+          if (!allTestable) {
             continue;
           }
-          Index k = distinctIndices[d][0];
-          Expression* v = distinct[d];
-          singletons.push_back({k, v});
-          Index eqCost = (k == 0) ? 1 : (2 + getSLEBSize(k));
-          singletonsCost += getOperandBytes(v) + eqCost + selectOpBytes;
+          Index defCount = distinctIndices[candDef].size();
+          if (defaultIdx == Index(-1) || condSum < bestCondSum ||
+              (condSum == bestCondSum && defCount > bestDefaultCount)) {
+            defaultIdx = candDef;
+            bestCondSum = condSum;
+            bestDefaultCount = defCount;
+          }
         }
-        Index M = singletons.size();
+        if (defaultIdx == Index(-1)) {
+          continue;
+        }
+
+        Expression* vDef = distinct[defaultIdx];
+        std::vector<Index> testedArms;
+        testedArms.reserve(D - 1);
+        Index baseSiteCost = getOperandBytes(vDef);
+        for (Index d = 0; d < D; d++) {
+          if (d == defaultIdx) {
+            continue;
+          }
+          testedArms.push_back(d);
+          baseSiteCost +=
+            getOperandBytes(distinct[d]) + plans[d].condExtra + selectOpBytes;
+        }
+        Index M = testedArms.size();
         Index costAfter = 0;
         for (auto& [_, site] : sites) {
           auto* ag = (*site)->cast<ArrayGet>();
           Index idxExtra =
-            ag->index->is<LocalGet>() ? (2 * (M - 1)) : (4 + 2 * (M - 1));
-          costAfter += singletonsCost + idxExtra;
+            (M <= 1) ? 0
+                     : (ag->index->is<LocalGet>() ? (2 * (M - 1))
+                                                  : (4 + 2 * (M - 1)));
+          costAfter += baseSiteCost + idxExtra;
         }
         if (costAfter < costBefore) {
           for (auto& [fn, site] : sites) {
             auto* ag = (*site)->cast<ArrayGet>();
             Index scratchLoc = Index(-1);
-            if (!ag->index->is<LocalGet>()) {
+            if (M > 1 && !ag->index->is<LocalGet>()) {
               scratchLoc = Builder::addVar(fn, Type::i32);
             }
-            Expression* acc = ExpressionManipulator::copy(vMaj, *module);
+            Expression* acc = ExpressionManipulator::copy(vDef, *module);
             for (Index m = 0; m < M; m++) {
-              auto [k, v] = singletons[m];
+              Index d = testedArms[m];
+              const ArmPlan& p = plans[d];
               Expression* idxExpr = nullptr;
-              if (ag->index->is<LocalGet>()) {
+              if (M == 1 || ag->index->is<LocalGet>()) {
                 idxExpr =
                   (m == 0) ? ag->index
                            : ExpressionManipulator::copy(ag->index, *module);
@@ -8115,13 +8317,37 @@ private:
                     : static_cast<Expression*>(
                         builder.makeLocalGet(scratchLoc, Type::i32));
               }
-              Expression* cond =
-                (k == 0) ? static_cast<Expression*>(
-                             builder.makeUnary(EqZInt32, idxExpr))
-                         : static_cast<Expression*>(builder.makeBinary(
-                             EqInt32, idxExpr, builder.makeConst(int32_t(k))));
+              Expression* cond = nullptr;
+              if (p.mode == DirectIdx) {
+                cond = idxExpr;
+              } else if (p.mode == EqConst) {
+                if (p.param1 == 0) {
+                  cond = builder.makeUnary(EqZInt32, idxExpr);
+                } else {
+                  cond = builder.makeBinary(
+                    EqInt32, idxExpr, builder.makeConst(int32_t(p.param1)));
+                }
+              } else if (p.mode == RangeLtU) {
+                cond = builder.makeBinary(
+                  LtUInt32, idxExpr, builder.makeConst(int32_t(p.param1)));
+              } else if (p.mode == RangeGeU) {
+                cond = builder.makeBinary(
+                  GeUInt32, idxExpr, builder.makeConst(int32_t(p.param1)));
+              } else if (p.mode == RangeMid) {
+                cond = builder.makeBinary(
+                  LtUInt32,
+                  builder.makeBinary(
+                    SubInt32, idxExpr, builder.makeConst(int32_t(p.param1))),
+                  builder.makeConst(int32_t(p.param2)));
+              } else {
+                cond = builder.makeBinary(
+                  AndInt32,
+                  builder.makeBinary(
+                    ShrUInt32, builder.makeConst(int32_t(p.param1)), idxExpr),
+                  builder.makeConst(int32_t(1)));
+              }
               acc = builder.makeSelect(
-                cond, ExpressionManipulator::copy(v, *module), acc);
+                cond, ExpressionManipulator::copy(distinct[d], *module), acc);
             }
             *site = acc;
             refinalizeFuncs.insert(fn);

@@ -1764,7 +1764,10 @@ struct ScopedDominatorCSE {
     if (curr->is<RefCast>() || curr->is<RefTest>()) {
       return 4;
     }
-    if (curr->is<ArrayGet>() || curr->is<Load>()) {
+    if (curr->is<ArrayGet>()) {
+      return 4;
+    }
+    if (curr->is<Load>()) {
       return 3;
     }
     if (auto* call = curr->dynCast<Call>()) {

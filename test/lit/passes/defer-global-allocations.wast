@@ -1714,6 +1714,7 @@
 )
 
 
+
 ;; CHECK:      (func $defer$pal$vt (type $5) (param $0 (ref $1)) (param $1 i32) (result (ref $vt))
 ;; CHECK-NEXT:  (local $2 (ref $vt))
 ;; CHECK-NEXT:  (block $cached (result (ref $vt))
@@ -1739,16 +1740,16 @@
 ;; CHECK-NEXT:   (local.get $2)
 ;; CHECK-NEXT:  )
 ;; CHECK-NEXT: )
-
 (module
   ;; CHECK:      (type $box (struct (field i32)))
   (type $box (struct (field i32)))
 
+
+  (global $flag (mut i32) (i32.const 0))
   ;; CHECK:      (type $1 (func (param i32) (result (ref null $box))))
 
   ;; CHECK:      (type $2 (func))
 
-  (global $flag (mut i32) (i32.const 0))
   ;; CHECK:      (global $g_hoisted (ref $box) (struct.new $box
   ;; CHECK-NEXT:  (i32.const 10)
   ;; CHECK-NEXT: ))
@@ -1826,11 +1827,12 @@
   ;; CHECK:      (type $box (struct (field i32)))
   (type $box (struct (field i32)))
 
+
+  (global $br_flag (mut i32) (i32.const 0))
   ;; CHECK:      (type $1 (func (result (ref null $box))))
 
   ;; CHECK:      (type $2 (func))
 
-  (global $br_flag (mut i32) (i32.const 0))
   ;; CHECK:      (global $g_base (mut (ref null $box)) (ref.null none))
   (global $g_base (mut (ref null $box)) (ref.null none))
   (global $g_alias (mut (ref null $box)) (ref.null none))
@@ -1875,5 +1877,99 @@
   (func $read_alias (export "read_alias") (result (ref null $box))
     (call $init_br)
     (call $callee_after_init)
+  )
+)
+
+(module
+  (type $arr_i64 (array (mut i64)))
+  ;; CHECK:      (type $arr_i32 (array i32))
+  (type $arr_i32 (array i32))
+
+  ;; CHECK:      (type $1 (func (param i32) (result i32)))
+
+  ;; CHECK:      (type $2 (func (result i64)))
+
+  ;; CHECK:      (global $c100 i32 (i32.const 100))
+  (global $c100 i32 (i32.const 100))
+  (global $g_const_idx (ref $arr_i64) (array.new_fixed $arr_i64 2
+    (i64.const 111111111111)
+    (i64.const 222222222222)
+  ))
+  (global $g_arith (ref $arr_i32) (array.new_fixed $arr_i32 4
+    (i32.const 3)
+    (i32.const 2)
+    (i32.const 1)
+    (i32.const 0)
+  ))
+  ;; CHECK:      (global $g_full (ref $arr_i32) (array.new_fixed $arr_i32 7
+  ;; CHECK-NEXT:  (i32.const 1)
+  ;; CHECK-NEXT:  (i32.const 10)
+  ;; CHECK-NEXT:  (i32.const 100)
+  ;; CHECK-NEXT:  (i32.const 1000)
+  ;; CHECK-NEXT:  (i32.const 10000)
+  ;; CHECK-NEXT:  (i32.const 100000)
+  ;; CHECK-NEXT:  (i32.const 1000000)
+  ;; CHECK-NEXT: ))
+  (global $g_full (ref $arr_i32) (array.new_fixed $arr_i32 7
+    (i32.const 1)
+    (i32.const 10)
+    (i32.const 100)
+    (i32.const 1000)
+    (i32.const 10000)
+    (i32.const 100000)
+    (i32.const 1000000)
+  ))
+  (global $g_prefix (ref $arr_i32) (array.new_fixed $arr_i32 3
+    (i32.const 1)
+    (i32.const 10)
+    (global.get $c100)
+  ))
+
+  ;; CHECK:      (export "fold_const_idx" (func $fold_const_idx))
+
+  ;; CHECK:      (export "fold_arith" (func $fold_arith))
+
+  ;; CHECK:      (export "fold_prefix" (func $fold_prefix))
+
+  ;; CHECK:      (func $fold_const_idx (type $2) (result i64)
+  ;; CHECK-NEXT:  (i64.add
+  ;; CHECK-NEXT:   (i64.const 111111111111)
+  ;; CHECK-NEXT:   (i64.const 222222222222)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $fold_const_idx (export "fold_const_idx") (result i64)
+    (i64.add
+      (array.get $arr_i64 (global.get $g_const_idx) (i32.const 0))
+      (array.get $arr_i64 (global.get $g_const_idx) (i32.const 1))
+    )
+  )
+
+  ;; CHECK:      (func $fold_arith (type $1) (param $i i32) (result i32)
+  ;; CHECK-NEXT:  (i32.sub
+  ;; CHECK-NEXT:   (i32.const 3)
+  ;; CHECK-NEXT:   (local.get $i)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $fold_arith (export "fold_arith") (param $i i32) (result i32)
+    (array.get $arr_i32 (global.get $g_arith) (local.get $i))
+  )
+
+  ;; CHECK:      (func $fold_prefix (type $1) (param $i i32) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (array.get $arr_i32
+  ;; CHECK-NEXT:    (global.get $g_full)
+  ;; CHECK-NEXT:    (local.get $i)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (array.get $arr_i32
+  ;; CHECK-NEXT:    (global.get $g_full)
+  ;; CHECK-NEXT:    (local.get $i)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $fold_prefix (export "fold_prefix") (param $i i32) (result i32)
+    (i32.add
+      (array.get $arr_i32 (global.get $g_full) (local.get $i))
+      (array.get $arr_i32 (global.get $g_prefix) (local.get $i))
+    )
   )
 )
