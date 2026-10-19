@@ -471,13 +471,11 @@
 
   ;; CHECK:      (type $3 (array (mut i8)))
 
-  ;; CHECK:      (type $4 (array (ref $vt)))
+  ;; CHECK:      (type $4 (array (mut i16)))
 
-  ;; CHECK:      (type $5 (array (mut i16)))
+  ;; CHECK:      (type $5 (func (result (ref $enum))))
 
-  ;; CHECK:      (type $6 (func (result (ref $enum))))
-
-  ;; CHECK:      (type $7 (func (param i32) (result (ref $enum))))
+  ;; CHECK:      (type $6 (func (param i32) (result (ref $enum))))
 
   ;; CHECK:      (global $vt0 (ref $vt) (struct.new $vt
   ;; CHECK-NEXT:  (i32.const 1)
@@ -513,20 +511,15 @@
   ;; CHECK-NEXT:  (i32.const 20)
   ;; CHECK-NEXT: ))
 
-  ;; CHECK:      (global $defer$enum$palette$0 (ref $4) (array.new_fixed $4 2
-  ;; CHECK-NEXT:  (global.get $vt0)
-  ;; CHECK-NEXT:  (global.get $vt1)
-  ;; CHECK-NEXT: ))
+  ;; CHECK:      (global $defer$enum$table$2 (mut (ref null $3)) (ref.null none))
 
-  ;; CHECK:      (global $defer$enum$table$w1 (mut (ref null $3)) (ref.null none))
+  ;; CHECK:      (global $defer$enum$table$3 (mut (ref null $4)) (ref.null none))
 
-  ;; CHECK:      (global $defer$enum$table$3 (mut (ref null $5)) (ref.null none))
-
-  ;; CHECK:      (data $defer$data "\00\01\00\01\00\01\00\01\00\01\00\01\00\01\00\01\00\01\00\01\n\0c\0e\10\12\14\16\18\1a\1c\n\0c\0e\10\12\14\16\18\1a\1c,\01\d4\fe,\01\d4\fe,\01\d4\fe,\01\d4\fe,\01\d4\fe,\01\d4\fe,\01\d4\fe,\01\d4\fe,\01\d4\fe,\01\d4\fe")
+  ;; CHECK:      (data $defer$data "\n\0c\0e\10\12\14\16\18\1a\1c\n\0c\0e\10\12\14\16\18\1a\1c,\01\d4\fe,\01\d4\fe,\01\d4\fe,\01\d4\fe,\01\d4\fe,\01\d4\fe,\01\d4\fe,\01\d4\fe,\01\d4\fe,\01\d4\fe")
 
   ;; CHECK:      (export "use" (func $use))
 
-  ;; CHECK:      (func $use (type $6) (result (ref $enum))
+  ;; CHECK:      (func $use (type $5) (result (ref $enum))
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (call $defer$enum
   ;; CHECK-NEXT:    (i32.const 0)
@@ -659,7 +652,7 @@
 ;; 3. Redundant i32 once-flag ($flag_redundant) guarding a single non-nullable
 ;;    reference global assignment ($lazy_target) is replaced by ref.is_null and
 ;;    deleted.
-;; CHECK:      (func $defer$enum (type $7) (param $0 i32) (result (ref $enum))
+;; CHECK:      (func $defer$enum (type $6) (param $0 i32) (result (ref $enum))
 ;; CHECK-NEXT:  (local $1 (ref $enum))
 ;; CHECK-NEXT:  (block $cached (result (ref $enum))
 ;; CHECK-NEXT:   (br_on_non_null $cached
@@ -670,18 +663,18 @@
 ;; CHECK-NEXT:   )
 ;; CHECK-NEXT:   (if
 ;; CHECK-NEXT:    (ref.is_null
-;; CHECK-NEXT:     (global.get $defer$enum$table$w1)
+;; CHECK-NEXT:     (global.get $defer$enum$table$2)
 ;; CHECK-NEXT:    )
 ;; CHECK-NEXT:    (then
-;; CHECK-NEXT:     (global.set $defer$enum$table$w1
+;; CHECK-NEXT:     (global.set $defer$enum$table$2
 ;; CHECK-NEXT:      (array.new_data $3 $defer$data
 ;; CHECK-NEXT:       (i32.const 0)
-;; CHECK-NEXT:       (i32.const 40)
+;; CHECK-NEXT:       (i32.const 20)
 ;; CHECK-NEXT:      )
 ;; CHECK-NEXT:     )
 ;; CHECK-NEXT:     (global.set $defer$enum$table$3
-;; CHECK-NEXT:      (array.new_data $5 $defer$data
-;; CHECK-NEXT:       (i32.const 40)
+;; CHECK-NEXT:      (array.new_data $4 $defer$data
+;; CHECK-NEXT:       (i32.const 20)
 ;; CHECK-NEXT:       (i32.const 20)
 ;; CHECK-NEXT:      )
 ;; CHECK-NEXT:     )
@@ -692,22 +685,23 @@
 ;; CHECK-NEXT:    (local.get $0)
 ;; CHECK-NEXT:    (local.tee $1
 ;; CHECK-NEXT:     (struct.new $enum
-;; CHECK-NEXT:      (array.get $4
-;; CHECK-NEXT:       (global.get $defer$enum$palette$0)
-;; CHECK-NEXT:       (array.get_u $3
-;; CHECK-NEXT:        (global.get $defer$enum$table$w1)
-;; CHECK-NEXT:        (local.get $0)
+;; CHECK-NEXT:      (select (result (ref $vt))
+;; CHECK-NEXT:       (global.get $vt1)
+;; CHECK-NEXT:       (global.get $vt0)
+;; CHECK-NEXT:       (i32.and
+;; CHECK-NEXT:        (i32.shr_u
+;; CHECK-NEXT:         (i32.const 699050)
+;; CHECK-NEXT:         (local.get $0)
+;; CHECK-NEXT:        )
+;; CHECK-NEXT:        (i32.const 1)
 ;; CHECK-NEXT:       )
 ;; CHECK-NEXT:      )
 ;; CHECK-NEXT:      (i32.const 0)
 ;; CHECK-NEXT:      (array.get_u $3
-;; CHECK-NEXT:       (global.get $defer$enum$table$w1)
-;; CHECK-NEXT:       (i32.add
-;; CHECK-NEXT:        (local.get $0)
-;; CHECK-NEXT:        (i32.const 20)
-;; CHECK-NEXT:       )
+;; CHECK-NEXT:       (global.get $defer$enum$table$2)
+;; CHECK-NEXT:       (local.get $0)
 ;; CHECK-NEXT:      )
-;; CHECK-NEXT:      (array.get_s $5
+;; CHECK-NEXT:      (array.get_s $4
 ;; CHECK-NEXT:       (global.get $defer$enum$table$3)
 ;; CHECK-NEXT:       (local.get $0)
 ;; CHECK-NEXT:      )
@@ -1307,15 +1301,13 @@
 
   ;; CHECK:      (type $3 (array (mut (ref null $enum))))
 
-  ;; CHECK:      (type $4 (array i32))
+  ;; CHECK:      (type $4 (array (mut i8)))
 
-  ;; CHECK:      (type $5 (array (mut i8)))
+  ;; CHECK:      (type $5 (func (param i32) (result (ref $enum))))
 
-  ;; CHECK:      (type $6 (func (param i32) (result (ref $enum))))
+  ;; CHECK:      (type $6 (func (param i32) (result (ref $vt))))
 
-  ;; CHECK:      (type $7 (func (param i32) (result (ref $vt))))
-
-  ;; CHECK:      (type $8 (func (param (ref $1) i32) (result (ref $vt))))
+  ;; CHECK:      (type $7 (func (param (ref $1) i32) (result (ref $vt))))
 
   ;; CHECK:      (global $pal1 (ref $1) (array.new_default $1
   ;; CHECK-NEXT:  (i32.const 2)
@@ -1343,14 +1335,7 @@
   ;; CHECK-NEXT:  (i32.const 4)
   ;; CHECK-NEXT: ))
 
-  ;; CHECK:      (global $defer$enum$table$0 (ref $4) (array.new_fixed $4 4
-  ;; CHECK-NEXT:  (i32.const 10)
-  ;; CHECK-NEXT:  (i32.const 20)
-  ;; CHECK-NEXT:  (i32.const 30)
-  ;; CHECK-NEXT:  (i32.const 40)
-  ;; CHECK-NEXT: ))
-
-  ;; CHECK:      (global $defer$enum$table$w1 (mut (ref null $5)) (ref.null none))
+  ;; CHECK:      (global $defer$enum$table$w1 (mut (ref null $4)) (ref.null none))
 
   ;; CHECK:      (data $defer$data "\01\03\00")
 
@@ -1358,7 +1343,7 @@
 
   ;; CHECK:      (export "read_pals" (func $read_pals))
 
-  ;; CHECK:      (func $read_enums (type $6) (param $i i32) (result (ref $enum))
+  ;; CHECK:      (func $read_enums (type $5) (param $i i32) (result (ref $enum))
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (call $defer$enum
   ;; CHECK-NEXT:    (local.get $i)
@@ -1376,7 +1361,7 @@
     (array.get $enum_arr (global.get $arr2) (local.get $i))
   )
 
-  ;; CHECK:      (func $read_pals (type $7) (param $i i32) (result (ref $vt))
+  ;; CHECK:      (func $read_pals (type $6) (param $i i32) (result (ref $vt))
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (call $defer$pal$vt
   ;; CHECK-NEXT:    (global.get $pal1)
@@ -1402,7 +1387,7 @@
 )
 
 ;; Multi-global once-flag elimination and array constant/select folding.
-;; CHECK:      (func $defer$enum (type $6) (param $0 i32) (result (ref $enum))
+;; CHECK:      (func $defer$enum (type $5) (param $0 i32) (result (ref $enum))
 ;; CHECK-NEXT:  (local $1 (ref $enum))
 ;; CHECK-NEXT:  (if
 ;; CHECK-NEXT:   (ref.is_null
@@ -1410,7 +1395,7 @@
 ;; CHECK-NEXT:   )
 ;; CHECK-NEXT:   (then
 ;; CHECK-NEXT:    (global.set $defer$enum$table$w1
-;; CHECK-NEXT:     (array.new_data $5 $defer$data
+;; CHECK-NEXT:     (array.new_data $4 $defer$data
 ;; CHECK-NEXT:      (i32.const 0)
 ;; CHECK-NEXT:      (i32.const 3)
 ;; CHECK-NEXT:     )
@@ -1424,7 +1409,7 @@
 ;; CHECK-NEXT:   )
 ;; CHECK-NEXT:   (then
 ;; CHECK-NEXT:    (local.set $0
-;; CHECK-NEXT:     (array.get_u $5
+;; CHECK-NEXT:     (array.get_u $4
 ;; CHECK-NEXT:      (global.get $defer$enum$table$w1)
 ;; CHECK-NEXT:      (i32.sub
 ;; CHECK-NEXT:       (local.get $0)
@@ -1446,9 +1431,24 @@
 ;; CHECK-NEXT:    (local.get $0)
 ;; CHECK-NEXT:    (local.tee $1
 ;; CHECK-NEXT:     (struct.new $enum
-;; CHECK-NEXT:      (array.get $4
-;; CHECK-NEXT:       (global.get $defer$enum$table$0)
-;; CHECK-NEXT:       (local.get $0)
+;; CHECK-NEXT:      (select
+;; CHECK-NEXT:       (i32.const 40)
+;; CHECK-NEXT:       (select
+;; CHECK-NEXT:        (i32.const 30)
+;; CHECK-NEXT:        (select
+;; CHECK-NEXT:         (i32.const 20)
+;; CHECK-NEXT:         (i32.const 10)
+;; CHECK-NEXT:         (local.get $0)
+;; CHECK-NEXT:        )
+;; CHECK-NEXT:        (i32.eq
+;; CHECK-NEXT:         (local.get $0)
+;; CHECK-NEXT:         (i32.const 2)
+;; CHECK-NEXT:        )
+;; CHECK-NEXT:       )
+;; CHECK-NEXT:       (i32.eq
+;; CHECK-NEXT:        (local.get $0)
+;; CHECK-NEXT:        (i32.const 3)
+;; CHECK-NEXT:       )
 ;; CHECK-NEXT:      )
 ;; CHECK-NEXT:      (i32.const 1000)
 ;; CHECK-NEXT:      (i32.const 2000)
@@ -1464,7 +1464,7 @@
 ;; CHECK-NEXT:  )
 ;; CHECK-NEXT: )
 
-;; CHECK:      (func $defer$pal$vt (type $8) (param $0 (ref $1)) (param $1 i32) (result (ref $vt))
+;; CHECK:      (func $defer$pal$vt (type $7) (param $0 (ref $1)) (param $1 i32) (result (ref $vt))
 ;; CHECK-NEXT:  (local $2 (ref $vt))
 ;; CHECK-NEXT:  (block $cached (result (ref $vt))
 ;; CHECK-NEXT:   (br_on_non_null $cached
@@ -1924,6 +1924,14 @@
     (i32.const 10)
     (global.get $c100)
   ))
+  ;; CHECK:      (global $g_default_1 (ref $arr_i32) (array.new_default $arr_i32
+  ;; CHECK-NEXT:  (i32.const 1)
+  ;; CHECK-NEXT: ))
+  (global $g_default_1 (export "g_default_1") (ref $arr_i32) (array.new_fixed $arr_i32 1
+    (i32.const 0)
+  ))
+
+  ;; CHECK:      (export "g_default_1" (global $g_default_1))
 
   ;; CHECK:      (export "fold_const_idx" (func $fold_const_idx))
 

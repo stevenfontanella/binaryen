@@ -1171,6 +1171,253 @@ private:
            field.type.getHeapType().getBottom() != HeapType::noext;
   }
 
+  enum SelectPredMode {
+    InvalidSelectPred,
+    SelectDirectIdx,
+    SelectEqConst,
+    SelectRangeLtU,
+    SelectRangeGeU,
+    SelectRangeMid,
+    SelectBitmask
+  };
+
+  struct SelectArmPlan {
+    SelectPredMode mode = InvalidSelectPred;
+    Index param1 = 0;
+    Index param2 = 0;
+    Index condExtra = 0;
+  };
+
+  bool planSelectChainSteps(
+    const std::vector<Expression*>& distinct,
+    const std::vector<std::vector<Index>>& distinctIndices,
+    Index N,
+    Index& defaultIdxOut,
+    std::vector<std::pair<Index, SelectArmPlan>>& stepsOut) {
+    Index D = distinct.size();
+    if (D < 2 || D > 5) {
+      return false;
+    }
+    Index numMasks = 1u << D;
+    std::vector<Index> fMin(numMasks, N);
+    std::vector<Index> fMax(numMasks, 0);
+    std::vector<Index> fCount(numMasks, 0);
+    for (Index mask = 1; mask < numMasks; mask++) {
+      for (Index d = 0; d < D; d++) {
+        if (mask & (1u << d)) {
+          const auto& ks = distinctIndices[d];
+          fMin[mask] = std::min(fMin[mask], ks.front());
+          fMax[mask] = std::max(fMax[mask], ks.back());
+          fCount[mask] += ks.size();
+        }
+      }
+    }
+
+    auto computeStepPlan = [&](Index mask, Index nextD) -> SelectArmPlan {
+      const auto& k1 = distinctIndices[nextD];
+      Index k1Min = k1.front();
+      Index k1Max = k1.back();
+      SelectArmPlan best;
+      auto tryPlan = [&](SelectPredMode m, Index p1, Index p2, Index cost) {
+        if (best.mode == InvalidSelectPred || cost < best.condExtra) {
+          best = {m, p1, p2, cost};
+        }
+      };
+      if (fCount[mask] == 1 && fMin[mask] == 0) {
+        tryPlan(SelectDirectIdx, 0, 0, 0);
+      }
+      if (k1.size() == 1) {
+        Index c = k1[0];
+        tryPlan(SelectEqConst, c, 0, (c == 0) ? 1 : (2 + getSLEBSize(c)));
+      }
+      if (k1Max < fMin[mask]) {
+        Index bestLim = k1Max + 1;
+        Index bestLimCost = 2 + getSLEBSize(bestLim);
+        for (Index lim = k1Max + 2; lim <= fMin[mask]; lim++) {
+          Index c = 2 + getSLEBSize(lim);
+          if (c < bestLimCost) {
+            bestLim = lim;
+            bestLimCost = c;
+          }
+        }
+        tryPlan(SelectRangeLtU, bestLim, 0, bestLimCost);
+      }
+      if (k1Min > fMax[mask]) {
+        Index bestStart = k1Min;
+        Index bestStartCost = 2 + getSLEBSize(bestStart);
+        for (Index st = fMax[mask] + 1; st < k1Min; st++) {
+          Index c = 2 + getSLEBSize(st);
+          if (c < bestStartCost) {
+            bestStart = st;
+            bestStartCost = c;
+          }
+        }
+        tryPlan(SelectRangeGeU, bestStart, 0, bestStartCost);
+      }
+      {
+        bool conflict = false;
+        for (Index d = 0; d < D; d++) {
+          if (mask & (1u << d)) {
+            for (Index f : distinctIndices[d]) {
+              if (f >= k1Min && f <= k1Max) {
+                conflict = true;
+                break;
+              }
+            }
+            if (conflict) {
+              break;
+            }
+          }
+        }
+        if (!conflict) {
+          Index len = k1Max - k1Min + 1;
+          tryPlan(SelectRangeMid,
+                  k1Min,
+                  len,
+                  4 + getSLEBSize(k1Min) + getSLEBSize(len));
+        }
+      }
+      if (k1Max < 32 && fMax[mask] < 32) {
+        uint32_t bm = 0;
+        for (Index idx : k1) {
+          bm |= (1u << idx);
+        }
+        tryPlan(SelectBitmask, Index(bm), 0, 5 + getSLEBSize(Index(bm)));
+      }
+      return best;
+    };
+
+    struct DPState {
+      Index condSum = Index(-1);
+      Index defaultCount = 0;
+      Index prevMask = 0;
+      Index addedArm = Index(-1);
+      SelectArmPlan plan;
+    };
+    std::vector<DPState> dp(numMasks);
+    for (Index d = 0; d < D; d++) {
+      Index m = 1u << d;
+      dp[m].condSum = 0;
+      dp[m].defaultCount = distinctIndices[d].size();
+    }
+    for (Index mask = 1; mask < numMasks; mask++) {
+      if (dp[mask].condSum == Index(-1)) {
+        continue;
+      }
+      for (Index nextD = 0; nextD < D; nextD++) {
+        if (mask & (1u << nextD)) {
+          continue;
+        }
+        SelectArmPlan p = computeStepPlan(mask, nextD);
+        if (p.mode == InvalidSelectPred) {
+          continue;
+        }
+        Index nextMask = mask | (1u << nextD);
+        Index nextCost = dp[mask].condSum + p.condExtra;
+        if (dp[nextMask].condSum == Index(-1) ||
+            nextCost < dp[nextMask].condSum ||
+            (nextCost == dp[nextMask].condSum &&
+             dp[mask].defaultCount > dp[nextMask].defaultCount)) {
+          dp[nextMask] = {nextCost, dp[mask].defaultCount, mask, nextD, p};
+        }
+      }
+    }
+    Index fullMask = numMasks - 1;
+    if (dp[fullMask].condSum == Index(-1)) {
+      return false;
+    }
+    stepsOut.clear();
+    Index curMask = fullMask;
+    while (dp[curMask].prevMask != 0) {
+      stepsOut.push_back({dp[curMask].addedArm, dp[curMask].plan});
+      curMask = dp[curMask].prevMask;
+    }
+    std::reverse(stepsOut.begin(), stepsOut.end());
+    defaultIdxOut = 0;
+    while ((curMask & (1u << defaultIdxOut)) == 0) {
+      defaultIdxOut++;
+    }
+    return true;
+  }
+
+  Expression* buildSelectCond(Builder& builder,
+                              const SelectArmPlan& p,
+                              Expression* idxExpr) {
+    if (p.mode == SelectDirectIdx) {
+      return idxExpr;
+    }
+    if (p.mode == SelectEqConst) {
+      if (p.param1 == 0) {
+        return builder.makeUnary(EqZInt32, idxExpr);
+      }
+      return builder.makeBinary(
+        EqInt32, idxExpr, builder.makeConst(int32_t(p.param1)));
+    }
+    if (p.mode == SelectRangeLtU) {
+      return builder.makeBinary(
+        LtUInt32, idxExpr, builder.makeConst(int32_t(p.param1)));
+    }
+    if (p.mode == SelectRangeGeU) {
+      return builder.makeBinary(
+        GeUInt32, idxExpr, builder.makeConst(int32_t(p.param1)));
+    }
+    if (p.mode == SelectRangeMid) {
+      return builder.makeBinary(
+        LtUInt32,
+        builder.makeBinary(
+          SubInt32, idxExpr, builder.makeConst(int32_t(p.param1))),
+        builder.makeConst(int32_t(p.param2)));
+    }
+    return builder.makeBinary(
+      AndInt32,
+      builder.makeBinary(
+        ShrUInt32, builder.makeConst(int32_t(p.param1)), idxExpr),
+      builder.makeConst(int32_t(1)));
+  }
+
+  bool tryPlanSelectChain(
+    const std::vector<Expression*>& distinct,
+    const std::vector<std::vector<Index>>& distinctIndices,
+    Index N,
+    Type resType,
+    Index indexLocal,
+    Expression** outExpr,
+    Index* outCodeCost) {
+    Index defaultIdx = 0;
+    std::vector<std::pair<Index, SelectArmPlan>> steps;
+    if (!planSelectChainSteps(
+          distinct, distinctIndices, N, defaultIdx, steps)) {
+      return false;
+    }
+    Expression* vDef = distinct[defaultIdx];
+    Index selectOpBytes = resType.isRef() ? 4 : 1;
+    Index baseSiteCost = getOperandBytes(vDef);
+    for (auto& [d, p] : steps) {
+      baseSiteCost +=
+        getOperandBytes(distinct[d]) + p.condExtra + selectOpBytes;
+    }
+    Index M = steps.size();
+    Index idxExtra = (M <= 1) ? 0 : (2 * (M - 1));
+    if (outCodeCost) {
+      *outCodeCost = baseSiteCost + idxExtra;
+    }
+    if (outExpr) {
+      Builder builder(*module);
+      Expression* acc = ExpressionManipulator::copy(vDef, *module);
+      for (Index m = 0; m < M; m++) {
+        Index d = steps[m].first;
+        const SelectArmPlan& p = steps[m].second;
+        Expression* idxExpr = builder.makeLocalGet(indexLocal, Type::i32);
+        Expression* cond = buildSelectCond(builder, p, idxExpr);
+        Expression* trueExpr =
+          ExpressionManipulator::copy(distinct[d], *module);
+        acc = builder.makeSelect(cond, trueExpr, acc);
+      }
+      *outExpr = acc;
+    }
+    return true;
+  }
+
   static int64_t getPackedOrI32Value(const Field& field, int32_t raw) {
     if (field.isPacked()) {
       if (field.packedType == Field::i8) {
@@ -1362,9 +1609,12 @@ private:
           continue;
         }
         std::vector<Expression*> distinct;
+        std::vector<std::vector<Index>> distinctIndices;
         bool ok = true;
-        for (auto* m : members) {
-          auto* leaf = m->leaves[i];
+        Index elemBytesSum = 0;
+        for (Index k = 0; k < N; k++) {
+          auto* leaf = members[k]->leaves[i];
+          elemBytesSum += getOperandBytes(leaf);
           Index idx = 0;
           while (idx < distinct.size() && !sameRefLeaf(distinct[idx], leaf)) {
             idx++;
@@ -1375,12 +1625,42 @@ private:
               break;
             }
             distinct.push_back(leaf);
+            distinctIndices.push_back({k});
+          } else {
+            distinctIndices[idx].push_back(k);
           }
         }
         if (!ok) {
           continue;
         }
+        Index D = distinct.size();
         Index effD = getEffectivePaletteCount(distinct);
+        Index distinctBytes = 0;
+        for (auto* expr : distinct) {
+          distinctBytes += getOperandBytes(expr);
+        }
+        if (D > effD) {
+          Index savedPal = 3 * (D - effD);
+          distinctBytes =
+            distinctBytes > savedPal ? distinctBytes - savedPal : 0;
+        }
+        Index uncompressedTableCost =
+          9 + getLEBSize(U32LEB(N)) + elemBytesSum + 6;
+        Index w1PaletteCostAt8 =
+          9 + getLEBSize(U32LEB(effD)) + distinctBytes + N + 8;
+        Index selectCodeCost = Index(-1);
+        if (D >= 2 && D <= 5 && D < N && D == effD &&
+            tryPlanSelectChain(distinct,
+                               distinctIndices,
+                               N,
+                               leafFields[i].type,
+                               0,
+                               nullptr,
+                               &selectCodeCost) &&
+            selectCodeCost <=
+              std::min(uncompressedTableCost, w1PaletteCostAt8)) {
+          continue;
+        }
         if (9 + 3 * effD + N + 25 < 9 + 3 * N) {
           hasW1Col = true;
           break;
@@ -1411,9 +1691,15 @@ private:
       }
       if (canUseData && isPaletteCandidate(field)) {
         std::vector<Expression*> distinct;
+        std::vector<std::vector<Index>> distinctIndices;
         bool ok = true;
-        for (auto* m : members) {
-          auto* leaf = m->leaves[i];
+        Index elemBytesSum = 0;
+        for (Index k = 0; k < N; k++) {
+          auto* leaf = members[k]->leaves[i];
+          elemBytesSum += getOperandBytes(leaf);
+          if (!ok) {
+            continue;
+          }
           Index idx = 0;
           while (idx < distinct.size() && !sameRefLeaf(distinct[idx], leaf)) {
             idx++;
@@ -1421,9 +1707,12 @@ private:
           if (idx == distinct.size()) {
             if (distinct.size() == 256) {
               ok = false;
-              break;
+            } else {
+              distinct.push_back(leaf);
+              distinctIndices.push_back({k});
             }
-            distinct.push_back(leaf);
+          } else {
+            distinctIndices[idx].push_back(k);
           }
         }
         Index D = distinct.size();
@@ -1433,14 +1722,34 @@ private:
           for (auto* m : members) {
             costs.memberTableBytes[m] += 1;
           }
-          Index palBytes = 9;
+          Index distinctBytes = 0;
           for (auto* expr : distinct) {
-            palBytes += getOperandBytes(expr);
+            distinctBytes += getOperandBytes(expr);
           }
           if (D > effD) {
             Index savedPal = 3 * (D - effD);
-            palBytes = palBytes > savedPal ? palBytes - savedPal : 9;
+            distinctBytes =
+              distinctBytes > savedPal ? distinctBytes - savedPal : 0;
           }
+          Index uncompressedTableCost =
+            9 + getLEBSize(U32LEB(N)) + elemBytesSum + 6;
+          Index w1PaletteCost =
+            9 + getLEBSize(U32LEB(effD)) + distinctBytes + N + w1Extra;
+          Index selectCodeCost = Index(-1);
+          if (D >= 2 && D <= 5 && D < N && D == effD &&
+              tryPlanSelectChain(distinct,
+                                 distinctIndices,
+                                 N,
+                                 field.type,
+                                 0,
+                                 nullptr,
+                                 &selectCodeCost) &&
+              selectCodeCost <=
+                std::min(uncompressedTableCost, w1PaletteCost)) {
+            paletteOverhead += (selectCodeCost > N ? selectCodeCost - N : 0);
+            continue;
+          }
+          Index palBytes = 9 + distinctBytes;
           paletteOverhead += palBytes + 6;
           dataWidthCols[1]++;
           hasW1Col = true;
@@ -1829,6 +2138,7 @@ private:
       Name paletteGlobal;
       Type paletteGlobalType;
       Index elemOffset = 0;
+      Expression* selectExpr = nullptr;
     };
     struct DataColumnInit {
       Name global;
@@ -1849,6 +2159,7 @@ private:
     std::vector<Index> prevI32Cols;
     std::vector<Index> uniqueVarying;
     Index N = members.size();
+    const Index indexLocal = 0;
     bool canUseData = module->features.hasBulkMemory();
     bool hasSecArrays = isFirstChunk && !group.secondaryArrays.empty();
     bool willHaveW1Col = hasSecArrays;
@@ -1933,11 +2244,14 @@ private:
           }
           continue;
         }
-        if (!preservedThunk && isPaletteCandidate(field)) {
+        if (isPaletteCandidate(field)) {
           std::vector<Expression*> distinct;
+          std::vector<std::vector<Index>> distinctIndices;
           bool ok = true;
-          for (auto* m : members) {
-            auto* leaf = m->leaves[i];
+          Index elemBytesSum = 0;
+          for (Index k = 0; k < N; k++) {
+            auto* leaf = members[k]->leaves[i];
+            elemBytesSum += getOperandBytes(leaf);
             Index idx = 0;
             while (idx < distinct.size() && !sameRefLeaf(distinct[idx], leaf)) {
               idx++;
@@ -1948,22 +2262,54 @@ private:
                 break;
               }
               distinct.push_back(leaf);
+              distinctIndices.push_back({k});
+            } else {
+              distinctIndices[idx].push_back(k);
             }
           }
           if (!ok) {
             continue;
           }
+          Index D = distinct.size();
           Index effD = getEffectivePaletteCount(distinct);
-          if (9 + 3 * effD + N + 25 < 9 + 3 * N) {
-            willHaveW1Col = true;
-            break;
+          Index distinctBytes = 0;
+          for (auto* expr : distinct) {
+            distinctBytes += getOperandBytes(expr);
           }
-          if (9 + 3 * effD + N + 8 < 9 + 3 * N) {
-            palCountAt8++;
-            combinedPalGainAt8 += (9 + 3 * N) - (9 + 3 * effD + N + 8);
-            if (palCountAt8 >= 2 && combinedPalGainAt8 > 17) {
+          if (D > effD) {
+            Index savedPal = 3 * (D - effD);
+            distinctBytes =
+              distinctBytes > savedPal ? distinctBytes - savedPal : 0;
+          }
+          Index uncompressedTableCost =
+            9 + getLEBSize(U32LEB(N)) + elemBytesSum + 6;
+          Index w1PaletteCostAt8 =
+            9 + getLEBSize(U32LEB(effD)) + distinctBytes + N + 8;
+          Index selectCodeCost = Index(-1);
+          if (D >= 2 && D <= 5 && D < N && D == effD &&
+              tryPlanSelectChain(distinct,
+                                 distinctIndices,
+                                 N,
+                                 field.type,
+                                 indexLocal,
+                                 nullptr,
+                                 &selectCodeCost) &&
+              selectCodeCost <=
+                std::min(uncompressedTableCost, w1PaletteCostAt8)) {
+            continue;
+          }
+          if (!preservedThunk) {
+            if (9 + 3 * effD + N + 25 < 9 + 3 * N) {
               willHaveW1Col = true;
               break;
+            }
+            if (9 + 3 * effD + N + 8 < 9 + 3 * N) {
+              palCountAt8++;
+              combinedPalGainAt8 += (9 + 3 * N) - (9 + 3 * effD + N + 8);
+              if (palCountAt8 >= 2 && combinedPalGainAt8 > 17) {
+                willHaveW1Col = true;
+                break;
+              }
             }
           }
         }
@@ -2136,13 +2482,19 @@ private:
                       0};
         continue;
       }
-      if (canUseData && isPaletteCandidate(field)) {
+      if (isPaletteCandidate(field)) {
         std::vector<Expression*> distinct;
+        std::vector<std::vector<Index>> distinctIndices;
         std::vector<uint8_t> indices;
         indices.reserve(N);
         bool ok = true;
-        for (auto* member : members) {
-          auto* leaf = member->leaves[i];
+        Index elemBytesSum = 0;
+        for (Index k = 0; k < N; k++) {
+          auto* leaf = members[k]->leaves[i];
+          elemBytesSum += getOperandBytes(leaf);
+          if (!ok) {
+            continue;
+          }
           Index idx = 0;
           while (idx < distinct.size() && !sameRefLeaf(distinct[idx], leaf)) {
             idx++;
@@ -2150,16 +2502,56 @@ private:
           if (idx == distinct.size()) {
             if (distinct.size() == 256) {
               ok = false;
-              break;
+              continue;
             }
             distinct.push_back(leaf);
+            distinctIndices.push_back({k});
+          } else {
+            distinctIndices[idx].push_back(k);
           }
           indices.push_back(uint8_t(idx));
         }
         Index D = distinct.size();
         Index effD = ok ? getEffectivePaletteCount(distinct) : D;
+        Index distinctBytes = 0;
+        for (auto* expr : distinct) {
+          distinctBytes += getOperandBytes(expr);
+        }
+        if (D > effD) {
+          Index savedPal = 3 * (D - effD);
+          distinctBytes =
+            distinctBytes > savedPal ? distinctBytes - savedPal : 0;
+        }
+        Index uncompressedTableCost =
+          9 + getLEBSize(U32LEB(N)) + elemBytesSum + 6;
         Index w1Extra = willHaveW1Col ? 8 : 25;
-        if (ok && 9 + 3 * effD + N + w1Extra < 9 + 3 * N) {
+        Index w1PaletteCost =
+          (canUseData && ok)
+            ? (9 + getLEBSize(U32LEB(effD)) + distinctBytes + N + w1Extra)
+            : Index(-1);
+        Expression* selectExpr = nullptr;
+        Index selectCodeCost = Index(-1);
+        if (ok && D >= 2 && D <= 5 && D < N && D == effD &&
+            tryPlanSelectChain(distinct,
+                               distinctIndices,
+                               N,
+                               field.type,
+                               indexLocal,
+                               &selectExpr,
+                               &selectCodeCost) &&
+            selectCodeCost <= std::min(uncompressedTableCost, w1PaletteCost)) {
+          columns[i] = {Name(),
+                        Type::none,
+                        false,
+                        false,
+                        Index(-1),
+                        Name(),
+                        Type::none,
+                        0,
+                        selectExpr};
+          continue;
+        }
+        if (canUseData && ok && 9 + 3 * effD + N + w1Extra < 9 + 3 * N) {
           willHaveW1Col = true;
           std::vector<Expression*> palValues;
           palValues.reserve(D);
@@ -2281,7 +2673,6 @@ private:
     }
 
     // The factory.
-    Index indexLocal = 0;
     std::vector<Type> vars;
     Index objectLocal = 1;
     if (!cacheless) {
@@ -2318,6 +2709,7 @@ private:
       auto it = baseColLocals.find(prev);
       if (it != baseColLocals.end() &&
           !columns.at(prev).paletteGlobal.is() &&
+          !columns.at(prev).selectExpr &&
           !columns.at(prev).addIndex &&
           columns.at(prev).baseColumn == Index(-1)) {
         dupColLocals[prev] = it->second;
@@ -2342,7 +2734,9 @@ private:
     std::function<Expression*(Index)> readColumn = [&](Index i) -> Expression* {
       auto& col = columns.at(i);
       Expression* val = nullptr;
-      if (col.paletteGlobal.is()) {
+      if (col.selectExpr) {
+        val = col.selectExpr;
+      } else if (col.paletteGlobal.is()) {
         auto* idx = builder.makeArrayGet(
           builder.makeGlobalGet(col.global, col.globalType),
           makeElemIndex(col.elemOffset),
@@ -8474,161 +8868,14 @@ private:
         }
       }
 
-      if (D == 2 || (D >= 3 && D <= 5 && D < N)) {
-        enum Mode {
-          InvalidMode,
-          DirectIdx,
-          EqConst,
-          RangeLtU,
-          RangeGeU,
-          RangeMid,
-          Bitmask
-        };
-        struct ArmPlan {
-          Mode mode = InvalidMode;
-          Index param1 = 0;
-          Index param2 = 0;
-          Index condExtra = 0;
-        };
-        Index numMasks = 1u << D;
-        std::vector<Index> fMin(numMasks, N);
-        std::vector<Index> fMax(numMasks, 0);
-        std::vector<Index> fCount(numMasks, 0);
-        for (Index mask = 1; mask < numMasks; mask++) {
-          for (Index d = 0; d < D; d++) {
-            if (mask & (1u << d)) {
-              const auto& ks = distinctIndices[d];
-              fMin[mask] = std::min(fMin[mask], ks.front());
-              fMax[mask] = std::max(fMax[mask], ks.back());
-              fCount[mask] += ks.size();
-            }
-          }
-        }
-
-        auto computeStepPlan = [&](Index mask, Index nextD) -> ArmPlan {
-          const auto& k1 = distinctIndices[nextD];
-          Index k1Min = k1.front();
-          Index k1Max = k1.back();
-          ArmPlan best;
-          auto tryPlan = [&](Mode m, Index p1, Index p2, Index cost) {
-            if (best.mode == InvalidMode || cost < best.condExtra) {
-              best = {m, p1, p2, cost};
-            }
-          };
-          if (fCount[mask] == 1 && fMin[mask] == 0) {
-            tryPlan(DirectIdx, 0, 0, 0);
-          }
-          if (k1.size() == 1) {
-            Index c = k1[0];
-            tryPlan(EqConst, c, 0, (c == 0) ? 1 : (2 + getSLEBSize(c)));
-          }
-          if (k1Max < fMin[mask]) {
-            Index bestLim = k1Max + 1;
-            Index bestLimCost = 2 + getSLEBSize(bestLim);
-            for (Index lim = k1Max + 2; lim <= fMin[mask]; lim++) {
-              Index c = 2 + getSLEBSize(lim);
-              if (c < bestLimCost) {
-                bestLim = lim;
-                bestLimCost = c;
-              }
-            }
-            tryPlan(RangeLtU, bestLim, 0, bestLimCost);
-          }
-          if (k1Min > fMax[mask]) {
-            Index bestStart = k1Min;
-            Index bestStartCost = 2 + getSLEBSize(bestStart);
-            for (Index st = fMax[mask] + 1; st < k1Min; st++) {
-              Index c = 2 + getSLEBSize(st);
-              if (c < bestStartCost) {
-                bestStart = st;
-                bestStartCost = c;
-              }
-            }
-            tryPlan(RangeGeU, bestStart, 0, bestStartCost);
-          }
-          {
-            bool conflict = false;
-            for (Index d = 0; d < D; d++) {
-              if (mask & (1u << d)) {
-                for (Index f : distinctIndices[d]) {
-                  if (f >= k1Min && f <= k1Max) {
-                    conflict = true;
-                    break;
-                  }
-                }
-                if (conflict) {
-                  break;
-                }
-              }
-            }
-            if (!conflict) {
-              Index len = k1Max - k1Min + 1;
-              tryPlan(RangeMid,
-                      k1Min,
-                      len,
-                      4 + getSLEBSize(k1Min) + getSLEBSize(len));
-            }
-          }
-          if (k1Max < 32) {
-            uint32_t bm = 0;
-            for (Index idx : k1) {
-              bm |= (1u << idx);
-            }
-            tryPlan(Bitmask, Index(bm), 0, 5 + getSLEBSize(Index(bm)));
-          }
-          return best;
-        };
-
-        struct DPState {
-          Index condSum = Index(-1);
-          Index defaultCount = 0;
-          Index prevMask = 0;
-          Index addedArm = Index(-1);
-          ArmPlan plan;
-        };
-        std::vector<DPState> dp(numMasks);
-        for (Index d = 0; d < D; d++) {
-          Index m = 1u << d;
-          dp[m].condSum = 0;
-          dp[m].defaultCount = distinctIndices[d].size();
-        }
-        for (Index mask = 1; mask < numMasks; mask++) {
-          if (dp[mask].condSum == Index(-1)) {
-            continue;
-          }
-          for (Index nextD = 0; nextD < D; nextD++) {
-            if (mask & (1u << nextD)) {
-              continue;
-            }
-            ArmPlan p = computeStepPlan(mask, nextD);
-            if (p.mode == InvalidMode) {
-              continue;
-            }
-            Index nextMask = mask | (1u << nextD);
-            Index nextCost = dp[mask].condSum + p.condExtra;
-            if (dp[nextMask].condSum == Index(-1) ||
-                nextCost < dp[nextMask].condSum ||
-                (nextCost == dp[nextMask].condSum &&
-                 dp[mask].defaultCount > dp[nextMask].defaultCount)) {
-              dp[nextMask] = {
-                nextCost, dp[mask].defaultCount, mask, nextD, p};
-            }
-          }
-        }
-        Index fullMask = numMasks - 1;
-        if (dp[fullMask].condSum != Index(-1)) {
-          std::vector<std::pair<Index, ArmPlan>> steps;
-          Index curMask = fullMask;
-          while (dp[curMask].prevMask != 0) {
-            steps.push_back({dp[curMask].addedArm, dp[curMask].plan});
-            curMask = dp[curMask].prevMask;
-          }
-          std::reverse(steps.begin(), steps.end());
-          Index defaultIdx = 0;
-          while ((curMask & (1u << defaultIdx)) == 0) {
-            defaultIdx++;
-          }
-
+      bool isExternRefElem =
+        elemField.type.isRef() &&
+        elemField.type.getHeapType().getBottom() == HeapType::noext;
+      if (D == 2 || (D >= 3 && D <= 5 && (D < N || !isExternRefElem))) {
+        Index defaultIdx = 0;
+        std::vector<std::pair<Index, SelectArmPlan>> steps;
+        if (planSelectChainSteps(
+              distinct, distinctIndices, N, defaultIdx, steps)) {
           Expression* vDef = distinct[defaultIdx];
           Index armOpBytes =
             hasStructAllocElem ? (selectOpBytes + 1) : selectOpBytes;
@@ -8647,7 +8894,7 @@ private:
                                                     : (4 + 2 * (M - 1)));
             costAfter += baseSiteCost + idxExtra;
           }
-          if (costAfter < costBefore) {
+          if (costAfter <= costBefore) {
             for (auto& [fn, site] : sites) {
               auto* ag = (*site)->cast<ArrayGet>();
               Index scratchLoc = Index(-1);
@@ -8658,7 +8905,7 @@ private:
               Expression* acc = ExpressionManipulator::copy(vDef, *module);
               for (Index m = 0; m < M; m++) {
                 Index d = steps[m].first;
-                const ArmPlan& p = steps[m].second;
+                const SelectArmPlan& p = steps[m].second;
                 Expression* idxExpr = nullptr;
                 if (M == 1 || ag->index->is<LocalGet>()) {
                   idxExpr =
@@ -8672,37 +8919,7 @@ private:
                       : static_cast<Expression*>(
                           builder.makeLocalGet(scratchLoc, Type::i32));
                 }
-                Expression* cond = nullptr;
-                if (p.mode == DirectIdx) {
-                  cond = idxExpr;
-                } else if (p.mode == EqConst) {
-                  if (p.param1 == 0) {
-                    cond = builder.makeUnary(EqZInt32, idxExpr);
-                  } else {
-                    cond = builder.makeBinary(
-                      EqInt32, idxExpr, builder.makeConst(int32_t(p.param1)));
-                  }
-                } else if (p.mode == RangeLtU) {
-                  cond = builder.makeBinary(
-                    LtUInt32, idxExpr, builder.makeConst(int32_t(p.param1)));
-                } else if (p.mode == RangeGeU) {
-                  cond = builder.makeBinary(
-                    GeUInt32, idxExpr, builder.makeConst(int32_t(p.param1)));
-                } else if (p.mode == RangeMid) {
-                  cond = builder.makeBinary(
-                    LtUInt32,
-                    builder.makeBinary(
-                      SubInt32, idxExpr, builder.makeConst(int32_t(p.param1))),
-                    builder.makeConst(int32_t(p.param2)));
-                } else {
-                  cond = builder.makeBinary(
-                    AndInt32,
-                    builder.makeBinary(
-                      ShrUInt32,
-                      builder.makeConst(int32_t(p.param1)),
-                      idxExpr),
-                    builder.makeConst(int32_t(1)));
-                }
+                Expression* cond = buildSelectCond(builder, p, idxExpr);
                 Expression* trueExpr =
                   ExpressionManipulator::copy(distinct[d], *module);
                 if (hasStructAllocElem) {
@@ -8932,6 +9149,44 @@ private:
     }
     for (Name gname : globalsToRemove) {
       module->removeGlobal(gname);
+    }
+
+    for (auto& g : module->globals) {
+      if (g->imported() || !g->init) {
+        continue;
+      }
+      for (auto** ptr : FindAllPointers<ArrayNewFixed>(g->init).list) {
+        auto* anf = (*ptr)->cast<ArrayNewFixed>();
+        if (anf->values.empty() || !anf->type.isRef() ||
+            !anf->type.getHeapType().isArray()) {
+          continue;
+        }
+        Field elemField = anf->type.getHeapType().getArray().element;
+        if (!elemField.type.isDefaultable()) {
+          continue;
+        }
+        bool allDefault = std::all_of(
+          anf->values.begin(), anf->values.end(), [&](Expression* v) {
+            if (v->is<RefNull>()) {
+              return true;
+            }
+            if (auto* c = resolveConstElem(v)) {
+              if (c->value == Literal::makeZero(c->type)) {
+                return true;
+              }
+              if (c->type == Type::i32 && elemField.isPacked() &&
+                  getPackedOrI32Value(elemField, c->value.geti32()) == 0) {
+                return true;
+              }
+            }
+            return false;
+          });
+        if (allDefault) {
+          *ptr =
+            builder.makeArrayNew(anf->type.getHeapType(),
+                                 builder.makeConst(int32_t(anf->values.size())));
+        }
+      }
     }
   }
 };
