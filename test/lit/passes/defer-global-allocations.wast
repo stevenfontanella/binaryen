@@ -2701,3 +2701,162 @@
     (global.get $c)
   )
 )
+
+;; Shape-fragmented root struct group with heterogeneous depth-1 nested
+;; struct.new operands in an abstract (eqref) field: hoisting the nested
+;; struct.new operands unifies the root struct globals into a single flat shape
+;; so they defer into one factory.
+(module
+  ;; CHECK:      (type $vt (struct (field eqref) (field i32) (field i32) (field i32) (field i32) (field i32)))
+
+  ;; CHECK:      (type $1 (array (mut (ref null $vt))))
+
+  ;; CHECK:      (type $2 (array eqref))
+
+  ;; CHECK:      (type $itA (struct (field i32) (field i32)))
+  (type $itA (struct (field i32) (field i32)))
+  ;; CHECK:      (type $itB (struct (field i32) (field i64)))
+  (type $itB (struct (field i32) (field i64)))
+  ;; CHECK:      (type $itC (struct (field i64) (field i32)))
+  (type $itC (struct (field i64) (field i32)))
+  ;; CHECK:      (type $itD (struct (field i32) (field i32) (field i32)))
+  (type $itD (struct (field i32) (field i32) (field i32)))
+  (type $vt (struct (field eqref) (field i32) (field i32) (field i32) (field i32) (field i32)))
+
+  (global $v0 (ref $vt) (struct.new $vt (struct.new $itA (i32.const 1) (i32.const 2)) (i32.const 100) (i32.const 200) (i32.const 300) (i32.const 400) (i32.const 500)))
+  (global $v1 (ref $vt) (struct.new $vt (struct.new $itB (i32.const 3) (i64.const 4)) (i32.const 100) (i32.const 200) (i32.const 300) (i32.const 400) (i32.const 500)))
+  (global $v2 (ref $vt) (struct.new $vt (struct.new $itC (i64.const 5) (i32.const 6)) (i32.const 100) (i32.const 200) (i32.const 300) (i32.const 400) (i32.const 500)))
+  (global $v3 (ref $vt) (struct.new $vt (struct.new $itD (i32.const 7) (i32.const 8) (i32.const 9)) (i32.const 100) (i32.const 200) (i32.const 300) (i32.const 400) (i32.const 500)))
+  (global $v4 (ref $vt) (struct.new $vt (struct.new $itA (i32.const 14) (i32.const 15)) (i32.const 100) (i32.const 200) (i32.const 300) (i32.const 400) (i32.const 500)))
+  (global $v5 (ref $vt) (struct.new $vt (struct.new $itB (i32.const 16) (i64.const 17)) (i32.const 100) (i32.const 200) (i32.const 300) (i32.const 400) (i32.const 500)))
+  (global $v6 (ref $vt) (struct.new $vt (struct.new $itC (i64.const 18) (i32.const 19)) (i32.const 100) (i32.const 200) (i32.const 300) (i32.const 400) (i32.const 500)))
+  (global $v7 (ref $vt) (struct.new $vt (struct.new $itD (i32.const 20) (i32.const 21) (i32.const 22)) (i32.const 100) (i32.const 200) (i32.const 300) (i32.const 400) (i32.const 500)))
+
+  ;; CHECK:      (type $7 (func (result (ref $vt))))
+
+  ;; CHECK:      (type $8 (func (param i32) (result (ref $vt))))
+
+  ;; CHECK:      (global $defer$vt$cache (ref $1) (array.new_default $1
+  ;; CHECK-NEXT:  (i32.const 8)
+  ;; CHECK-NEXT: ))
+
+  ;; CHECK:      (global $defer$vt$table$0 (ref $2) (array.new_fixed $2 8
+  ;; CHECK-NEXT:  (struct.new $itA
+  ;; CHECK-NEXT:   (i32.const 1)
+  ;; CHECK-NEXT:   (i32.const 2)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (struct.new $itB
+  ;; CHECK-NEXT:   (i32.const 3)
+  ;; CHECK-NEXT:   (i64.const 4)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (struct.new $itC
+  ;; CHECK-NEXT:   (i64.const 5)
+  ;; CHECK-NEXT:   (i32.const 6)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (struct.new $itD
+  ;; CHECK-NEXT:   (i32.const 7)
+  ;; CHECK-NEXT:   (i32.const 8)
+  ;; CHECK-NEXT:   (i32.const 9)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (struct.new $itA
+  ;; CHECK-NEXT:   (i32.const 14)
+  ;; CHECK-NEXT:   (i32.const 15)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (struct.new $itB
+  ;; CHECK-NEXT:   (i32.const 16)
+  ;; CHECK-NEXT:   (i64.const 17)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (struct.new $itC
+  ;; CHECK-NEXT:   (i64.const 18)
+  ;; CHECK-NEXT:   (i32.const 19)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (struct.new $itD
+  ;; CHECK-NEXT:   (i32.const 20)
+  ;; CHECK-NEXT:   (i32.const 21)
+  ;; CHECK-NEXT:   (i32.const 22)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: ))
+
+  ;; CHECK:      (export "use_vt" (func $use_vt))
+
+  ;; CHECK:      (func $use_vt (type $7) (result (ref $vt))
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$vt
+  ;; CHECK-NEXT:    (i32.const 0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$vt
+  ;; CHECK-NEXT:    (i32.const 1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$vt
+  ;; CHECK-NEXT:    (i32.const 2)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$vt
+  ;; CHECK-NEXT:    (i32.const 3)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$vt
+  ;; CHECK-NEXT:    (i32.const 4)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$vt
+  ;; CHECK-NEXT:    (i32.const 5)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$vt
+  ;; CHECK-NEXT:    (i32.const 6)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (call $defer$vt
+  ;; CHECK-NEXT:   (i32.const 7)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $use_vt (export "use_vt") (result (ref $vt))
+    (drop (global.get $v0))
+    (drop (global.get $v1))
+    (drop (global.get $v2))
+    (drop (global.get $v3))
+    (drop (global.get $v4))
+    (drop (global.get $v5))
+    (drop (global.get $v6))
+    (global.get $v7)
+  )
+)
+
+;; CHECK:      (func $defer$vt (type $8) (param $0 i32) (result (ref $vt))
+;; CHECK-NEXT:  (local $1 (ref $vt))
+;; CHECK-NEXT:  (block $cached (result (ref $vt))
+;; CHECK-NEXT:   (br_on_non_null $cached
+;; CHECK-NEXT:    (array.get $1
+;; CHECK-NEXT:     (global.get $defer$vt$cache)
+;; CHECK-NEXT:     (local.get $0)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (array.set $1
+;; CHECK-NEXT:    (global.get $defer$vt$cache)
+;; CHECK-NEXT:    (local.get $0)
+;; CHECK-NEXT:    (local.tee $1
+;; CHECK-NEXT:     (struct.new $vt
+;; CHECK-NEXT:      (array.get $2
+;; CHECK-NEXT:       (global.get $defer$vt$table$0)
+;; CHECK-NEXT:       (local.get $0)
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:      (i32.const 100)
+;; CHECK-NEXT:      (i32.const 200)
+;; CHECK-NEXT:      (i32.const 300)
+;; CHECK-NEXT:      (i32.const 400)
+;; CHECK-NEXT:      (i32.const 500)
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (local.get $1)
+;; CHECK-NEXT:  )
+;; CHECK-NEXT: )

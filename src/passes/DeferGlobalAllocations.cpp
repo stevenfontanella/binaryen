@@ -167,6 +167,8 @@ struct DeferGlobalAllocations : public Pass {
   std::unordered_map<Name, Index> functionIndexes;
   std::unordered_map<Name, StructNew*> soleCandidateStructInits;
   std::unordered_map<Name, std::vector<PaletteSlice>> paletteSlices;
+  std::unordered_set<Name> hoistedGlobalNames;
+  Index numHoisted = 0;
   bool includeAllocationOperands = false;
   bool preserveThunkTypes = false;
   bool onceOnly = false;
@@ -185,6 +187,8 @@ struct DeferGlobalAllocations : public Pass {
     }
     segmentName = Names::getValidDataSegmentName(*module, "defer$data");
     paletteSlices.clear();
+    hoistedGlobalNames.clear();
+    numHoisted = 0;
     includeAllocationOperands =
       !getArgumentOrDefault("defer-global-allocations-allocation-operands", "")
          .empty();
@@ -214,6 +218,9 @@ struct DeferGlobalAllocations : public Pass {
       segmentData.clear();
       paletteSlices.clear();
     }
+    if (!onceOnly && !preserveThunkTypes && !always) {
+      hoistFragmentedNestedStructInits();
+    }
     runGroupDeferral(/*skipPreservedThunkGroups=*/false);
     if (!onceOnly) {
       runGroupDeferral(/*skipPreservedThunkGroups=*/true);
@@ -222,6 +229,9 @@ struct DeferGlobalAllocations : public Pass {
     optimizeOnceGlobals(/*onlyArrays=*/false);
     if (!preserveThunkTypes && !always) {
       foldArrayGlobals();
+      if (!onceOnly) {
+        inlineInitOnlyStructGlobals();
+      }
     }
     if (!segmentData.empty()) {
       module->addDataSegment(Builder::makeDataSegment(
@@ -3747,26 +3757,56 @@ private:
         continue;
       }
       HeapType structHt = elemField.type.getHeapType();
-      if (!structHt.isStruct() || structHt.isShared()) {
-        continue;
-      }
       Name existingHelper;
       StructNew* existingTempl = nullptr;
-      if (!elemField.type.isNullable() && elemField.mutable_ == Immutable) {
+      if (elemField.mutable_ == Immutable) {
         if (totalGets != arrayGetSites[g->name].size()) {
           continue;
         }
         bool allNonNullGlobalGets = true;
+        HeapType commonElemHt;
+        bool hasCommonElemHt = false;
         for (auto* val : anf->values) {
-          if (!val->is<GlobalGet>()) {
+          auto* gg = val->dynCast<GlobalGet>();
+          if (!gg) {
+            allNonNullGlobalGets = false;
+            break;
+          }
+          auto* eg = module->getGlobalOrNull(gg->name);
+          if (!eg || !eg->type.isRef() || eg->type.isNullable()) {
+            allNonNullGlobalGets = false;
+            break;
+          }
+          HeapType eHt = eg->type.getHeapType();
+          if (!eHt.isStruct() || eHt.isShared()) {
+            allNonNullGlobalGets = false;
+            break;
+          }
+          if (!hasCommonElemHt) {
+            commonElemHt = eHt;
+            hasCommonElemHt = true;
+          } else if (commonElemHt != eHt) {
             allNonNullGlobalGets = false;
             break;
           }
         }
-        if (!allNonNullGlobalGets) {
+        if (!allNonNullGlobalGets || !hasCommonElemHt) {
+          continue;
+        }
+        if (structHt.isStruct()) {
+          if (structHt.isShared() || commonElemHt != structHt) {
+            continue;
+          }
+        } else if (Type::isSubType(Type(commonElemHt, NonNullable),
+                                   elemField.type)) {
+          structHt = commonElemHt;
+        } else {
           continue;
         }
       } else if (elemField.type.isNullable() && elemField.mutable_ == Mutable) {
+        if (!structHt.isStruct() || structHt.isShared()) {
+          continue;
+        }
         auto& targets = allPalCallTargets[g->name];
         if (targets.size() != totalGets) {
           continue;
@@ -3783,13 +3823,18 @@ private:
           continue;
         }
         auto* helperFn = module->getFunctionOrNull(commonTarget);
-        if (!helperFn || helperFn->imported() || !helperFn->body) {
+        if (!helperFn || helperFn->imported() || !helperFn->body ||
+            helperFn->getNumParams() != 2 ||
+            !helperFn->getParams()[0].isRef() ||
+            helperFn->getParams()[0].isExact() ||
+            helperFn->getParams()[0].getHeapType() != arrHt ||
+            helperFn->getParams()[1] != Type::i32 ||
+            !helperFn->getResults().isRef() ||
+            helperFn->getResults().getHeapType() != structHt) {
           continue;
         }
         if (!commonTarget.startsWith("defer$pal$")) {
-          if (helperFn->getNumParams() != 2 || helperFn->getNumVars() != 1 ||
-              !helperFn->getResults().isRef() ||
-              helperFn->getResults().getHeapType() != structHt ||
+          if (helperFn->getNumVars() != 1 ||
               FindAll<BrOn>(helperFn->body).list.size() != 1 ||
               FindAll<ArrayGet>(helperFn->body).list.size() != 1 ||
               FindAll<ArraySet>(helperFn->body).list.size() != 1) {
@@ -4019,6 +4064,10 @@ private:
         Type nonNullStructType(structHt, NonNullable);
         Type nullStructType(structHt, Nullable);
         HeapType mutArrHt(Array(Field(nullStructType, Mutable)));
+        if (reusedHelper.is()) {
+          mutArrHt =
+            module->getFunction(reusedHelper)->getParams()[0].getHeapType();
+        }
         Type mutArrRefType(mutArrHt, NonNullable);
 
         Name helperName = reusedHelper;
@@ -9735,6 +9784,867 @@ private:
                                  builder.makeConst(int32_t(anf->values.size())));
         }
       }
+    }
+  }
+
+  int64_t estimateGroupNetGain(Group group) {
+    auto& members = group.members;
+    members.erase(
+      std::remove_if(members.begin(),
+                     members.end(),
+                     [&](const Candidate& c) { return c.uses == 0; }),
+      members.end());
+    if (members.empty()) {
+      return 0;
+    }
+    if (!includeAllocationOperands) {
+      Index uses = 0, allocOperandUses = 0;
+      for (auto& member : members) {
+        uses += member.uses;
+        allocOperandUses += member.allocOperandUses;
+      }
+      if (onceOnly ? allocOperandUses > 0 : allocOperandUses * 2 > uses) {
+        members.erase(std::remove_if(members.begin(),
+                                     members.end(),
+                                     [&](const Candidate& c) {
+                                       if (!onceOnly &&
+                                           c.allocOperandUses == 0) {
+                                         return false;
+                                       }
+                                       return !(c.uses == 1 &&
+                                                c.onceUses == 1);
+                                     }),
+                      members.end());
+        if (members.empty()) {
+          return 0;
+        }
+      }
+    }
+    if (members.size() < 2) {
+      return 0;
+    }
+    Index numLeaves = group.leafFields.size();
+    auto varying = getVaryingColumns(members, numLeaves);
+    const Index callBytes = 3;
+    std::vector<Candidate*> sorted;
+    sorted.reserve(members.size());
+    for (auto& member : members) {
+      sorted.push_back(&member);
+    }
+    std::sort(sorted.begin(), sorted.end(), [](Candidate* a, Candidate* b) {
+      if (a->uses != b->uses) {
+        return a->uses < b->uses;
+      }
+      if (a->absorbedIndex != b->absorbedIndex) {
+        return a->absorbedIndex < b->absorbedIndex;
+      }
+      return a->firstUse < b->firstUse;
+    });
+    std::vector<Candidate*> viable;
+    for (auto* member : sorted) {
+      Index getBytes =
+        1 + getLEBSize(U32LEB(globalIndexes[member->global->name]));
+      int64_t minSiteDelta = int64_t(callBytes + 2) - int64_t(getBytes);
+      int64_t maxSaving = int64_t(member->initBytes) + int64_t(member->bonus) -
+                          int64_t(member->uses) * minSiteDelta;
+      if (maxSaving > 0) {
+        viable.push_back(member);
+      }
+    }
+    if (viable.size() < 2) {
+      return 0;
+    }
+    std::vector<Candidate> viableCandidates;
+    viableCandidates.reserve(viable.size());
+    for (auto* m : viable) {
+      viableCandidates.push_back(*m);
+    }
+    auto viableVarying = getVaryingColumns(viableCandidates, numLeaves);
+    auto initialCosts = computeColumnCosts(group, viable, viableVarying, false);
+    auto getMemberTableBytes = [&](const Candidate* m) -> Index {
+      auto it = initialCosts.memberTableBytes.find(m);
+      if (it != initialCosts.memberTableBytes.end()) {
+        return it->second;
+      }
+      Index tb = 0;
+      for (auto i : varying) {
+        tb += getOperandBytes(m->leaves[i]);
+      }
+      return tb;
+    };
+    std::vector<Candidate*> chosen;
+    int64_t saving = 0;
+    for (auto* member : sorted) {
+      Index tableBytes = getMemberTableBytes(member);
+      Index index = chosen.size() % MaxChunkSize;
+      Index getBytes =
+        1 + getLEBSize(U32LEB(globalIndexes[member->global->name]));
+      int64_t siteDelta =
+        int64_t(callBytes + 1 + getSLEBSize(index)) - int64_t(getBytes);
+      int64_t memberSaving = int64_t(member->initBytes) +
+                             int64_t(member->bonus) - int64_t(tableBytes) -
+                             int64_t(member->uses) * siteDelta;
+      if (memberSaving > 0) {
+        chosen.push_back(member);
+        saving += memberSaving;
+      }
+    }
+    if (chosen.size() < 2) {
+      return 0;
+    }
+    auto evaluateChosen = [&](const std::vector<Candidate*>& curChosen,
+                              std::vector<Index>& outVarying,
+                              ColumnCosts& outCosts,
+                              int64_t& outSaving,
+                              Index& outOverhead) {
+      std::vector<Candidate> curMembers;
+      curMembers.reserve(curChosen.size());
+      for (auto* member : curChosen) {
+        curMembers.push_back(*member);
+      }
+      outVarying = getVaryingColumns(curMembers, numLeaves);
+      outCosts = computeColumnCosts(
+        group, curChosen, outVarying, false, /*forFinalCosts=*/true);
+      outSaving = 0;
+      for (Index idxInChosen = 0; idxInChosen < curChosen.size();
+           idxInChosen++) {
+        auto* member = curChosen[idxInChosen];
+        Index tableBytes = outCosts.memberTableBytes[member];
+        Index getBytes =
+          1 + getLEBSize(U32LEB(globalIndexes[member->global->name]));
+        Index index = idxInChosen % MaxChunkSize;
+        int64_t siteDelta =
+          int64_t(callBytes + 1 + getSLEBSize(index)) - int64_t(getBytes);
+        outSaving += int64_t(member->initBytes) + int64_t(member->bonus) -
+                     int64_t(tableBytes) - int64_t(member->uses) * siteDelta;
+      }
+      bool allOnceSingleUse =
+        std::all_of(curChosen.begin(), curChosen.end(), [](Candidate* c) {
+          return c->uses == 1 && c->onceUses == 1;
+        });
+      Index varyingInitBytes = 0;
+      for (auto i : outVarying) {
+        varyingInitBytes += getOperandBytes(curChosen[0]->leaves[i]);
+      }
+      Index fixedTemplateBytes =
+        curChosen[0]->initBytes > 9 + varyingInitBytes
+          ? curChosen[0]->initBytes - 9 - varyingInitBytes
+          : 0;
+      Index numChunks = (curChosen.size() + MaxChunkSize - 1) / MaxChunkSize;
+      Index baseFixed = allOnceSingleUse ? 16 : 53;
+      outOverhead =
+        numChunks *
+        (baseFixed + fixedTemplateBytes + outCosts.chunkColumnOverhead);
+    };
+    ColumnCosts finalCosts;
+    Index overhead = 0;
+    evaluateChosen(chosen, varying, finalCosts, saving, overhead);
+    bool hasNestedStruct =
+      std::any_of(chosen[0]->init->operands.begin(),
+                  chosen[0]->init->operands.end(),
+                  isNestedNew);
+    while (!hasNestedStruct && saving <= int64_t(overhead) &&
+           chosen.size() > 4 && chosen.size() <= 15) {
+      Index bestDropIdx = Index(-1);
+      int64_t bestNetGain = saving - int64_t(overhead);
+      std::vector<Index> bestVarying;
+      ColumnCosts bestCosts;
+      int64_t bestSaving = 0;
+      Index bestOverhead = 0;
+      for (Index dropIdx = 0; dropIdx < chosen.size(); dropIdx++) {
+        std::vector<Candidate*> trialChosen;
+        trialChosen.reserve(chosen.size() - 1);
+        for (Index j = 0; j < chosen.size(); j++) {
+          if (j != dropIdx) {
+            trialChosen.push_back(chosen[j]);
+          }
+        }
+        std::vector<Index> trialVarying;
+        ColumnCosts trialCosts;
+        int64_t trialSaving = 0;
+        Index trialOverhead = 0;
+        evaluateChosen(
+          trialChosen, trialVarying, trialCosts, trialSaving, trialOverhead);
+        int64_t trialNetGain = trialSaving - int64_t(trialOverhead);
+        if (trialNetGain > bestNetGain) {
+          bestNetGain = trialNetGain;
+          bestDropIdx = dropIdx;
+          bestVarying = std::move(trialVarying);
+          bestCosts = std::move(trialCosts);
+          bestSaving = trialSaving;
+          bestOverhead = trialOverhead;
+        }
+      }
+      if (bestDropIdx == Index(-1)) {
+        break;
+      }
+      chosen.erase(chosen.begin() + bestDropIdx);
+      varying = std::move(bestVarying);
+      finalCosts = std::move(bestCosts);
+      saving = bestSaving;
+      overhead = bestOverhead;
+    }
+    return saving > int64_t(overhead) ? (saving - int64_t(overhead)) : 0;
+  }
+
+  void hoistFragmentedNestedStructInits() {
+    computeIndexes();
+    soleCandidateStructInits.clear();
+
+    std::unordered_set<Expression*> onceGets;
+    computeOnceGetSet(onceGets);
+
+    std::unordered_set<Name> nonCodeUses;
+    {
+      struct Scanner : public PostWalker<Scanner> {
+        std::unordered_set<Name>& names;
+        Scanner(std::unordered_set<Name>& names) : names(names) {}
+        void visitGlobalGet(GlobalGet* curr) { names.insert(curr->name); }
+      } scanner(nonCodeUses);
+      for (auto& global : module->globals) {
+        if (!global->imported()) {
+          scanner.walk(global->init);
+        }
+      }
+      for (auto& segment : module->elementSegments) {
+        if (segment->offset) {
+          scanner.walk(segment->offset);
+        }
+        for (auto*& item : segment->data) {
+          scanner.walk(item);
+        }
+      }
+      for (auto& segment : module->dataSegments) {
+        if (segment->offset) {
+          scanner.walk(segment->offset);
+        }
+      }
+      for (auto& ex : module->exports) {
+        if (ex->kind == ExternalKind::Global) {
+          nonCodeUses.insert(*ex->getInternalName());
+        }
+      }
+    }
+
+    std::unordered_set<Name> potentialSet;
+    for (auto& global : module->globals) {
+      if (global->imported() || global->mutable_ ||
+          nonCodeUses.count(global->name)) {
+        continue;
+      }
+      auto* init = global->init->dynCast<StructNew>();
+      if (!init || init->desc || !init->type.isRef()) {
+        continue;
+      }
+      auto type = init->type.getHeapType();
+      if (type.isShared() || !global->type.isRef() ||
+          global->type.isNullable() || global->type.getHeapType() != type ||
+          init->operands.size() != type.getStruct().fields.size()) {
+        continue;
+      }
+      std::vector<Expression*> leaves;
+      std::vector<Field> leafFields;
+      std::string shape;
+      if (!flatten(init, leaves, leafFields, shape)) {
+        continue;
+      }
+      potentialSet.insert(global->name);
+    }
+    if (potentialSet.empty()) {
+      return;
+    }
+
+    struct HoistFuncInfo {
+      std::vector<Name> gets;
+      std::unordered_map<Name, Index> onceUses;
+      std::unordered_map<Name, Index> allocOperandUses;
+      std::unordered_set<Index> allocParams;
+      std::vector<std::tuple<Name, Index, Name>> callArgCandidates;
+    };
+    ModuleUtils::ParallelFunctionAnalysis<HoistFuncInfo> analysis(
+      *module, [&](Function* func, HoistFuncInfo& info) {
+        if (func->imported()) {
+          return;
+        }
+        struct Scanner : public PostWalker<Scanner> {
+          Function* func;
+          HoistFuncInfo& info;
+          const std::unordered_set<Name>& potentialSet;
+          const std::unordered_set<Expression*>& onceGets;
+          Scanner(Function* func,
+                  HoistFuncInfo& info,
+                  const std::unordered_set<Name>& potentialSet,
+                  const std::unordered_set<Expression*>& onceGets)
+            : func(func), info(info), potentialSet(potentialSet),
+              onceGets(onceGets) {}
+          static Expression* unwrapRef(Expression* expr) {
+            while (true) {
+              if (auto* ra = expr->dynCast<RefAs>()) {
+                expr = ra->value;
+              } else if (auto* rc = expr->dynCast<RefCast>()) {
+                expr = rc->ref;
+              } else {
+                return expr;
+              }
+            }
+          }
+          void visitGlobalGet(GlobalGet* curr) {
+            if (potentialSet.count(curr->name)) {
+              info.gets.push_back(curr->name);
+              if (onceGets.count(curr)) {
+                info.onceUses[curr->name]++;
+              }
+            }
+          }
+          void visitStructNew(StructNew* curr) {
+            for (auto* operand : curr->operands) {
+              Expression* base = unwrapRef(operand);
+              if (auto* get = base->dynCast<GlobalGet>()) {
+                if (potentialSet.count(get->name) && !onceGets.count(get)) {
+                  info.allocOperandUses[get->name]++;
+                }
+              } else if (auto* lg = base->dynCast<LocalGet>()) {
+                if (lg->index < func->getNumParams()) {
+                  info.allocParams.insert(lg->index);
+                }
+              }
+            }
+          }
+          void visitCall(Call* curr) {
+            for (Index i = 0; i < curr->operands.size(); i++) {
+              if (auto* get =
+                    unwrapRef(curr->operands[i])->dynCast<GlobalGet>()) {
+                if (potentialSet.count(get->name) && !onceGets.count(get)) {
+                  info.callArgCandidates.emplace_back(
+                    curr->target, i, get->name);
+                }
+              }
+            }
+          }
+        };
+        Scanner(func, info, potentialSet, onceGets).walk(func->body);
+      });
+
+    std::unordered_map<Name, Index> codeUses;
+    std::unordered_map<Name, Index> codeOnceUses;
+    std::unordered_map<Name, Index> codeAllocUses;
+    std::unordered_map<Name, Index> codeFirstUse;
+    std::unordered_map<Name, std::unordered_set<Index>> funcAllocParams;
+    Index getCounter = 0;
+    for (auto& func : module->functions) {
+      if (func->imported()) {
+        continue;
+      }
+      auto& info = analysis.map[func.get()];
+      if (!info.allocParams.empty()) {
+        funcAllocParams[func->name] = info.allocParams;
+      }
+      for (Name name : info.gets) {
+        if (codeUses[name] == 0) {
+          codeFirstUse[name] = getCounter;
+        }
+        codeUses[name]++;
+        getCounter++;
+      }
+      for (auto& [name, count] : info.onceUses) {
+        codeOnceUses[name] += count;
+      }
+      for (auto& [name, count] : info.allocOperandUses) {
+        codeAllocUses[name] += count;
+      }
+    }
+    for (auto& func : module->functions) {
+      if (func->imported()) {
+        continue;
+      }
+      for (auto& [callee, argIdx, candName] :
+           analysis.map[func.get()].callArgCandidates) {
+        auto it = funcAllocParams.find(callee);
+        if (it != funcAllocParams.end() && it->second.count(argIdx)) {
+          codeAllocUses[candName]++;
+        }
+      }
+    }
+
+    using RootKey = std::pair<HeapType, Type>;
+    InsertOrderedMap<RootKey, std::vector<Global*>> byRootType;
+    for (auto& global : module->globals) {
+      if (!potentialSet.count(global->name) || codeUses[global->name] == 0) {
+        continue;
+      }
+      auto* init = global->init->cast<StructNew>();
+      byRootType[{init->type.getHeapType(), global->type}].push_back(
+        global.get());
+    }
+
+    Builder builder(*module);
+    std::unordered_map<HeapType, std::vector<Global*>> hoistedByType;
+
+    auto getOrAddHoistedGlobalGet = [&](StructNew* subSn,
+                                        const Field& parentField) -> GlobalGet* {
+      HeapType subHt = subSn->type.getHeapType();
+      Exactness exact = parentField.type.isExact() ? Exact : Inexact;
+      Type gType(subHt, NonNullable, exact);
+      auto& list = hoistedByType[subHt];
+      for (auto* existingG : list) {
+        if (existingG->type == gType &&
+            ExpressionAnalyzer::equal(existingG->init, subSn)) {
+          return builder.makeGlobalGet(existingG->name, gType);
+        }
+      }
+      Name gName = Names::getValidGlobalName(
+        *module, "defer$hoist$" + std::to_string(numHoisted++));
+      auto* copySn =
+        ExpressionManipulator::copy(subSn, *module)->cast<StructNew>();
+      auto newG = builder.makeGlobal(gName, gType, copySn, Builder::Immutable);
+      Global* gPtr = newG.get();
+      globalIndexes[gName] = module->globals.size();
+      module->addGlobal(std::move(newG));
+      list.push_back(gPtr);
+      hoistedGlobalNames.insert(gName);
+      return builder.makeGlobalGet(gName, gType);
+    };
+
+    std::function<void(StructNew*)> hoistNestedChildrenRec =
+      [&](StructNew* sn) {
+        auto& fields = sn->type.getHeapType().getStruct().fields;
+        for (Index i = 0; i < sn->operands.size(); i++) {
+          if (isNestedNew(sn->operands[i])) {
+            auto* childSn = sn->operands[i]->cast<StructNew>();
+            hoistNestedChildrenRec(childSn);
+            sn->operands[i] = getOrAddHoistedGlobalGet(childSn, fields[i]);
+          }
+        }
+      };
+
+    auto buildCandidate = [&](Global* g,
+                              StructNew* sn,
+                              std::vector<Field>& leafFieldsOut,
+                              std::string& shapeOut,
+                              Candidate& candOut) -> bool {
+      candOut = Candidate{};
+      leafFieldsOut.clear();
+      shapeOut.clear();
+      if (!flatten(sn, candOut.leaves, leafFieldsOut, shapeOut)) {
+        return false;
+      }
+      candOut.global = g;
+      candOut.init = sn;
+      candOut.initBytes = getGlobalEntryBytes(sn);
+      candOut.uses = codeUses[g->name];
+      candOut.onceUses = codeOnceUses[g->name];
+      candOut.allocOperandUses = codeAllocUses[g->name];
+      candOut.firstUse = codeFirstUse[g->name];
+      return true;
+    };
+
+    // Stage A: For shape-fragmented root types, hoist depth >= 2 nested
+    // StructNew operands out of depth >= 2 shape buckets that are not
+    // profitable on their own, reducing them to depth 1.
+    for (auto& [rootKey, rootGlobals] : byRootType) {
+      if (rootGlobals.size() < 2) {
+        continue;
+      }
+      auto [rootHt, rootGlobalType] = rootKey;
+      InsertOrderedMap<std::string, Group> shapeBuckets;
+      for (auto* g : rootGlobals) {
+        Candidate cand;
+        std::vector<Field> leafFields;
+        std::string shape;
+        if (!buildCandidate(
+              g, g->init->cast<StructNew>(), leafFields, shape, cand)) {
+          continue;
+        }
+        auto& grp = shapeBuckets[shape];
+        if (grp.members.empty()) {
+          grp.type = rootHt;
+          grp.globalType = rootGlobalType;
+          grp.leafFields = std::move(leafFields);
+        }
+        grp.members.push_back(std::move(cand));
+      }
+      if (shapeBuckets.size() < 2) {
+        continue;
+      }
+      for (auto& [shape, grp] : shapeBuckets) {
+        bool hasDepth2 = false;
+        for (auto* op1 : grp.members[0].init->operands) {
+          if (isNestedNew(op1)) {
+            for (auto* op2 : op1->cast<StructNew>()->operands) {
+              if (isNestedNew(op2)) {
+                hasDepth2 = true;
+                break;
+              }
+            }
+          }
+          if (hasDepth2) {
+            break;
+          }
+        }
+        if (!hasDepth2) {
+          continue;
+        }
+        if (estimateGroupNetGain(grp) <= 0) {
+          for (auto& m : grp.members) {
+            for (auto* op1 : m.init->operands) {
+              if (isNestedNew(op1)) {
+                hoistNestedChildrenRec(op1->cast<StructNew>());
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Stage B: For shape-fragmented root types, hoist depth-1 nested StructNew
+    // operands into immutable globals when pooling into the flat shape increases
+    // net factory deferral savings.
+    for (auto& [rootKey, rootGlobals] : byRootType) {
+      if (rootGlobals.size() < 2) {
+        continue;
+      }
+      auto [rootHt, rootGlobalType] = rootKey;
+      InsertOrderedMap<std::string, Group> shapeBuckets;
+      for (auto* g : rootGlobals) {
+        Candidate cand;
+        std::vector<Field> leafFields;
+        std::string shape;
+        if (!buildCandidate(
+              g, g->init->cast<StructNew>(), leafFields, shape, cand)) {
+          continue;
+        }
+        auto& grp = shapeBuckets[shape];
+        if (grp.members.empty()) {
+          grp.type = rootHt;
+          grp.globalType = rootGlobalType;
+          grp.leafFields = std::move(leafFields);
+        }
+        grp.members.push_back(std::move(cand));
+      }
+      if (shapeBuckets.size() < 2) {
+        continue;
+      }
+      const auto& rootFields = rootHt.getStruct().fields;
+      std::string flatShape =
+        "(" + std::to_string(rootHt.getID()) +
+        std::string(rootFields.size(), '.') + ")";
+
+      auto makeTrialFlatCandidate = [&](const Candidate& orig) -> Candidate {
+        auto* copySn =
+          ExpressionManipulator::copy(orig.init, *module)->cast<StructNew>();
+        hoistNestedChildrenRec(copySn);
+        Candidate flatCand;
+        std::vector<Field> dummyFields;
+        std::string dummyShape;
+        buildCandidate(orig.global, copySn, dummyFields, dummyShape, flatCand);
+        return flatCand;
+      };
+
+      Group origFlatGroup;
+      origFlatGroup.type = rootHt;
+      origFlatGroup.globalType = rootGlobalType;
+      origFlatGroup.leafFields = rootFields;
+      auto flatIt = shapeBuckets.find(flatShape);
+      if (flatIt != shapeBuckets.end()) {
+        origFlatGroup = flatIt->second;
+      }
+      int64_t origFlatGain = estimateGroupNetGain(origFlatGroup);
+
+      Group poolGroup = origFlatGroup;
+      std::vector<Global*> poolHoistGlobals;
+      std::vector<std::pair<std::string, int64_t>> profitableNestedBuckets;
+      for (auto& [shape, grp] : shapeBuckets) {
+        if (shape == flatShape) {
+          continue;
+        }
+        int64_t bGain = estimateGroupNetGain(grp);
+        if (bGain <= 0) {
+          for (auto& m : grp.members) {
+            poolGroup.members.push_back(makeTrialFlatCandidate(m));
+            poolHoistGlobals.push_back(m.global);
+          }
+        } else {
+          profitableNestedBuckets.push_back({shape, bGain});
+        }
+      }
+
+      int64_t curPoolGain = estimateGroupNetGain(poolGroup);
+      for (auto& [shape, bGain] : profitableNestedBuckets) {
+        Group trialGroup = poolGroup;
+        auto& bMembers = shapeBuckets[shape].members;
+        for (auto& m : bMembers) {
+          trialGroup.members.push_back(makeTrialFlatCandidate(m));
+        }
+        int64_t trialGain = estimateGroupNetGain(trialGroup);
+        if (trialGain > curPoolGain + bGain) {
+          poolGroup = std::move(trialGroup);
+          curPoolGain = trialGain;
+          for (auto& m : bMembers) {
+            poolHoistGlobals.push_back(m.global);
+          }
+        }
+      }
+
+      if (!poolHoistGlobals.empty() && curPoolGain > origFlatGain) {
+        for (auto* g : poolHoistGlobals) {
+          hoistNestedChildrenRec(g->init->cast<StructNew>());
+        }
+      }
+    }
+
+    if (hoistedGlobalNames.empty()) {
+      return;
+    }
+
+    // Remove any trial hoisted globals that were not committed.
+    {
+      std::unordered_set<Name> usedHoisted;
+      for (auto& g : module->globals) {
+        if (!g->imported() && g->init) {
+          for (auto* gg : FindAll<GlobalGet>(g->init).list) {
+            if (hoistedGlobalNames.count(gg->name)) {
+              usedHoisted.insert(gg->name);
+            }
+          }
+        }
+      }
+      std::vector<Name> unusedHoisted;
+      for (Name hName : hoistedGlobalNames) {
+        if (!usedHoisted.count(hName)) {
+          unusedHoisted.push_back(hName);
+        }
+      }
+      for (Name hName : unusedHoisted) {
+        module->removeGlobal(hName);
+        hoistedGlobalNames.erase(hName);
+      }
+      if (hoistedGlobalNames.empty()) {
+        return;
+      }
+    }
+
+    // Topologically order defined globals so every GlobalGet in a global
+    // initializer references a preceding global.
+    std::vector<std::unique_ptr<Global>> sortedGlobals;
+    sortedGlobals.reserve(module->globals.size());
+    std::unordered_map<Name, std::unique_ptr<Global>> definedMap;
+    std::vector<Name> origOrder;
+    for (auto& g : module->globals) {
+      if (g->imported()) {
+        sortedGlobals.push_back(std::move(g));
+      } else {
+        origOrder.push_back(g->name);
+        definedMap[g->name] = std::move(g);
+      }
+    }
+    std::unordered_set<Name> visited;
+    std::function<void(Name)> visitGlobal = [&](Name name) {
+      if (!visited.insert(name).second) {
+        return;
+      }
+      auto it = definedMap.find(name);
+      if (it == definedMap.end() || !it->second) {
+        return;
+      }
+      if (it->second->init) {
+        for (auto* gg : FindAll<GlobalGet>(it->second->init).list) {
+          if (definedMap.count(gg->name)) {
+            visitGlobal(gg->name);
+          }
+        }
+      }
+      sortedGlobals.push_back(std::move(it->second));
+    };
+    for (Name name : origOrder) {
+      visitGlobal(name);
+    }
+    module->globals = std::move(sortedGlobals);
+    module->updateMaps();
+  }
+
+  void inlineInitOnlyStructGlobals() {
+    if (hoistedGlobalNames.empty()) {
+      return;
+    }
+    std::unordered_set<Function*> refinalizeFuncs;
+    bool changed = true;
+    while (changed && !hoistedGlobalNames.empty()) {
+      changed = false;
+      std::unordered_set<Name> otherNonCodeUses;
+      std::unordered_map<Name, std::vector<Expression**>> initUseSites;
+      {
+        struct NonCodeScanner : public PostWalker<NonCodeScanner> {
+          std::unordered_set<Name>& names;
+          NonCodeScanner(std::unordered_set<Name>& names) : names(names) {}
+          void visitGlobalGet(GlobalGet* curr) { names.insert(curr->name); }
+        } scanner(otherNonCodeUses);
+        for (auto& seg : module->elementSegments) {
+          if (seg->offset) {
+            scanner.walk(seg->offset);
+          }
+          for (auto* item : seg->data) {
+            scanner.walk(item);
+          }
+        }
+        for (auto& seg : module->dataSegments) {
+          if (seg->offset) {
+            scanner.walk(seg->offset);
+          }
+        }
+        for (auto& ex : module->exports) {
+          if (ex->kind == ExternalKind::Global) {
+            otherNonCodeUses.insert(*ex->getInternalName());
+          }
+        }
+        for (auto& g : module->globals) {
+          if (!g->imported() && g->init) {
+            for (auto** ptr : FindAllPointers<GlobalGet>(g->init).list) {
+              initUseSites[(*ptr)->cast<GlobalGet>()->name].push_back(ptr);
+            }
+          }
+        }
+      }
+
+      struct CodeUseInfo {
+        std::unordered_map<Name, Index> counts;
+        std::unordered_map<Name, std::vector<Expression**>> cachedBlockSites;
+      };
+      ModuleUtils::ParallelFunctionAnalysis<CodeUseInfo> codeScan(
+        *module, [&](Function* func, CodeUseInfo& info) {
+          if (func->imported()) {
+            return;
+          }
+          std::function<void(Expression**, bool, bool)> walk =
+            [&](Expression** exprp, bool inCachedMiss, bool inLoopOrTry) {
+              if (!exprp || !*exprp) {
+                return;
+              }
+              Expression* curr = *exprp;
+              if (curr->is<Loop>() || curr->is<Try>() || curr->is<TryTable>()) {
+                inLoopOrTry = true;
+              }
+              if (auto* b = curr->dynCast<Block>()) {
+                if (b->name.is() && b->list.size() >= 2) {
+                  if (auto* brOn = b->list[0]->dynCast<BrOn>();
+                      brOn && brOn->op == BrOnNonNull &&
+                      brOn->name == b->name) {
+                    walk(&b->list[0], inCachedMiss, inLoopOrTry);
+                    for (Index i = 1; i < b->list.size(); i++) {
+                      walk(&b->list[i], true, inLoopOrTry);
+                    }
+                    return;
+                  }
+                }
+              }
+              if (auto* gg = curr->dynCast<GlobalGet>()) {
+                if (hoistedGlobalNames.count(gg->name)) {
+                  info.counts[gg->name]++;
+                  if (inCachedMiss && !inLoopOrTry) {
+                    info.cachedBlockSites[gg->name].push_back(exprp);
+                  }
+                }
+                return;
+              }
+              for (auto*& ch : ChildIterator(curr)) {
+                walk(&ch, inCachedMiss, inLoopOrTry);
+              }
+            };
+          walk(&func->body, false, false);
+        });
+
+      std::unordered_map<Name, Index> codeUseCounts;
+      std::unordered_map<Name, std::vector<std::pair<Function*, Expression**>>>
+        cachedFactorySites;
+      for (auto& func : module->functions) {
+        if (func->imported()) {
+          continue;
+        }
+        auto& info = codeScan.map[func.get()];
+        for (auto& [name, count] : info.counts) {
+          codeUseCounts[name] += count;
+        }
+        for (auto& [name, sites] : info.cachedBlockSites) {
+          for (auto** site : sites) {
+            cachedFactorySites[name].push_back({func.get(), site});
+          }
+        }
+      }
+
+      computeIndexes();
+      std::vector<Name> globalsToRemove;
+      std::unordered_set<Name> removingSet;
+      std::unordered_set<Name> mutatedTargetGlobals;
+
+      for (auto& g : module->globals) {
+        if (!hoistedGlobalNames.count(g->name) || g->imported() ||
+            g->mutable_ || otherNonCodeUses.count(g->name) ||
+            mutatedTargetGlobals.count(g->name)) {
+          continue;
+        }
+        auto* sn = g->init->dynCast<StructNew>();
+        if (!sn || sn->desc || !sn->type.isRef()) {
+          continue;
+        }
+        bool dependsOnRemoving = false;
+        for (auto* gg : FindAll<GlobalGet>(sn).list) {
+          if (removingSet.count(gg->name)) {
+            dependsOnRemoving = true;
+            break;
+          }
+        }
+        if (dependsOnRemoving) {
+          continue;
+        }
+        Index cUses = codeUseCounts[g->name];
+        auto& iSites = initUseSites[g->name];
+        if (cUses == 0 && iSites.empty()) {
+          globalsToRemove.push_back(g->name);
+          removingSet.insert(g->name);
+          changed = true;
+          continue;
+        }
+        if (cUses == 0 && !iSites.empty()) {
+          Index m = iSites.size();
+          Index snBytes = getOperandBytes(sn);
+          Index entryBytes = getGlobalEntryBytes(sn);
+          Index getBytes = 1 + getLEBSize(U32LEB(globalIndexes[g->name]));
+          if (m * snBytes < entryBytes + m * getBytes) {
+            for (auto** sitePtr : iSites) {
+              *sitePtr = ExpressionManipulator::copy(sn, *module);
+            }
+            for (auto* gg : FindAll<GlobalGet>(sn).list) {
+              mutatedTargetGlobals.insert(gg->name);
+            }
+            globalsToRemove.push_back(g->name);
+            removingSet.insert(g->name);
+            changed = true;
+          }
+          continue;
+        }
+        if (iSites.empty() && cUses == 1) {
+          auto& cSites = cachedFactorySites[g->name];
+          if (cSites.size() == 1) {
+            auto [fn, sitePtr] = cSites[0];
+            *sitePtr = ExpressionManipulator::copy(sn, *module);
+            refinalizeFuncs.insert(fn);
+            for (auto* gg : FindAll<GlobalGet>(sn).list) {
+              mutatedTargetGlobals.insert(gg->name);
+            }
+            globalsToRemove.push_back(g->name);
+            removingSet.insert(g->name);
+            changed = true;
+          }
+        }
+      }
+
+      for (Name gname : globalsToRemove) {
+        module->removeGlobal(gname);
+        hoistedGlobalNames.erase(gname);
+      }
+    }
+
+    for (auto* fn : refinalizeFuncs) {
+      ReFinalize().walkFunctionInModule(fn, module);
     }
   }
 };
