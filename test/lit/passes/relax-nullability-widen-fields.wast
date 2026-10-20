@@ -944,3 +944,229 @@
     )
   )
 )
+
+(module
+  ;; 1. Unpinned leaf sibling structs $ClosMutA (mutable non-inherited reference
+  ;;    field) and $ClosImmB (immutable non-inherited reference field) share coarse
+  ;;    skeleton with $ClosTarget ((mut (ref null $ValBase))), widening both to
+  ;;    (mut (ref null $ValBase)) and inserting ref.cast at narrow struct.get sites.
+  ;; 2. Unpinned narrow reference array $SubAArr widens to canonical mutable array
+  ;;    $ValBaseMutArr ((array (mut (ref null $ValBase)))) and inserts ref.cast at
+  ;;    its narrow array.get site.
+  (rec
+    ;; CHECK:      (rec
+    ;; CHECK-NEXT:  (type $ValBase (sub (struct (field i32))))
+    (type $ValBase (sub (struct (field i32))))
+    ;; CHECK:       (type $ClosBase (sub (struct (field i32))))
+
+    ;; CHECK:       (type $SubB (sub final $ValBase (struct (field i32) (field i64))))
+
+    ;; CHECK:       (type $SubA (sub final $ValBase (struct (field i32) (field i32))))
+    (type $SubA (sub final $ValBase (struct (field i32) (field i32))))
+    (type $SubB (sub final $ValBase (struct (field i32) (field i64))))
+    (type $ClosBase (sub (struct (field i32))))
+    ;; CHECK:       (type $SubAArr (array (mut (ref null $ValBase))))
+
+    ;; CHECK:       (type $ValBaseMutArr (array (mut (ref null $ValBase))))
+
+    ;; CHECK:       (type $ClosImmB (sub final $ClosBase (struct (field i32) (field (mut (ref null $ValBase))))))
+
+    ;; CHECK:       (type $ClosMutA (sub final $ClosBase (struct (field i32) (field (mut (ref null $ValBase))))))
+
+    ;; CHECK:       (type $ClosTarget (sub final $ClosBase (struct (field i32) (field (mut (ref null $ValBase))))))
+    (type $ClosTarget (sub final $ClosBase (struct (field i32) (field (mut (ref null $ValBase))))))
+    (type $ClosMutA (sub final $ClosBase (struct (field i32) (field (mut (ref null $SubA))))))
+    (type $ClosImmB (sub final $ClosBase (struct (field i32) (field (ref null $SubB)))))
+    (type $ValBaseMutArr (array (mut (ref null $ValBase))))
+    (type $SubAArr (array (ref null $SubA)))
+  )
+
+
+  ;; CHECK:      (type $9 (func (param i32) (result i32)))
+
+  ;; CHECK:      (export "entry7" (func $entry7))
+  (export "entry7" (func $entry7))
+
+  ;; CHECK:      (func $entry7 (type $9) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (local $ct (ref null $ClosTarget))
+  ;; CHECK-NEXT:  (local $ca (ref null $ClosMutA))
+  ;; CHECK-NEXT:  (local $cb (ref null $ClosImmB))
+  ;; CHECK-NEXT:  (local $vm (ref null $ValBaseMutArr))
+  ;; CHECK-NEXT:  (local $arr (ref null $SubAArr))
+  ;; CHECK-NEXT:  (local.set $ct
+  ;; CHECK-NEXT:   (struct.new $ClosTarget
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (struct.new $SubA
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:     (i32.const 1)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $ca
+  ;; CHECK-NEXT:   (struct.new $ClosMutA
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (struct.new $SubA
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:     (i32.const 2)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (struct.set $ClosMutA 1
+  ;; CHECK-NEXT:   (local.get $ca)
+  ;; CHECK-NEXT:   (struct.new $SubA
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (i32.const 3)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $cb
+  ;; CHECK-NEXT:   (struct.new $ClosImmB
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (struct.new $SubB
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:     (i64.const 4)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $vm
+  ;; CHECK-NEXT:   (array.new_default $ValBaseMutArr
+  ;; CHECK-NEXT:    (i32.const 2)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $arr
+  ;; CHECK-NEXT:   (array.new_default $SubAArr
+  ;; CHECK-NEXT:    (i32.const 2)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (struct.get $ValBase 0
+  ;; CHECK-NEXT:     (struct.get $ClosTarget 1
+  ;; CHECK-NEXT:      (local.get $ct)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (struct.get $ValBase 0
+  ;; CHECK-NEXT:     (array.get $ValBaseMutArr
+  ;; CHECK-NEXT:      (local.get $vm)
+  ;; CHECK-NEXT:      (i32.const 0)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (struct.get $SubA 1
+  ;; CHECK-NEXT:      (ref.cast (ref null $SubA)
+  ;; CHECK-NEXT:       (struct.get $ClosMutA 1
+  ;; CHECK-NEXT:        (local.get $ca)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.wrap_i64
+  ;; CHECK-NEXT:      (struct.get $SubB 1
+  ;; CHECK-NEXT:       (ref.cast (ref null $SubB)
+  ;; CHECK-NEXT:        (struct.get $ClosImmB 1
+  ;; CHECK-NEXT:         (local.get $cb)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (struct.get $SubA 1
+  ;; CHECK-NEXT:     (ref.cast (ref null $SubA)
+  ;; CHECK-NEXT:      (array.get $SubAArr
+  ;; CHECK-NEXT:       (local.get $arr)
+  ;; CHECK-NEXT:       (i32.const 0)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $entry7 (param $x i32) (result i32)
+    (local $ct (ref null $ClosTarget))
+    (local $ca (ref null $ClosMutA))
+    (local $cb (ref null $ClosImmB))
+    (local $vm (ref null $ValBaseMutArr))
+    (local $arr (ref null $SubAArr))
+    (local.set $ct
+      (struct.new $ClosTarget
+        (local.get $x)
+        (struct.new $SubA
+          (local.get $x)
+          (i32.const 1)
+        )
+      )
+    )
+    (local.set $ca
+      (struct.new $ClosMutA
+        (local.get $x)
+        (struct.new $SubA
+          (local.get $x)
+          (i32.const 2)
+        )
+      )
+    )
+    (struct.set $ClosMutA 1
+      (local.get $ca)
+      (struct.new $SubA
+        (local.get $x)
+        (i32.const 3)
+      )
+    )
+    (local.set $cb
+      (struct.new $ClosImmB
+        (local.get $x)
+        (struct.new $SubB
+          (local.get $x)
+          (i64.const 4)
+        )
+      )
+    )
+    (local.set $vm
+      (array.new_default $ValBaseMutArr
+        (i32.const 2)
+      )
+    )
+    (local.set $arr
+      (array.new_default $SubAArr
+        (i32.const 2)
+      )
+    )
+    (i32.add
+      (i32.add
+        (struct.get $ValBase 0
+          (struct.get $ClosTarget 1
+            (local.get $ct)
+          )
+        )
+        (struct.get $ValBase 0
+          (array.get $ValBaseMutArr
+            (local.get $vm)
+            (i32.const 0)
+          )
+        )
+      )
+      (i32.add
+        (i32.add
+          (struct.get $SubA 1
+            (struct.get $ClosMutA 1
+              (local.get $ca)
+            )
+          )
+          (i32.wrap_i64
+            (struct.get $SubB 1
+              (struct.get $ClosImmB 1
+                (local.get $cb)
+              )
+            )
+          )
+        )
+        (struct.get $SubA 1
+          (array.get $SubAArr
+            (local.get $arr)
+            (i32.const 0)
+          )
+        )
+      )
+    )
+  )
+)
