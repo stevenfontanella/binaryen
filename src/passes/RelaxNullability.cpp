@@ -2659,6 +2659,12 @@ struct FieldAndArrayDemandWalker
       et = Type(et.getHeapType(), Nullable);
     }
     note(&curr->ref, Type(arrHT, Nullable));
+    if (auto* gget = curr->ref->dynCast<GlobalGet>()) {
+      if (pureGlobalCandidates.count(gget->name) &&
+          arrHT.getArray().element.mutable_ == Mutable) {
+        out.validArrayGlobalGets[gget->name]++;
+      }
+    }
     note(&curr->index, Type::i32);
     note(&curr->value, et);
   }
@@ -2716,6 +2722,9 @@ struct FieldAndArrayDemandWalker
   }
 
   void visitRefTest(RefTest* curr) {
+    if (curr->castType.isArray()) {
+      out.pinnedArrays.push_back(curr->castType.getHeapType());
+    }
     if (curr->castType.isExact() && !wasm.features.hasCustomDescriptors()) {
       if (curr->ref->type.isRef()) {
         walk(curr->ref, curr->ref->type.getHeapType(), true);
@@ -3111,6 +3120,10 @@ struct FieldAndArrayDemandWalker
       return;
     }
     if (auto* brOn = curr->dynCast<BrOn>()) {
+      if ((brOn->op == BrOnCast || brOn->op == BrOnCastFail) &&
+          brOn->castType.isArray()) {
+        out.pinnedArrays.push_back(brOn->castType.getHeapType());
+      }
       if (brOn->desc) {
         walk(brOn->desc,
              brOn->desc->type.isRef()
@@ -3185,7 +3198,8 @@ struct RelaxNullability : public Pass {
                             const std::unordered_set<Name>& escapedFuncs,
                             const std::unordered_set<Name>& hasReturnCall,
                             const std::unordered_set<HeapType>& fixed,
-                            const std::unordered_set<HeapType>& sigUsedAsRef) {
+                            const std::unordered_set<HeapType>& sigUsedAsRef,
+                            bool widenFields = false) {
     auto allTypes = ModuleUtils::collectHeapTypes(*module);
     SubTypes subTypes(allTypes);
 
@@ -3279,6 +3293,258 @@ struct RelaxNullability : public Pass {
       }
     }
 
+    // Pre-scan unpinned sole-group DGA cache array types `(array (mut (ref null
+    // $T)))` whose `ArrayGet`/`ArraySet` users all belong to a single signature
+    // group `ht` and whose `ArrayGet`s flow directly to the function return.
+    std::unordered_map<Type, HeapType> existingMutArrayHT;
+    std::unordered_map<HeapType, std::vector<HeapType>> coupledArraysForSig;
+    std::unordered_map<HeapType, int> arrGlobalCount;
+    std::unordered_map<HeapType, int> arrFuncCount;
+    std::unordered_map<HeapType, std::vector<HeapType>> arrCastInnerHTs;
+    if (widenFields) {
+      std::unordered_set<HeapType> candArrayHTs;
+      for (auto type : allTypes) {
+        if (type.isArray() && !type.isShared() && !type.getDescriptorType() &&
+            !type.getDescribedType() && !type.getDeclaredSuperType() &&
+            subTypes.getImmediateSubTypes(type).empty()) {
+          const auto& elem = type.getArray().element;
+          if (!elem.isPacked() && elem.mutable_ == Mutable &&
+              elem.type.isRef() && !elem.type.isExact()) {
+            existingMutArrayHT.try_emplace(elem.type, type);
+            if (!fixed.count(type) && elem.type.isNullable() &&
+                !elem.type.isNull()) {
+              candArrayHTs.insert(type);
+            }
+          }
+        }
+      }
+      if (!candArrayHTs.empty()) {
+        std::unordered_set<Name> exportedGlobals;
+        for (auto& exp : module->exports) {
+          if (exp->kind == ExternalKind::Global) {
+            exportedGlobals.insert(*exp->getInternalName());
+          }
+        }
+        for (auto& g : module->globals) {
+          if (!g->imported() && !exportedGlobals.count(g->name) &&
+              g->type.isArray() && candArrayHTs.count(g->type.getHeapType())) {
+            arrGlobalCount[g->type.getHeapType()]++;
+          }
+        }
+        struct FuncArrScan {
+          std::vector<HeapType> pinned;
+          std::vector<HeapType> gets;
+          std::vector<HeapType> sets;
+          std::vector<std::pair<HeapType, HeapType>> castInners;
+        };
+        ModuleUtils::ParallelFunctionAnalysis<FuncArrScan> arrScans(
+          *module, [&](Function* func, FuncArrScan& scan) {
+            if (func->imported()) {
+              return;
+            }
+            std::unordered_set<Name> retBlockNames;
+            Expression* cur = func->body;
+            while (auto* b = cur->dynCast<Block>()) {
+              if (b->name.is()) {
+                retBlockNames.insert(b->name);
+              }
+              if (!b->list.empty()) {
+                cur = b->list.back();
+              } else {
+                break;
+              }
+            }
+            std::unordered_set<Expression*> retTailGets;
+            for (auto* tailp : summaries.map[func].returnValueLocs) {
+              retTailGets.insert(*tailp);
+            }
+            struct Scanner : public PostWalker<Scanner> {
+              const std::unordered_set<HeapType>& candArrayHTs;
+              const std::unordered_set<Name>& retBlockNames;
+              std::unordered_set<Expression*>& retTailGets;
+              Function* func;
+              FuncArrScan& out;
+              std::unordered_set<HeapType> seenGets;
+              std::unordered_set<HeapType> seenSets;
+              std::unordered_map<Type, std::vector<HeapType>> localCastInners;
+
+              Scanner(const std::unordered_set<HeapType>& candArrayHTs,
+                      const std::unordered_set<Name>& retBlockNames,
+                      std::unordered_set<Expression*>& retTailGets,
+                      Function* func,
+                      FuncArrScan& out)
+                : candArrayHTs(candArrayHTs), retBlockNames(retBlockNames),
+                  retTailGets(retTailGets), func(func), out(out) {}
+
+              void visitBrOn(BrOn* curr) {
+                if (curr->op == BrOnNonNull &&
+                    retBlockNames.count(curr->name)) {
+                  retTailGets.insert(curr->ref);
+                }
+                if ((curr->op == BrOnCast || curr->op == BrOnCastFail) &&
+                    curr->castType.isArray() &&
+                    candArrayHTs.count(curr->castType.getHeapType())) {
+                  out.pinned.push_back(curr->castType.getHeapType());
+                }
+              }
+              void visitRefTest(RefTest* curr) {
+                if (curr->castType.isArray() &&
+                    candArrayHTs.count(curr->castType.getHeapType())) {
+                  out.pinned.push_back(curr->castType.getHeapType());
+                }
+              }
+              void visitArrayCopy(ArrayCopy* curr) {
+                if (curr->destRef->type.isArray() &&
+                    curr->srcRef->type.isArray()) {
+                  HeapType dHT = curr->destRef->type.getHeapType();
+                  HeapType sHT = curr->srcRef->type.getHeapType();
+                  if (dHT != sHT) {
+                    if (candArrayHTs.count(dHT)) {
+                      out.pinned.push_back(dHT);
+                    }
+                    if (candArrayHTs.count(sHT)) {
+                      out.pinned.push_back(sHT);
+                    }
+                  }
+                }
+              }
+              void visitArrayRMW(ArrayRMW* curr) {
+                if (curr->ref->type.isArray() &&
+                    candArrayHTs.count(curr->ref->type.getHeapType())) {
+                  out.pinned.push_back(curr->ref->type.getHeapType());
+                }
+              }
+              void visitArrayCmpxchg(ArrayCmpxchg* curr) {
+                if (curr->ref->type.isArray() &&
+                    candArrayHTs.count(curr->ref->type.getHeapType())) {
+                  out.pinned.push_back(curr->ref->type.getHeapType());
+                }
+              }
+              void visitLocalSet(LocalSet* curr) {
+                Type lt = func->getLocalType(curr->index);
+                if (!lt.isRef()) {
+                  return;
+                }
+                Expression* val = curr->value;
+                while (auto* as = val->dynCast<RefAs>()) {
+                  if (as->op == RefAsNonNull) {
+                    val = as->value;
+                  } else {
+                    break;
+                  }
+                }
+                if (auto* cast = val->dynCast<RefCast>()) {
+                  if (!cast->desc && cast->type.isRef() &&
+                      cast->type.getHeapType() == lt.getHeapType() &&
+                      cast->ref->type.isRef() && !cast->ref->type.isNull()) {
+                    localCastInners[lt.with(Nullable)].push_back(
+                      cast->ref->type.getHeapType());
+                  }
+                }
+              }
+              void visitArrayGet(ArrayGet* curr) {
+                if (curr->ref->type.isArray()) {
+                  HeapType arrHT = curr->ref->type.getHeapType();
+                  if (candArrayHTs.count(arrHT)) {
+                    seenGets.insert(arrHT);
+                  }
+                }
+              }
+              void visitArraySet(ArraySet* curr) {
+                if (curr->ref->type.isArray()) {
+                  HeapType arrHT = curr->ref->type.getHeapType();
+                  if (candArrayHTs.count(arrHT)) {
+                    seenSets.insert(arrHT);
+                  }
+                }
+              }
+              void visitArrayFill(ArrayFill* curr) {
+                if (curr->ref->type.isArray()) {
+                  HeapType arrHT = curr->ref->type.getHeapType();
+                  if (candArrayHTs.count(arrHT)) {
+                    seenSets.insert(arrHT);
+                  }
+                }
+              }
+            } scanner(candArrayHTs, retBlockNames, retTailGets, func, scan);
+            scanner.walk(func->body);
+            // Verify every ArrayGet of a seen candidate array flows to return.
+            for (auto* aget : FindAll<ArrayGet>(func->body).list) {
+              if (aget->ref->type.isArray()) {
+                HeapType arrHT = aget->ref->type.getHeapType();
+                if (candArrayHTs.count(arrHT) && !retTailGets.count(aget)) {
+                  scan.pinned.push_back(arrHT);
+                }
+              }
+            }
+            for (auto arrHT : scanner.seenGets) {
+              scan.gets.push_back(arrHT);
+            }
+            for (auto arrHT : scanner.seenSets) {
+              scan.sets.push_back(arrHT);
+              Type et = arrHT.getArray().element.type;
+              auto cIt = scanner.localCastInners.find(et);
+              if (cIt != scanner.localCastInners.end()) {
+                for (HeapType innerHT : cIt->second) {
+                  scan.castInners.push_back({arrHT, innerHT});
+                }
+              }
+            }
+          });
+
+        std::unordered_set<HeapType> pinnedArrs;
+        std::unordered_map<HeapType, std::unordered_set<Function*>> arrGetFuncs;
+        std::unordered_map<HeapType, std::unordered_set<Function*>> arrSetFuncs;
+        for (auto& fn : module->functions) {
+          if (fn->imported()) {
+            continue;
+          }
+          auto& scan = arrScans.map[fn.get()];
+          for (auto arrHT : scan.pinned) {
+            pinnedArrs.insert(arrHT);
+          }
+          for (auto arrHT : scan.gets) {
+            arrGetFuncs[arrHT].insert(fn.get());
+          }
+          for (auto arrHT : scan.sets) {
+            arrSetFuncs[arrHT].insert(fn.get());
+          }
+          for (auto& [arrHT, innerHT] : scan.castInners) {
+            arrCastInnerHTs[arrHT].push_back(innerHT);
+          }
+        }
+        for (auto arrHT : candArrayHTs) {
+          if (pinnedArrs.count(arrHT)) {
+            continue;
+          }
+          auto& gFuncs = arrGetFuncs[arrHT];
+          auto& sFuncs = arrSetFuncs[arrHT];
+          if (gFuncs.empty() || gFuncs != sFuncs) {
+            continue;
+          }
+          Function* firstF = *gFuncs.begin();
+          HeapType sigHT = firstF->type.getHeapType();
+          if (pinnedHTs.count(sigHT) ||
+              sigHT.getSignature().results != arrHT.getArray().element.type) {
+            continue;
+          }
+          auto& flist = htFuncs[sigHT];
+          bool allInFlist = true;
+          for (auto* gf : gFuncs) {
+            if (gf->type.getHeapType() != sigHT ||
+                std::find(flist.begin(), flist.end(), gf) == flist.end()) {
+              allInFlist = false;
+              break;
+            }
+          }
+          if (allInFlist) {
+            arrFuncCount[arrHT] = int(gFuncs.size());
+            coupledArraysForSig[sigHT].push_back(arrHT);
+          }
+        }
+      }
+    }
+
     auto getTypeBytes = [&](Type t) -> int {
       if (t == Type::none) {
         return 0;
@@ -3317,12 +3583,21 @@ struct RelaxNullability : public Pass {
       if (origRes.isRef() && !origRes.isExact()) {
         Type nullRes = Type(origRes.getHeapType(), Nullable);
         Type rootRes = Type(getRootAncestor(origRes.getHeapType()), Nullable);
+        HeapType eqHT =
+          HeapTypes::eq.getBasic(origRes.getHeapType().getShared());
         Type topRes = Type(origRes.getHeapType().getTop(), Nullable);
         if (nullRes != origRes) {
           resChoices.push_back(nullRes);
         }
         if (rootRes != nullRes) {
           resChoices.push_back(rootRes);
+        }
+        if (origRes.getHeapType().isBasic() &&
+            HeapType::isSubType(origRes.getHeapType(), eqHT)) {
+          Type eqRes(eqHT, Nullable);
+          if (eqRes != rootRes) {
+            resChoices.push_back(eqRes);
+          }
         }
         if (topRes != rootRes) {
           resChoices.push_back(topRes);
@@ -3645,7 +3920,8 @@ struct RelaxNullability : public Pass {
         std::vector<Type> basicParams = origParams;
         for (size_t i = 0; i < basicParams.size(); ++i) {
           Type p = basicParams[i];
-          if (!p.isRef() || p.isExact() || p.getHeapType().isBasic()) {
+          if (!p.isRef() || p.isExact() ||
+              p.getHeapType() == p.getHeapType().getTop()) {
             continue;
           }
           HeapType topHT = p.getHeapType().getTop();
@@ -3693,7 +3969,7 @@ struct RelaxNullability : public Pass {
         }
         Type basicRes = origRes;
         if (origRes.isRef() && !origRes.isExact() &&
-            !origRes.getHeapType().isBasic()) {
+            origRes.getHeapType() != origRes.getHeapType().getTop()) {
           HeapType topHT = origRes.getHeapType().getTop();
           HeapType eqHT =
             HeapTypes::eq.getBasic(origRes.getHeapType().getShared());
@@ -3926,12 +4202,57 @@ struct RelaxNullability : public Pass {
         if (!possible) {
           continue;
         }
+        if (widenFields && canMutateHTInPlace && candRes != origRes &&
+            candRes.isNullable()) {
+          auto cIt = coupledArraysForSig.find(ht);
+          if (cIt != coupledArraysForSig.end()) {
+            for (HeapType arrHT : cIt->second) {
+              auto mIt = existingMutArrayHT.find(candRes);
+              if (mIt != existingMutArrayHT.end() && mIt->second != arrHT) {
+                int numGlobals = arrGlobalCount[arrHT];
+                int numFuncs = arrFuncCount[arrHT];
+                int arrBonus = 5 + 2 * numFuncs;
+                if (primaryStructRoot &&
+                    candRes == Type(*primaryStructRoot, Nullable)) {
+                  arrBonus += 4 * numGlobals + 4 * numFuncs;
+                } else if (!candRes.getHeapType().isBasic()) {
+                  arrBonus += 2 * numGlobals + 2 * numFuncs;
+                } else {
+                  arrBonus += 2 * numGlobals;
+                }
+                for (HeapType innerHT : arrCastInnerHTs[arrHT]) {
+                  if (HeapType::isSubType(innerHT, candRes.getHeapType())) {
+                    arrBonus += 3;
+                  }
+                }
+                castsSavedBytes += arrBonus;
+              }
+            }
+          }
+        }
+        int candDefBytes = getSigDefBytes(candSig);
+        if (widenFields && canMutateHTInPlace && castsAddedBytes == 0 &&
+            castsSavedBytes == 0) {
+          bool isBasicSubtypeWiden = true;
+          for (size_t i = 0; i < origParams.size(); ++i) {
+            if (candParams[i] != origParams[i] &&
+                !origParams[i].getHeapType().isBasic()) {
+              isBasicSubtypeWiden = false;
+              break;
+            }
+          }
+          if (candRes != origRes && !origRes.getHeapType().isBasic()) {
+            isBasicSubtypeWiden = false;
+          }
+          if (isBasicSubtypeWiden) {
+            castsSavedBytes = 1;
+          }
+        }
         if (castsSavedBytes <= castsAddedBytes && !mergeSignatures &&
             (totalNarrowGets > 1 || totalNarrowCalls > 1 ||
              castsAddedBytes > castsSavedBytes + (alreadyExists ? 4 : 0))) {
           continue;
         }
-        int candDefBytes = getSigDefBytes(candSig);
         int memberNet = (canMutateHTInPlace ? sigDefBytes : 0) +
                         castsSavedBytes - castsAddedBytes;
         outEvals.push_back({candSig,
@@ -4509,16 +4830,33 @@ struct RelaxNullability : public Pass {
     std::unordered_map<Name, FieldDemandState> pureGlobalCandidates;
     for (auto& g : module->globals) {
       if (g->imported() || g->mutable_ || exportedGlobals.count(g->name) ||
-          !g->init) {
+          !g->init || !g->type.isArray() || g->type.isExact()) {
         continue;
       }
       if (auto* anew = g->init->dynCast<ArrayNewFixed>()) {
-        if (!anew->type.isArray() || !g->type.isArray() || g->type.isExact()) {
+        if (!anew->type.isArray()) {
           continue;
         }
         HeapType arrHT = anew->type.getHeapType();
         if (g->type.getHeapType() != arrHT || !arrayCandidates.count(arrHT) ||
             arrHT.getArray().element.mutable_ != Immutable) {
+          continue;
+        }
+        HeapType baseHT = arrHT.getArray().element.type.getHeapType();
+        pureGlobalCandidateSet.insert(g->name);
+        pureGlobalCandidates.emplace(
+          g->name,
+          FieldDemandState{baseHT, baseHT.getTop(), true, true, false});
+      } else if (auto* anew = g->init->dynCast<ArrayNew>()) {
+        if (!anew->type.isArray() ||
+            (!anew->isWithDefault() &&
+             (!anew->init || !anew->init->type.isNull()))) {
+          continue;
+        }
+        HeapType arrHT = anew->type.getHeapType();
+        if (g->type.getHeapType() != arrHT || !arrayCandidates.count(arrHT) ||
+            arrHT.getArray().element.mutable_ != Mutable ||
+            !arrHT.getArray().element.type.isNullable()) {
           continue;
         }
         HeapType baseHT = arrHT.getArray().element.type.getHeapType();
@@ -4536,6 +4874,7 @@ struct RelaxNullability : public Pass {
     ArrayUpdateMap arrayUpdates;
     std::unordered_map<Name, Index> totalGlobalGets;
     std::unordered_map<Name, Index> validArrayGlobalGets;
+    std::unordered_set<Name> pureGlobalHasGet;
 
     while (true) {
       for (auto& [_, state] : fieldCandidates) {
@@ -4554,6 +4893,7 @@ struct RelaxNullability : public Pass {
       arrayUpdates.clear();
       totalGlobalGets.clear();
       validArrayGlobalGets.clear();
+      pureGlobalHasGet.clear();
 
       ModuleUtils::ParallelFunctionAnalysis<FuncFieldDemandSummary> summaries(
         *module, [&](Function* func, FuncFieldDemandSummary& summary) {
@@ -4630,6 +4970,7 @@ struct RelaxNullability : public Pass {
           }
         }
         for (const auto& r : sum.pureGlobalReqs) {
+          pureGlobalHasGet.insert(r.name);
           if (auto it = pureGlobalCandidates.find(r.name);
               it != pureGlobalCandidates.end()) {
             it->second.require(r.reqHT, r.reqNull);
@@ -4654,7 +4995,7 @@ struct RelaxNullability : public Pass {
         HeapType arrHT = module->getGlobal(gName)->type.getHeapType();
         if (auto it = arrayCandidates.find(arrHT);
             it != arrayCandidates.end()) {
-          if (validArrayGlobalGets[gName] > 0) {
+          if (pureGlobalHasGet.count(gName)) {
             it->second.mergeIn(gState);
           }
         }
@@ -4826,23 +5167,74 @@ struct RelaxNullability : public Pass {
       }
     }
 
+    std::unordered_set<Type> mutableElemTypes;
+    for (auto ht : allTypes) {
+      if (ht.isArray() && !ht.isShared() && !ht.getDescriptorType() &&
+          !ht.getDescribedType() && !ht.getDeclaredSuperType() &&
+          subTypes.getImmediateSubTypes(ht).empty()) {
+        const auto& elem = ht.getArray().element;
+        if (!elem.isPacked() && elem.mutable_ == Mutable &&
+            elem.type.isRef() && !elem.type.isExact()) {
+          auto uIt = arrayUpdates.find(ht);
+          mutableElemTypes.insert(uIt != arrayUpdates.end() ? uIt->second
+                                                            : elem.type);
+        }
+      }
+    }
+
+    std::unordered_set<HeapType> arrayMutUpdates;
+    for (const auto& [arrHT, state] : arrayCandidates) {
+      if (state.pinned || arrHT.getArray().element.mutable_ != Immutable) {
+        continue;
+      }
+      auto uIt = arrayUpdates.find(arrHT);
+      Type finalET = uIt != arrayUpdates.end()
+                       ? uIt->second
+                       : arrHT.getArray().element.type;
+      if (mutableElemTypes.count(finalET)) {
+        arrayMutUpdates.insert(arrHT);
+      } else if (uIt != arrayUpdates.end()) {
+        Type oldET = arrHT.getArray().element.type;
+        Nullability newNull = finalET.getNullability();
+        Type rootET(getRootAncestor(oldET.getHeapType()), newNull);
+        Type eqET(
+          HeapTypes::eq.getBasic(oldET.getHeapType().getShared()), newNull);
+        if (Type::isSubType(oldET, rootET) &&
+            Type::isSubType(rootET, finalET) &&
+            mutableElemTypes.count(rootET)) {
+          uIt->second = rootET;
+          arrayMutUpdates.insert(arrHT);
+        } else if (Type::isSubType(oldET, eqET) &&
+                   Type::isSubType(eqET, finalET) &&
+                   mutableElemTypes.count(eqET)) {
+          uIt->second = eqET;
+          arrayMutUpdates.insert(arrHT);
+        }
+      }
+    }
+
     bool anyModified = false;
     GlobalTypeRewriter::TypeMap oldToNew;
-    if (!structUpdates.empty() || !arrayUpdates.empty()) {
+    if (!structUpdates.empty() || !arrayUpdates.empty() ||
+        !arrayMutUpdates.empty()) {
       class FieldAndArrayRewriter : public GlobalTypeRewriter {
         const StructUpdateMap& structUpdates;
         const ArrayUpdateMap& arrayUpdates;
+        const std::unordered_set<HeapType>& arrayMutUpdates;
 
       public:
         TypeMap& outMap;
 
-        FieldAndArrayRewriter(Module& wasm,
-                              const StructUpdateMap& structUpdates,
-                              const ArrayUpdateMap& arrayUpdates,
-                              WorldMode worldMode,
-                              TypeMap& outMap)
+        FieldAndArrayRewriter(
+          Module& wasm,
+          const StructUpdateMap& structUpdates,
+          const ArrayUpdateMap& arrayUpdates,
+          const std::unordered_set<HeapType>& arrayMutUpdates,
+          WorldMode worldMode,
+          TypeMap& outMap)
           : GlobalTypeRewriter(wasm, worldMode), structUpdates(structUpdates),
-            arrayUpdates(arrayUpdates), outMap(outMap) {
+            arrayUpdates(arrayUpdates), arrayMutUpdates(arrayMutUpdates),
+            outMap(outMap) {
           outMap = rebuildTypes(getSortedTypes(getPrivatePredecessors()));
           mapTypes(outMap);
         }
@@ -4861,10 +5253,14 @@ struct RelaxNullability : public Pass {
           if (it != arrayUpdates.end()) {
             array.element.type = getTempType(it->second);
           }
+          if (arrayMutUpdates.count(oldType)) {
+            array.element.mutable_ = Mutable;
+          }
         }
       } rewriter(*module,
                  structUpdates,
                  arrayUpdates,
+                 arrayMutUpdates,
                  getPassOptions().worldMode,
                  oldToNew);
       anyModified = true;
@@ -4877,54 +5273,104 @@ struct RelaxNullability : public Pass {
       return ht;
     };
 
-    // Check if any pure immutable array global can switch to an existing wider
-    // immutable array HeapType when its shared array type remained narrower.
+    // Check if any pure array global can switch to an existing wider or
+    // canonical mutable/immutable array HeapType.
+    std::unordered_set<HeapType> newlyMutatedArrHTs;
+    for (auto ht : arrayMutUpdates) {
+      newlyMutatedArrHTs.insert(mapNewHT(ht));
+    }
     auto curTypes = ModuleUtils::collectHeapTypes(*module);
     SubTypes curSubTypes(curTypes);
+    std::unordered_map<Type, HeapType> existingMutArrayHT;
     std::unordered_map<Type, HeapType> existingImmArrayHT;
     for (auto ht : curTypes) {
       if (ht.isArray() && !ht.isShared() && !ht.getDescriptorType() &&
           !ht.getDescribedType() && !ht.getDeclaredSuperType() &&
           curSubTypes.getImmediateSubTypes(ht).empty()) {
         const auto& elem = ht.getArray().element;
-        if (!elem.isPacked() && elem.mutable_ == Immutable &&
-            elem.type.isRef() && !elem.type.isExact()) {
-          existingImmArrayHT.try_emplace(elem.type, ht);
+        if (!elem.isPacked() && elem.mutable_ == Mutable &&
+            elem.type.isRef() && !elem.type.isExact() &&
+            !newlyMutatedArrHTs.count(ht)) {
+          existingMutArrayHT.try_emplace(elem.type, ht);
+        }
+      }
+    }
+    for (auto ht : curTypes) {
+      if (ht.isArray() && !ht.isShared() && !ht.getDescriptorType() &&
+          !ht.getDescribedType() && !ht.getDeclaredSuperType() &&
+          curSubTypes.getImmediateSubTypes(ht).empty()) {
+        const auto& elem = ht.getArray().element;
+        if (!elem.isPacked() && elem.type.isRef() && !elem.type.isExact()) {
+          if (elem.mutable_ == Mutable) {
+            existingMutArrayHT.try_emplace(elem.type, ht);
+          } else {
+            existingImmArrayHT.try_emplace(elem.type, ht);
+          }
         }
       }
     }
 
     std::unordered_set<Name> retargetedGlobals;
     for (const auto& [gName, gState] : pureGlobalCandidates) {
-      if (gState.pinned || totalGlobalGets[gName] == 0 ||
+      if (gState.pinned || !pureGlobalHasGet.count(gName) ||
           totalGlobalGets[gName] != validArrayGlobalGets[gName]) {
         continue;
       }
       Global* g = module->getGlobal(gName);
       HeapType curArrHT = g->type.getHeapType();
       Type curET = curArrHT.getArray().element.type;
+      bool isImmGlobal = g->init->is<ArrayNewFixed>();
       Nullability wantNull =
         (curET.isNullable() || gState.acceptsNull) ? Nullable : NonNullable;
       HeapType wantHT =
         gState.canWidenHT ? mapNewHT(gState.allowedHT) : curET.getHeapType();
       Type wantET(wantHT, wantNull);
-      if (wantET != curET && Type::isSubType(curET, wantET)) {
-        auto it = existingImmArrayHT.find(wantET);
-        if (it == existingImmArrayHT.end() && wantHT.isBasic()) {
-          Type rootET(getRootAncestor(curET.getHeapType()), wantNull);
-          if (rootET != curET && Type::isSubType(curET, rootET) &&
-              Type::isSubType(rootET, wantET)) {
-            it = existingImmArrayHT.find(rootET);
+      if (!Type::isSubType(curET, wantET)) {
+        continue;
+      }
+      auto findTargetArr = [&](Type et) -> std::optional<HeapType> {
+        auto mIt = existingMutArrayHT.find(et);
+        if (mIt != existingMutArrayHT.end()) {
+          return mIt->second;
+        }
+        if (isImmGlobal) {
+          auto iIt = existingImmArrayHT.find(et);
+          if (iIt != existingImmArrayHT.end()) {
+            return iIt->second;
           }
         }
-        if (it != existingImmArrayHT.end()) {
-          HeapType targetArrHT = it->second;
-          g->type = g->type.with(targetArrHT);
-          auto* anew = g->init->cast<ArrayNewFixed>();
-          anew->type = anew->type.with(targetArrHT);
-          retargetedGlobals.insert(gName);
-          anyModified = true;
+        return std::nullopt;
+      };
+      std::optional<HeapType> targetArrHT;
+      if (wantHT.isBasic() && !curET.getHeapType().isBasic()) {
+        Type rootET(getRootAncestor(curET.getHeapType()), wantNull);
+        if (Type::isSubType(curET, rootET) &&
+            Type::isSubType(rootET, wantET)) {
+          targetArrHT = findTargetArr(rootET);
         }
+        if (!targetArrHT) {
+          Type eqET(
+            HeapTypes::eq.getBasic(curET.getHeapType().getShared()), wantNull);
+          if (Type::isSubType(curET, eqET) &&
+              Type::isSubType(eqET, wantET)) {
+            targetArrHT = findTargetArr(eqET);
+          }
+        }
+      }
+      if (!targetArrHT) {
+        targetArrHT = findTargetArr(wantET);
+      }
+      if (targetArrHT && *targetArrHT != curArrHT &&
+          (wantET != curET ||
+           existingMutArrayHT.find(curET) != existingMutArrayHT.end())) {
+        g->type = g->type.with(*targetArrHT);
+        if (auto* anew = g->init->dynCast<ArrayNewFixed>()) {
+          anew->type = anew->type.with(*targetArrHT);
+        } else if (auto* anew = g->init->dynCast<ArrayNew>()) {
+          anew->type = anew->type.with(*targetArrHT);
+        }
+        retargetedGlobals.insert(gName);
+        anyModified = true;
       }
     }
 
@@ -5606,7 +6052,7 @@ struct RelaxNullability : public Pass {
     FunctionRelaxer(widenTypes).run(getPassRunner(), module);
   }
 
-  void runGeneralizeSignatures(Module* module) {
+  void runGeneralizeSignatures(Module* module, bool widenFields) {
     auto types = ModuleUtils::collectHeapTypes(*module);
     std::unordered_set<HeapType> fixed;
     std::unordered_map<HeapType, std::vector<Function*>> sigFuncs;
@@ -5623,7 +6069,7 @@ struct RelaxNullability : public Pass {
                                   hasReturnCall,
                                   sigUsedAsRef);
     generalizeSignatures(
-      module, escapedFuncs, hasReturnCall, fixed, sigUsedAsRef);
+      module, escapedFuncs, hasReturnCall, fixed, sigUsedAsRef, widenFields);
   }
 
   void run(Module* module) override {
@@ -5661,14 +6107,18 @@ struct RelaxNullability : public Pass {
     // 5. Whole-signature reference generalization for remaining private
     // signatures where profitable.
     if (widenTypes) {
-      runGeneralizeSignatures(module);
+      runGeneralizeSignatures(module, widenFields);
     }
 
     // 6. Second pass of field/array widening after signature generalization.
     if (widenFields && widenFieldsAndArrays(module)) {
+      widenFieldsAndArrays(module);
       FunctionRelaxer(widenTypes).run(getPassRunner(), module);
       if (modeArg == "cache-param-casts") {
-        runGeneralizeSignatures(module);
+        runGeneralizeSignatures(module, widenFields);
+        if (widenFieldsAndArrays(module)) {
+          FunctionRelaxer(widenTypes).run(getPassRunner(), module);
+        }
       }
     }
   }

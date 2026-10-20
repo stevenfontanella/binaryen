@@ -306,3 +306,166 @@
     )
   )
 )
+
+(module
+  ;; Private immutable reference array types unify with an existing non-subtyped
+  ;; mutable reference array type of the same target element type, and coupled
+  ;; sole-use DGA cache array factory functions generalize their return type so
+  ;; the cache array global retargets to the canonical mutable root array type.
+  (rec
+    ;; CHECK:      (rec
+    ;; CHECK-NEXT:  (type $Root (sub (struct (field i32))))
+    (type $Root (sub (struct (field i32))))
+    ;; CHECK:       (type $1 (func (param i32) (result (ref null $Root))))
+
+    ;; CHECK:       (type $RootMutArr (array (mut (ref null $Root))))
+
+    ;; CHECK:       (type $Child (sub $Root (struct (field i32) (field i64))))
+    (type $Child (sub $Root (struct (field i32) (field i64))))
+    (type $RootMutArr (array (mut (ref null $Root))))
+    (type $RootImmArr (array (ref null $Root)))
+    (type $ChildCacheArr (array (mut (ref null $Child))))
+  )
+
+  ;; CHECK:      (type $4 (func (param i32) (result i32)))
+
+  ;; CHECK:      (global $c1 (ref $Child) (struct.new $Child
+  ;; CHECK-NEXT:  (i32.const 7)
+  ;; CHECK-NEXT:  (i64.const 8)
+  ;; CHECK-NEXT: ))
+  (global $c1 (ref $Child) (struct.new $Child (i32.const 7) (i64.const 8)))
+  ;; CHECK:      (global $mut-root (ref $RootMutArr) (array.new_default $RootMutArr
+  ;; CHECK-NEXT:  (i32.const 2)
+  ;; CHECK-NEXT: ))
+  (global $mut-root (ref $RootMutArr) (array.new_default $RootMutArr (i32.const 2)))
+  ;; CHECK:      (global $imm-root (ref $RootMutArr) (array.new_fixed $RootMutArr 1
+  ;; CHECK-NEXT:  (global.get $c1)
+  ;; CHECK-NEXT: ))
+  (global $imm-root (ref $RootImmArr) (array.new_fixed $RootImmArr 1 (global.get $c1)))
+  ;; CHECK:      (global $dga-cache (ref $RootMutArr) (array.new_default $RootMutArr
+  ;; CHECK-NEXT:  (i32.const 4)
+  ;; CHECK-NEXT: ))
+  (global $dga-cache (ref $ChildCacheArr) (array.new_default $ChildCacheArr (i32.const 4)))
+
+  ;; CHECK:      (export "entry3" (func $entry3))
+
+  ;; CHECK:      (func $get-cached (type $1) (param $idx i32) (result (ref null $Root))
+  ;; CHECK-NEXT:  (local $v (ref null $Root))
+  ;; CHECK-NEXT:  (block $found (result (ref $Root))
+  ;; CHECK-NEXT:   (br_on_non_null $found
+  ;; CHECK-NEXT:    (array.get $RootMutArr
+  ;; CHECK-NEXT:     (global.get $dga-cache)
+  ;; CHECK-NEXT:     (local.get $idx)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.set $v
+  ;; CHECK-NEXT:    (array.get $RootMutArr
+  ;; CHECK-NEXT:     (global.get $mut-root)
+  ;; CHECK-NEXT:     (local.get $idx)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (array.set $RootMutArr
+  ;; CHECK-NEXT:    (global.get $dga-cache)
+  ;; CHECK-NEXT:    (local.get $idx)
+  ;; CHECK-NEXT:    (local.get $v)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (return
+  ;; CHECK-NEXT:    (local.get $v)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $get-cached (param $idx i32) (result (ref null $Child))
+    (local $v (ref null $Child))
+    (block $found (result (ref $Child))
+      (br_on_non_null $found
+        (array.get $ChildCacheArr
+          (global.get $dga-cache)
+          (local.get $idx)
+        )
+      )
+      (local.set $v
+        (ref.cast (ref null $Child)
+          (array.get $RootMutArr
+            (global.get $mut-root)
+            (local.get $idx)
+          )
+        )
+      )
+      (array.set $ChildCacheArr
+        (global.get $dga-cache)
+        (local.get $idx)
+        (local.get $v)
+      )
+      (return
+        (local.get $v)
+      )
+    )
+  )
+
+  ;; CHECK:      (func $entry3 (type $4) (param $i i32) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (struct.get $Root 0
+  ;; CHECK-NEXT:     (array.get $RootMutArr
+  ;; CHECK-NEXT:      (global.get $imm-root)
+  ;; CHECK-NEXT:      (local.get $i)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (struct.get $Root 0
+  ;; CHECK-NEXT:     (array.get $RootMutArr
+  ;; CHECK-NEXT:      (global.get $mut-root)
+  ;; CHECK-NEXT:      (local.get $i)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (struct.get $Root 0
+  ;; CHECK-NEXT:     (call $get-cached
+  ;; CHECK-NEXT:      (local.get $i)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.wrap_i64
+  ;; CHECK-NEXT:     (struct.get $Child 1
+  ;; CHECK-NEXT:      (ref.cast (ref null $Child)
+  ;; CHECK-NEXT:       (call $get-cached
+  ;; CHECK-NEXT:        (local.get $i)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $entry3 (export "entry3") (param $i i32) (result i32)
+    (i32.add
+      (i32.add
+        (struct.get $Root 0
+          (array.get $RootImmArr
+            (global.get $imm-root)
+            (local.get $i)
+          )
+        )
+        (struct.get $Root 0
+          (array.get $RootMutArr
+            (global.get $mut-root)
+            (local.get $i)
+          )
+        )
+      )
+      (i32.add
+        (struct.get $Root 0
+          (call $get-cached
+            (local.get $i)
+          )
+        )
+        (i32.wrap_i64
+          (struct.get $Child 1
+            (call $get-cached
+              (local.get $i)
+            )
+          )
+        )
+      )
+    )
+  )
+)
