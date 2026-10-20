@@ -748,3 +748,147 @@
     (drop (global.get $vt2))
   )
 )
+
+;; Hoist a pair (count == 2) of large nested allocations and a nested allocation
+;; shared across global initializers and a cached-once factory block.
+(module
+  ;; CHECK:      (type $small (struct (field funcref) (field i32)))
+
+  ;; CHECK:      (type $itable (struct (field funcref) (field funcref) (field funcref) (field funcref) (field i32)))
+  ;; LAZY:      (type $small (struct (field funcref) (field i32)))
+
+  ;; LAZY:      (type $itable (struct (field funcref) (field funcref) (field funcref) (field funcref) (field i32)))
+  (type $itable (struct (field funcref) (field funcref) (field funcref) (field funcref) (field i32)))
+  (type $small (struct (field funcref) (field i32)))
+  ;; CHECK:      (type $vtable (struct (field (ref null $itable)) (field (ref null $small)) (field i32)))
+  ;; LAZY:      (type $vtable (struct (field (ref null $itable)) (field (ref null $small)) (field i32)))
+  (type $vtable (struct (field (ref null $itable)) (field (ref null $small)) (field i32)))
+
+  ;; CHECK:      (type $3 (func))
+
+  ;; CHECK:      (type $4 (func (result (ref $vtable))))
+
+  ;; CHECK:      (global $cache (mut (ref null $vtable)) (ref.null none))
+  ;; LAZY:      (type $3 (func))
+
+  ;; LAZY:      (type $4 (func (result (ref $vtable))))
+
+  ;; LAZY:      (global $cache (mut (ref null $vtable)) (ref.null none))
+  (global $cache (mut (ref null $vtable)) (ref.null none))
+
+  ;; CHECK:      (global $hoisted_4 (ref (exact $small)) (struct.new $small
+  ;; CHECK-NEXT:  (ref.func $f)
+  ;; CHECK-NEXT:  (i32.const 500)
+  ;; CHECK-NEXT: ))
+
+  ;; CHECK:      (global $hoisted (ref (exact $itable)) (struct.new $itable
+  ;; CHECK-NEXT:  (ref.func $f)
+  ;; CHECK-NEXT:  (ref.func $g)
+  ;; CHECK-NEXT:  (ref.func $f)
+  ;; CHECK-NEXT:  (ref.func $g)
+  ;; CHECK-NEXT:  (i32.const 1000)
+  ;; CHECK-NEXT: ))
+
+  ;; CHECK:      (global $g1 (ref $vtable) (struct.new $vtable
+  ;; CHECK-NEXT:  (global.get $hoisted)
+  ;; CHECK-NEXT:  (global.get $hoisted_4)
+  ;; CHECK-NEXT:  (i32.const 1)
+  ;; CHECK-NEXT: ))
+  ;; LAZY:      (global $hoisted_4 (ref (exact $small)) (struct.new $small
+  ;; LAZY-NEXT:  (ref.func $f)
+  ;; LAZY-NEXT:  (i32.const 500)
+  ;; LAZY-NEXT: ))
+
+  ;; LAZY:      (global $hoisted (ref (exact $itable)) (struct.new $itable
+  ;; LAZY-NEXT:  (ref.func $f)
+  ;; LAZY-NEXT:  (ref.func $g)
+  ;; LAZY-NEXT:  (ref.func $f)
+  ;; LAZY-NEXT:  (ref.func $g)
+  ;; LAZY-NEXT:  (i32.const 1000)
+  ;; LAZY-NEXT: ))
+
+  ;; LAZY:      (global $g1 (ref $vtable) (struct.new $vtable
+  ;; LAZY-NEXT:  (global.get $hoisted)
+  ;; LAZY-NEXT:  (global.get $hoisted_4)
+  ;; LAZY-NEXT:  (i32.const 1)
+  ;; LAZY-NEXT: ))
+  (global $g1 (ref $vtable) (struct.new $vtable
+    (struct.new $itable (ref.func $f) (ref.func $g) (ref.func $f) (ref.func $g) (i32.const 1000))
+    (struct.new $small (ref.func $f) (i32.const 500))
+    (i32.const 1)
+  ))
+  ;; CHECK:      (global $g2 (ref $vtable) (struct.new $vtable
+  ;; CHECK-NEXT:  (global.get $hoisted)
+  ;; CHECK-NEXT:  (global.get $hoisted_4)
+  ;; CHECK-NEXT:  (i32.const 2)
+  ;; CHECK-NEXT: ))
+  ;; LAZY:      (global $g2 (ref $vtable) (struct.new $vtable
+  ;; LAZY-NEXT:  (global.get $hoisted)
+  ;; LAZY-NEXT:  (global.get $hoisted_4)
+  ;; LAZY-NEXT:  (i32.const 2)
+  ;; LAZY-NEXT: ))
+  (global $g2 (ref $vtable) (struct.new $vtable
+    (struct.new $itable (ref.func $f) (ref.func $g) (ref.func $f) (ref.func $g) (i32.const 1000))
+    (struct.new $small (ref.func $f) (i32.const 500))
+    (i32.const 2)
+  ))
+
+  ;; CHECK:      (func $f (type $3)
+  ;; CHECK-NEXT: )
+  ;; LAZY:      (func $f (type $3)
+  ;; LAZY-NEXT: )
+  (func $f)
+  ;; CHECK:      (func $g (type $3)
+  ;; CHECK-NEXT: )
+  ;; LAZY:      (func $g (type $3)
+  ;; LAZY-NEXT: )
+  (func $g)
+
+  ;; CHECK:      (func $factory (type $4) (result (ref $vtable))
+  ;; CHECK-NEXT:  (block $done (result (ref $vtable))
+  ;; CHECK-NEXT:   (br_on_non_null $done
+  ;; CHECK-NEXT:    (global.get $cache)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (global.set $cache
+  ;; CHECK-NEXT:    (struct.new $vtable
+  ;; CHECK-NEXT:     (ref.null none)
+  ;; CHECK-NEXT:     (global.get $hoisted_4)
+  ;; CHECK-NEXT:     (i32.const 3)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (ref.as_non_null
+  ;; CHECK-NEXT:    (global.get $cache)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; LAZY:      (func $factory (type $4) (result (ref $vtable))
+  ;; LAZY-NEXT:  (block $done (result (ref $vtable))
+  ;; LAZY-NEXT:   (br_on_non_null $done
+  ;; LAZY-NEXT:    (global.get $cache)
+  ;; LAZY-NEXT:   )
+  ;; LAZY-NEXT:   (global.set $cache
+  ;; LAZY-NEXT:    (struct.new $vtable
+  ;; LAZY-NEXT:     (ref.null none)
+  ;; LAZY-NEXT:     (global.get $hoisted_4)
+  ;; LAZY-NEXT:     (i32.const 3)
+  ;; LAZY-NEXT:    )
+  ;; LAZY-NEXT:   )
+  ;; LAZY-NEXT:   (ref.as_non_null
+  ;; LAZY-NEXT:    (global.get $cache)
+  ;; LAZY-NEXT:   )
+  ;; LAZY-NEXT:  )
+  ;; LAZY-NEXT: )
+  (func $factory (result (ref $vtable))
+    (block $done (result (ref $vtable))
+      (br_on_non_null $done (global.get $cache))
+      (global.set $cache
+        (struct.new $vtable
+          (ref.null none)
+          (struct.new $small (ref.func $f) (i32.const 500))
+          (i32.const 3)
+        )
+      )
+      (ref.as_non_null (global.get $cache))
+    )
+  )
+)

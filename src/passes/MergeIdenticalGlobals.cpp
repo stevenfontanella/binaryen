@@ -96,6 +96,7 @@ struct Writes {
 struct MergeIdenticalGlobals : public Pass {
   Module* module;
   bool mergeLazyNull = false;
+  bool earlyMode = false;
 
   Writes writes;
   std::unordered_map<HeapType, std::vector<WriteState>> fieldStateCache;
@@ -112,6 +113,7 @@ struct MergeIdenticalGlobals : public Pass {
     mergeLazyNull =
       !getArgumentOrDefault("merge-identical-globals-merge-lazy-null", "")
          .empty();
+    earlyMode = getArgumentOrDefault("merge-identical-globals", "") == "early";
 
     collectWrites();
     for (auto& ex : module->exports) {
@@ -557,6 +559,7 @@ struct MergeIdenticalGlobals : public Pass {
     Expression* expr;
     // The type the parent requires at this position.
     Type required;
+    Function* func = nullptr;
   };
 
   // The type a parent allocation requires for the given child.
@@ -576,7 +579,7 @@ struct MergeIdenticalGlobals : public Pass {
 
   bool hoistNestedRound() {
     // Collect the innermost nested allocations (all children are leaves) in
-    // all global initializers.
+    // all global initializers and cached-once factory blocks.
     struct Collector
       : public ExpressionStackWalker<Collector,
                                      UnifiedExpressionVisitor<Collector>> {
@@ -608,6 +611,60 @@ struct MergeIdenticalGlobals : public Pass {
         collector.walk(global->init);
       }
     }
+    for (auto& func : module->functions) {
+      if (!earlyMode && !func->imported() && func->body) {
+        std::function<void(Expression*, Expression**, bool, bool)> walkFunc =
+          [&](Expression* parentExpr,
+              Expression** exprp,
+              bool inCachedMiss,
+              bool inLoopOrTry) {
+            if (!exprp || !*exprp) {
+              return;
+            }
+            Expression* curr = *exprp;
+            if (curr->is<Loop>() || curr->is<Try>() || curr->is<TryTable>()) {
+              inLoopOrTry = true;
+            }
+            if (auto* b = curr->dynCast<Block>()) {
+              if (b->name.is() && b->list.size() >= 2) {
+                if (auto* brOn = b->list[0]->dynCast<BrOn>();
+                    brOn && brOn->op == BrOnNonNull && brOn->name == b->name) {
+                  walkFunc(curr, &b->list[0], inCachedMiss, inLoopOrTry);
+                  for (Index i = 1; i < b->list.size(); i++) {
+                    walkFunc(curr, &b->list[i], true, inLoopOrTry);
+                  }
+                  return;
+                }
+              }
+            }
+            for (auto*& ch : ChildIterator(curr)) {
+              walkFunc(curr, &ch, inCachedMiss, inLoopOrTry);
+            }
+            if (inCachedMiss && !inLoopOrTry && parentExpr &&
+                isAllocation(parentExpr) && isAllocation(curr)) {
+              bool allImmutableLeaves = true;
+              for (auto* child : ChildIterator(curr)) {
+                if (!isLeaf(child)) {
+                  allImmutableLeaves = false;
+                  break;
+                }
+                if (auto* gg = child->dynCast<GlobalGet>()) {
+                  auto* g = module->getGlobalOrNull(gg->name);
+                  if (!g || g->mutable_) {
+                    allImmutableLeaves = false;
+                    break;
+                  }
+                }
+              }
+              if (allImmutableLeaves && isShareable(curr)) {
+                occurrences.push_back(
+                  {exprp, curr, getRequiredType(parentExpr, curr), func.get()});
+              }
+            }
+          };
+        walkFunc(nullptr, &func->body, false, false);
+      }
+    }
     if (occurrences.empty()) {
       return false;
     }
@@ -634,6 +691,7 @@ struct MergeIdenticalGlobals : public Pass {
     }
 
     bool changed = false;
+    std::unordered_set<Function*> refinalizeFuncs;
     Builder builder(*module);
     for (auto& [hash, list] : groups) {
       for (auto& group : list) {
@@ -659,8 +717,9 @@ struct MergeIdenticalGlobals : public Pass {
           // occurrence becomes a global.get, which gets a small index when
           // it is used often.
           Index getBytes = count >= 64 ? 2 : 3;
+          Index threshold = (earlyMode ? bytes : getBytes) + 5;
           if (bytes <= getBytes ||
-              (count - 1) * (bytes - getBytes) <= bytes + 5) {
+              (count - 1) * (bytes - getBytes) <= threshold) {
             continue;
           }
           name = Names::getValidGlobalName(*module, "hoisted");
@@ -671,9 +730,15 @@ struct MergeIdenticalGlobals : public Pass {
         }
         for (auto& member : group.members) {
           *member.location = builder.makeGlobalGet(name, type);
+          if (member.func) {
+            refinalizeFuncs.insert(member.func);
+          }
         }
         changed = true;
       }
+    }
+    for (auto* fn : refinalizeFuncs) {
+      ReFinalize().walkFunctionInModule(fn, module);
     }
     return changed;
   }
