@@ -1442,3 +1442,257 @@
     )
   )
 )
+
+(module
+  ;; 1. Step C memObjOrTopShape / canonAllObjRootAt: when $MixRootA and
+  ;;    $MixRootB both have $ValBase-rooted subtypes at field 1, but field 2
+  ;;    mixes a $ValBase subtype and a rootless struct $Rootless, field 1
+  ;;    widens only to (ref null $ValBase) while field 2 widens to anyref.
+  ;; 2. Combined non-inherited field permutation + subsequence field padding:
+  ;;    $PermPadShort has non-inherited fields (i64, (ref null $SubA)) in
+  ;;    reverse order compared to $PermPadTarget's (anyref, i32, i64). With
+  ;;    reorderable struct.new operands, $PermPadShort permutes its non-inherited
+  ;;    fields and pads the middle i32 field with (i32.const 0).
+  (rec
+    ;; CHECK:      (rec
+    ;; CHECK-NEXT:  (type $ValBase (sub (struct (field i32))))
+    (type $ValBase (sub (struct (field i32))))
+    ;; CHECK:       (type $ClosBase (sub (struct (field i32))))
+
+    ;; CHECK:       (type $Rootless (sub (struct (field i32))))
+
+    ;; CHECK:       (type $SubB (sub final $ValBase (struct (field i32) (field i64))))
+
+    ;; CHECK:       (type $SubA (sub final $ValBase (struct (field i32) (field i32))))
+    (type $SubA (sub final $ValBase (struct (field i32) (field i32))))
+    (type $SubB (sub final $ValBase (struct (field i32) (field i64))))
+    (type $Rootless (struct (field i32)))
+    (type $ClosBase (sub (struct (field i32))))
+    ;; CHECK:       (type $PermPadShort (sub final $ClosBase (struct (field i32) (field anyref) (field i32) (field i64))))
+
+    ;; CHECK:       (type $PermPadTarget (sub final $ClosBase (struct (field i32) (field anyref) (field i32) (field i64))))
+
+    ;; CHECK:       (type $MixRootB (sub final $ClosBase (struct (field i32) (field (ref null $ValBase)) (field anyref))))
+
+    ;; CHECK:       (type $MixRootA (sub final $ClosBase (struct (field i32) (field (ref null $ValBase)) (field anyref))))
+    (type $MixRootA (sub final $ClosBase (struct (field i32) (field (ref null $SubA)) (field (ref null $SubB)))))
+    (type $MixRootB (sub final $ClosBase (struct (field i32) (field (ref null $SubB)) (field (ref null $Rootless)))))
+    (type $PermPadTarget (sub final $ClosBase (struct (field i32) (field anyref) (field i32) (field i64))))
+    (type $PermPadShort (sub final $ClosBase (struct (field i32) (field i64) (field (ref null $SubA)))))
+  )
+
+  ;; CHECK:      (type $9 (func (param i32) (result i32)))
+
+  ;; CHECK:      (export "entry9" (func $entry9))
+  (export "entry9" (func $entry9))
+
+  ;; CHECK:      (func $entry9 (type $9) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (local $ma (ref null $MixRootA))
+  ;; CHECK-NEXT:  (local $mb (ref null $MixRootB))
+  ;; CHECK-NEXT:  (local $ppt (ref null $PermPadTarget))
+  ;; CHECK-NEXT:  (local $pps (ref null $PermPadShort))
+  ;; CHECK-NEXT:  (local.set $ma
+  ;; CHECK-NEXT:   (struct.new $MixRootA
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (struct.new $SubB
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:     (i64.const 2)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (struct.new $SubA
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:     (i32.const 1)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $mb
+  ;; CHECK-NEXT:   (struct.new $MixRootB
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (struct.new $SubB
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:     (i64.const 3)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (struct.new $Rootless
+  ;; CHECK-NEXT:     (i32.const 4)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $ppt
+  ;; CHECK-NEXT:   (struct.new $PermPadTarget
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (ref.null none)
+  ;; CHECK-NEXT:    (i32.const 5)
+  ;; CHECK-NEXT:    (i64.const 6)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $pps
+  ;; CHECK-NEXT:   (struct.new $PermPadShort
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (struct.new $SubA
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:     (i32.const 8)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.const 0)
+  ;; CHECK-NEXT:    (i64.const 7)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (struct.get $SubA 1
+  ;; CHECK-NEXT:      (ref.cast (ref null $SubA)
+  ;; CHECK-NEXT:       (struct.get $MixRootA 2
+  ;; CHECK-NEXT:        (local.get $ma)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (struct.get $ValBase 0
+  ;; CHECK-NEXT:      (struct.get $MixRootA 1
+  ;; CHECK-NEXT:       (local.get $ma)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (struct.get $ValBase 0
+  ;; CHECK-NEXT:      (struct.get $MixRootB 1
+  ;; CHECK-NEXT:       (local.get $mb)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (struct.get $Rootless 0
+  ;; CHECK-NEXT:      (ref.cast (ref null $Rootless)
+  ;; CHECK-NEXT:       (struct.get $MixRootB 2
+  ;; CHECK-NEXT:        (local.get $mb)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (struct.get $PermPadTarget 2
+  ;; CHECK-NEXT:      (local.get $ppt)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.wrap_i64
+  ;; CHECK-NEXT:      (struct.get $PermPadTarget 3
+  ;; CHECK-NEXT:       (local.get $ppt)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (i32.wrap_i64
+  ;; CHECK-NEXT:      (struct.get $PermPadShort 3
+  ;; CHECK-NEXT:       (local.get $pps)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (struct.get $SubA 1
+  ;; CHECK-NEXT:      (ref.cast (ref null $SubA)
+  ;; CHECK-NEXT:       (struct.get $PermPadShort 1
+  ;; CHECK-NEXT:        (local.get $pps)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $entry9 (param $x i32) (result i32)
+    (local $ma (ref null $MixRootA))
+    (local $mb (ref null $MixRootB))
+    (local $ppt (ref null $PermPadTarget))
+    (local $pps (ref null $PermPadShort))
+    (local.set $ma
+      (struct.new $MixRootA
+        (local.get $x)
+        (struct.new $SubA
+          (local.get $x)
+          (i32.const 1)
+        )
+        (struct.new $SubB
+          (local.get $x)
+          (i64.const 2)
+        )
+      )
+    )
+    (local.set $mb
+      (struct.new $MixRootB
+        (local.get $x)
+        (struct.new $SubB
+          (local.get $x)
+          (i64.const 3)
+        )
+        (struct.new $Rootless
+          (i32.const 4)
+        )
+      )
+    )
+    (local.set $ppt
+      (struct.new $PermPadTarget
+        (local.get $x)
+        (ref.null none)
+        (i32.const 5)
+        (i64.const 6)
+      )
+    )
+    (local.set $pps
+      (struct.new $PermPadShort
+        (local.get $x)
+        (i64.const 7)
+        (struct.new $SubA
+          (local.get $x)
+          (i32.const 8)
+        )
+      )
+    )
+    (i32.add
+      (i32.add
+        (i32.add
+          (struct.get $SubA 1
+            (struct.get $MixRootA 1
+              (local.get $ma)
+            )
+          )
+          (struct.get $ValBase 0
+            (struct.get $MixRootA 2
+              (local.get $ma)
+            )
+          )
+        )
+        (i32.add
+          (struct.get $ValBase 0
+            (struct.get $MixRootB 1
+              (local.get $mb)
+            )
+          )
+          (struct.get $Rootless 0
+            (struct.get $MixRootB 2
+              (local.get $mb)
+            )
+          )
+        )
+      )
+      (i32.add
+        (i32.add
+          (struct.get $PermPadTarget 2
+            (local.get $ppt)
+          )
+          (i32.wrap_i64
+            (struct.get $PermPadTarget 3
+              (local.get $ppt)
+            )
+          )
+        )
+        (i32.add
+          (i32.wrap_i64
+            (struct.get $PermPadShort 1
+              (local.get $pps)
+            )
+          )
+          (struct.get $SubA 1
+            (struct.get $PermPadShort 2
+              (local.get $pps)
+            )
+          )
+        )
+      )
+    )
+  )
+)

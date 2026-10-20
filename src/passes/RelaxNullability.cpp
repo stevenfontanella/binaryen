@@ -6449,6 +6449,7 @@ struct RelaxNullability : public Pass {
 
           std::vector<bool> canonVarying(numF, false);
           std::vector<bool> canonHasObjRootAt(numF, false);
+          std::vector<bool> canonAllObjRootAt(numF, commonObjRoot.has_value());
           for (Index cPos = 0; cPos < numF; ++cPos) {
             CandField firstCF = mCurShapes[0][canonOrder[0][cPos]];
             for (size_t mi = 0; mi < members.size(); ++mi) {
@@ -6459,6 +6460,8 @@ struct RelaxNullability : public Pass {
               if (commonObjRoot &&
                   Type::isSubType(cf.first, Type(*commonObjRoot, Nullable))) {
                 canonHasObjRootAt[cPos] = true;
+              } else {
+                canonAllObjRootAt[cPos] = false;
               }
             }
           }
@@ -6469,16 +6472,19 @@ struct RelaxNullability : public Pass {
               oldToCanonPos[canonOrder[mi][cPos]] = cPos;
             }
             CandShape memObjShape(numF);
+            CandShape memObjOrTopShape(numF);
             CandShape memTopShape(numF);
             for (Index fi = 0; fi < numF; ++fi) {
               Index cPos = oldToCanonPos[fi];
               Field::PackedType pt = mCurShapes[mi][fi].second;
               if (!canonVarying[cPos]) {
                 memObjShape[fi] = mCurShapes[mi][fi];
+                memObjOrTopShape[fi] = mCurShapes[mi][fi];
                 memTopShape[fi] = mCurShapes[mi][fi];
               } else if (fi < supLen) {
                 Type sFT = mapMergedType(getFinalFieldType(*skel.super, fi));
                 memObjShape[fi] = {sFT, pt};
+                memObjOrTopShape[fi] = {sFT, pt};
                 memTopShape[fi] = {sFT, pt};
               } else {
                 Type ft = mCurShapes[mi][fi].first;
@@ -6490,30 +6496,41 @@ struct RelaxNullability : public Pass {
                     objFT = Type(rHT, Nullable);
                   }
                 }
+                Type objOrTopFT =
+                  (commonObjRoot && ft.isRef() && ft.isNullable() &&
+                   !ft.isExact() && !ft.isNull() &&
+                   HeapType::isSubType(ft.getHeapType(), *commonObjRoot))
+                    ? Type(*commonObjRoot, Nullable)
+                    : mCoarse[mi][fi].first;
                 memObjShape[fi] = {objFT, pt};
+                memObjOrTopShape[fi] = {objOrTopFT, pt};
                 memTopShape[fi] = {mCoarse[mi][fi].first, pt};
               }
             }
             addCandShape(memObjShape);
+            addCandShape(memObjOrTopShape);
             addCandShape(memTopShape);
             if (canPermuteToCanon[mi]) {
               CandShape canonCur(numF);
               CandShape canonObj(numF);
+              CandShape canonObjOrTop(numF);
               CandShape canonTop(numF);
               for (Index cPos = 0; cPos < numF; ++cPos) {
                 Index oldFi = canonOrder[mi][cPos];
                 canonCur[cPos] = mCurShapes[mi][oldFi];
                 canonObj[cPos] = memObjShape[oldFi];
+                canonObjOrTop[cPos] = memObjOrTopShape[oldFi];
                 canonTop[cPos] = memTopShape[oldFi];
               }
               addCandShape(canonCur);
               addCandShape(canonObj);
+              addCandShape(canonObjOrTop);
               addCandShape(canonTop);
             }
           }
 
           Type anyRefT(HeapType::any, Nullable);
-          for (int useObjRoot = 0; useObjRoot < 2; ++useObjRoot) {
+          for (int useObjRoot = 0; useObjRoot < 3; ++useObjRoot) {
             if (useObjRoot && !commonObjRoot) {
               continue;
             }
@@ -6530,9 +6547,9 @@ struct RelaxNullability : public Pass {
                 } else if (onlyVarying && !canonVarying[cPos]) {
                   synth[cPos] = mCurShapes[0][canonOrder[0][cPos]];
                 } else if (skel.fields[cPos].first == anyRefT) {
-                  Type ft = (useObjRoot && canonHasObjRootAt[cPos])
-                              ? Type(*commonObjRoot, Nullable)
-                              : anyRefT;
+                  bool useRoot = (useObjRoot == 1 && canonHasObjRootAt[cPos]) ||
+                                 (useObjRoot == 2 && canonAllObjRootAt[cPos]);
+                  Type ft = useRoot ? Type(*commonObjRoot, Nullable) : anyRefT;
                   synth[cPos] = {ft, pt};
                 } else {
                   synth[cPos] = skel.fields[cPos];
@@ -7362,6 +7379,88 @@ struct RelaxNullability : public Pass {
           std::vector<Index> bestOldToNew;
           std::vector<Index> bestNewToOld;
 
+          std::vector<bool> canSwapM;
+          bool computedCanSwapM = false;
+          bool anyCanSwapM = false;
+          auto ensureCanSwapM = [&]() {
+            if (computedCanSwapM) {
+              return;
+            }
+            computedCanSwapM = true;
+            if (K < 2 || K > 8) {
+              return;
+            }
+            canSwapM.assign(lenM * lenM, false);
+            for (Index a = supLen; a < lenM; ++a) {
+              for (Index b = a + 1; b < lenM; ++b) {
+                canSwapM[a * lenM + b] = true;
+              }
+            }
+            auto nIt = allStructNews.find(M);
+            if (nIt != allStructNews.end()) {
+              for (auto* snew : nIt->second) {
+                if (snew->isWithDefault() || snew->operands.size() != lenM) {
+                  continue;
+                }
+                std::vector<EffectAnalyzer> eas;
+                eas.reserve(K);
+                for (Index fi = supLen; fi < lenM; ++fi) {
+                  eas.emplace_back(
+                    getPassOptions(), *module, snew->operands[fi]);
+                }
+                for (Index a = supLen; a < lenM; ++a) {
+                  for (Index b = a + 1; b < lenM; ++b) {
+                    if (canSwapM[a * lenM + b]) {
+                      const auto& eaA = eas[a - supLen];
+                      const auto& eaB = eas[b - supLen];
+                      if (eaA.orderedBefore(eaB) || eaB.orderedBefore(eaA)) {
+                        canSwapM[a * lenM + b] = false;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            for (Index a = supLen; a < lenM; ++a) {
+              for (Index b = a + 1; b < lenM; ++b) {
+                if (canSwapM[a * lenM + b]) {
+                  anyCanSwapM = true;
+                  return;
+                }
+              }
+            }
+          };
+
+          auto evalNonInhMatchCost = [&]( const PaddingTargetGroup& tGroup,
+                                          Index oldIdx,
+                                          Index newIdx) -> int {
+            if (mFields[oldIdx].packedType != tGroup.fields[newIdx].packedType) {
+              return -1;
+            }
+            bool mReq = mGroup.reqMut[oldIdx];
+            bool mAllow = mGroup.allowMut[oldIdx];
+            Type mFT = mGroup.fields[oldIdx].type;
+            Type tFT = tGroup.fields[newIdx].type;
+            if (mFT != tFT && canWidenFi[oldIdx]) {
+              mAllow = true;
+            }
+            if ((mReq || tGroup.reqMut[newIdx]) &&
+                !(mAllow && tGroup.allowMut[newIdx])) {
+              return -1;
+            }
+            if (mFT == tFT) {
+              return 0;
+            }
+            if (canWidenFi[oldIdx] && !tFT.isExact() && !tFT.isNull() &&
+                Type::isSubType(realFTs[oldIdx], tFT)) {
+              int narrowGets = countNarrowGets({M}, oldIdx, tFT);
+              int castBytes =
+                (typeIndex[realFTs[oldIdx].getHeapType()] < 64) ? 3 : 4;
+              return narrowGets * castBytes;
+            }
+            return -1;
+          };
+
           auto supIt = groupsBySuperAndLen.find(mGroup.super);
           if (supIt == groupsBySuperAndLen.end()) {
             continue;
@@ -7459,44 +7558,117 @@ struct RelaxNullability : public Pass {
                   if (i < K && j < N) {
                     Index oldIdx = supLen + i;
                     Index newIdx = supLen + j;
-                    if (mFields[oldIdx].packedType ==
-                        tGroup.fields[newIdx].packedType) {
-                      bool mReq = mGroup.reqMut[oldIdx];
-                      bool mAllow = mGroup.allowMut[oldIdx];
-                      Type mFT = mGroup.fields[oldIdx].type;
-                      Type tFT = tGroup.fields[newIdx].type;
-                      if (mFT != tFT && canWidenFi[oldIdx]) {
-                        mAllow = true;
-                      }
-                      if (!((mReq || tGroup.reqMut[newIdx]) &&
-                            !(mAllow && tGroup.allowMut[newIdx]))) {
-                        int mCost = -1;
-                        if (mFT == tFT) {
-                          mCost = 0;
-                        } else if (canWidenFi[oldIdx] && !tFT.isExact() &&
-                                   !tFT.isNull() &&
-                                   Type::isSubType(realFTs[oldIdx], tFT)) {
-                          int narrowGets = countNarrowGets({M}, oldIdx, tFT);
-                          int castBytes =
-                            (typeIndex[realFTs[oldIdx].getHeapType()] < 64)
-                              ? 3
-                              : 4;
-                          mCost = narrowGets * castBytes;
-                        }
-                        if (mCost >= 0 && cur + mCost < dp[i + 1][d]) {
-                          dp[i + 1][d] = cur + mCost;
-                          parentMove[i + 1][d] = 1;
-                        }
-                      }
+                    int mCost = evalNonInhMatchCost(tGroup, oldIdx, newIdx);
+                    if (mCost >= 0 && cur + mCost < dp[i + 1][d]) {
+                      dp[i + 1][d] = cur + mCost;
+                      parentMove[i + 1][d] = 1;
                     }
                   }
                 }
               }
 
-              if (dp[K][D] >= INF) {
+              int bestNonInhCost = dp[K][D];
+              std::vector<Index> permAssign;
+              if (bestNonInhCost > 0 && K >= 2 && K <= 8) {
+                ensureCanSwapM();
+                if (anyCanSwapM) {
+                  std::vector<int> padCostJ(N, -1);
+                  int nonPadCount = 0;
+                  for (Index j = 0; j < N; ++j) {
+                    int cb =
+                      getDefaultConstBytes(tGroup.fields[supLen + j].type);
+                    if (cb >= 0) {
+                      padCostJ[j] = mNews * cb;
+                    } else {
+                      nonPadCount++;
+                    }
+                  }
+                  if (nonPadCount <= int(K)) {
+                    std::vector<std::vector<std::pair<Index, int>>> compatJ(K);
+                    bool allHaveCompat = true;
+                    for (Index i = 0; i < K; ++i) {
+                      for (Index j = 0; j < N; ++j) {
+                        int mc =
+                          evalNonInhMatchCost(tGroup, supLen + i, supLen + j);
+                        if (mc >= 0) {
+                          compatJ[i].push_back({j, mc});
+                        }
+                      }
+                      if (compatJ[i].empty()) {
+                        allHaveCompat = false;
+                        break;
+                      }
+                    }
+                    if (allHaveCompat) {
+                      std::vector<Index> curAssign(K, 0);
+                      int bestInvs = INF;
+                      auto solvePermPad = [&](auto& self,
+                                              Index i,
+                                              uint32_t usedMask,
+                                              int curMatchCost,
+                                              int curInvs) -> void {
+                        if (curMatchCost >= bestNonInhCost) {
+                          return;
+                        }
+                        if (i == K) {
+                          int padCost = 0;
+                          for (Index j = 0; j < N; ++j) {
+                            if (!(usedMask & (1u << j))) {
+                              if (padCostJ[j] < 0) {
+                                return;
+                              }
+                              padCost += padCostJ[j];
+                            }
+                          }
+                          int tot = curMatchCost + padCost;
+                          if (tot < bestNonInhCost ||
+                              (tot == bestNonInhCost && curInvs < bestInvs)) {
+                            bestNonInhCost = tot;
+                            bestInvs = curInvs;
+                            permAssign = curAssign;
+                          }
+                          return;
+                        }
+                        Index oldI = supLen + i;
+                        for (const auto& [j, mc] : compatJ[i]) {
+                          if (usedMask & (1u << j)) {
+                            continue;
+                          }
+                          if (curMatchCost + mc >= bestNonInhCost) {
+                            continue;
+                          }
+                          bool swapOk = true;
+                          int addInvs = 0;
+                          for (Index prevI = 0; prevI < i; ++prevI) {
+                            if (curAssign[prevI] > j) {
+                              if (!canSwapM[(supLen + prevI) * lenM + oldI]) {
+                                swapOk = false;
+                                break;
+                              }
+                              addInvs++;
+                            }
+                          }
+                          if (!swapOk) {
+                            continue;
+                          }
+                          curAssign[i] = j;
+                          self(self,
+                               i + 1,
+                               usedMask | (1u << j),
+                               curMatchCost + mc,
+                               curInvs + addInvs);
+                        }
+                      };
+                      solvePermPad(solvePermPad, 0, 0, 0, 0);
+                    }
+                  }
+                }
+              }
+
+              if (bestNonInhCost >= INF) {
                 continue;
               }
-              int totalCost = inhCastCost + dp[K][D];
+              int totalCost = inhCastCost + bestNonInhCost;
               Index cIdx = std::min(typeIndex[M], tGroup.cIdx);
               int lebSave = getLebSavings(M, cIdx);
               if (cIdx < tGroup.cIdx) {
@@ -7514,19 +7686,28 @@ struct RelaxNullability : public Pass {
                   bestOldToNew[fi] = fi;
                   bestNewToOld[fi] = fi;
                 }
-                Index ci = K;
-                Index cd = D;
-                while (ci > 0 || cd > 0) {
-                  uint8_t mv = parentMove[ci][cd];
-                  assert(mv == 1 || mv == 2);
-                  if (mv == 1) {
-                    ci--;
-                    Index oldIdx = supLen + ci;
-                    Index newIdx = supLen + ci + cd;
+                if (!permAssign.empty()) {
+                  for (Index i = 0; i < K; ++i) {
+                    Index oldIdx = supLen + i;
+                    Index newIdx = supLen + permAssign[i];
                     bestOldToNew[oldIdx] = newIdx;
                     bestNewToOld[newIdx] = oldIdx;
-                  } else {
-                    cd--;
+                  }
+                } else {
+                  Index ci = K;
+                  Index cd = D;
+                  while (ci > 0 || cd > 0) {
+                    uint8_t mv = parentMove[ci][cd];
+                    assert(mv == 1 || mv == 2);
+                    if (mv == 1) {
+                      ci--;
+                      Index oldIdx = supLen + ci;
+                      Index newIdx = supLen + ci + cd;
+                      bestOldToNew[oldIdx] = newIdx;
+                      bestNewToOld[newIdx] = oldIdx;
+                    } else {
+                      cd--;
+                    }
                   }
                 }
               }
