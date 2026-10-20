@@ -1392,9 +1392,13 @@
 
   ;; CHECK:      (type $2 (func (param (ref null $Base) i32) (result i32)))
 
-  ;; CHECK:      (type $3 (func (param (ref null $Base)) (result i32)))
+  ;; CHECK:      (type $3 (func (param (ref null $Base) i64) (result i32)))
+
+  ;; CHECK:      (type $4 (func (param (ref null $Base)) (result i32)))
 
   ;; CHECK:      (export "existing-base" (func $existing-base))
+
+  ;; CHECK:      (export "existing-base-i64" (func $existing-base-i64))
 
   ;; CHECK:      (export "call-multi" (func $call-multi-get-sub))
 
@@ -1403,11 +1407,17 @@
   ;; CHECK-NEXT: )
   ;; NO_TNH:      (type $2 (func (param (ref null $Base) i32) (result i32)))
 
-  ;; NO_TNH:      (type $3 (func (param (ref null $Sub) i32) (result i32)))
+  ;; NO_TNH:      (type $3 (func (param (ref null $Base) i64) (result i32)))
 
-  ;; NO_TNH:      (type $4 (func (param (ref null $Base)) (result i32)))
+  ;; NO_TNH:      (type $4 (func (param (ref null $Sub) i32) (result i32)))
+
+  ;; NO_TNH:      (type $5 (func (param (ref null $Base)) (result i32)))
+
+  ;; NO_TNH:      (type $6 (func (param (ref null $Sub) i64) (result i32)))
 
   ;; NO_TNH:      (export "existing-base" (func $existing-base))
+
+  ;; NO_TNH:      (export "existing-base-i64" (func $existing-base-i64))
 
   ;; NO_TNH:      (export "call-multi" (func $call-multi-get-sub))
 
@@ -1416,6 +1426,22 @@
   ;; NO_TNH-NEXT: )
   (func $existing-base (export "existing-base") (param $p (ref null $Base)) (param $y i32) (result i32)
     (local.get $y)
+  )
+
+  ;; CHECK:      (func $existing-base-i64 (type $3) (param $p (ref null $Base)) (param $y i64) (result i32)
+  ;; CHECK-NEXT:  (i32.wrap_i64
+  ;; CHECK-NEXT:   (local.get $y)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; NO_TNH:      (func $existing-base-i64 (type $3) (param $p (ref null $Base)) (param $y i64) (result i32)
+  ;; NO_TNH-NEXT:  (i32.wrap_i64
+  ;; NO_TNH-NEXT:   (local.get $y)
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT: )
+  (func $existing-base-i64 (export "existing-base-i64") (param $p (ref null $Base)) (param $y i64) (result i32)
+    (i32.wrap_i64
+      (local.get $y)
+    )
   )
 
   ;; Sole-use-signature function reads subtype parameter $p 4 times for narrow
@@ -1450,7 +1476,7 @@
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
-  ;; NO_TNH:      (func $multi-get-sub (type $3) (param $p (ref null $Sub)) (param $y i32) (result i32)
+  ;; NO_TNH:      (func $multi-get-sub (type $4) (param $p (ref null $Sub)) (param $y i32) (result i32)
   ;; NO_TNH-NEXT:  (i32.add
   ;; NO_TNH-NEXT:   (i32.add
   ;; NO_TNH-NEXT:    (struct.get $Sub 1
@@ -1497,26 +1523,144 @@
     )
   )
 
-  ;; CHECK:      (func $call-multi-get-sub (type $3) (param $b (ref null $Base)) (result i32)
-  ;; CHECK-NEXT:  (call $multi-get-sub
-  ;; CHECK-NEXT:   (local.get $b)
-  ;; CHECK-NEXT:   (i32.const 7)
+  ;; CHECK:      (func $call-multi-get-sub (type $4) (param $b (ref null $Base)) (result i32)
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (call $multi-get-sub
+  ;; CHECK-NEXT:    (local.get $b)
+  ;; CHECK-NEXT:    (i32.const 7)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (call $written-param-sub
+  ;; CHECK-NEXT:     (local.get $b)
+  ;; CHECK-NEXT:     (i64.const 3)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (call $written-param-sub
+  ;; CHECK-NEXT:     (local.get $b)
+  ;; CHECK-NEXT:     (i64.const 4)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
-  ;; NO_TNH:      (func $call-multi-get-sub (type $4) (param $b (ref null $Base)) (result i32)
-  ;; NO_TNH-NEXT:  (call $multi-get-sub
-  ;; NO_TNH-NEXT:   (ref.cast (ref null $Sub)
-  ;; NO_TNH-NEXT:    (local.get $b)
+  ;; NO_TNH:      (func $call-multi-get-sub (type $5) (param $b (ref null $Base)) (result i32)
+  ;; NO_TNH-NEXT:  (i32.add
+  ;; NO_TNH-NEXT:   (call $multi-get-sub
+  ;; NO_TNH-NEXT:    (ref.cast (ref null $Sub)
+  ;; NO_TNH-NEXT:     (local.get $b)
+  ;; NO_TNH-NEXT:    )
+  ;; NO_TNH-NEXT:    (i32.const 7)
   ;; NO_TNH-NEXT:   )
-  ;; NO_TNH-NEXT:   (i32.const 7)
+  ;; NO_TNH-NEXT:   (i32.add
+  ;; NO_TNH-NEXT:    (call $written-param-sub
+  ;; NO_TNH-NEXT:     (ref.cast (ref null $Sub)
+  ;; NO_TNH-NEXT:      (local.get $b)
+  ;; NO_TNH-NEXT:     )
+  ;; NO_TNH-NEXT:     (i64.const 3)
+  ;; NO_TNH-NEXT:    )
+  ;; NO_TNH-NEXT:    (call $written-param-sub
+  ;; NO_TNH-NEXT:     (ref.cast (ref null $Sub)
+  ;; NO_TNH-NEXT:      (local.get $b)
+  ;; NO_TNH-NEXT:     )
+  ;; NO_TNH-NEXT:     (i64.const 4)
+  ;; NO_TNH-NEXT:    )
+  ;; NO_TNH-NEXT:   )
   ;; NO_TNH-NEXT:  )
   ;; NO_TNH-NEXT: )
   (func $call-multi-get-sub (export "call-multi") (param $b (ref null $Base)) (result i32)
-    (call $multi-get-sub
-      (ref.cast (ref null $Sub)
-        (local.get $b)
+    (i32.add
+      (call $multi-get-sub
+        (ref.cast (ref null $Sub)
+          (local.get $b)
+        )
+        (i32.const 7)
       )
-      (i32.const 7)
+      (i32.add
+        (call $written-param-sub
+          (ref.cast (ref null $Sub)
+            (local.get $b)
+          )
+          (i64.const 3)
+        )
+        (call $written-param-sub
+          (ref.cast (ref null $Sub)
+            (local.get $b)
+          )
+          (i64.const 4)
+        )
+      )
+    )
+  )
+
+  ;; Sole-use-signature function writes to subtype parameter $p and reads it
+  ;; narrowly; generalizeSignatures allocates a scratch local of type
+  ;; (ref null $Sub), initializes it with a prologue ref.cast of $p, redirects
+  ;; all body local.get/local.set of $p to the scratch local, and merges the
+  ;; signature with $existing-base-i64.
+  ;; CHECK:      (func $written-param-sub (type $3) (param $p (ref null $Base)) (param $y i64) (result i32)
+  ;; CHECK-NEXT:  (local $2 (ref null $Sub))
+  ;; CHECK-NEXT:  (local.set $2
+  ;; CHECK-NEXT:   (ref.cast (ref null $Sub)
+  ;; CHECK-NEXT:    (local.get $p)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (block (result i32)
+  ;; CHECK-NEXT:   (if
+  ;; CHECK-NEXT:    (i32.wrap_i64
+  ;; CHECK-NEXT:     (local.get $y)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (then
+  ;; CHECK-NEXT:     (local.set $2
+  ;; CHECK-NEXT:      (ref.null none)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (struct.get $Sub 1
+  ;; CHECK-NEXT:     (local.get $2)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (struct.get $Sub 2
+  ;; CHECK-NEXT:     (local.get $2)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; NO_TNH:      (func $written-param-sub (type $6) (param $p (ref null $Sub)) (param $y i64) (result i32)
+  ;; NO_TNH-NEXT:  (if
+  ;; NO_TNH-NEXT:   (i32.wrap_i64
+  ;; NO_TNH-NEXT:    (local.get $y)
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:   (then
+  ;; NO_TNH-NEXT:    (local.set $p
+  ;; NO_TNH-NEXT:     (ref.null none)
+  ;; NO_TNH-NEXT:    )
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT:  (i32.add
+  ;; NO_TNH-NEXT:   (struct.get $Sub 1
+  ;; NO_TNH-NEXT:    (local.get $p)
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:   (struct.get $Sub 2
+  ;; NO_TNH-NEXT:    (local.get $p)
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT: )
+  (func $written-param-sub (param $p (ref null $Sub)) (param $y i64) (result i32)
+    (if
+      (i32.wrap_i64
+        (local.get $y)
+      )
+      (then
+        (local.set $p
+          (ref.null $Sub)
+        )
+      )
+    )
+    (i32.add
+      (struct.get $Sub 1
+        (local.get $p)
+      )
+      (struct.get $Sub 2
+        (local.get $p)
+      )
     )
   )
 )
