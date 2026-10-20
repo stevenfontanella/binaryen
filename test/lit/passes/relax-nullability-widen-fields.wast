@@ -151,40 +151,36 @@
 (module
   (rec
     ;; CHECK:      (rec
-    ;; CHECK-NEXT:  (type $ObjRoot (sub (struct (field anyref))))
-
-    ;; CHECK:       (type $Payload (struct (field i32)))
+    ;; CHECK-NEXT:  (type $Payload (struct (field i32)))
 
     ;; CHECK:       (type $MutualB (struct (field (mut (ref null $Payload)))))
 
-    ;; CHECK:       (type $MutualA (struct (field (ref null $Payload))))
+    ;; CHECK:       (type $MutualA (struct (field (mut (ref null $Payload)))))
 
     ;; CHECK:       (type $SelfCopy (struct (field (mut (ref null $Payload)))))
 
-    ;; CHECK:       (type $5 (func (param (ref null $SelfCopy) (ref null $MutualA) (ref null $MutualB)) (result i32)))
+    ;; CHECK:       (type $4 (func (param (ref null $SelfCopy) (ref null $MutualA) (ref null $MutualB)) (result i32)))
 
     ;; CHECK:       (type $VtRoot (sub (struct (field anyref))))
     (type $VtRoot (sub (struct (field structref))))
     (type $VtNull (sub $VtRoot (struct (field nullref))))
     (type $VtSub1 (sub $VtRoot (struct (field (ref $VtRoot)))))
     (type $VtSub2 (sub $VtSub1 (struct (field (ref $VtSub1)))))
+    ;; CHECK:       (type $ObjRoot (sub (struct (field anyref))))
     (type $ObjRoot (sub (struct (field (ref null $VtRoot)))))
     ;; $ObjSub1 has no direct struct.get on field 0, so its field 0 widens to
     ;; (ref null $VtRoot) even though sibling $ObjSub2 has a narrow struct.get.
-    ;; CHECK:       (type $ObjSub2 (sub $ObjRoot (struct (field (ref null $VtRoot)))))
-
-    ;; CHECK:       (type $ObjSub1 (sub $ObjRoot (struct (field anyref))))
     (type $ObjSub1 (sub $ObjRoot (struct (field (ref $VtSub1)))))
     (type $ObjSub2 (sub $ObjRoot (struct (field (ref $VtSub2)))))
   )
 
-  ;; CHECK:       (type $9 (func (param (ref null $ObjRoot) (ref null $ObjSub2) (ref null $VtRoot)) (result (ref null $VtRoot))))
+  ;; CHECK:       (type $7 (func (param (ref null $ObjRoot) (ref null $ObjRoot) (ref null $VtRoot)) (result anyref)))
 
-  ;; CHECK:      (type $10 (func))
+  ;; CHECK:      (type $8 (func))
 
   ;; CHECK:      (export "entry2" (func $entry2))
 
-  ;; CHECK:      (func $use-covariant (type $9) (param $o1 (ref null $ObjRoot)) (param $o2 (ref null $ObjSub2)) (param $vn (ref null $VtRoot)) (result (ref null $VtRoot))
+  ;; CHECK:      (func $use-covariant (type $7) (param $o1 (ref null $ObjRoot)) (param $o2 (ref null $ObjRoot)) (param $vn (ref null $VtRoot)) (result anyref)
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (struct.get $ObjRoot 0
   ;; CHECK-NEXT:    (local.get $o1)
@@ -193,7 +189,7 @@
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (local.get $vn)
   ;; CHECK-NEXT:  )
-  ;; CHECK-NEXT:  (struct.get $ObjSub2 0
+  ;; CHECK-NEXT:  (struct.get $ObjRoot 0
   ;; CHECK-NEXT:   (local.get $o2)
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
@@ -211,7 +207,7 @@
     )
   )
 
-  ;; CHECK:      (func $entry2 (type $10)
+  ;; CHECK:      (func $entry2 (type $8)
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (call $use-covariant
   ;; CHECK-NEXT:    (ref.null none)
@@ -253,7 +249,7 @@
     (type $MutualB (struct (field (mut (ref $Payload)))))
   )
 
-  ;; CHECK:      (func $copy-fields (type $5) (param $s (ref null $SelfCopy)) (param $a (ref null $MutualA)) (param $b (ref null $MutualB)) (result i32)
+  ;; CHECK:      (func $copy-fields (type $4) (param $s (ref null $SelfCopy)) (param $a (ref null $MutualA)) (param $b (ref null $MutualB)) (result i32)
   ;; CHECK-NEXT:  (struct.set $SelfCopy 0
   ;; CHECK-NEXT:   (local.get $s)
   ;; CHECK-NEXT:   (struct.get $SelfCopy 0
@@ -618,6 +614,149 @@
           (struct.get $ObjSub 0
             (local.get $s)
           )
+        )
+      )
+    )
+  )
+)
+
+(module
+  ;; 1. Same-length finalized subtype $VtSub <: $VtBase widens its covariant
+  ;;    immutable signature field (ref null $FnSig) -> funcref, unfinalizes to
+  ;;    open (sub $VtBase), and inserts a ref.cast at its single struct.get;
+  ;;    coupled same-length finalized holder $HolderSub <: $HolderBase is also
+  ;;    unfinalized with zero casts on its field 0 so TypeMerging merges both
+  ;;    into their supertypes.
+  ;; 2. Unpinned private sibling structs $BoxMut (open, mutable field) and
+  ;;    $BoxImm (final, immutable field) unify field mutability to (mut i32)
+  ;;    and open-ness to (sub (struct ...)).
+  (rec
+    ;; CHECK:      (rec
+    ;; CHECK-NEXT:  (type $HolderBase (sub (struct (field anyref) (field (mut i32)))))
+
+    ;; CHECK:       (type $VtBase (sub (struct (field i32) (field funcref))))
+
+    ;; CHECK:       (type $HolderSub (sub $HolderBase (struct (field anyref) (field (mut i32)))))
+
+    ;; CHECK:       (type $BoxImm (sub (struct (field (mut i32)))))
+
+    ;; CHECK:       (type $BoxMut (sub (struct (field (mut i32)))))
+
+    ;; CHECK:       (type $VtSub (sub $VtBase (struct (field i32) (field funcref))))
+
+    ;; CHECK:       (type $FnSig (func (param i32) (result i32)))
+    (type $FnSig (func (param i32) (result i32)))
+    (type $VtBase (sub (struct (field i32) (field funcref))))
+    (type $VtSub (sub final $VtBase (struct (field i32) (field (ref null $FnSig)))))
+    (type $HolderBase (sub (struct (field (ref null $VtBase)) (field (mut i32)))))
+    (type $HolderSub (sub final $HolderBase (struct (field (ref null $VtSub)) (field (mut i32)))))
+    (type $BoxMut (sub (struct (field (mut i32)))))
+    (type $BoxImm (sub final (struct (field i32))))
+  )
+
+  ;; CHECK:      (type $7 (func (param i32) (result i32)))
+
+  ;; CHECK:      (elem declare func $fn-impl)
+
+  ;; CHECK:      (export "entry5" (func $entry5))
+
+  ;; CHECK:      (func $fn-impl (type $FnSig) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (local.get $x)
+  ;; CHECK-NEXT: )
+  (func $fn-impl (type $FnSig) (param $x i32) (result i32)
+    (local.get $x)
+  )
+
+  ;; CHECK:      (func $entry5 (type $7) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (local $v (ref null $VtBase))
+  ;; CHECK-NEXT:  (local $h (ref null $HolderBase))
+  ;; CHECK-NEXT:  (local $bm (ref null $BoxMut))
+  ;; CHECK-NEXT:  (local $bi (ref null $BoxImm))
+  ;; CHECK-NEXT:  (local.set $v
+  ;; CHECK-NEXT:   (struct.new $VtSub
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (ref.func $fn-impl)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $h
+  ;; CHECK-NEXT:   (struct.new $HolderSub
+  ;; CHECK-NEXT:    (local.get $v)
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $bm
+  ;; CHECK-NEXT:   (struct.new $BoxMut
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $bi
+  ;; CHECK-NEXT:   (struct.new $BoxImm
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (call_ref $FnSig
+  ;; CHECK-NEXT:    (struct.get $HolderBase 1
+  ;; CHECK-NEXT:     (local.get $h)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (ref.cast (ref null $FnSig)
+  ;; CHECK-NEXT:     (struct.get $VtBase 1
+  ;; CHECK-NEXT:      (local.get $v)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (struct.get $BoxMut 0
+  ;; CHECK-NEXT:     (local.get $bm)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (struct.get $BoxImm 0
+  ;; CHECK-NEXT:     (local.get $bi)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $entry5 (export "entry5") (param $x i32) (result i32)
+    (local $v (ref null $VtSub))
+    (local $h (ref null $HolderSub))
+    (local $bm (ref null $BoxMut))
+    (local $bi (ref null $BoxImm))
+    (local.set $v
+      (struct.new $VtSub
+        (local.get $x)
+        (ref.func $fn-impl)
+      )
+    )
+    (local.set $h
+      (struct.new $HolderSub
+        (local.get $v)
+        (local.get $x)
+      )
+    )
+    (local.set $bm
+      (struct.new $BoxMut
+        (local.get $x)
+      )
+    )
+    (local.set $bi
+      (struct.new $BoxImm
+        (local.get $x)
+      )
+    )
+    (i32.add
+      (call_ref $FnSig
+        (struct.get $HolderBase 1
+          (local.get $h)
+        )
+        (struct.get $VtSub 1
+          (local.get $v)
+        )
+      )
+      (i32.add
+        (struct.get $BoxMut 0
+          (local.get $bm)
+        )
+        (struct.get $BoxImm 0
+          (local.get $bi)
         )
       )
     )
