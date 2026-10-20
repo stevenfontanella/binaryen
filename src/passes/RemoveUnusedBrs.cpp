@@ -6034,10 +6034,27 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
     return measurer.bytes;
   }
 
-  static bool isSwitchChainChild(Block* child, Block* parent) {
-    return parent->list.size() >= 2 && parent->list[0] == child &&
-           child->type == Type::none && !child->list.empty() &&
-           child->list.back()->type == Type::unreachable;
+  static bool isSwitchChainChild(Block* child,
+                                 Block* parent,
+                                 bool allowConcreteParent = false) {
+    if (parent->list.size() < 2 || parent->list[0] != child ||
+        child->type != Type::none || child->list.empty()) {
+      return false;
+    }
+    if (child->list.back()->type == Type::unreachable) {
+      return true;
+    }
+    if (allowConcreteParent && parent->type.isConcrete() &&
+        parent->name.is() && parent->list.back()->type == Type::unreachable &&
+        !child->name.is() && child->list.size() >= 2) {
+      if (auto* grandChild = child->list[0]->dynCast<Block>()) {
+        if (grandChild->type == Type::none && !grandChild->list.empty() &&
+            grandChild->list.back()->type == Type::unreachable) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   bool checkConstLeafTree(Expression* expr,
@@ -6228,24 +6245,273 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
     return 0;
   }
 
+  static bool getSinkableOpChildren(Expression* expr,
+                                    SmallVector<Expression**, 8>& children) {
+    children.clear();
+    switch (expr->_id) {
+      case Expression::Id::LocalSetId: {
+        auto* set = expr->cast<LocalSet>();
+        if (set->isTee()) {
+          return false;
+        }
+        children.push_back(&set->value);
+        return true;
+      }
+      case Expression::Id::GlobalSetId: {
+        auto* set = expr->cast<GlobalSet>();
+        children.push_back(&set->value);
+        return true;
+      }
+      case Expression::Id::CallId: {
+        auto* call = expr->cast<Call>();
+        if (call->isReturn) {
+          return false;
+        }
+        for (auto& op : call->operands) {
+          children.push_back(&op);
+        }
+        return !children.empty();
+      }
+      case Expression::Id::CallRefId: {
+        auto* call = expr->cast<CallRef>();
+        if (call->isReturn) {
+          return false;
+        }
+        for (auto& op : call->operands) {
+          children.push_back(&op);
+        }
+        children.push_back(&call->target);
+        return true;
+      }
+      case Expression::Id::StructNewId: {
+        auto* sn = expr->cast<StructNew>();
+        if (sn->isWithDefault()) {
+          return false;
+        }
+        for (auto& op : sn->operands) {
+          children.push_back(&op);
+        }
+        return !children.empty();
+      }
+      case Expression::Id::StructSetId: {
+        auto* ss = expr->cast<StructSet>();
+        children.push_back(&ss->ref);
+        children.push_back(&ss->value);
+        return true;
+      }
+      case Expression::Id::StructGetId: {
+        auto* sg = expr->cast<StructGet>();
+        children.push_back(&sg->ref);
+        return true;
+      }
+      case Expression::Id::ArrayNewId: {
+        auto* an = expr->cast<ArrayNew>();
+        if (!an->isWithDefault()) {
+          children.push_back(&an->init);
+        }
+        children.push_back(&an->size);
+        return true;
+      }
+      case Expression::Id::ArrayNewFixedId: {
+        auto* anf = expr->cast<ArrayNewFixed>();
+        for (auto& op : anf->values) {
+          children.push_back(&op);
+        }
+        return !children.empty();
+      }
+      case Expression::Id::ArraySetId: {
+        auto* as = expr->cast<ArraySet>();
+        children.push_back(&as->ref);
+        children.push_back(&as->index);
+        children.push_back(&as->value);
+        return true;
+      }
+      case Expression::Id::ArrayGetId: {
+        auto* ag = expr->cast<ArrayGet>();
+        children.push_back(&ag->ref);
+        children.push_back(&ag->index);
+        return true;
+      }
+      case Expression::Id::BinaryId: {
+        auto* bin = expr->cast<Binary>();
+        children.push_back(&bin->left);
+        children.push_back(&bin->right);
+        return true;
+      }
+      case Expression::Id::UnaryId: {
+        auto* un = expr->cast<Unary>();
+        children.push_back(&un->value);
+        return true;
+      }
+      case Expression::Id::SelectId: {
+        auto* sel = expr->cast<Select>();
+        children.push_back(&sel->ifTrue);
+        children.push_back(&sel->ifFalse);
+        children.push_back(&sel->condition);
+        return true;
+      }
+      case Expression::Id::RefCastId: {
+        auto* rc = expr->cast<RefCast>();
+        children.push_back(&rc->ref);
+        return true;
+      }
+      case Expression::Id::RefTestId: {
+        auto* rt = expr->cast<RefTest>();
+        children.push_back(&rt->ref);
+        return true;
+      }
+      case Expression::Id::RefAsId: {
+        auto* ra = expr->cast<RefAs>();
+        children.push_back(&ra->value);
+        return true;
+      }
+      case Expression::Id::RefEqId: {
+        auto* re = expr->cast<RefEq>();
+        children.push_back(&re->left);
+        children.push_back(&re->right);
+        return true;
+      }
+      default:
+        return false;
+    }
+  }
+
+  static bool sameSinkableOpSkeleton(Expression* a,
+                                     Expression* b,
+                                     Index d,
+                                     const SmallVector<Expression**, 8>& chA,
+                                     const SmallVector<Expression**, 8>& chB) {
+    if (a->_id != b->_id || a->type != b->type || chA.size() != chB.size() ||
+        d >= chA.size()) {
+      return false;
+    }
+    switch (a->_id) {
+      case Expression::Id::LocalSetId:
+        if (a->cast<LocalSet>()->index != b->cast<LocalSet>()->index ||
+            a->cast<LocalSet>()->isTee() != b->cast<LocalSet>()->isTee()) {
+          return false;
+        }
+        break;
+      case Expression::Id::GlobalSetId:
+        if (a->cast<GlobalSet>()->name != b->cast<GlobalSet>()->name) {
+          return false;
+        }
+        break;
+      case Expression::Id::CallId:
+        if (a->cast<Call>()->target != b->cast<Call>()->target ||
+            a->cast<Call>()->isReturn != b->cast<Call>()->isReturn) {
+          return false;
+        }
+        break;
+      case Expression::Id::CallRefId:
+        if (a->cast<CallRef>()->isReturn != b->cast<CallRef>()->isReturn ||
+            a->cast<CallRef>()->target->type !=
+              b->cast<CallRef>()->target->type) {
+          return false;
+        }
+        break;
+      case Expression::Id::StructNewId:
+        if (a->cast<StructNew>()->isWithDefault() !=
+            b->cast<StructNew>()->isWithDefault()) {
+          return false;
+        }
+        break;
+      case Expression::Id::StructSetId:
+        if (a->cast<StructSet>()->index != b->cast<StructSet>()->index ||
+            a->cast<StructSet>()->ref->type !=
+              b->cast<StructSet>()->ref->type) {
+          return false;
+        }
+        break;
+      case Expression::Id::StructGetId:
+        if (a->cast<StructGet>()->index != b->cast<StructGet>()->index ||
+            a->cast<StructGet>()->signed_ != b->cast<StructGet>()->signed_ ||
+            a->cast<StructGet>()->ref->type !=
+              b->cast<StructGet>()->ref->type) {
+          return false;
+        }
+        break;
+      case Expression::Id::ArrayNewId:
+        if (a->cast<ArrayNew>()->isWithDefault() !=
+            b->cast<ArrayNew>()->isWithDefault()) {
+          return false;
+        }
+        break;
+      case Expression::Id::ArrayNewFixedId:
+        break;
+      case Expression::Id::ArraySetId:
+        if (a->cast<ArraySet>()->ref->type != b->cast<ArraySet>()->ref->type) {
+          return false;
+        }
+        break;
+      case Expression::Id::ArrayGetId:
+        if (a->cast<ArrayGet>()->signed_ != b->cast<ArrayGet>()->signed_ ||
+            a->cast<ArrayGet>()->ref->type != b->cast<ArrayGet>()->ref->type) {
+          return false;
+        }
+        break;
+      case Expression::Id::BinaryId:
+        if (a->cast<Binary>()->op != b->cast<Binary>()->op) {
+          return false;
+        }
+        break;
+      case Expression::Id::UnaryId:
+        if (a->cast<Unary>()->op != b->cast<Unary>()->op) {
+          return false;
+        }
+        break;
+      case Expression::Id::SelectId:
+        break;
+      case Expression::Id::RefCastId:
+        break;
+      case Expression::Id::RefTestId:
+        if (a->cast<RefTest>()->castType != b->cast<RefTest>()->castType) {
+          return false;
+        }
+        break;
+      case Expression::Id::RefAsId:
+        if (a->cast<RefAs>()->op != b->cast<RefAs>()->op) {
+          return false;
+        }
+        break;
+      case Expression::Id::RefEqId:
+        break;
+      default:
+        return false;
+    }
+    for (Index k = 0; k < chA.size(); ++k) {
+      if (k == d) {
+        continue;
+      }
+      if (!ExpressionAnalyzer::equal(*chA[k], *chB[k])) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   bool optimizeSwitchArms(Function* func) {
     if (!func->body) {
       return false;
     }
+    const bool enableV4SwitchOpts =
+      isV4Enabled(getPassOptions()) || !getPassOptions().optimizeLevel;
     struct BlockCollector : public PostWalker<BlockCollector> {
+      bool allowConcreteParent = false;
       std::vector<Block*> postOrderBlocks;
       std::unordered_set<Block*> isChainChild;
       void visitBlock(Block* curr) {
         postOrderBlocks.push_back(curr);
         if (curr->list.size() >= 2) {
           if (auto* first = curr->list[0]->dynCast<Block>()) {
-            if (isSwitchChainChild(first, curr)) {
+            if (isSwitchChainChild(first, curr, allowConcreteParent)) {
               isChainChild.insert(first);
             }
           }
         }
       }
     } collector;
+    collector.allowConcreteParent = enableV4SwitchOpts;
     collector.walk(func->body);
 
     Builder builder(*getModule());
@@ -6255,6 +6521,17 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         labelManager = std::make_unique<LabelUtils::LabelManager>(func);
       }
       return labelManager->getUnique(prefix);
+    };
+
+    std::unordered_map<Type, Index> scratchLocals;
+    auto getScratchLocal = [&](Type t) -> Index {
+      auto it = scratchLocals.find(t);
+      if (it != scratchLocals.end()) {
+        return it->second;
+      }
+      Index idx = Builder::addVar(func, t);
+      scratchLocals[t] = idx;
+      return idx;
     };
 
     bool changed = false;
@@ -6269,7 +6546,7 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         chain.push_back(curr);
         if (curr->list.size() >= 2) {
           if (auto* child = curr->list[0]->dynCast<Block>()) {
-            if (isSwitchChainChild(child, curr)) {
+            if (isSwitchChainChild(child, curr, enableV4SwitchOpts)) {
               curr = child;
               continue;
             }
@@ -6281,16 +6558,36 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         continue;
       }
       std::reverse(chain.begin(), chain.end());
-      if (!FindAll<Switch>(chain[0]).has()) {
-        continue;
+      const bool hasSwitch = FindAll<Switch>(chain[0]).has();
+      if (!hasSwitch) {
+        if (!enableV4SwitchOpts || chain.size() < 3) {
+          continue;
+        }
+        std::unordered_set<Name> chainNames;
+        for (Block* blk : chain) {
+          if (blk->name.is()) {
+            chainNames.insert(blk->name);
+          }
+        }
+        Index targetBranches = 0;
+        for (auto* br : FindAll<Break>(chain[0]).list) {
+          if (chainNames.count(br->name)) {
+            ++targetBranches;
+          }
+        }
+        if (targetBranches < 2) {
+          continue;
+        }
       }
       const Index n = chain.size() - 1;
+      const bool lastChildEndsUnreachable =
+        chain[n - 1]->list.back()->type == Type::unreachable;
       std::vector<bool> eliminated(n, false);
       bool chainChanged = false;
 
       // 1. Exact Duplicate Switch-Arm Elimination (Inner-to-Outer + Fallthrough)
       for (Index last = n - 1; last >= 1; --last) {
-        if (eliminated[last]) {
+        if (eliminated[last] || (last == n - 1 && !lastChildEndsUnreachable)) {
           continue;
         }
         Block* bLast = chain[last];
@@ -6299,6 +6596,10 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
           continue;
         }
         Index armLastLen = bLastParent->list.size() - 1;
+        if (!hasSwitch && armLastLen == 1 &&
+            bLastParent->list[1]->is<Unreachable>()) {
+          continue;
+        }
         if (bLastParent->list.back()->type == Type::unreachable) {
           for (Index i = 0; i < last; ++i) {
             if (eliminated[i] || !chain[i]->name.is()) {
@@ -6328,40 +6629,77 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
               chainChanged = true;
             }
           }
-        } else if (last == n - 1 && bLastParent->type == Type::none &&
-                   bLastParent->name.is()) {
-          // Outermost fallthrough exact duplicate: Arm_i == Arm_{n-1} + (br $b_n)
-          for (Index i = 0; i < last; ++i) {
-            if (eliminated[i] || !chain[i]->name.is()) {
-              continue;
-            }
-            Block* bIParent = chain[i + 1];
-            if (bIParent->list.size() - 1 != armLastLen + 1) {
-              continue;
-            }
-            auto* br = bIParent->list.back()->dynCast<Break>();
-            if (!br || br->condition || br->value ||
-                br->name != bLastParent->name) {
-              continue;
-            }
-            bool allEqual = true;
-            for (Index k = 0; k < armLastLen; ++k) {
-              if (!ExpressionAnalyzer::equal(bIParent->list[1 + k],
-                                             bLastParent->list[1 + k])) {
-                allEqual = false;
-                break;
+        } else if (last == n - 1 && bLastParent->name.is()) {
+          // Outermost fallthrough exact duplicate: Arm_i == Arm_{n-1} + (br $b_n [val])
+          if (bLastParent->type == Type::none) {
+            for (Index i = 0; i < last; ++i) {
+              if (eliminated[i] || !chain[i]->name.is()) {
+                continue;
+              }
+              Block* bIParent = chain[i + 1];
+              if (bIParent->list.size() - 1 != armLastLen + 1) {
+                continue;
+              }
+              auto* br = bIParent->list.back()->dynCast<Break>();
+              if (!br || br->condition || br->value ||
+                  br->name != bLastParent->name) {
+                continue;
+              }
+              bool allEqual = true;
+              for (Index k = 0; k < armLastLen; ++k) {
+                if (!ExpressionAnalyzer::equal(bIParent->list[1 + k],
+                                               bLastParent->list[1 + k])) {
+                  allEqual = false;
+                  break;
+                }
+              }
+              if (allEqual) {
+                if (!bLast->name.is()) {
+                  bLast->name = getFreshLabel("rub_dedup$");
+                }
+                replaceBranchTargetsInSubtree(
+                  chain[i], chain[i]->name, bLast->name);
+                chain[i]->name = Name();
+                bIParent->list.resize(1);
+                eliminated[i] = true;
+                chainChanged = true;
               }
             }
-            if (allEqual) {
-              if (!bLast->name.is()) {
-                bLast->name = getFreshLabel("rub_dedup$");
+          } else if (enableV4SwitchOpts && bLastParent->type.isConcrete()) {
+            for (Index i = 0; i < last; ++i) {
+              if (eliminated[i] || !chain[i]->name.is()) {
+                continue;
               }
-              replaceBranchTargetsInSubtree(
-                chain[i], chain[i]->name, bLast->name);
-              chain[i]->name = Name();
-              bIParent->list.resize(1);
-              eliminated[i] = true;
-              chainChanged = true;
+              Block* bIParent = chain[i + 1];
+              if (bIParent->list.size() - 1 != armLastLen) {
+                continue;
+              }
+              auto* br = bIParent->list.back()->dynCast<Break>();
+              if (!br || br->condition || !br->value ||
+                  br->name != bLastParent->name) {
+                continue;
+              }
+              bool allEqual = true;
+              for (Index k = 0; k + 1 < armLastLen; ++k) {
+                if (!ExpressionAnalyzer::equal(bIParent->list[1 + k],
+                                               bLastParent->list[1 + k])) {
+                  allEqual = false;
+                  break;
+                }
+              }
+              if (allEqual &&
+                  ExpressionAnalyzer::equal(br->value,
+                                            bLastParent->list.back())) {
+                if (!bLast->name.is()) {
+                  bLast->name = getFreshLabel("rub_dedup$");
+                }
+                replaceBranchTargetsInSubtree(
+                  chain[i], chain[i]->name, bLast->name);
+                chain[i]->name = Name();
+                bIParent->list.resize(1);
+                eliminated[i] = true;
+                chainChanged = true;
+              }
             }
           }
         }
@@ -6382,7 +6720,8 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
               chainChanged = true;
 
               for (Index m = 0; m < n; ++m) {
-                if (eliminated[m]) {
+                if (eliminated[m] ||
+                    (m == n - 1 && !lastChildEndsUnreachable)) {
                   continue;
                 }
                 Block* bM = chain[m];
@@ -6435,10 +6774,17 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         }
         Block* bLast = chain[last];
         Block* bLastParent = chain[last + 1];
-        if (bLastParent->list.size() < 3 ||
-            bLastParent->list.back()->type != Type::unreachable) {
+        bool isFallthroughLast =
+          (enableV4SwitchOpts && last == n - 1 &&
+           bLastParent->type == Type::none && bLastParent->name.is() &&
+           bLastParent->list.size() >= 2 &&
+           bLastParent->list.back()->type != Type::unreachable);
+        if (!isFallthroughLast &&
+            (bLastParent->list.size() < 3 ||
+             bLastParent->list.back()->type != Type::unreachable)) {
           continue;
         }
+        Index minS = isFallthroughLast ? 1 : 2;
         Index armLastLen = bLastParent->list.size() - 1;
         std::vector<Index> lcp(last, 0);
         Index maxS = 0;
@@ -6447,25 +6793,49 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
             continue;
           }
           Block* bIParent = chain[i + 1];
-          if (bIParent->list.size() < 3 ||
-              bIParent->list.back()->type != Type::unreachable) {
-            continue;
-          }
-          Index armILen = bIParent->list.size() - 1;
-          Index limit = std::min(armILen, armLastLen);
-          Index match = 0;
-          while (match < limit &&
-                 ExpressionAnalyzer::equal(
-                   bIParent->list[bIParent->list.size() - 1 - match],
-                   bLastParent->list[bLastParent->list.size() - 1 - match])) {
-            ++match;
-          }
-          if (match >= 2) {
-            lcp[i] = match;
-            maxS = std::max(maxS, match);
+          if (isFallthroughLast) {
+            if (bIParent->list.size() < 3) {
+              continue;
+            }
+            auto* br = bIParent->list.back()->dynCast<Break>();
+            if (!br || br->condition || br->value ||
+                br->name != bLastParent->name) {
+              continue;
+            }
+            Index armIEffLen = bIParent->list.size() - 2;
+            Index limit = std::min(armIEffLen, armLastLen);
+            Index match = 0;
+            while (match < limit &&
+                   ExpressionAnalyzer::equal(
+                     bIParent->list[bIParent->list.size() - 2 - match],
+                     bLastParent->list[bLastParent->list.size() - 1 - match])) {
+              ++match;
+            }
+            if (match >= minS) {
+              lcp[i] = match;
+              maxS = std::max(maxS, match);
+            }
+          } else {
+            if (bIParent->list.size() < 3 ||
+                bIParent->list.back()->type != Type::unreachable) {
+              continue;
+            }
+            Index armILen = bIParent->list.size() - 1;
+            Index limit = std::min(armILen, armLastLen);
+            Index match = 0;
+            while (match < limit &&
+                   ExpressionAnalyzer::equal(
+                     bIParent->list[bIParent->list.size() - 1 - match],
+                     bLastParent->list[bLastParent->list.size() - 1 - match])) {
+              ++match;
+            }
+            if (match >= minS) {
+              lcp[i] = match;
+              maxS = std::max(maxS, match);
+            }
           }
         }
-        if (maxS < 2) {
+        if (maxS < minS) {
           continue;
         }
         std::vector<int32_t> suffixByteLen(maxS + 1, 0);
@@ -6475,25 +6845,40 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         }
         Index bestS = 0;
         int32_t bestSavings = 0;
-        for (Index s = 2; s <= maxS; ++s) {
+        for (Index s = minS; s <= maxS; ++s) {
           int32_t k = 1;
+          int32_t fullArms = 0;
           for (Index i = 0; i < last; ++i) {
             if (lcp[i] >= s) {
               ++k;
+              Block* bIParent = chain[i + 1];
+              Index armIEffLen = isFallthroughLast
+                                   ? (bIParent->list.size() - 2)
+                                   : (bIParent->list.size() - 1);
+              if (s == armIEffLen) {
+                ++fullArms;
+              }
             }
           }
           if (k < 2) {
             continue;
           }
           bool prefixLastEmpty = (s == armLastLen);
-          int32_t savings =
-            (k - 1) * (suffixByteLen[s] - 2) - (prefixLastEmpty ? 0 : 3);
+          if (prefixLastEmpty &&
+              (last == n - 1 && !lastChildEndsUnreachable)) {
+            continue;
+          }
+          int32_t savings = isFallthroughLast
+                              ? ((k - 1) * suffixByteLen[s] + fullArms * 2 -
+                                 (prefixLastEmpty ? 0 : 3))
+                              : ((k - 1) * (suffixByteLen[s] - 2) -
+                                 (prefixLastEmpty ? 0 : 3));
           if (savings > bestSavings) {
             bestSavings = savings;
             bestS = s;
           }
         }
-        if (bestS < 2 || bestSavings <= 0) {
+        if (bestS < minS || bestSavings <= 0) {
           continue;
         }
         bool prefixLastEmpty = (bestS == armLastLen);
@@ -6511,14 +6896,18 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
             continue;
           }
           Block* bIParent = chain[i + 1];
-          Index armILen = bIParent->list.size() - 1;
-          if (bestS == armILen) {
+          Index armIEffLen = isFallthroughLast
+                               ? (bIParent->list.size() - 2)
+                               : (bIParent->list.size() - 1);
+          if (bestS == armIEffLen) {
             replaceBranchTargetsInSubtree(chain[i], chain[i]->name, target);
             chain[i]->name = Name();
             bIParent->list.resize(1);
             eliminated[i] = true;
           } else {
-            bIParent->list.resize(bIParent->list.size() - bestS);
+            bIParent->list.resize(
+              bIParent->list.size() -
+              (isFallthroughLast ? (bestS + 1) : bestS));
             bIParent->list.push_back(builder.makeBreak(target));
           }
           usedInPart2[i] = true;
@@ -6540,6 +6929,394 @@ struct RemoveUnusedBrs : public WalkerPass<PostWalker<RemoveUnusedBrs>> {
         }
         usedInPart2[last] = true;
         chainChanged = true;
+      }
+
+      // 4. Multi-Group 1..2-Level Outer-Operation Sinking with $tmp-Local Fallback
+      if (enableV4SwitchOpts) {
+        struct CandidateArm {
+          Index blkIdx;
+          bool isValued;
+          bool isFallthrough;
+          Name target;
+          Expression* opExpr;
+        };
+        std::vector<CandidateArm> candArms;
+        candArms.reserve(n + 1);
+        for (Index blkIdx = 0; blkIdx <= n; ++blkIdx) {
+          if (blkIdx >= 1 && eliminated[blkIdx - 1]) {
+            continue;
+          }
+          Block* armBlk = chain[blkIdx];
+          if (armBlk->list.size() < 2) {
+            continue;
+          }
+          Expression* lastStmt = armBlk->list.back();
+          if (auto* br = lastStmt->dynCast<Break>()) {
+            if (br->condition || !br->name.is()) {
+              continue;
+            }
+            if (br->value) {
+              if (!br->value->type.isConcrete()) {
+                continue;
+              }
+              SmallVector<Expression**, 8> ch;
+              if (!getSinkableOpChildren(br->value, ch)) {
+                continue;
+              }
+              candArms.push_back({blkIdx, true, false, br->name, br->value});
+            } else {
+              if (armBlk->list.size() < 3) {
+                continue;
+              }
+              Expression* prevStmt = armBlk->list[armBlk->list.size() - 2];
+              if (prevStmt->type != Type::none) {
+                continue;
+              }
+              SmallVector<Expression**, 8> ch;
+              if (!getSinkableOpChildren(prevStmt, ch)) {
+                continue;
+              }
+              candArms.push_back({blkIdx, false, false, br->name, prevStmt});
+            }
+          } else if (blkIdx == n && armBlk->name.is() &&
+                     lastStmt->type != Type::unreachable) {
+            if (armBlk->type == Type::none) {
+              if (lastStmt->type != Type::none) {
+                continue;
+              }
+              SmallVector<Expression**, 8> ch;
+              if (!getSinkableOpChildren(lastStmt, ch)) {
+                continue;
+              }
+              candArms.push_back({blkIdx, false, true, armBlk->name, lastStmt});
+            } else if (armBlk->type.isConcrete()) {
+              if (!lastStmt->type.isConcrete()) {
+                continue;
+              }
+              SmallVector<Expression**, 8> ch;
+              if (!getSinkableOpChildren(lastStmt, ch)) {
+                continue;
+              }
+              candArms.push_back({blkIdx, true, true, armBlk->name, lastStmt});
+            }
+          }
+        }
+
+        if (candArms.size() >= 2) {
+          std::unordered_set<Index> writtenLocals;
+          std::unordered_set<Name> writtenGlobals;
+          for (auto* ls : FindAll<LocalSet>(chain.back()).list) {
+            writtenLocals.insert(ls->index);
+          }
+          for (auto* gs : FindAll<GlobalSet>(chain.back()).list) {
+            writtenGlobals.insert(gs->name);
+          }
+
+          auto isSafeInvariant = [&](Expression* e) -> bool {
+            if (e->is<Const>() || e->is<RefNull>() || e->is<RefFunc>()) {
+              return true;
+            }
+            if (auto* lg = e->dynCast<LocalGet>()) {
+              return !writtenLocals.count(lg->index);
+            }
+            if (auto* gg = e->dynCast<GlobalGet>()) {
+              return !writtenGlobals.count(gg->name);
+            }
+            return false;
+          };
+
+          auto isPureExpr = [&](Expression* e) -> bool {
+            if (isSafeInvariant(e) || e->is<LocalGet>() ||
+                e->is<GlobalGet>()) {
+              return true;
+            }
+            return BranchUtils::getExitingBranches(e).empty() &&
+                   !EffectAnalyzer(getPassOptions(), *getModule(), e)
+                      .hasSideEffects();
+          };
+
+          std::vector<bool> candUsed(candArms.size(), false);
+          while (true) {
+            int32_t bestSav = 0;
+            Index bestLevel = 0;
+            Index bestD1 = 0;
+            Index bestD2 = 0;
+            bool bestUseTmp = false;
+            std::vector<Index> bestGroup;
+
+            for (Index seedIdx = 0; seedIdx < candArms.size(); ++seedIdx) {
+              if (candUsed[seedIdx]) {
+                continue;
+              }
+              const auto& seed = candArms[seedIdx];
+              SmallVector<Expression**, 8> seedCh1;
+              if (!getSinkableOpChildren(seed.opExpr, seedCh1)) {
+                continue;
+              }
+              int32_t op1Bytes = estimateByteLen(seed.opExpr);
+
+              for (Index d1 = 0; d1 < seedCh1.size(); ++d1) {
+                bool prefix1Inv = true;
+                bool prefix1Pure = true;
+                for (Index k = 0; k < d1; ++k) {
+                  if (!isSafeInvariant(*seedCh1[k])) {
+                    prefix1Inv = false;
+                  }
+                  if (!isPureExpr(*seedCh1[k])) {
+                    prefix1Pure = false;
+                  }
+                }
+                if (!prefix1Inv && !prefix1Pure) {
+                  continue;
+                }
+
+                Expression* seedV1 = *seedCh1[d1];
+                // Level 1 candidate group
+                if (seedV1->type.isConcrete()) {
+                  int32_t shell1Bytes = op1Bytes - estimateByteLen(seedV1);
+                  if (shell1Bytes > 0) {
+                    std::vector<Index> group;
+                    group.push_back(seedIdx);
+                    bool allVPure = isPureExpr(seedV1);
+                    for (Index j = seedIdx + 1; j < candArms.size(); ++j) {
+                      if (candUsed[j]) {
+                        continue;
+                      }
+                      const auto& candJ = candArms[j];
+                      if (candJ.isValued != seed.isValued ||
+                          candJ.target != seed.target) {
+                        continue;
+                      }
+                      SmallVector<Expression**, 8> chJ1;
+                      if (!getSinkableOpChildren(candJ.opExpr, chJ1) ||
+                          !sameSinkableOpSkeleton(
+                            seed.opExpr, candJ.opExpr, d1, seedCh1, chJ1)) {
+                        continue;
+                      }
+                      Expression* vJ = *chJ1[d1];
+                      if (!vJ->type.isConcrete()) {
+                        continue;
+                      }
+                      Type lub = Type::getLeastUpperBound(seedV1->type, vJ->type);
+                      if (lub == Type::none) {
+                        continue;
+                      }
+                      group.push_back(j);
+                      if (!isPureExpr(vJ)) {
+                        allVPure = false;
+                      }
+                    }
+                    if (group.size() >= 2) {
+                      bool useTmp = !prefix1Inv;
+                      if (!useTmp || allVPure) {
+                        int32_t sav =
+                          int32_t(group.size() - 1) * shell1Bytes - 3 -
+                          (useTmp ? 4 : 0);
+                        if (sav > bestSav) {
+                          bestSav = sav;
+                          bestLevel = 1;
+                          bestD1 = d1;
+                          bestD2 = 0;
+                          bestUseTmp = useTmp;
+                          bestGroup = std::move(group);
+                        }
+                      }
+                    }
+                  }
+                }
+
+                // Level 2 candidate group: peel inside seedV1
+                SmallVector<Expression**, 8> seedCh2;
+                if (getSinkableOpChildren(seedV1, seedCh2)) {
+                  for (Index d2 = 0; d2 < seedCh2.size(); ++d2) {
+                    bool prefix2Inv = prefix1Inv;
+                    bool prefix2Pure = prefix1Pure;
+                    for (Index k = 0; k < d2; ++k) {
+                      if (!isSafeInvariant(*seedCh2[k])) {
+                        prefix2Inv = false;
+                      }
+                      if (!isPureExpr(*seedCh2[k])) {
+                        prefix2Pure = false;
+                      }
+                    }
+                    if (!prefix2Inv && !prefix2Pure) {
+                      continue;
+                    }
+                    Expression* seedV2 = *seedCh2[d2];
+                    if (!seedV2->type.isConcrete()) {
+                      continue;
+                    }
+                    int32_t shell2Bytes = op1Bytes - estimateByteLen(seedV2);
+                    if (shell2Bytes <= 0) {
+                      continue;
+                    }
+                    std::vector<Index> group;
+                    group.push_back(seedIdx);
+                    bool allVPure = isPureExpr(seedV2);
+                    for (Index j = seedIdx + 1; j < candArms.size(); ++j) {
+                      if (candUsed[j]) {
+                        continue;
+                      }
+                      const auto& candJ = candArms[j];
+                      if (candJ.isValued != seed.isValued ||
+                          candJ.target != seed.target) {
+                        continue;
+                      }
+                      SmallVector<Expression**, 8> chJ1;
+                      if (!getSinkableOpChildren(candJ.opExpr, chJ1) ||
+                          !sameSinkableOpSkeleton(
+                            seed.opExpr, candJ.opExpr, d1, seedCh1, chJ1)) {
+                        continue;
+                      }
+                      Expression* vJ1 = *chJ1[d1];
+                      SmallVector<Expression**, 8> chJ2;
+                      if (!getSinkableOpChildren(vJ1, chJ2) ||
+                          !sameSinkableOpSkeleton(
+                            seedV1, vJ1, d2, seedCh2, chJ2)) {
+                        continue;
+                      }
+                      Expression* vJ2 = *chJ2[d2];
+                      if (!vJ2->type.isConcrete()) {
+                        continue;
+                      }
+                      Type lub = Type::getLeastUpperBound(seedV2->type, vJ2->type);
+                      if (lub == Type::none) {
+                        continue;
+                      }
+                      group.push_back(j);
+                      if (!isPureExpr(vJ2)) {
+                        allVPure = false;
+                      }
+                    }
+                    if (group.size() >= 2) {
+                      bool useTmp = !prefix2Inv;
+                      if (!useTmp || allVPure) {
+                        int32_t sav =
+                          int32_t(group.size() - 1) * shell2Bytes - 3 -
+                          (useTmp ? 4 : 0);
+                        if (sav > bestSav) {
+                          bestSav = sav;
+                          bestLevel = 2;
+                          bestD1 = d1;
+                          bestD2 = d2;
+                          bestUseTmp = useTmp;
+                          bestGroup = std::move(group);
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+
+            if (bestSav <= 0 || bestGroup.size() < 2) {
+              break;
+            }
+
+            auto getVaryingPtr = [&](Expression* opExpr,
+                                     Expression*& innerOpOut) -> Expression** {
+              SmallVector<Expression**, 8> ch1;
+              getSinkableOpChildren(opExpr, ch1);
+              if (bestLevel == 1) {
+                innerOpOut = nullptr;
+                return ch1[bestD1];
+              }
+              innerOpOut = *ch1[bestD1];
+              SmallVector<Expression**, 8> ch2;
+              getSinkableOpChildren(innerOpOut, ch2);
+              return ch2[bestD2];
+            };
+
+            Expression* dummyInner = nullptr;
+            Type vType = (*getVaryingPtr(candArms[bestGroup[0]].opExpr,
+                                         dummyInner))
+                           ->type;
+            for (size_t idx = 1; idx < bestGroup.size(); ++idx) {
+              Type t = (*getVaryingPtr(candArms[bestGroup[idx]].opExpr,
+                                       dummyInner))
+                         ->type;
+              vType = Type::getLeastUpperBound(vType, t);
+            }
+
+            Name bSharedName = getFreshLabel("rub_sink$");
+
+            // Rewrite earlier arms in bestGroup
+            for (size_t idx = 0; idx + 1 < bestGroup.size(); ++idx) {
+              Index candIdx = bestGroup[idx];
+              candUsed[candIdx] = true;
+              const auto& arm = candArms[candIdx];
+              Block* armBlk = chain[arm.blkIdx];
+              Expression* innerOp = nullptr;
+              Expression* vI = *getVaryingPtr(arm.opExpr, innerOp);
+              Expression* newBr = builder.makeBreak(bSharedName, vI);
+              if (!arm.isValued && !arm.isFallthrough) {
+                armBlk->list.pop_back();
+                armBlk->list.back() = newBr;
+              } else {
+                armBlk->list.back() = newBr;
+              }
+            }
+
+            // Rewrite last arm in bestGroup
+            Index lastCandIdx = bestGroup.back();
+            candUsed[lastCandIdx] = true;
+            const auto& lastArm = candArms[lastCandIdx];
+            Block* bLastParent = chain[lastArm.blkIdx];
+            Expression* innerLastOp = nullptr;
+            Expression** lastVaryingPtr =
+              getVaryingPtr(lastArm.opExpr, innerLastOp);
+            Expression* vLast = *lastVaryingPtr;
+
+            Index splitIdx =
+              bLastParent->list.size() -
+              ((!lastArm.isValued && !lastArm.isFallthrough) ? 2 : 1);
+            Block* bShared = builder.makeBlock();
+            bShared->name = bSharedName;
+            for (Index k = 0; k < splitIdx; ++k) {
+              bShared->list.push_back(bLastParent->list[k]);
+            }
+            bShared->list.push_back(vLast);
+            bShared->type = vType;
+
+            Expression* lastOpExpr = lastArm.opExpr;
+            ExpressionList newList(getModule()->allocator);
+            if (!bestUseTmp) {
+              *lastVaryingPtr = bShared;
+              if (innerLastOp) {
+                innerLastOp->finalize();
+              }
+              lastOpExpr->finalize();
+              if (!lastArm.isValued && !lastArm.isFallthrough) {
+                newList.push_back(lastOpExpr);
+                newList.push_back(builder.makeBreak(lastArm.target));
+              } else if (lastArm.isValued && !lastArm.isFallthrough) {
+                newList.push_back(
+                  builder.makeBreak(lastArm.target, lastOpExpr));
+              } else {
+                newList.push_back(lastOpExpr);
+              }
+            } else {
+              Index tmpLocal = getScratchLocal(vType);
+              newList.push_back(builder.makeLocalSet(tmpLocal, bShared));
+              *lastVaryingPtr = builder.makeLocalGet(tmpLocal, vType);
+              if (innerLastOp) {
+                innerLastOp->finalize();
+              }
+              lastOpExpr->finalize();
+              if (!lastArm.isValued && !lastArm.isFallthrough) {
+                newList.push_back(lastOpExpr);
+                newList.push_back(builder.makeBreak(lastArm.target));
+              } else if (lastArm.isValued && !lastArm.isFallthrough) {
+                newList.push_back(
+                  builder.makeBreak(lastArm.target, lastOpExpr));
+              } else {
+                newList.push_back(lastOpExpr);
+              }
+            }
+            bLastParent->list = std::move(newList);
+            chainChanged = true;
+          }
+        }
       }
 
       if (chainChanged) {

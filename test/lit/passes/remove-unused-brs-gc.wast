@@ -19,7 +19,7 @@
  ;; CHECK:      (global $struct (ref $struct) (struct.new_default $struct))
  (global $struct (ref $struct) (struct.new $struct))
 
- ;; CHECK:      (func $br_on-if (type $10) (param $0 (ref struct))
+ ;; CHECK:      (func $br_on-if (type $12) (param $0 (ref struct))
  ;; CHECK-NEXT:  (block $label
  ;; CHECK-NEXT:   (drop
  ;; CHECK-NEXT:    (select (result (ref struct))
@@ -54,7 +54,7 @@
   )
  )
 
- ;; CHECK:      (func $br_on_cast (type $4) (param $0 (ref $struct)) (result (ref $struct))
+ ;; CHECK:      (func $br_on_cast (type $6) (param $0 (ref $struct)) (result (ref $struct))
  ;; CHECK-NEXT:  (local $struct (ref null $struct))
  ;; CHECK-NEXT:  (block $block (result (ref $struct))
  ;; CHECK-NEXT:   (drop
@@ -105,7 +105,7 @@
   )
  )
 
- ;; CHECK:      (func $br_on_cast-fallthrough (type $4) (param $0 (ref $struct)) (result (ref $struct))
+ ;; CHECK:      (func $br_on_cast-fallthrough (type $6) (param $0 (ref $struct)) (result (ref $struct))
  ;; CHECK-NEXT:  (local $struct (ref null $struct))
  ;; CHECK-NEXT:  (local $any anyref)
  ;; CHECK-NEXT:  (block $block (result (ref $struct))
@@ -168,7 +168,7 @@
   )
  )
 
- ;; CHECK:      (func $nested_br_on_cast (type $11) (result i31ref)
+ ;; CHECK:      (func $nested_br_on_cast (type $13) (result i31ref)
  ;; CHECK-NEXT:  (block $label$1 (result (ref i31))
  ;; CHECK-NEXT:   (drop
  ;; CHECK-NEXT:    (br $label$1
@@ -196,7 +196,7 @@
   )
  )
 
- ;; CHECK:      (func $br_on_cast_unrelated (type $5) (result (ref null $struct))
+ ;; CHECK:      (func $br_on_cast_unrelated (type $7) (result (ref null $struct))
  ;; CHECK-NEXT:  (local $nullable-struct2 (ref null $struct2))
  ;; CHECK-NEXT:  (block $block (result nullref)
  ;; CHECK-NEXT:   (drop
@@ -250,7 +250,7 @@
   )
  )
 
- ;; CHECK:      (func $br_on_cast_unrelated-fallthrough (type $5) (result (ref null $struct))
+ ;; CHECK:      (func $br_on_cast_unrelated-fallthrough (type $7) (result (ref null $struct))
  ;; CHECK-NEXT:  (local $any anyref)
  ;; CHECK-NEXT:  (local $nullable-struct2 (ref null $struct2))
  ;; CHECK-NEXT:  (block $block (result nullref)
@@ -316,7 +316,7 @@
   )
  )
 
- ;; CHECK:      (func $br_on_cast_fail (type $6) (param $0 (ref $struct)) (result anyref)
+ ;; CHECK:      (func $br_on_cast_fail (type $8) (param $0 (ref $struct)) (result anyref)
  ;; CHECK-NEXT:  (local $struct (ref null $struct))
  ;; CHECK-NEXT:  (block $block (result (ref null $struct))
  ;; CHECK-NEXT:   (drop
@@ -363,7 +363,7 @@
   )
  )
 
- ;; CHECK:      (func $br_on_cast_fail-fallthrough (type $6) (param $0 (ref $struct)) (result anyref)
+ ;; CHECK:      (func $br_on_cast_fail-fallthrough (type $8) (param $0 (ref $struct)) (result anyref)
  ;; CHECK-NEXT:  (local $any anyref)
  ;; CHECK-NEXT:  (local $struct (ref null $struct))
  ;; CHECK-NEXT:  (block $block (result anyref)
@@ -419,7 +419,7 @@
   )
  )
 
- ;; CHECK:      (func $br_on_cast_fail_unrelated (type $7) (result anyref)
+ ;; CHECK:      (func $br_on_cast_fail_unrelated (type $9) (result anyref)
  ;; CHECK-NEXT:  (local $nullable-struct2 (ref null $struct2))
  ;; CHECK-NEXT:  (block $block (result (ref null $struct2))
  ;; CHECK-NEXT:   (drop
@@ -481,7 +481,7 @@
   )
  )
 
- ;; CHECK:      (func $br_on_cast_fail_unrelated-fallthrough (type $7) (result anyref)
+ ;; CHECK:      (func $br_on_cast_fail_unrelated-fallthrough (type $9) (result anyref)
  ;; CHECK-NEXT:  (local $any anyref)
  ;; CHECK-NEXT:  (local $nullable-struct2 (ref null $struct2))
  ;; CHECK-NEXT:  (block $block (result anyref)
@@ -557,7 +557,7 @@
   )
  )
 
- ;; CHECK:      (func $br_on_cast_fail_unrelated-fallthrough-non-null (type $12) (result (ref any))
+ ;; CHECK:      (func $br_on_cast_fail_unrelated-fallthrough-non-null (type $14) (result (ref any))
  ;; CHECK-NEXT:  (local $any anyref)
  ;; CHECK-NEXT:  (local $nullable-struct2 (ref null $struct2))
  ;; CHECK-NEXT:  (block $block (result (ref any))
@@ -605,7 +605,7 @@
   )
  )
 
- ;; CHECK:      (func $br_on_cast-unreachable (type $8) (param $i31ref i31ref) (result anyref)
+ ;; CHECK:      (func $br_on_cast-unreachable (type $10) (param $i31ref i31ref) (result anyref)
  ;; CHECK-NEXT:  (block $block
  ;; CHECK-NEXT:   (drop
  ;; CHECK-NEXT:    (block
@@ -661,7 +661,7 @@
   )
  )
 
- ;; CHECK:      (func $fallthrough-unreachable (type $8) (param $0 i31ref) (result anyref)
+ ;; CHECK:      (func $fallthrough-unreachable (type $10) (param $0 i31ref) (result anyref)
  ;; CHECK-NEXT:  (block $outer
  ;; CHECK-NEXT:   (drop
  ;; CHECK-NEXT:    (block ;; (replaces unreachable RefCast we can't emit)
@@ -700,7 +700,7 @@
   )
  )
 
- ;; CHECK:      (func $casts-are-costly (type $9) (param $x i32)
+ ;; CHECK:      (func $casts-are-costly (type $4) (param $x i32)
  ;; CHECK-NEXT:  (local $struct (ref null $struct))
  ;; CHECK-NEXT:  (drop
  ;; CHECK-NEXT:   (if (result i32)
@@ -845,7 +845,7 @@
   )
  )
 
- ;; CHECK:      (func $allocations-are-costly (type $9) (param $x i32)
+ ;; CHECK:      (func $allocations-are-costly (type $4) (param $x i32)
  ;; CHECK-NEXT:  (drop
  ;; CHECK-NEXT:   (if (result (ref null (exact $struct)))
  ;; CHECK-NEXT:    (local.get $x)
@@ -893,7 +893,7 @@
   )
  )
 
- ;; CHECK:      (func $threading (type $13) (param $x anyref)
+ ;; CHECK:      (func $threading (type $15) (param $x anyref)
  ;; CHECK-NEXT:  (block $outer
  ;; CHECK-NEXT:   (block $inner
  ;; CHECK-NEXT:    (drop
@@ -917,7 +917,7 @@
   )
  )
 
- ;; CHECK:      (func $test (type $14) (param $x (ref any))
+ ;; CHECK:      (func $test (type $16) (param $x (ref any))
  ;; CHECK-NEXT:  (local $temp anyref)
  ;; CHECK-NEXT:  (drop
  ;; CHECK-NEXT:   (block $block (result (ref $struct-nn))
@@ -969,7 +969,7 @@
   )
  )
 
- ;; CHECK:      (func $select-refinalize (type $15) (param $param (ref $struct)) (result (ref struct))
+ ;; CHECK:      (func $select-refinalize (type $17) (param $param (ref $struct)) (result (ref struct))
  ;; CHECK-NEXT:  (select (result (ref $struct))
  ;; CHECK-NEXT:   (select (result (ref $struct))
  ;; CHECK-NEXT:    (global.get $struct)
@@ -998,7 +998,7 @@
   )
  )
 
- ;; CHECK:      (func $costly-br-value-no-if (type $16) (param $x i32) (result anyref)
+ ;; CHECK:      (func $costly-br-value-no-if (type $18) (param $x i32) (result anyref)
  ;; CHECK-NEXT:  (block $out (result anyref)
  ;; CHECK-NEXT:   (if
  ;; CHECK-NEXT:    (local.get $x)
@@ -1045,7 +1045,7 @@
   )
  )
 
- ;; CHECK:      (func $cheap-br-value-yes-if (type $17) (param $x i32) (result i32)
+ ;; CHECK:      (func $cheap-br-value-yes-if (type $11) (param $x i32) (result i32)
  ;; CHECK-NEXT:  (block $out (result i32)
  ;; CHECK-NEXT:   (drop
  ;; CHECK-NEXT:    (br_if $out
@@ -1084,4 +1084,263 @@
    )
    (i32.const 42)
   )
- ))
+ )
+
+ ;; CHECK:      (func $sink-helper-a (type $3) (param $a i32) (param $b i32) (result anyref)
+ ;; CHECK-NEXT:  (ref.null none)
+ ;; CHECK-NEXT: )
+ (func $sink-helper-a (param $a i32) (param $b i32) (result anyref)
+  (ref.null any)
+ )
+
+ ;; CHECK:      (func $sink-helper-b (type $3) (param $a i32) (param $b i32) (result anyref)
+ ;; CHECK-NEXT:  (ref.null none)
+ ;; CHECK-NEXT: )
+ (func $sink-helper-b (param $a i32) (param $b i32) (result anyref)
+  (ref.null any)
+ )
+
+ ;; CHECK:      (func $sink-void-helper (type $4) (param $a i32)
+ ;; CHECK-NEXT: )
+ (func $sink-void-helper (param $a i32)
+ )
+
+ ;; CHECK:      (func $switch-sink-multi-group-valued (type $3) (param $x i32) (param $y i32) (result anyref)
+ ;; CHECK-NEXT:  (block $out (result anyref)
+ ;; CHECK-NEXT:   (call $sink-helper-b
+ ;; CHECK-NEXT:    (local.get $y)
+ ;; CHECK-NEXT:    (block $rub_sink$1 (result i32)
+ ;; CHECK-NEXT:     (block $b3
+ ;; CHECK-NEXT:      (br $out
+ ;; CHECK-NEXT:       (call $sink-helper-a
+ ;; CHECK-NEXT:        (local.get $y)
+ ;; CHECK-NEXT:        (block $rub_sink$0 (result i32)
+ ;; CHECK-NEXT:         (block $b2
+ ;; CHECK-NEXT:          (block $b1
+ ;; CHECK-NEXT:           (block $b0
+ ;; CHECK-NEXT:            (br_table $b0 $b1 $b2 $b3
+ ;; CHECK-NEXT:             (local.get $x)
+ ;; CHECK-NEXT:            )
+ ;; CHECK-NEXT:           )
+ ;; CHECK-NEXT:           (br $rub_sink$0
+ ;; CHECK-NEXT:            (i32.const 10)
+ ;; CHECK-NEXT:           )
+ ;; CHECK-NEXT:          )
+ ;; CHECK-NEXT:          (br $rub_sink$1
+ ;; CHECK-NEXT:           (i32.const 100)
+ ;; CHECK-NEXT:          )
+ ;; CHECK-NEXT:         )
+ ;; CHECK-NEXT:         (i32.const 20)
+ ;; CHECK-NEXT:        )
+ ;; CHECK-NEXT:       )
+ ;; CHECK-NEXT:      )
+ ;; CHECK-NEXT:     )
+ ;; CHECK-NEXT:     (i32.const 200)
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT: )
+ (func $switch-sink-multi-group-valued (param $x i32) (param $y i32) (result anyref)
+  (block $out (result anyref)
+   (block $b3
+    (block $b2
+     (block $b1
+      (block $b0
+       (br_table $b0 $b1 $b2 $b3 (local.get $x))
+      )
+      (br $out (call $sink-helper-a (local.get $y) (i32.const 10)))
+     )
+     (br $out (call $sink-helper-b (local.get $y) (i32.const 100)))
+    )
+    (br $out (call $sink-helper-a (local.get $y) (i32.const 20)))
+   )
+   (call $sink-helper-b (local.get $y) (i32.const 200))
+  )
+ )
+
+ ;; CHECK:      (func $switch-sink-2level-tmp-local (type $3) (param $x i32) (param $y i32) (result anyref)
+ ;; CHECK-NEXT:  (local $mod i32)
+ ;; CHECK-NEXT:  (local $res anyref)
+ ;; CHECK-NEXT:  (local $4 i32)
+ ;; CHECK-NEXT:  (block $out
+ ;; CHECK-NEXT:   (local.set $4
+ ;; CHECK-NEXT:    (block $rub_sink$0 (result i32)
+ ;; CHECK-NEXT:     (block $b2
+ ;; CHECK-NEXT:      (block $b1
+ ;; CHECK-NEXT:       (block $b0
+ ;; CHECK-NEXT:        (br_table $b0 $b1 $b2
+ ;; CHECK-NEXT:         (local.get $x)
+ ;; CHECK-NEXT:        )
+ ;; CHECK-NEXT:       )
+ ;; CHECK-NEXT:       (local.set $mod
+ ;; CHECK-NEXT:        (i32.const 1)
+ ;; CHECK-NEXT:       )
+ ;; CHECK-NEXT:       (br $rub_sink$0
+ ;; CHECK-NEXT:        (i32.const 11)
+ ;; CHECK-NEXT:       )
+ ;; CHECK-NEXT:      )
+ ;; CHECK-NEXT:      (local.set $mod
+ ;; CHECK-NEXT:       (i32.const 2)
+ ;; CHECK-NEXT:      )
+ ;; CHECK-NEXT:      (br $rub_sink$0
+ ;; CHECK-NEXT:       (i32.const 22)
+ ;; CHECK-NEXT:      )
+ ;; CHECK-NEXT:     )
+ ;; CHECK-NEXT:     (local.set $mod
+ ;; CHECK-NEXT:      (i32.const 3)
+ ;; CHECK-NEXT:     )
+ ;; CHECK-NEXT:     (i32.const 33)
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (local.set $res
+ ;; CHECK-NEXT:    (call $sink-helper-a
+ ;; CHECK-NEXT:     (local.get $mod)
+ ;; CHECK-NEXT:     (local.get $4)
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (local.get $res)
+ ;; CHECK-NEXT: )
+ (func $switch-sink-2level-tmp-local (param $x i32) (param $y i32) (result anyref)
+  (local $mod i32)
+  (local $res anyref)
+  (block $out
+   (block $b2
+    (block $b1
+     (block $b0
+      (br_table $b0 $b1 $b2 (local.get $x))
+     )
+     (local.set $mod (i32.const 1))
+     (local.set $res (call $sink-helper-a (local.get $mod) (i32.const 11)))
+     (br $out)
+    )
+    (local.set $mod (i32.const 2))
+    (local.set $res (call $sink-helper-a (local.get $mod) (i32.const 22)))
+    (br $out)
+   )
+   (local.set $mod (i32.const 3))
+   (local.set $res (call $sink-helper-a (local.get $mod) (i32.const 33)))
+  )
+  (local.get $res)
+ )
+
+ ;; CHECK:      (func $br-if-tower-sink (type $3) (param $x i32) (param $y i32) (result anyref)
+ ;; CHECK-NEXT:  (block $out (result anyref)
+ ;; CHECK-NEXT:   (block
+ ;; CHECK-NEXT:    (block $b2
+ ;; CHECK-NEXT:     (br $out
+ ;; CHECK-NEXT:      (call $sink-helper-a
+ ;; CHECK-NEXT:       (local.get $y)
+ ;; CHECK-NEXT:       (block $rub_sink$0 (result i32)
+ ;; CHECK-NEXT:        (block $b1
+ ;; CHECK-NEXT:         (block $b0
+ ;; CHECK-NEXT:          (nop)
+ ;; CHECK-NEXT:          (nop)
+ ;; CHECK-NEXT:          (block $tablify|0
+ ;; CHECK-NEXT:           (br_table $b0 $b1 $b2 $tablify|0
+ ;; CHECK-NEXT:            (local.get $x)
+ ;; CHECK-NEXT:           )
+ ;; CHECK-NEXT:          )
+ ;; CHECK-NEXT:          (br $rub_sink$0
+ ;; CHECK-NEXT:           (i32.const 99)
+ ;; CHECK-NEXT:          )
+ ;; CHECK-NEXT:         )
+ ;; CHECK-NEXT:         (br $rub_sink$0
+ ;; CHECK-NEXT:          (i32.const 10)
+ ;; CHECK-NEXT:         )
+ ;; CHECK-NEXT:        )
+ ;; CHECK-NEXT:        (i32.const 20)
+ ;; CHECK-NEXT:       )
+ ;; CHECK-NEXT:      )
+ ;; CHECK-NEXT:     )
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:    (call $sink-void-helper
+ ;; CHECK-NEXT:     (local.get $x)
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (unreachable)
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT: )
+ (func $br-if-tower-sink (param $x i32) (param $y i32) (result anyref)
+  (block $out (result anyref)
+   (block
+    (block $b2
+     (block $b1
+      (block $b0
+       (br_if $b0 (i32.eq (local.get $x) (i32.const 0)))
+       (br_if $b1 (i32.eq (local.get $x) (i32.const 1)))
+       (br_if $b2 (i32.eq (local.get $x) (i32.const 2)))
+       (br $out (call $sink-helper-a (local.get $y) (i32.const 99)))
+      )
+      (br $out (call $sink-helper-a (local.get $y) (i32.const 10)))
+     )
+     (br $out (call $sink-helper-a (local.get $y) (i32.const 20)))
+    )
+    (call $sink-void-helper (local.get $x))
+   )
+   (unreachable)
+  )
+ )
+
+ ;; CHECK:      (func $switch-fallthrough-shared-suffix (type $11) (param $x i32) (result i32)
+ ;; CHECK-NEXT:  (local $a i32)
+ ;; CHECK-NEXT:  (local $b i32)
+ ;; CHECK-NEXT:  (block $out
+ ;; CHECK-NEXT:   (block $rub_tail$0
+ ;; CHECK-NEXT:    (block $b2
+ ;; CHECK-NEXT:     (block $b1
+ ;; CHECK-NEXT:      (block $b0
+ ;; CHECK-NEXT:       (br_table $b0 $b1 $b2
+ ;; CHECK-NEXT:        (local.get $x)
+ ;; CHECK-NEXT:       )
+ ;; CHECK-NEXT:      )
+ ;; CHECK-NEXT:      (local.set $a
+ ;; CHECK-NEXT:       (i32.const 1)
+ ;; CHECK-NEXT:      )
+ ;; CHECK-NEXT:      (br $rub_tail$0)
+ ;; CHECK-NEXT:     )
+ ;; CHECK-NEXT:     (local.set $a
+ ;; CHECK-NEXT:      (i32.const 2)
+ ;; CHECK-NEXT:     )
+ ;; CHECK-NEXT:     (br $out)
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:    (local.set $a
+ ;; CHECK-NEXT:     (i32.const 3)
+ ;; CHECK-NEXT:    )
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (call $sink-void-helper
+ ;; CHECK-NEXT:    (i32.const 77)
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:   (local.set $b
+ ;; CHECK-NEXT:    (i32.const 88)
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT:  (i32.add
+ ;; CHECK-NEXT:   (local.get $a)
+ ;; CHECK-NEXT:   (local.get $b)
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT: )
+ (func $switch-fallthrough-shared-suffix (param $x i32) (result i32)
+  (local $a i32)
+  (local $b i32)
+  (block $out
+   (block $b2
+    (block $b1
+     (block $b0
+      (br_table $b0 $b1 $b2 (local.get $x))
+     )
+     (local.set $a (i32.const 1))
+     (call $sink-void-helper (i32.const 77))
+     (local.set $b (i32.const 88))
+     (br $out)
+    )
+    (local.set $a (i32.const 2))
+    (br $out)
+   )
+   (local.set $a (i32.const 3))
+   (call $sink-void-helper (i32.const 77))
+   (local.set $b (i32.const 88))
+  )
+  (i32.add (local.get $a) (local.get $b))
+ )
+)
