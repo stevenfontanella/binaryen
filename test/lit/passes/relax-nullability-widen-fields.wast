@@ -762,3 +762,185 @@
     )
   )
 )
+
+(module
+  ;; 1. Unpinned non-leaf struct $ParentImm has a subtype $TestedChild that is
+  ;;    tested by ref.test, but field 0 is invariant across $ParentImm and
+  ;;    $TestedChild, so $ParentImm and $TestedChild unify field 0 mutability
+  ;;    to (mut i32) to match sibling $ParentMut.
+  ;; 2. Unpinned leaf sibling structs $ClosA and $ClosB share supertype $ClosBase
+  ;;    and coarse field skeleton, differing in immutable reference field 1
+  ;;    ((ref null $SubA) vs (ref null $SubB)) and field 2 mutability (i32 vs
+  ;;    (mut i32)). Both widen field 1 to (ref null $ValBase) (inserting
+  ;;    ref.cast at narrow struct.get sites) and unify field 2 to (mut i32).
+  (rec
+    ;; CHECK:      (rec
+    ;; CHECK-NEXT:  (type $ValBase (sub (struct (field (mut i32)))))
+
+    ;; CHECK:       (type $ParentImm (sub (struct (field (mut i32)))))
+
+    ;; CHECK:       (type $ClosBase (sub (struct (field (mut i32)))))
+
+    ;; CHECK:       (type $SubB (sub final $ValBase (struct (field (mut i32)) (field i64))))
+
+    ;; CHECK:       (type $SubA (sub final $ValBase (struct (field (mut i32)) (field i32))))
+
+    ;; CHECK:       (type $TestedChild (sub final $ParentImm (struct (field (mut i32)) (field i64))))
+
+    ;; CHECK:       (type $ClosB (sub final $ClosBase (struct (field (mut i32)) (field anyref) (field (mut i32)))))
+
+    ;; CHECK:       (type $ClosA (sub final $ClosBase (struct (field (mut i32)) (field anyref) (field (mut i32)))))
+
+    ;; CHECK:       (type $ParentMut (sub (struct (field (mut i32)))))
+    (type $ParentMut (sub (struct (field (mut i32)))))
+    (type $ParentImm (sub (struct (field i32))))
+    (type $TestedChild (sub final $ParentImm (struct (field i32) (field i64))))
+    (type $ValBase (sub (struct (field i32))))
+    (type $SubA (sub final $ValBase (struct (field i32) (field i32))))
+    (type $SubB (sub final $ValBase (struct (field i32) (field i64))))
+    (type $ClosBase (sub (struct (field i32))))
+    (type $ClosA (sub final $ClosBase (struct (field i32) (field (ref null $SubA)) (field i32))))
+    (type $ClosB (sub final $ClosBase (struct (field i32) (field (ref null $SubB)) (field (mut i32)))))
+  )
+
+  ;; CHECK:      (type $9 (func (param i32) (result i32)))
+
+  ;; CHECK:      (export "entry6" (func $entry6))
+
+  ;; CHECK:      (func $entry6 (type $9) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (local $pm (ref null $ParentMut))
+  ;; CHECK-NEXT:  (local $pi (ref null $ParentImm))
+  ;; CHECK-NEXT:  (local $ca (ref null $ClosA))
+  ;; CHECK-NEXT:  (local $cb (ref null $ClosB))
+  ;; CHECK-NEXT:  (local.set $pm
+  ;; CHECK-NEXT:   (struct.new $ParentMut
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $pi
+  ;; CHECK-NEXT:   (struct.new $TestedChild
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (i64.const 1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $ca
+  ;; CHECK-NEXT:   (struct.new $ClosA
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (struct.new $SubA
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:     (i32.const 10)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.const 20)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $cb
+  ;; CHECK-NEXT:   (struct.new $ClosB
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (struct.new $SubB
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:     (i64.const 30)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.const 40)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (ref.test (ref $TestedChild)
+  ;; CHECK-NEXT:     (local.get $pi)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (struct.get $ParentMut 0
+  ;; CHECK-NEXT:      (local.get $pm)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (struct.get $ParentImm 0
+  ;; CHECK-NEXT:      (local.get $pi)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (struct.get $SubA 1
+  ;; CHECK-NEXT:     (ref.cast (ref null $SubA)
+  ;; CHECK-NEXT:      (struct.get $ClosA 1
+  ;; CHECK-NEXT:       (local.get $ca)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.wrap_i64
+  ;; CHECK-NEXT:     (struct.get $SubB 1
+  ;; CHECK-NEXT:      (ref.cast (ref null $SubB)
+  ;; CHECK-NEXT:       (struct.get $ClosB 1
+  ;; CHECK-NEXT:        (local.get $cb)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $entry6 (export "entry6") (param $x i32) (result i32)
+    (local $pm (ref null $ParentMut))
+    (local $pi (ref null $ParentImm))
+    (local $ca (ref null $ClosA))
+    (local $cb (ref null $ClosB))
+    (local.set $pm
+      (struct.new $ParentMut
+        (local.get $x)
+      )
+    )
+    (local.set $pi
+      (struct.new $TestedChild
+        (local.get $x)
+        (i64.const 1)
+      )
+    )
+    (local.set $ca
+      (struct.new $ClosA
+        (local.get $x)
+        (struct.new $SubA
+          (local.get $x)
+          (i32.const 10)
+        )
+        (i32.const 20)
+      )
+    )
+    (local.set $cb
+      (struct.new $ClosB
+        (local.get $x)
+        (struct.new $SubB
+          (local.get $x)
+          (i64.const 30)
+        )
+        (i32.const 40)
+      )
+    )
+    (i32.add
+      (i32.add
+        (ref.test (ref $TestedChild)
+          (local.get $pi)
+        )
+        (i32.add
+          (struct.get $ParentMut 0
+            (local.get $pm)
+          )
+          (struct.get $ParentImm 0
+            (local.get $pi)
+          )
+        )
+      )
+      (i32.add
+        (struct.get $SubA 1
+          (struct.get $ClosA 1
+            (local.get $ca)
+          )
+        )
+        (i32.wrap_i64
+          (struct.get $SubB 1
+            (struct.get $ClosB 1
+              (local.get $cb)
+            )
+          )
+        )
+      )
+    )
+  )
+)

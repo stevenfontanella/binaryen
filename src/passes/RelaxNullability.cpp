@@ -4777,7 +4777,8 @@ struct RelaxNullability : public Pass {
     }
   }
 
-  bool widenFieldsAndArrays(Module* module) {
+  bool widenFieldsAndArrays(Module* module,
+                            bool allowSiblingCastWiden = false) {
     std::unordered_set<HeapType> fixed;
     for (auto type :
          ModuleUtils::getPublicHeapTypes(*module, getPassOptions().worldMode)) {
@@ -5424,6 +5425,46 @@ struct RelaxNullability : public Pass {
     }
 
     std::unordered_map<FieldKey, Type, FieldKeyHash> castWidenedImmFields;
+    auto getExactTypeBytes = [&](Type t) -> int {
+      if (!t.isRef()) {
+        return 1;
+      }
+      HeapType ht = t.getHeapType();
+      if (ht.isBasic()) {
+        return (t.isNullable() && !ht.isShared()) ? 1 : 2;
+      }
+      auto it = typeIndex.find(ht);
+      return (it != typeIndex.end() && it->second < 64) ? 2 : 3;
+    };
+
+    auto getStructDefBytes = [&](HeapType W) -> int {
+      auto super = W.getDeclaredSuperType();
+      int bytes = super ? (5 + (typeIndex[*super] >= 64 ? 1 : 0)) : 2;
+      const auto& fields = W.getStruct().fields;
+      for (Index k = 0; k < fields.size(); ++k) {
+        bytes += getExactTypeBytes(getFinalFieldType(W, k)) + 1;
+      }
+      return bytes;
+    };
+
+    auto countNarrowGets = [&](const std::vector<HeapType>& ws,
+                               Index fi,
+                               Type boundFT) -> int {
+      int narrowGets = 0;
+      for (auto W : ws) {
+        if (auto demIt = immFieldDemands.find(FieldKey{W, fi});
+            demIt != immFieldDemands.end()) {
+          for (const auto& [reqHT, reqNull] : demIt->second) {
+            if (!HeapType::isSubType(boundFT.getHeapType(), reqHT) ||
+                (boundFT.isNullable() && !reqNull)) {
+              narrowGets++;
+            }
+          }
+        }
+      }
+      return narrowGets;
+    };
+
     if (hasImmCandidate) {
       auto getTypeBytes = [&](Type t) -> int {
         if (!t.isRef()) {
@@ -5438,29 +5479,6 @@ struct RelaxNullability : public Pass {
           return 2;
         }
         return 3;
-      };
-
-      auto getExactTypeBytes = [&](Type t) -> int {
-        if (!t.isRef()) {
-          return 1;
-        }
-        HeapType ht = t.getHeapType();
-        if (ht.isBasic()) {
-          return (t.isNullable() && !ht.isShared()) ? 1 : 2;
-        }
-        auto it = typeIndex.find(ht);
-        return (it != typeIndex.end() && it->second < 64) ? 2 : 3;
-      };
-
-      auto getStructDefBytes = [&](HeapType W) -> int {
-        auto super = W.getDeclaredSuperType();
-        int bytes =
-          super ? (5 + (typeIndex[*super] >= 64 ? 1 : 0)) : 2;
-        const auto& fields = W.getStruct().fields;
-        for (Index k = 0; k < fields.size(); ++k) {
-          bytes += getExactTypeBytes(getFinalFieldType(W, k)) + 1;
-        }
-        return bytes;
       };
 
       std::unordered_map<HeapType, int> totalStructFieldHTCount;
@@ -5613,35 +5631,37 @@ struct RelaxNullability : public Pass {
         }
       };
 
-      auto countNarrowGets = [&](const std::vector<HeapType>& ws,
-                                 Index fi,
-                                 Type boundFT) -> int {
-        int narrowGets = 0;
-        for (auto W : ws) {
-          if (auto demIt = immFieldDemands.find(FieldKey{W, fi});
-              demIt != immFieldDemands.end()) {
-            for (const auto& [reqHT, reqNull] : demIt->second) {
-              if (!HeapType::isSubType(boundFT.getHeapType(), reqHT) ||
-                  (boundFT.isNullable() && !reqNull)) {
-                narrowGets++;
-              }
-            }
-          }
-        }
-        return narrowGets;
-      };
-
-      int numPhases = cacheParamCasts ? 2 : 1;
+      int numPhases = cacheParamCasts ? 3 : 1;
+      auto ancTypes = allTypes;
+      if (cacheParamCasts) {
+        auto subTypesFirst = subTypes.getSubTypesFirstSort();
+        ancTypes.assign(subTypesFirst.rbegin(), subTypesFirst.rend());
+      }
       for (int phase = 0; phase < numPhases; ++phase) {
-        for (auto anc : allTypes) {
+        for (auto anc : ancTypes) {
           if (!anc.isStruct()) {
             continue;
           }
           const auto& aFields = anc.getStruct().fields;
           for (Index fi = 0; fi < aFields.size(); ++fi) {
-            if (aFields[fi].mutable_ != Immutable ||
-                getHighestFieldAncestor(anc, fi) != anc) {
+            if (aFields[fi].mutable_ != Immutable) {
               continue;
+            }
+            if (phase < 2) {
+              if (getHighestFieldAncestor(anc, fi) != anc) {
+                continue;
+              }
+            } else {
+              if (getHighestFieldAncestor(anc, fi) == anc) {
+                continue;
+              }
+              auto ancSup = anc.getDeclaredSuperType();
+              if (!ancSup || !ancSup->isStruct() ||
+                  fi >= ancSup->getStruct().fields.size() ||
+                  getFinalFieldType(anc, fi) ==
+                    getFinalFieldType(*ancSup, fi)) {
+                continue;
+              }
             }
             auto ancIt = finalImmFieldTypes.find(FieldKey{anc, fi});
             if (ancIt == finalImmFieldTypes.end()) {
@@ -5651,7 +5671,7 @@ struct RelaxNullability : public Pass {
             if (ancFT.isExact() || ancFT.isNull()) {
               continue;
             }
-            if (cacheParamCasts) {
+            if (cacheParamCasts && phase < 2) {
               bool isBasicAnc = ancFT.getHeapType().isBasic();
               if ((phase == 0) != isBasicAnc) {
                 continue;
@@ -5660,7 +5680,7 @@ struct RelaxNullability : public Pass {
             const auto& family = subTypes.getSubTypes(anc);
             std::unordered_map<Type, std::vector<HeapType>> groups;
             for (auto W : family) {
-              if (W == anc) {
+              if (W == anc || castWidenedImmFields.count(FieldKey{W, fi})) {
                 continue;
               }
               bool wFixed = fixed.count(W) || W.isShared() ||
@@ -5865,12 +5885,493 @@ struct RelaxNullability : public Pass {
         }
       };
 
+      auto canMakeMut = [&](HeapType T, Index fi) -> bool {
+        HeapType root = getHighestFieldAncestor(T, fi);
+        if (root != T) {
+          return false;
+        }
+        if (auto fIt = fieldCandidates.find(FieldKey{root, fi});
+            fIt != fieldCandidates.end() && fIt->second.pinned) {
+          return false;
+        }
+        Type rootFT = mapMergedType(getFinalFieldType(root, fi));
+        Field::PackedType rootPT = root.getStruct().fields[fi].packedType;
+        for (auto V : subTypes.getSubTypes(root)) {
+          if (fixed.count(V) || V.isShared() || V.getDescriptorType() ||
+              V.getDescribedType() ||
+              mapMergedType(getFinalFieldType(V, fi)) != rootFT ||
+              V.getStruct().fields[fi].packedType != rootPT) {
+            return false;
+          }
+        }
+        return true;
+      };
+
+      auto getEffMut = [&](HeapType T, Index fi) -> Mutability {
+        if (T.getStruct().fields[fi].mutable_ == Mutable) {
+          return Mutable;
+        }
+        auto it = structMutUpdates.find(T);
+        if (it != structMutUpdates.end() && it->second.count(fi)) {
+          return Mutable;
+        }
+        return Immutable;
+      };
+
+      auto subTypesFirst = subTypes.getSubTypesFirstSort();
+
+      if (allowSiblingCastWiden && hasImmCandidate) {
+        std::vector<StructShapeKey> skelOrder;
+        std::unordered_map<StructShapeKey,
+                           std::vector<HeapType>,
+                           StructShapeKeyHash>
+          skelGroups;
+        for (auto it = subTypesFirst.rbegin(); it != subTypesFirst.rend();
+             ++it) {
+          HeapType T = *it;
+          if (!isCleanPrivateStruct(T) || mergedIntoSuper.count(T)) {
+            continue;
+          }
+          StructShapeKey skel;
+          if (auto s = T.getDeclaredSuperType()) {
+            skel.super = mapMergedHT(*s);
+          }
+          const auto& tFields = T.getStruct().fields;
+          skel.fields.reserve(tFields.size());
+          for (Index fi = 0; fi < tFields.size(); ++fi) {
+            Type curFT = mapMergedType(getFinalFieldType(T, fi));
+            Field::PackedType pt = tFields[fi].packedType;
+            Type coarseFT = (!pt && curFT.isRef() && curFT.isNullable() &&
+                             !curFT.isExact() && !curFT.isNull())
+                              ? Type(curFT.getHeapType().getTop(), Nullable)
+                              : curFT;
+            skel.fields.push_back({coarseFT, pt});
+          }
+          auto& vec = skelGroups[skel];
+          if (vec.empty()) {
+            skelOrder.push_back(skel);
+          }
+          vec.push_back(T);
+        }
+
+        auto getShapeDefBytes = [&](std::optional<HeapType> sup,
+                                    const std::vector<Type>& fts) -> int {
+          int bytes = sup ? (5 + (typeIndex[*sup] >= 64 ? 1 : 0)) : 2;
+          for (Type ft : fts) {
+            bytes += getExactTypeBytes(ft) + 1;
+          }
+          return bytes;
+        };
+
+        for (const auto& skel : skelOrder) {
+          const auto& members = skelGroups[skel];
+          if (members.size() < 2) {
+            continue;
+          }
+          Index numF = skel.fields.size();
+          Index supLen =
+            (skel.super && skel.super->isStruct())
+              ? Index(skel.super->getStruct().fields.size())
+              : 0;
+
+          std::vector<std::vector<Type>> mCurShapes(members.size());
+          std::vector<int> mDefBytes(members.size());
+          std::vector<std::vector<Type>> candShapes;
+          auto addCandShape = [&](const std::vector<Type>& s) -> Index {
+            for (Index i = 0; i < candShapes.size(); ++i) {
+              if (candShapes[i] == s) {
+                return i;
+              }
+            }
+            candShapes.push_back(s);
+            return Index(candShapes.size() - 1);
+          };
+
+          std::vector<Index> mCurShapeIdx(members.size());
+          std::optional<HeapType> commonObjRoot;
+          for (size_t mi = 0; mi < members.size(); ++mi) {
+            HeapType M = members[mi];
+            mCurShapes[mi].resize(numF);
+            for (Index fi = 0; fi < numF; ++fi) {
+              Type ft = mapMergedType(getFinalFieldType(M, fi));
+              mCurShapes[mi][fi] = ft;
+              if (!commonObjRoot && fi >= supLen && ft.isStruct()) {
+                HeapType rHT = getRootAncestor(ft.getHeapType());
+                if (!rHT.isBasic() &&
+                    !subTypes.getImmediateSubTypes(rHT).empty()) {
+                  commonObjRoot = rHT;
+                }
+              }
+            }
+            mCurShapeIdx[mi] = addCandShape(mCurShapes[mi]);
+            mDefBytes[mi] = getStructDefBytes(M);
+          }
+
+          std::vector<bool> varying(numF, false);
+          std::vector<bool> hasObjRootAt(numF, false);
+          for (Index fi = 0; fi < numF; ++fi) {
+            Type firstFT = mCurShapes[0][fi];
+            for (size_t mi = 0; mi < members.size(); ++mi) {
+              if (mCurShapes[mi][fi] != firstFT) {
+                varying[fi] = true;
+              }
+              if (commonObjRoot &&
+                  mCurShapes[mi][fi] == Type(*commonObjRoot, Nullable)) {
+                hasObjRootAt[fi] = true;
+              }
+            }
+          }
+
+          Type anyRefT(HeapType::any, Nullable);
+          for (int useObjRoot = 0; useObjRoot < 2; ++useObjRoot) {
+            if (useObjRoot && !commonObjRoot) {
+              continue;
+            }
+            for (int onlyVarying = 0; onlyVarying < 2; ++onlyVarying) {
+              std::vector<Type> synth(numF);
+              for (Index fi = 0; fi < numF; ++fi) {
+                if (fi < supLen) {
+                  synth[fi] = varying[fi]
+                                ? mapMergedType(
+                                    getFinalFieldType(*skel.super, fi))
+                                : mCurShapes[0][fi];
+                } else if (onlyVarying && !varying[fi]) {
+                  synth[fi] = mCurShapes[0][fi];
+                } else if (skel.fields[fi].first == anyRefT) {
+                  synth[fi] = (useObjRoot && hasObjRootAt[fi])
+                                ? Type(*commonObjRoot, Nullable)
+                                : anyRefT;
+                } else {
+                  synth[fi] = skel.fields[fi].first;
+                }
+              }
+              addCandShape(synth);
+            }
+          }
+
+          if (candShapes.size() <= 1) {
+            continue;
+          }
+
+          std::vector<int> sDefBytes(candShapes.size());
+          for (size_t si = 0; si < candShapes.size(); ++si) {
+            sDefBytes[si] = getShapeDefBytes(skel.super, candShapes[si]);
+          }
+
+          // Precompute reachability and cast cost for each member -> shape.
+          std::vector<std::vector<std::pair<Index, int>>> reach(members.size());
+          for (size_t mi = 0; mi < members.size(); ++mi) {
+            HeapType M = members[mi];
+            reach[mi].push_back({mCurShapeIdx[mi], 0});
+            if (!subTypes.getImmediateSubTypes(M).empty()) {
+              continue;
+            }
+            const auto& mFields = M.getStruct().fields;
+            std::vector<bool> canWidenFi(numF, false);
+            std::vector<Type> realFTs(numF);
+            for (Index fi = 0; fi < numF; ++fi) {
+              realFTs[fi] = getFinalFieldType(M, fi);
+              if (mFields[fi].mutable_ == Immutable &&
+                  getEffMut(M, fi) == Immutable && !mFields[fi].isPacked() &&
+                  realFTs[fi] == mFields[fi].type && realFTs[fi].isRef() &&
+                  realFTs[fi].isNullable() && !realFTs[fi].isExact() &&
+                  !realFTs[fi].isNull() &&
+                  !castWidenedImmFields.count(FieldKey{M, fi})) {
+                canWidenFi[fi] = true;
+              }
+            }
+            for (Index si = 0; si < candShapes.size(); ++si) {
+              if (si == mCurShapeIdx[mi]) {
+                continue;
+              }
+              const auto& targetS = candShapes[si];
+              bool ok = true;
+              int castCost = 0;
+              for (Index fi = 0; fi < numF; ++fi) {
+                if (mCurShapes[mi][fi] == targetS[fi]) {
+                  continue;
+                }
+                if (!canWidenFi[fi] ||
+                    !Type::isSubType(realFTs[fi], targetS[fi]) ||
+                    targetS[fi].isExact() || targetS[fi].isNull()) {
+                  ok = false;
+                  break;
+                }
+                if (fi < supLen &&
+                    !Type::isSubType(targetS[fi],
+                                     getFinalFieldType(*skel.super, fi))) {
+                  ok = false;
+                  break;
+                }
+                int narrowGets = countNarrowGets({M}, fi, targetS[fi]);
+                int castBytes =
+                  (typeIndex[realFTs[fi].getHeapType()] < 64) ? 3 : 4;
+                castCost += narrowGets * castBytes;
+              }
+              if (ok) {
+                reach[mi].push_back({si, castCost});
+              }
+            }
+          }
+
+          std::vector<Index> selected = mCurShapeIdx;
+          std::vector<bool> activeShapes(candShapes.size(), true);
+          for (int iter = 0; iter < 8; ++iter) {
+            std::vector<int> cohortCounts(candShapes.size(), 0);
+            std::vector<Index> canonIdx(candShapes.size(), Index(-1));
+            for (size_t mi = 0; mi < members.size(); ++mi) {
+              Index si = selected[mi];
+              cohortCounts[si]++;
+              Index tIdx = typeIndex[members[mi]];
+              if (tIdx < canonIdx[si]) {
+                canonIdx[si] = tIdx;
+              }
+              Index curSi = mCurShapeIdx[mi];
+              if (tIdx < canonIdx[curSi]) {
+                canonIdx[curSi] = tIdx;
+              }
+            }
+
+            std::vector<Index> newSelected(members.size());
+            for (size_t mi = 0; mi < members.size(); ++mi) {
+              HeapType M = members[mi];
+              Index curSi = mCurShapeIdx[mi];
+              Index bestSi = curSi;
+              int bestScore = 0;
+              for (const auto& [si, castCost] : reach[mi]) {
+                if (si == curSi || !activeShapes[si]) {
+                  continue;
+                }
+                int lebSavings =
+                  (canonIdx[si] < 64 && typeIndex[M] >= 64)
+                    ? int(structTypeUses[M])
+                    : 0;
+                int mNet = mDefBytes[mi] + lebSavings - castCost;
+                if (mNet <= 0) {
+                  continue;
+                }
+                bool hasOtherStationary = false;
+                for (size_t m2 = 0; m2 < members.size(); ++m2) {
+                  if (m2 != mi && mCurShapeIdx[m2] == si &&
+                      selected[m2] == si) {
+                    hasOtherStationary = true;
+                    break;
+                  }
+                }
+                int score = 0;
+                if (hasOtherStationary) {
+                  score = mNet * 2 + 1;
+                } else {
+                  int k = std::max(2, cohortCounts[si]);
+                  score = std::max(1, mNet * 2 - (sDefBytes[si] * 2) / k);
+                }
+                if (score > bestScore) {
+                  bestScore = score;
+                  bestSi = si;
+                }
+              }
+              newSelected[mi] = bestSi;
+            }
+
+            std::vector<std::vector<size_t>> cohorts(candShapes.size());
+            for (size_t mi = 0; mi < members.size(); ++mi) {
+              cohorts[newSelected[mi]].push_back(mi);
+            }
+            std::vector<bool> nextActive(candShapes.size(), false);
+            for (Index si = 0; si < candShapes.size(); ++si) {
+              const auto& cm = cohorts[si];
+              if (cm.size() < 2) {
+                continue;
+              }
+              bool hasStationary = false;
+              Index cIdx = Index(-1);
+              for (size_t mi : cm) {
+                if (mCurShapeIdx[mi] == si) {
+                  hasStationary = true;
+                }
+                cIdx = std::min(cIdx, typeIndex[members[mi]]);
+              }
+              if (hasStationary) {
+                nextActive[si] = true;
+              } else {
+                int totNet = 0;
+                for (size_t mi : cm) {
+                  int cc = 0;
+                  for (const auto& [rsi, rcc] : reach[mi]) {
+                    if (rsi == si) {
+                      cc = rcc;
+                      break;
+                    }
+                  }
+                  int lebSavings =
+                    (cIdx < 64 && typeIndex[members[mi]] >= 64)
+                      ? int(structTypeUses[members[mi]])
+                      : 0;
+                  totNet += mDefBytes[mi] + lebSavings - cc;
+                }
+                if (totNet - sDefBytes[si] > 0) {
+                  nextActive[si] = true;
+                }
+              }
+            }
+            for (size_t mi = 0; mi < members.size(); ++mi) {
+              if (!nextActive[newSelected[mi]]) {
+                newSelected[mi] = mCurShapeIdx[mi];
+              }
+            }
+            if (newSelected == selected && nextActive == activeShapes) {
+              break;
+            }
+            selected = std::move(newSelected);
+            activeShapes = std::move(nextActive);
+          }
+
+          std::vector<std::vector<size_t>> finalCohorts(candShapes.size());
+          for (size_t mi = 0; mi < members.size(); ++mi) {
+            finalCohorts[selected[mi]].push_back(mi);
+          }
+          for (Index si = 0; si < candShapes.size(); ++si) {
+            const auto& cm = finalCohorts[si];
+            if (cm.size() < 2) {
+              continue;
+            }
+            bool anyWidened = false;
+            for (size_t mi : cm) {
+              if (mCurShapeIdx[mi] != si) {
+                anyWidened = true;
+                break;
+              }
+            }
+            if (!anyWidened) {
+              continue;
+            }
+            const auto& targetS = candShapes[si];
+            struct MutSubGroup {
+              std::vector<size_t> mIndices;
+              std::vector<bool> reqMut;
+              std::vector<bool> allowMut;
+            };
+            std::vector<MutSubGroup> mSubGroups;
+            for (size_t mi : cm) {
+              HeapType M = members[mi];
+              std::vector<bool> reqM(numF, false);
+              std::vector<bool> allowM(numF, false);
+              for (Index fi = 0; fi < numF; ++fi) {
+                if (mCurShapes[mi][fi] == targetS[fi]) {
+                  bool isMut = (getEffMut(M, fi) == Mutable);
+                  reqM[fi] = isMut;
+                  allowM[fi] = isMut || canMakeMut(M, fi);
+                } else {
+                  reqM[fi] = false;
+                  allowM[fi] = (getHighestFieldAncestor(M, fi) == M);
+                }
+              }
+              bool placed = false;
+              for (auto& msg : mSubGroups) {
+                bool compat = true;
+                for (Index fi = 0; fi < numF; ++fi) {
+                  bool cReq = msg.reqMut[fi] || reqM[fi];
+                  bool cAllow = msg.allowMut[fi] && allowM[fi];
+                  if (cReq && !cAllow) {
+                    compat = false;
+                    break;
+                  }
+                }
+                if (compat) {
+                  msg.mIndices.push_back(mi);
+                  for (Index fi = 0; fi < numF; ++fi) {
+                    msg.reqMut[fi] = msg.reqMut[fi] || reqM[fi];
+                    msg.allowMut[fi] = msg.allowMut[fi] && allowM[fi];
+                  }
+                  placed = true;
+                  break;
+                }
+              }
+              if (!placed) {
+                mSubGroups.push_back(
+                  {{mi}, std::move(reqM), std::move(allowM)});
+              }
+            }
+
+            for (const auto& msg : mSubGroups) {
+              if (msg.mIndices.size() < 2) {
+                continue;
+              }
+              bool hasStationary = false;
+              Index cIdx = Index(-1);
+              for (size_t mi : msg.mIndices) {
+                if (mCurShapeIdx[mi] == si) {
+                  hasStationary = true;
+                }
+                cIdx = std::min(cIdx, typeIndex[members[mi]]);
+              }
+              int sgNet = 0;
+              for (size_t mi : msg.mIndices) {
+                HeapType M = members[mi];
+                int lebSavings =
+                  (cIdx < 64 && typeIndex[M] >= 64)
+                    ? int(structTypeUses[M])
+                    : 0;
+                if (mCurShapeIdx[mi] == si) {
+                  if (typeIndex[M] != cIdx) {
+                    sgNet += mDefBytes[mi] + lebSavings;
+                  }
+                } else {
+                  int cc = 0;
+                  for (const auto& [rsi, rcc] : reach[mi]) {
+                    if (rsi == si) {
+                      cc = rcc;
+                      break;
+                    }
+                  }
+                  sgNet += mDefBytes[mi] + lebSavings - cc;
+                }
+              }
+              if (!hasStationary) {
+                sgNet -= sDefBytes[si];
+              }
+              if (sgNet <= 0) {
+                continue;
+              }
+              for (size_t mi : msg.mIndices) {
+                if (mCurShapeIdx[mi] == si) {
+                  continue;
+                }
+                HeapType M = members[mi];
+                for (Index fi = 0; fi < numF; ++fi) {
+                  if (mCurShapes[mi][fi] == targetS[fi]) {
+                    continue;
+                  }
+                  Type realFT = getFinalFieldType(M, fi);
+                  Type targetFT = targetS[fi];
+                  finalImmFieldTypes[FieldKey{M, fi}] = targetFT;
+                  castWidenedImmFields[FieldKey{M, fi}] = realFT;
+                  auto& vec = structUpdates[M];
+                  bool found = false;
+                  for (auto& [ufi, uFT] : vec) {
+                    if (ufi == fi) {
+                      uFT = targetFT;
+                      found = true;
+                      break;
+                    }
+                  }
+                  if (!found && targetFT != M.getStruct().fields[fi].type) {
+                    vec.push_back({fi, targetFT});
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
       std::vector<StructShapeKey> shapeGroupOrder;
       std::unordered_map<StructShapeKey,
                          std::vector<HeapType>,
                          StructShapeKeyHash>
         shapeGroups;
-      for (auto T : allTypes) {
+      for (auto it = subTypesFirst.rbegin(); it != subTypesFirst.rend(); ++it) {
+        HeapType T = *it;
         if (!isCleanPrivateStruct(T) || mergedIntoSuper.count(T)) {
           continue;
         }
@@ -5890,35 +6391,6 @@ struct RelaxNullability : public Pass {
         }
         vec.push_back(T);
       }
-
-      auto canMakeMut = [&](HeapType T, Index fi) -> bool {
-        HeapType root = getHighestFieldAncestor(T, fi);
-        if (auto fIt = fieldCandidates.find(FieldKey{root, fi});
-            fIt != fieldCandidates.end() && fIt->second.pinned) {
-          return false;
-        }
-        Type rootFT = mapMergedType(getFinalFieldType(root, fi));
-        Field::PackedType rootPT = root.getStruct().fields[fi].packedType;
-        for (auto V : subTypes.getSubTypes(root)) {
-          if (!isCleanPrivateStruct(V) ||
-              mapMergedType(getFinalFieldType(V, fi)) != rootFT ||
-              V.getStruct().fields[fi].packedType != rootPT) {
-            return false;
-          }
-        }
-        return true;
-      };
-
-      auto getEffMut = [&](HeapType T, Index fi) -> Mutability {
-        if (T.getStruct().fields[fi].mutable_ == Mutable) {
-          return Mutable;
-        }
-        auto it = structMutUpdates.find(T);
-        if (it != structMutUpdates.end() && it->second.count(fi)) {
-          return Mutable;
-        }
-        return Immutable;
-      };
 
       struct SubGroup {
         std::vector<HeapType> types;
@@ -7016,6 +7488,16 @@ struct RelaxNullability : public Pass {
       if (widenFieldsAndArrays(module)) {
         FunctionRelaxer(widenTypes, widenFields).run(getPassRunner(), module);
       }
+    }
+
+    // 7. Final sibling-targeted cast-inserting field widening and mutability
+    // unification before TypeMerging.
+    bool cacheParamCasts =
+      hasArgument("relax-nullability-cache-param-casts") ||
+      modeArg == "cache-param-casts" || !getPassOptions().optimizeLevel;
+    if (widenFields && cacheParamCasts &&
+        widenFieldsAndArrays(module, /*allowSiblingCastWiden=*/true)) {
+      FunctionRelaxer(widenTypes, widenFields).run(getPassRunner(), module);
     }
   }
 };

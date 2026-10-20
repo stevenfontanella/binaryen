@@ -2872,7 +2872,8 @@ struct Inlining : public Pass {
       if (inliningMode != InliningMode::Uninlineable) {
         state.inlinableFunctions[func->name] = inliningMode;
       }
-      if (byteBudget) {
+      if (byteBudget && (inliningMode == InliningMode::Full ||
+                         inliningMode == InliningMode::Uninlineable)) {
         auto& info = infos[func->name];
         if (!info.usedGlobally && !info.hasTryDelegate && !func->noFullInline &&
             info.toolchainInlineHint != CodeAnnotation::NeverInline &&
