@@ -5,7 +5,7 @@
 (module
   (rec
     ;; CHECK:      (rec
-    ;; CHECK-NEXT:  (type $Base (sub (struct (field i32))))
+    ;; CHECK-NEXT:  (type $Base (sub (struct (field i32) (field i64))))
     (type $Base (sub (struct (field i32))))
     ;; CHECK:       (type $Holder (struct (field (ref null $Base))))
 
@@ -310,7 +310,7 @@
   ;; the cache array global retargets to the canonical mutable root array type.
   (rec
     ;; CHECK:      (rec
-    ;; CHECK-NEXT:  (type $Root (sub (struct (field i32))))
+    ;; CHECK-NEXT:  (type $Root (sub (struct (field i32) (field i64))))
     (type $Root (sub (struct (field i32))))
     ;; CHECK:       (type $1 (func (param i32) (result (ref null $Root))))
 
@@ -421,11 +421,9 @@
   ;; CHECK-NEXT:     )
   ;; CHECK-NEXT:    )
   ;; CHECK-NEXT:    (i32.wrap_i64
-  ;; CHECK-NEXT:     (struct.get $Child 1
-  ;; CHECK-NEXT:      (ref.cast (ref null $Child)
-  ;; CHECK-NEXT:       (call $get-cached
-  ;; CHECK-NEXT:        (local.get $i)
-  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:     (struct.get $Root 1
+  ;; CHECK-NEXT:      (call $get-cached
+  ;; CHECK-NEXT:       (local.get $i)
   ;; CHECK-NEXT:      )
   ;; CHECK-NEXT:     )
   ;; CHECK-NEXT:    )
@@ -477,7 +475,7 @@
     ;; CHECK:      (rec
     ;; CHECK-NEXT:  (type $ObjBase (sub (struct (field (ref null $VtBase)))))
 
-    ;; CHECK:       (type $VtBase (sub (struct (field i32))))
+    ;; CHECK:       (type $VtBase (sub (struct (field i32) (field i64))))
     (type $VtBase (sub (struct (field i32))))
     ;; CHECK:       (type $ObjSub (sub $ObjBase (struct (field (ref null $VtBase)))))
 
@@ -576,11 +574,9 @@
   ;; CHECK-NEXT:    )
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:   (i32.wrap_i64
-  ;; CHECK-NEXT:    (struct.get $VtSub 1
-  ;; CHECK-NEXT:     (ref.cast (ref null $VtSub)
-  ;; CHECK-NEXT:      (struct.get $ObjBase 0
-  ;; CHECK-NEXT:       (local.get $s)
-  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:    (struct.get $VtBase 1
+  ;; CHECK-NEXT:     (struct.get $ObjBase 0
+  ;; CHECK-NEXT:      (local.get $s)
   ;; CHECK-NEXT:     )
   ;; CHECK-NEXT:    )
   ;; CHECK-NEXT:   )
@@ -1164,6 +1160,282 @@
           (array.get $SubAArr
             (local.get $arr)
             (i32.const 0)
+          )
+        )
+      )
+    )
+  )
+)
+
+(module
+  ;; 1. Single-child uncast parent/child collapsing ($SingleParent -> $SingleChild):
+  ;;    $SingleParent appends $SingleChild's extra field (field i64) and pads
+  ;;    struct.new $SingleParent with (i64.const 0).
+  ;; 2. Non-inherited field permutation ($PermA vs $PermB): $PermB permutes its
+  ;;    reorderable non-inherited fields (field i64) (field (ref null $SubB))
+  ;;    to match $PermA's order and widens field 1 to anyref.
+  ;; 3. Order-preserving subsequence field padding ($PadShort -> $PadTarget):
+  ;;    singleton leaf $PadShort pads missing middle field (field (mut i32)) with
+  ;;    (i32.const 0) at struct.new $PadShort and shifts struct.get $PadShort 1 -> 2.
+  (rec
+    ;; CHECK:      (rec
+    ;; CHECK-NEXT:  (type $ValBase (sub (struct (field i32))))
+    (type $ValBase (sub (struct (field i32))))
+    ;; CHECK:       (type $ClosBase (sub (struct (field i32))))
+
+    ;; CHECK:       (type $SingleParent (sub (struct (field i32) (field i64))))
+
+    ;; CHECK:       (type $SubB (sub final $ValBase (struct (field i32) (field i64))))
+
+    ;; CHECK:       (type $SubA (sub final $ValBase (struct (field i32) (field i32))))
+    (type $SubA (sub final $ValBase (struct (field i32) (field i32))))
+    (type $SubB (sub final $ValBase (struct (field i32) (field i64))))
+    (type $SingleParent (sub (struct (field i32))))
+    ;; CHECK:       (type $PadShort (sub final $ClosBase (struct (field i32) (field anyref) (field i64))))
+
+    ;; CHECK:       (type $PadTarget (sub final $ClosBase (struct (field i32) (field (mut i32)) (field i64))))
+
+    ;; CHECK:       (type $PermB (sub final $ClosBase (struct (field i32) (field anyref) (field i64))))
+
+    ;; CHECK:       (type $PermA (sub final $ClosBase (struct (field i32) (field anyref) (field i64))))
+
+    ;; CHECK:       (type $SingleChild (sub $SingleParent (struct (field i32) (field i64))))
+    (type $SingleChild (sub final $SingleParent (struct (field i32) (field i64))))
+    (type $ClosBase (sub (struct (field i32))))
+    (type $PermA (sub final $ClosBase (struct (field i32) (field (ref null $SubA)) (field i64))))
+    (type $PermB (sub final $ClosBase (struct (field i32) (field i64) (field (ref null $SubB)))))
+    (type $PadTarget (sub final $ClosBase (struct (field i32) (field (mut i32)) (field i64))))
+    (type $PadShort (sub final $ClosBase (struct (field i32) (field i64))))
+  )
+
+  ;; CHECK:      (type $10 (func (param i32) (result i32)))
+
+  ;; CHECK:      (export "entry8" (func $entry8))
+  (export "entry8" (func $entry8))
+
+  ;; CHECK:      (func $entry8 (type $10) (param $x i32) (result i32)
+  ;; CHECK-NEXT:  (local $sp (ref null $SingleParent))
+  ;; CHECK-NEXT:  (local $sc (ref null $SingleParent))
+  ;; CHECK-NEXT:  (local $pa (ref null $PermA))
+  ;; CHECK-NEXT:  (local $pb (ref null $PermB))
+  ;; CHECK-NEXT:  (local $pt (ref null $PadTarget))
+  ;; CHECK-NEXT:  (local $ps (ref null $PadShort))
+  ;; CHECK-NEXT:  (local.set $sp
+  ;; CHECK-NEXT:   (struct.new $SingleParent
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (i64.const 0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $sc
+  ;; CHECK-NEXT:   (struct.new $SingleChild
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (i64.const 5)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $pa
+  ;; CHECK-NEXT:   (struct.new $PermA
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (struct.new $SubA
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:     (i32.const 11)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i64.const 22)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $pb
+  ;; CHECK-NEXT:   (struct.new $PermB
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (struct.new $SubB
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:     (i64.const 44)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i64.const 33)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $pt
+  ;; CHECK-NEXT:   (struct.new $PadTarget
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (i32.const 55)
+  ;; CHECK-NEXT:    (i64.const 66)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (local.set $ps
+  ;; CHECK-NEXT:   (struct.new $PadShort
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:    (ref.null none)
+  ;; CHECK-NEXT:    (i64.const 77)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (struct.get $SingleParent 0
+  ;; CHECK-NEXT:     (local.get $sp)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.wrap_i64
+  ;; CHECK-NEXT:     (struct.get $SingleParent 1
+  ;; CHECK-NEXT:      (local.get $sc)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (i32.add
+  ;; CHECK-NEXT:      (struct.get $SubA 1
+  ;; CHECK-NEXT:       (ref.cast (ref null $SubA)
+  ;; CHECK-NEXT:        (struct.get $PermA 1
+  ;; CHECK-NEXT:         (local.get $pa)
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (i32.wrap_i64
+  ;; CHECK-NEXT:       (struct.get $PermA 2
+  ;; CHECK-NEXT:        (local.get $pa)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.add
+  ;; CHECK-NEXT:      (i32.wrap_i64
+  ;; CHECK-NEXT:       (struct.get $PermB 2
+  ;; CHECK-NEXT:        (local.get $pb)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (i32.wrap_i64
+  ;; CHECK-NEXT:       (struct.get $SubB 1
+  ;; CHECK-NEXT:        (ref.cast (ref null $SubB)
+  ;; CHECK-NEXT:         (struct.get $PermB 1
+  ;; CHECK-NEXT:          (local.get $pb)
+  ;; CHECK-NEXT:         )
+  ;; CHECK-NEXT:        )
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (i32.add
+  ;; CHECK-NEXT:     (i32.add
+  ;; CHECK-NEXT:      (struct.get $PadTarget 1
+  ;; CHECK-NEXT:       (local.get $pt)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:      (i32.wrap_i64
+  ;; CHECK-NEXT:       (struct.get $PadTarget 2
+  ;; CHECK-NEXT:        (local.get $pt)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (i32.wrap_i64
+  ;; CHECK-NEXT:      (struct.get $PadShort 2
+  ;; CHECK-NEXT:       (local.get $ps)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $entry8 (param $x i32) (result i32)
+    (local $sp (ref null $SingleParent))
+    (local $sc (ref null $SingleChild))
+    (local $pa (ref null $PermA))
+    (local $pb (ref null $PermB))
+    (local $pt (ref null $PadTarget))
+    (local $ps (ref null $PadShort))
+    (local.set $sp
+      (struct.new $SingleParent
+        (local.get $x)
+      )
+    )
+    (local.set $sc
+      (struct.new $SingleChild
+        (local.get $x)
+        (i64.const 5)
+      )
+    )
+    (local.set $pa
+      (struct.new $PermA
+        (local.get $x)
+        (struct.new $SubA
+          (local.get $x)
+          (i32.const 11)
+        )
+        (i64.const 22)
+      )
+    )
+    (local.set $pb
+      (struct.new $PermB
+        (local.get $x)
+        (i64.const 33)
+        (struct.new $SubB
+          (local.get $x)
+          (i64.const 44)
+        )
+      )
+    )
+    (local.set $pt
+      (struct.new $PadTarget
+        (local.get $x)
+        (i32.const 55)
+        (i64.const 66)
+      )
+    )
+    (local.set $ps
+      (struct.new $PadShort
+        (local.get $x)
+        (i64.const 77)
+      )
+    )
+    (i32.add
+      (i32.add
+        (struct.get $SingleParent 0
+          (local.get $sp)
+        )
+        (i32.wrap_i64
+          (struct.get $SingleChild 1
+            (local.get $sc)
+          )
+        )
+      )
+      (i32.add
+        (i32.add
+          (i32.add
+            (struct.get $SubA 1
+              (struct.get $PermA 1
+                (local.get $pa)
+              )
+            )
+            (i32.wrap_i64
+              (struct.get $PermA 2
+                (local.get $pa)
+              )
+            )
+          )
+          (i32.add
+            (i32.wrap_i64
+              (struct.get $PermB 1
+                (local.get $pb)
+              )
+            )
+            (i32.wrap_i64
+              (struct.get $SubB 1
+                (struct.get $PermB 2
+                  (local.get $pb)
+                )
+              )
+            )
+          )
+        )
+        (i32.add
+          (i32.add
+            (struct.get $PadTarget 1
+              (local.get $pt)
+            )
+            (i32.wrap_i64
+              (struct.get $PadTarget 2
+                (local.get $pt)
+              )
+            )
+          )
+          (i32.wrap_i64
+            (struct.get $PadShort 1
+              (local.get $ps)
+            )
           )
         )
       )

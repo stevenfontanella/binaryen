@@ -7660,9 +7660,9 @@ private:
           if (ExpressionAnalyzer::shallowEqual(trueTail, falseTail)) {
             ChildIterator ifTrueChildren(trueTail);
             ChildIterator ifFalseChildren(falseTail);
-            Index numChildren = ifTrueChildren.children.size();
+            Index numChildren = ifTrueChildren.getNumChildren();
             if (numChildren >= 1 &&
-                ifFalseChildren.children.size() == numChildren) {
+                ifFalseChildren.getNumChildren() == numChildren) {
               Index diffCount = 0;
               Index diffIdx = 0;
               if (numChildren == 1) {
@@ -7670,8 +7670,8 @@ private:
                 diffIdx = 0;
               } else {
                 for (Index j = 0; j < numChildren; ++j) {
-                  Expression* aChild = *ifTrueChildren.children[j];
-                  Expression* bChild = *ifFalseChildren.children[j];
+                  Expression* aChild = ifTrueChildren.getChild(j);
+                  Expression* bChild = ifFalseChildren.getChild(j);
                   if (ExpressionAnalyzer::equal(aChild, bChild) ||
                       (std::is_same<T, Select>::value &&
                        isTeeAndGet(aChild, bChild))) {
@@ -7683,8 +7683,8 @@ private:
               }
 
               if (diffCount == 1) {
-                auto* ifTrueChild = *ifTrueChildren.children[diffIdx];
-                auto* ifFalseChild = *ifFalseChildren.children[diffIdx];
+                auto* ifTrueChild = ifTrueChildren.getChild(diffIdx);
+                auto* ifFalseChild = ifFalseChildren.getChild(diffIdx);
                 auto* reuse = falseTail;
 
                 bool validInvariantArgs = true;
@@ -7705,8 +7705,8 @@ private:
                     if (j == diffIdx) {
                       continue;
                     }
-                    Expression* aChild = *ifTrueChildren.children[j];
-                    Expression* bChild = *ifFalseChildren.children[j];
+                    Expression* aChild = ifTrueChildren.getChild(j);
+                    Expression* bChild = ifFalseChildren.getChild(j);
                     if (std::is_same<T, Select>::value && j < diffIdx &&
                         isTeeAndGet(aChild, bChild)) {
                       Index v = aChild->cast<LocalSet>()->index;
@@ -7821,7 +7821,8 @@ private:
                           Type::isSubType(lub, fields[sset->index].type);
                       }
                     } else if (auto* snew = reuse->dynCast<StructNew>()) {
-                      if (!snew->isWithDefault() && snew->type.isStruct()) {
+                      if (!snew->isWithDefault() && !snew->desc &&
+                          snew->type.isStruct()) {
                         const auto& fields =
                           snew->type.getHeapType().getStruct().fields;
                         validTypes = diffIdx < fields.size() &&
@@ -7850,10 +7851,10 @@ private:
                 if (validTypes && validEffects && validChildren) {
                   if (std::is_same<T, Select>::value && numChildren > 1) {
                     for (Index j = 0; j < diffIdx; ++j) {
-                      Expression* aChild = *ifTrueChildren.children[j];
-                      Expression* bChild = *ifFalseChildren.children[j];
+                      Expression* aChild = ifTrueChildren.getChild(j);
+                      Expression* bChild = ifFalseChildren.getChild(j);
                       if (isTeeAndGet(aChild, bChild)) {
-                        *ifFalseChildren.children[j] = aChild;
+                        ifFalseChildren.getChild(j) = aChild;
                       }
                     }
                   }
@@ -7866,7 +7867,7 @@ private:
                     falseBlocks[i]->finalize();
                   }
                   curr->finalize();
-                  Expression** slot = ifFalseChildren.children[diffIdx];
+                  Expression** slot = &ifFalseChildren.getChild(diffIdx);
                   *slot = curr;
                   reuse->finalize();
                   if (!chain.empty()) {
