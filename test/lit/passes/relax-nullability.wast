@@ -1396,11 +1396,15 @@
 
   ;; CHECK:      (type $4 (func (param (ref null $Base)) (result i32)))
 
+  ;; CHECK:      (type $5 (func (param i32 (ref null $Base)) (result i32)))
+
   ;; CHECK:      (export "existing-base" (func $existing-base))
 
   ;; CHECK:      (export "existing-base-i64" (func $existing-base-i64))
 
   ;; CHECK:      (export "call-multi" (func $call-multi-get-sub))
+
+  ;; CHECK:      (export "strip-br" (func $strip-dropped-br-if-and-br-on))
 
   ;; CHECK:      (func $existing-base (type $2) (param $p (ref null $Base)) (param $y i32) (result i32)
   ;; CHECK-NEXT:  (local.get $y)
@@ -1415,11 +1419,15 @@
 
   ;; NO_TNH:      (type $6 (func (param (ref null $Sub) i64) (result i32)))
 
+  ;; NO_TNH:      (type $7 (func (param i32 (ref null $Base)) (result i32)))
+
   ;; NO_TNH:      (export "existing-base" (func $existing-base))
 
   ;; NO_TNH:      (export "existing-base-i64" (func $existing-base-i64))
 
   ;; NO_TNH:      (export "call-multi" (func $call-multi-get-sub))
+
+  ;; NO_TNH:      (export "strip-br" (func $strip-dropped-br-if-and-br-on))
 
   ;; NO_TNH:      (func $existing-base (type $2) (param $p (ref null $Base)) (param $y i32) (result i32)
   ;; NO_TNH-NEXT:  (local.get $y)
@@ -1660,6 +1668,94 @@
       )
       (struct.get $Sub 2
         (local.get $p)
+      )
+    )
+  )
+
+  ;; Strip ref.as_non_null and ref.cast inside dropped br_if, br_on_non_null,
+  ;; and br_on_null when the target block accepts a wider nullable type.
+  ;; CHECK:      (func $strip-dropped-br-if-and-br-on (type $5) (param $c i32) (param $x (ref null $Base)) (result i32)
+  ;; CHECK-NEXT:  (struct.get $Base 0
+  ;; CHECK-NEXT:   (block $out (result (ref null $Base))
+  ;; CHECK-NEXT:    (drop
+  ;; CHECK-NEXT:     (br_if $out
+  ;; CHECK-NEXT:      (local.get $x)
+  ;; CHECK-NEXT:      (local.get $c)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (br_on_non_null $out
+  ;; CHECK-NEXT:     (local.get $x)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (block $null
+  ;; CHECK-NEXT:     (br $out
+  ;; CHECK-NEXT:      (br_on_null $null
+  ;; CHECK-NEXT:       (local.get $x)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (ref.null none)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  ;; NO_TNH:      (func $strip-dropped-br-if-and-br-on (type $7) (param $c i32) (param $x (ref null $Base)) (result i32)
+  ;; NO_TNH-NEXT:  (struct.get $Base 0
+  ;; NO_TNH-NEXT:   (block $out (result (ref null $Base))
+  ;; NO_TNH-NEXT:    (drop
+  ;; NO_TNH-NEXT:     (br_if $out
+  ;; NO_TNH-NEXT:      (ref.as_non_null
+  ;; NO_TNH-NEXT:       (ref.cast (ref null $Sub)
+  ;; NO_TNH-NEXT:        (local.get $x)
+  ;; NO_TNH-NEXT:       )
+  ;; NO_TNH-NEXT:      )
+  ;; NO_TNH-NEXT:      (local.get $c)
+  ;; NO_TNH-NEXT:     )
+  ;; NO_TNH-NEXT:    )
+  ;; NO_TNH-NEXT:    (br_on_non_null $out
+  ;; NO_TNH-NEXT:     (ref.cast (ref null $Sub)
+  ;; NO_TNH-NEXT:      (local.get $x)
+  ;; NO_TNH-NEXT:     )
+  ;; NO_TNH-NEXT:    )
+  ;; NO_TNH-NEXT:    (block $null
+  ;; NO_TNH-NEXT:     (br $out
+  ;; NO_TNH-NEXT:      (br_on_null $null
+  ;; NO_TNH-NEXT:       (ref.cast (ref null $Sub)
+  ;; NO_TNH-NEXT:        (local.get $x)
+  ;; NO_TNH-NEXT:       )
+  ;; NO_TNH-NEXT:      )
+  ;; NO_TNH-NEXT:     )
+  ;; NO_TNH-NEXT:    )
+  ;; NO_TNH-NEXT:    (ref.null none)
+  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:  )
+  ;; NO_TNH-NEXT: )
+  (func $strip-dropped-br-if-and-br-on (export "strip-br") (param $c i32) (param $x (ref null $Base)) (result i32)
+    (struct.get $Base 0
+      (block $out (result (ref null $Base))
+        (drop
+          (br_if $out
+            (ref.as_non_null
+              (ref.cast (ref null $Sub)
+                (local.get $x)
+              )
+            )
+            (local.get $c)
+          )
+        )
+        (br_on_non_null $out
+          (ref.cast (ref null $Sub)
+            (local.get $x)
+          )
+        )
+        (block $null
+          (br $out
+            (br_on_null $null
+              (ref.cast (ref null $Sub)
+                (local.get $x)
+              )
+            )
+          )
+        )
+        (ref.null $Base)
       )
     )
   )

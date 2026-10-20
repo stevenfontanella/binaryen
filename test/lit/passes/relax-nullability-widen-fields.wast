@@ -153,6 +153,16 @@
     ;; CHECK:      (rec
     ;; CHECK-NEXT:  (type $ObjRoot (sub (struct (field anyref))))
 
+    ;; CHECK:       (type $Payload (struct (field i32)))
+
+    ;; CHECK:       (type $MutualB (struct (field (mut (ref null $Payload)))))
+
+    ;; CHECK:       (type $MutualA (struct (field (ref null $Payload))))
+
+    ;; CHECK:       (type $SelfCopy (struct (field (mut (ref null $Payload)))))
+
+    ;; CHECK:       (type $5 (func (param (ref null $SelfCopy) (ref null $MutualA) (ref null $MutualB)) (result i32)))
+
     ;; CHECK:       (type $VtRoot (sub (struct (field anyref))))
     (type $VtRoot (sub (struct (field structref))))
     (type $VtNull (sub $VtRoot (struct (field nullref))))
@@ -168,13 +178,13 @@
     (type $ObjSub2 (sub $ObjRoot (struct (field (ref $VtSub2)))))
   )
 
-  ;; CHECK:       (type $4 (func (param (ref null $ObjRoot) (ref null $ObjSub2) (ref null $VtRoot)) (result (ref null $VtRoot))))
+  ;; CHECK:       (type $9 (func (param (ref null $ObjRoot) (ref null $ObjSub2) (ref null $VtRoot)) (result (ref null $VtRoot))))
 
-  ;; CHECK:      (type $5 (func))
+  ;; CHECK:      (type $10 (func))
 
   ;; CHECK:      (export "entry2" (func $entry2))
 
-  ;; CHECK:      (func $use-covariant (type $4) (param $o1 (ref null $ObjRoot)) (param $o2 (ref null $ObjSub2)) (param $vn (ref null $VtRoot)) (result (ref null $VtRoot))
+  ;; CHECK:      (func $use-covariant (type $9) (param $o1 (ref null $ObjRoot)) (param $o2 (ref null $ObjSub2)) (param $vn (ref null $VtRoot)) (result (ref null $VtRoot))
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (struct.get $ObjRoot 0
   ;; CHECK-NEXT:    (local.get $o1)
@@ -201,9 +211,16 @@
     )
   )
 
-  ;; CHECK:      (func $entry2 (type $5)
+  ;; CHECK:      (func $entry2 (type $10)
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (call $use-covariant
+  ;; CHECK-NEXT:    (ref.null none)
+  ;; CHECK-NEXT:    (ref.null none)
+  ;; CHECK-NEXT:    (ref.null none)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $copy-fields
   ;; CHECK-NEXT:    (ref.null none)
   ;; CHECK-NEXT:    (ref.null none)
   ;; CHECK-NEXT:    (ref.null none)
@@ -216,6 +233,75 @@
         (ref.null none)
         (ref.null none)
         (ref.null none)
+      )
+    )
+    (drop
+      (call $copy-fields
+        (ref.null none)
+        (ref.null none)
+        (ref.null none)
+      )
+    )
+  )
+
+  ;; Self-copy and mutual-copy non-nullable fields relax to nullable when no
+  ;; external consumer requires non-null.
+  (rec
+    (type $Payload (struct (field i32)))
+    (type $SelfCopy (struct (field (mut (ref $Payload)))))
+    (type $MutualA (struct (field (ref $Payload))))
+    (type $MutualB (struct (field (mut (ref $Payload)))))
+  )
+
+  ;; CHECK:      (func $copy-fields (type $5) (param $s (ref null $SelfCopy)) (param $a (ref null $MutualA)) (param $b (ref null $MutualB)) (result i32)
+  ;; CHECK-NEXT:  (struct.set $SelfCopy 0
+  ;; CHECK-NEXT:   (local.get $s)
+  ;; CHECK-NEXT:   (struct.get $SelfCopy 0
+  ;; CHECK-NEXT:    (local.get $s)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (struct.set $MutualB 0
+  ;; CHECK-NEXT:   (local.get $b)
+  ;; CHECK-NEXT:   (struct.get $MutualA 0
+  ;; CHECK-NEXT:    (local.get $a)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (struct.new $MutualA
+  ;; CHECK-NEXT:    (struct.get $MutualB 0
+  ;; CHECK-NEXT:     (local.get $b)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (struct.get $Payload 0
+  ;; CHECK-NEXT:   (struct.get $SelfCopy 0
+  ;; CHECK-NEXT:    (local.get $s)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $copy-fields (param $s (ref null $SelfCopy)) (param $a (ref null $MutualA)) (param $b (ref null $MutualB)) (result i32)
+    (struct.set $SelfCopy 0
+      (local.get $s)
+      (struct.get $SelfCopy 0
+        (local.get $s)
+      )
+    )
+    (struct.set $MutualB 0
+      (local.get $b)
+      (struct.get $MutualA 0
+        (local.get $a)
+      )
+    )
+    (drop
+      (struct.new $MutualA
+        (struct.get $MutualB 0
+          (local.get $b)
+        )
+      )
+    )
+    (struct.get $Payload 0
+      (struct.get $SelfCopy 0
+        (local.get $s)
       )
     )
   )

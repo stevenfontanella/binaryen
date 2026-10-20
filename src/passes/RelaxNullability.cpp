@@ -607,9 +607,21 @@ struct DemandAnalyzer : public ChildTyper<DemandAnalyzer> {
           tailReq = reqHT ? *reqHT : block->type.getHeapType();
           tailNull = reqHT ? acceptsNull : block->type.isNullable();
         }
-        if (block->name.is()) {
+      }
+      std::optional<HeapType> prevLabelType;
+      bool prevLabelNull = false;
+      if (block->name.is()) {
+        auto it = labelTypes.find(block->name);
+        if (it != labelTypes.end()) {
+          prevLabelType = it->second;
+          prevLabelNull = labelAcceptsNull[block->name];
+        }
+        if (tailReq) {
           labelTypes[block->name] = *tailReq;
           labelAcceptsNull[block->name] = tailNull;
+        } else {
+          labelTypes.erase(block->name);
+          labelAcceptsNull.erase(block->name);
         }
       }
       for (size_t i = 0; i + 1 < block->list.size(); ++i) {
@@ -617,9 +629,18 @@ struct DemandAnalyzer : public ChildTyper<DemandAnalyzer> {
       }
       if (!block->type.isRef()) {
         walk(block->list.back(), std::nullopt, false);
-        return;
+      } else {
+        walk(block->list.back(), tailReq, tailNull);
       }
-      walk(block->list.back(), tailReq, tailNull);
+      if (block->name.is()) {
+        if (prevLabelType) {
+          labelTypes[block->name] = *prevLabelType;
+          labelAcceptsNull[block->name] = prevLabelNull;
+        } else {
+          labelTypes.erase(block->name);
+          labelAcceptsNull.erase(block->name);
+        }
+      }
       return;
     }
     if (auto* iff = curr->dynCast<If>()) {
@@ -731,13 +752,37 @@ struct DemandAnalyzer : public ChildTyper<DemandAnalyzer> {
              brOn->desc->type.isRef()
                ? std::optional<HeapType>(brOn->desc->type.getHeapType())
                : std::nullopt,
-             false);
+             brOn->desc->type.isNullable());
       }
-      walk(brOn->ref,
-           brOn->ref->type.isRef()
-             ? std::optional<HeapType>(brOn->ref->type.getHeapType())
-             : std::nullopt,
-           false);
+      if (!brOn->ref->type.isRef()) {
+        walk(brOn->ref, std::nullopt, false);
+        return;
+      }
+      std::optional<HeapType> refReq = brOn->ref->type.getHeapType();
+      bool refNull = brOn->ref->type.isNullable();
+      if (brOn->op == BrOnNull) {
+        if (!brOn->ref->type.isExact() && reqHT) {
+          refReq = reqHT;
+        }
+        refNull = true;
+      } else if (brOn->op == BrOnNonNull) {
+        if (!brOn->ref->type.isExact()) {
+          if (auto it = labelTypes.find(brOn->name); it != labelTypes.end()) {
+            refReq = it->second;
+          }
+        }
+        refNull = true;
+      } else if (!brOn->desc && !brOn->ref->type.isExact()) {
+        if (brOn->op == BrOnCast) {
+          refNull = refNull || brOn->castType.isNullable() || acceptsNull;
+        } else if (brOn->op == BrOnCastFail) {
+          auto it = labelAcceptsNull.find(brOn->name);
+          bool targetNull = it != labelAcceptsNull.end() && it->second;
+          refNull = refNull || (brOn->castType.isNullable() ? acceptsNull
+                                                            : targetNull);
+        }
+      }
+      walk(brOn->ref, refReq, refNull);
       return;
     }
     if (auto* sel = curr->dynCast<Select>()) {
@@ -799,17 +844,19 @@ struct FunctionRelaxer
         struct BranchFinder : public PostWalker<BranchFinder> {
           Name target;
           bool canModify = true;
+          std::vector<Break*> allBreaks;
+          std::unordered_set<Break*> droppedBreaks;
           std::vector<Break*> breaks;
+          std::vector<BrOn*> brOnNonNulls;
           void visitBreak(Break* curr) {
             if (curr->name == target) {
-              if (!curr->value) {
-                canModify = false;
-              } else if (curr->condition) {
-                if (!curr->value->type.isNull()) {
-                  canModify = false;
-                }
-              } else {
-                breaks.push_back(curr);
+              allBreaks.push_back(curr);
+            }
+          }
+          void visitDrop(Drop* curr) {
+            if (auto* br = curr->value->dynCast<Break>()) {
+              if (br->name == target && br->value) {
+                droppedBreaks.insert(br);
               }
             }
           }
@@ -827,12 +874,26 @@ struct FunctionRelaxer
           }
           void visitBrOn(BrOn* curr) {
             if (curr->name == target) {
+              if (curr->op == BrOnNonNull) {
+                brOnNonNulls.push_back(curr);
+              }
               canModify = false;
             }
           }
         } finder;
         finder.target = block->name;
         finder.walk(*exprp);
+        for (auto* br : finder.allBreaks) {
+          if (!br->value) {
+            finder.canModify = false;
+          } else if (br->condition && !finder.droppedBreaks.count(br)) {
+            if (!br->value->type.isNull()) {
+              finder.canModify = false;
+            }
+          } else {
+            finder.breaks.push_back(br);
+          }
+        }
         Nullability armNull =
           demanded.isNullable() ? Nullable : block->type.getNullability();
         Type armDemanded(demanded.getHeapType(), armNull);
@@ -843,8 +904,21 @@ struct FunctionRelaxer
         }
         for (auto* br : finder.breaks) {
           if (br->value->type.isRef()) {
-            anyChanged |= stripTrailingCasts(
-              &br->value, armDemanded, stripRefAs && armNull == Nullable);
+            if (stripTrailingCasts(
+                  &br->value, armDemanded, stripRefAs && armNull == Nullable)) {
+              br->finalize();
+              anyChanged = true;
+            }
+          }
+        }
+        for (auto* brOn : finder.brOnNonNulls) {
+          if (brOn->ref->type.isRef()) {
+            if (stripTrailingCasts(&brOn->ref,
+                                   Type(armDemanded.getHeapType(), Nullable),
+                                   true)) {
+              brOn->finalize();
+              anyChanged = true;
+            }
           }
         }
         if (anyChanged) {
@@ -925,12 +999,28 @@ struct FunctionRelaxer
                   }
                 }
               }
+              for (auto* br : finder.breaks) {
+                br->finalize();
+              }
               block->finalize();
               *exprp = Builder(*getModule())
                          .makeRefCast(*exprp, Type(blockHT, outerNull));
               return true;
             }
           }
+        }
+        return false;
+      }
+    }
+    if (auto* loop = (*exprp)->dynCast<Loop>()) {
+      if (loop->type.isRef() && !loop->type.isExact()) {
+        Nullability armNull =
+          demanded.isNullable() ? Nullable : loop->type.getNullability();
+        Type armDemanded(demanded.getHeapType(), armNull);
+        if (stripTrailingCasts(
+              &loop->body, armDemanded, stripRefAs && armNull == Nullable)) {
+          loop->finalize();
+          return true;
         }
         return false;
       }
@@ -962,6 +1052,17 @@ struct FunctionRelaxer
           &sel->ifFalse, armDemanded, stripRefAs && armNull == Nullable);
         if (c1 || c2) {
           sel->finalize();
+          return true;
+        }
+        return false;
+      }
+    }
+    if (auto* brOn = (*exprp)->dynCast<BrOn>()) {
+      if (brOn->op == BrOnNull && brOn->type.isRef() &&
+          !brOn->type.isExact()) {
+        if (stripTrailingCasts(
+              &brOn->ref, Type(demanded.getHeapType(), Nullable), true)) {
+          brOn->finalize();
           return true;
         }
         return false;
@@ -1758,12 +1859,35 @@ void scanFunctionConsumers(Module& wasm,
     FuncConsumerSummary& out;
     decltype(recordChild)& record;
     std::unordered_set<Expression*> handled;
+    std::vector<Block*> blockStack;
 
     Scanner(Module& wasm,
             Function* func,
             FuncConsumerSummary& out,
             decltype(recordChild)& record)
       : wasm(wasm), func(func), out(out), record(record) {}
+
+    static void doEnterBlock(Scanner* self, Expression** currp) {
+      self->blockStack.push_back((*currp)->cast<Block>());
+    }
+
+    static void scan(Scanner* self, Expression** currp) {
+      PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>>::scan(self, currp);
+      if (auto* block = (*currp)->dynCast<Block>()) {
+        if (block->name.is()) {
+          self->pushTask(Scanner::doEnterBlock, currp);
+        }
+      }
+    }
+
+    Type getTargetBlockType(Name name) const {
+      for (auto it = blockStack.rbegin(); it != blockStack.rend(); ++it) {
+        if ((*it)->name == name) {
+          return (*it)->type;
+        }
+      }
+      return Type::none;
+    }
 
     void markAndRecord(Expression** childp,
                        bool isFixed,
@@ -1780,6 +1904,14 @@ void scanFunctionConsumers(Module& wasm,
       Expression* curr = *childp;
       if (handled.count(curr)) {
         return;
+      }
+      if (auto* brOn = curr->dynCast<BrOn>()) {
+        if (brOn->op == BrOnNull && brOn->ref->type.isRef() &&
+            !brOn->ref->type.isExact()) {
+          handled.insert(brOn);
+          markAndRecord(&brOn->ref, isFixed, false, accHT, Nullable);
+          return;
+        }
       }
       if (auto* iff = curr->dynCast<If>()) {
         if (iff->ifFalse && iff->type.isRef()) {
@@ -1835,12 +1967,91 @@ void scanFunctionConsumers(Module& wasm,
           }
         }
       } else if (auto* drop = curr->dynCast<Drop>()) {
-        if (drop->value->type.isRef()) {
+        if (auto* br = drop->value->dynCast<Break>()) {
+          if (br->condition && br->value && br->value->type.isRef()) {
+            if (Type bt = getTargetBlockType(br->name);
+                bt.isRef() && !bt.isExact()) {
+              markAndRecord(
+                &br->value, true, false, bt.getHeapType(), bt.getNullability());
+            }
+          }
+        } else if (drop->value->type.isRef()) {
           markAndRecord(&drop->value,
                         true,
                         false,
                         drop->value->type.getHeapType().getTop(),
                         Nullable);
+        }
+      } else if (auto* block = curr->dynCast<Block>()) {
+        if (block->name.is()) {
+          blockStack.pop_back();
+        }
+        if (!block->list.empty() && block->type.isRef() &&
+            !block->type.isExact() && block->list.back()->type.isRef()) {
+          markAndRecord(&block->list.back(),
+                        true,
+                        false,
+                        block->type.getHeapType(),
+                        block->type.getNullability());
+        }
+      } else if (auto* br = curr->dynCast<Break>()) {
+        if (!br->condition && br->value && br->value->type.isRef()) {
+          if (Type bt = getTargetBlockType(br->name);
+              bt.isRef() && !bt.isExact()) {
+            markAndRecord(
+              &br->value, true, false, bt.getHeapType(), bt.getNullability());
+          }
+        }
+      } else if (auto* brOn = curr->dynCast<BrOn>()) {
+        if (brOn->op == BrOnNonNull && brOn->ref->type.isRef() &&
+            !brOn->ref->type.isExact()) {
+          if (Type bt = getTargetBlockType(brOn->name);
+              bt.isRef() && !bt.isExact()) {
+            markAndRecord(
+              &brOn->ref, true, false, bt.getHeapType(), Nullable);
+          }
+        }
+      } else if (auto* alen = curr->dynCast<ArrayLen>()) {
+        if (alen->ref->type.isRef()) {
+          markAndRecord(&alen->ref,
+                        true,
+                        false,
+                        HeapTypes::array.getBasic(
+                          alen->ref->type.getHeapType().getShared()),
+                        Nullable);
+        }
+      } else if (auto* aget = curr->dynCast<ArrayGet>()) {
+        if (aget->ref->type.isArray()) {
+          markAndRecord(
+            &aget->ref, true, false, aget->ref->type.getHeapType(), Nullable);
+        }
+      } else if (auto* aset = curr->dynCast<ArraySet>()) {
+        if (aset->ref->type.isArray()) {
+          HeapType arrHT = aset->ref->type.getHeapType();
+          markAndRecord(&aset->ref, true, false, arrHT, Nullable);
+          Type et = arrHT.getArray().element.type;
+          if (et.isRef() && !et.isExact()) {
+            markAndRecord(
+              &aset->value, true, false, et.getHeapType(), et.getNullability());
+          }
+        }
+      } else if (auto* anew = curr->dynCast<ArrayNew>()) {
+        if (!anew->isWithDefault() && anew->type.isArray()) {
+          Type et = anew->type.getHeapType().getArray().element.type;
+          if (et.isRef() && !et.isExact()) {
+            markAndRecord(
+              &anew->init, true, false, et.getHeapType(), et.getNullability());
+          }
+        }
+      } else if (auto* afixed = curr->dynCast<ArrayNewFixed>()) {
+        if (afixed->type.isArray()) {
+          Type et = afixed->type.getHeapType().getArray().element.type;
+          if (et.isRef() && !et.isExact()) {
+            for (auto& val : afixed->values) {
+              markAndRecord(
+                &val, true, false, et.getHeapType(), et.getNullability());
+            }
+          }
         }
       } else if (auto* isNull = curr->dynCast<RefIsNull>()) {
         if (isNull->value->type.isRef()) {
@@ -2272,6 +2483,8 @@ struct FuncFieldDemandSummary {
 struct FieldAndArrayDemandWalker
   : public ChildTyper<FieldAndArrayDemandWalker> {
   const std::unordered_set<Name>& pureGlobalCandidates;
+  const std::unordered_set<FieldKey, FieldKeyHash>& nullRelaxableFields;
+  const std::unordered_set<HeapType>& nullRelaxableArrays;
   FuncFieldDemandSummary& out;
   std::unordered_map<Name, HeapType> labelTypes;
   std::unordered_map<Name, bool> labelAcceptsNull;
@@ -2282,9 +2495,12 @@ struct FieldAndArrayDemandWalker
     Module& wasm,
     Function* func,
     const std::unordered_set<Name>& pureGlobalCandidates,
+    const std::unordered_set<FieldKey, FieldKeyHash>& nullRelaxableFields,
+    const std::unordered_set<HeapType>& nullRelaxableArrays,
     FuncFieldDemandSummary& out)
     : ChildTyper(wasm, func), pureGlobalCandidates(pureGlobalCandidates),
-      out(out) {
+      nullRelaxableFields(nullRelaxableFields),
+      nullRelaxableArrays(nullRelaxableArrays), out(out) {
     if (func) {
       auto results = func->getResults();
       if (results.isRef()) {
@@ -2293,6 +2509,32 @@ struct FieldAndArrayDemandWalker
       }
     }
   }
+
+  bool isNullRelaxableStructField(HeapType uHT, Index fi) const {
+    if (func == nullptr || !uHT.isStruct()) {
+      return false;
+    }
+    const auto& fields = uHT.getStruct().fields;
+    if (fi >= fields.size()) {
+      return false;
+    }
+    const auto& f = fields[fi];
+    if (f.isPacked() || !f.type.isRef() || f.type.isExact() ||
+        f.type.isNull()) {
+      return false;
+    }
+    FieldKey key = f.mutable_ == Mutable
+                     ? FieldKey{getHighestFieldAncestor(uHT, fi), fi}
+                     : FieldKey{uHT, fi};
+    return nullRelaxableFields.count(key) != 0;
+  }
+
+  bool isNullRelaxableArrayElem(HeapType arrHT) const {
+    return func != nullptr && arrHT.isArray() &&
+           nullRelaxableArrays.count(arrHT) != 0;
+  }
+
+  using ChildTyper<FieldAndArrayDemandWalker>::note;
 
   void note(Expression** childp, Constraints constraints) {
     auto* child = *childp;
@@ -2336,15 +2578,108 @@ struct FieldAndArrayDemandWalker
 
   void noteUnknown() {}
 
+  void visitStructNew(StructNew* curr) {
+    if (!curr->type.isStruct()) {
+      return;
+    }
+    HeapType uHT = curr->type.getHeapType();
+    if (!curr->isWithDefault()) {
+      const auto& fields = uHT.getStruct().fields;
+      assert(fields.size() == curr->operands.size());
+      for (size_t i = 0; i < fields.size(); ++i) {
+        Type ft = fields[i].type;
+        if (isNullRelaxableStructField(uHT, i)) {
+          ft = Type(ft.getHeapType(), Nullable);
+        }
+        note(&curr->operands[i], ft);
+      }
+    }
+    if (auto desc = uHT.getDescriptorType()) {
+      note(&curr->desc, Type(*desc, NonNullable, Exact));
+    }
+  }
+
   void visitStructSet(StructSet* curr) {
     if (!curr->ref->type.isStruct()) {
       walk(curr->ref, std::nullopt, false);
       walk(curr->value, std::nullopt, false);
       return;
     }
-    auto anc =
-      getHighestDefiningAncestor(curr->ref->type.getHeapType(), curr->index);
-    ChildTyper<FieldAndArrayDemandWalker>::visitStructSet(curr, anc);
+    HeapType uHT = curr->ref->type.getHeapType();
+    auto anc = getHighestDefiningAncestor(uHT, curr->index);
+    const auto& fields = anc.getStruct().fields;
+    assert(curr->index < fields.size());
+    note(&curr->ref, Type(anc, Nullable));
+    Type ft = fields[curr->index].type;
+    if (isNullRelaxableStructField(uHT, curr->index)) {
+      ft = Type(ft.getHeapType(), Nullable);
+    }
+    note(&curr->value, ft);
+  }
+
+  void visitArrayNew(ArrayNew* curr) {
+    if (!curr->isWithDefault()) {
+      if (!curr->type.isArray()) {
+        return;
+      }
+      HeapType arrHT = curr->type.getHeapType();
+      Type et = arrHT.getArray().element.type;
+      if (isNullRelaxableArrayElem(arrHT)) {
+        et = Type(et.getHeapType(), Nullable);
+      }
+      note(&curr->init, et);
+    }
+    note(&curr->size, Type::i32);
+  }
+
+  void visitArrayNewFixed(ArrayNewFixed* curr) {
+    if (!curr->type.isArray()) {
+      return;
+    }
+    HeapType arrHT = curr->type.getHeapType();
+    Type et = arrHT.getArray().element.type;
+    if (isNullRelaxableArrayElem(arrHT)) {
+      et = Type(et.getHeapType(), Nullable);
+    }
+    for (auto& expr : curr->values) {
+      note(&expr, et);
+    }
+  }
+
+  void visitArraySet(ArraySet* curr) {
+    if (!curr->ref->type.isArray()) {
+      walk(curr->ref, std::nullopt, false);
+      walk(curr->index, std::nullopt, false);
+      walk(curr->value, std::nullopt, false);
+      return;
+    }
+    HeapType arrHT = curr->ref->type.getHeapType();
+    Type et = arrHT.getArray().element.type;
+    if (isNullRelaxableArrayElem(arrHT)) {
+      et = Type(et.getHeapType(), Nullable);
+    }
+    note(&curr->ref, Type(arrHT, Nullable));
+    note(&curr->index, Type::i32);
+    note(&curr->value, et);
+  }
+
+  void visitArrayFill(ArrayFill* curr) {
+    if (!curr->ref->type.isArray()) {
+      walk(curr->ref, std::nullopt, false);
+      walk(curr->index, std::nullopt, false);
+      walk(curr->value, std::nullopt, false);
+      walk(curr->size, std::nullopt, false);
+      return;
+    }
+    HeapType arrHT = curr->ref->type.getHeapType();
+    Type et = arrHT.getArray().element.type;
+    if (isNullRelaxableArrayElem(arrHT)) {
+      et = Type(et.getHeapType(), Nullable);
+    }
+    note(&curr->ref, Type(arrHT, Nullable));
+    note(&curr->index, Type::i32);
+    note(&curr->value, et);
+    note(&curr->size, Type::i32);
   }
 
   void visitRefIsNull(RefIsNull* curr) {
@@ -2631,9 +2966,21 @@ struct FieldAndArrayDemandWalker
           tailReq = reqHT ? *reqHT : block->type.getHeapType();
           tailNull = reqHT ? acceptsNull : block->type.isNullable();
         }
-        if (block->name.is()) {
+      }
+      std::optional<HeapType> prevLabelType;
+      bool prevLabelNull = false;
+      if (block->name.is()) {
+        auto it = labelTypes.find(block->name);
+        if (it != labelTypes.end()) {
+          prevLabelType = it->second;
+          prevLabelNull = labelAcceptsNull[block->name];
+        }
+        if (tailReq) {
           labelTypes[block->name] = *tailReq;
           labelAcceptsNull[block->name] = tailNull;
+        } else {
+          labelTypes.erase(block->name);
+          labelAcceptsNull.erase(block->name);
         }
       }
       for (size_t i = 0; i + 1 < block->list.size(); ++i) {
@@ -2641,9 +2988,18 @@ struct FieldAndArrayDemandWalker
       }
       if (!block->type.isRef()) {
         walk(block->list.back(), std::nullopt, false);
-        return;
+      } else {
+        walk(block->list.back(), tailReq, tailNull);
       }
-      walk(block->list.back(), tailReq, tailNull);
+      if (block->name.is()) {
+        if (prevLabelType) {
+          labelTypes[block->name] = *prevLabelType;
+          labelAcceptsNull[block->name] = prevLabelNull;
+        } else {
+          labelTypes.erase(block->name);
+          labelAcceptsNull.erase(block->name);
+        }
+      }
       return;
     }
     if (auto* iff = curr->dynCast<If>()) {
@@ -2760,13 +3116,37 @@ struct FieldAndArrayDemandWalker
              brOn->desc->type.isRef()
                ? std::optional<HeapType>(brOn->desc->type.getHeapType())
                : std::nullopt,
-             false);
+             brOn->desc->type.isNullable());
       }
-      walk(brOn->ref,
-           brOn->ref->type.isRef()
-             ? std::optional<HeapType>(brOn->ref->type.getHeapType())
-             : std::nullopt,
-           false);
+      if (!brOn->ref->type.isRef()) {
+        walk(brOn->ref, std::nullopt, false);
+        return;
+      }
+      std::optional<HeapType> refReq = brOn->ref->type.getHeapType();
+      bool refNull = brOn->ref->type.isNullable();
+      if (brOn->op == BrOnNull) {
+        if (!brOn->ref->type.isExact() && reqHT) {
+          refReq = reqHT;
+        }
+        refNull = true;
+      } else if (brOn->op == BrOnNonNull) {
+        if (!brOn->ref->type.isExact()) {
+          if (auto it = labelTypes.find(brOn->name); it != labelTypes.end()) {
+            refReq = it->second;
+          }
+        }
+        refNull = true;
+      } else if (!brOn->desc && !brOn->ref->type.isExact()) {
+        if (brOn->op == BrOnCast) {
+          refNull = refNull || brOn->castType.isNullable() || acceptsNull;
+        } else if (brOn->op == BrOnCastFail) {
+          auto it = labelAcceptsNull.find(brOn->name);
+          bool targetNull = it != labelAcceptsNull.end() && it->second;
+          refNull = refNull || (brOn->castType.isNullable() ? acceptsNull
+                                                            : targetNull);
+        }
+      }
+      walk(brOn->ref, refReq, refNull);
       return;
     }
     if (auto* sel = curr->dynCast<Select>()) {
@@ -4035,6 +4415,7 @@ struct RelaxNullability : public Pass {
 
     std::unordered_map<FieldKey, FieldDemandState, FieldKeyHash>
       fieldCandidates;
+    std::unordered_set<FieldKey, FieldKeyHash> nullRelaxableFields;
     bool hasImmCandidate = false;
     for (auto A : allTypes) {
       if (!A.isStruct()) {
@@ -4047,6 +4428,9 @@ struct RelaxNullability : public Pass {
             !fixed.count(A) && !A.isShared() && !A.getDescriptorType() &&
             !A.getDescribedType()) {
           hasImmCandidate = true;
+          if (!aFields[fi].type.isNullable() && !aFields[fi].type.isNull()) {
+            nullRelaxableFields.insert(FieldKey{A, fi});
+          }
           continue;
         }
         if (aFields[fi].mutable_ != Mutable ||
@@ -4086,11 +4470,15 @@ struct RelaxNullability : public Pass {
           fieldCandidates.emplace(
             FieldKey{A, fi},
             FieldDemandState{baseHT, baseHT.getTop(), true, true, false});
+          if (!aFields[fi].type.isNullable()) {
+            nullRelaxableFields.insert(FieldKey{A, fi});
+          }
         }
       }
     }
 
     std::unordered_map<HeapType, FieldDemandState> arrayCandidates;
+    std::unordered_set<HeapType> nullRelaxableArrays;
     for (auto arrHT : allTypes) {
       if (!arrHT.isArray() || fixed.count(arrHT) || arrHT.isShared() ||
           arrHT.getDescriptorType() || arrHT.getDescribedType()) {
@@ -4108,6 +4496,9 @@ struct RelaxNullability : public Pass {
       HeapType baseHT = elem.type.getHeapType();
       arrayCandidates.emplace(
         arrHT, FieldDemandState{baseHT, baseHT.getTop(), true, true, false});
+      if (!elem.type.isNullable()) {
+        nullRelaxableArrays.insert(arrHT);
+      }
     }
 
     if (fieldCandidates.empty() && !hasImmCandidate && arrayCandidates.empty()) {
@@ -4138,236 +4529,300 @@ struct RelaxNullability : public Pass {
       }
     }
 
-    ModuleUtils::ParallelFunctionAnalysis<FuncFieldDemandSummary> summaries(
-      *module, [&](Function* func, FuncFieldDemandSummary& summary) {
-        if (!func->imported()) {
-          FieldAndArrayDemandWalker walker(
-            *module, func, pureGlobalCandidateSet, summary);
-          walker.walk(func->body, walker.bodyReq, walker.bodyAcceptsNull);
-        }
-      });
-
-    FuncFieldDemandSummary moduleRootSummary;
-    {
-      FieldAndArrayDemandWalker rootWalker(
-        *module, nullptr, pureGlobalCandidateSet, moduleRootSummary);
-      for (auto& g : module->globals) {
-        if (!g->imported() && g->init) {
-          rootWalker.walk(g->init,
-                          g->type.isRef()
-                            ? std::optional<HeapType>(g->type.getHeapType())
-                            : std::nullopt,
-                          g->type.isRef() && !g->type.isExact() &&
-                            g->type.isNullable());
-        }
-      }
-      for (auto& seg : module->elementSegments) {
-        for (auto* expr : seg->data) {
-          rootWalker.walk(expr,
-                          seg->type.isRef()
-                            ? std::optional<HeapType>(seg->type.getHeapType())
-                            : std::nullopt,
-                          seg->type.isRef() && !seg->type.isExact() &&
-                            seg->type.isNullable());
-        }
-      }
-    }
-
-    std::unordered_map<FieldKey,
-                       std::vector<std::pair<HeapType, bool>>,
-                       FieldKeyHash>
-      immFieldDemands;
-    std::unordered_map<Name, Index> totalGlobalGets;
-    std::unordered_map<Name, Index> validArrayGlobalGets;
-    auto mergeSummary = [&](const FuncFieldDemandSummary& sum) {
-      for (const auto& k : sum.pinnedFields) {
-        if (auto it = fieldCandidates.find(k); it != fieldCandidates.end()) {
-          it->second.pin();
-        }
-      }
-      for (const auto& r : sum.fieldReqs) {
-        if (auto it = fieldCandidates.find(r.key);
-            it != fieldCandidates.end()) {
-          it->second.require(r.reqHT, r.reqNull);
-        }
-      }
-      for (const auto& r : sum.immFieldReqs) {
-        immFieldDemands[r.key].push_back({r.reqHT, r.reqNull});
-      }
-      for (const auto& arrHT : sum.pinnedArrays) {
-        if (auto it = arrayCandidates.find(arrHT);
-            it != arrayCandidates.end()) {
-          it->second.pin();
-        }
-      }
-      for (const auto& r : sum.arrayReqs) {
-        if (auto it = arrayCandidates.find(r.arrHT);
-            it != arrayCandidates.end()) {
-          it->second.require(r.reqHT, r.reqNull);
-        }
-      }
-      for (const auto& r : sum.pureGlobalReqs) {
-        if (auto it = pureGlobalCandidates.find(r.name);
-            it != pureGlobalCandidates.end()) {
-          it->second.require(r.reqHT, r.reqNull);
-        }
-      }
-      for (const auto& [name, count] : sum.totalGlobalGets) {
-        totalGlobalGets[name] += count;
-      }
-      for (const auto& [name, count] : sum.validArrayGlobalGets) {
-        validArrayGlobalGets[name] += count;
-      }
-    };
-
-    for (auto& fn : module->functions) {
-      if (!fn->imported()) {
-        mergeSummary(summaries.map[fn.get()]);
-      }
-    }
-    mergeSummary(moduleRootSummary);
-
-    for (const auto& [gName, gState] : pureGlobalCandidates) {
-      HeapType arrHT = module->getGlobal(gName)->type.getHeapType();
-      if (auto it = arrayCandidates.find(arrHT); it != arrayCandidates.end()) {
-        if (validArrayGlobalGets[gName] > 0) {
-          it->second.mergeIn(gState);
-        }
-      }
-    }
-
     using StructUpdateMap =
       std::unordered_map<HeapType, std::vector<std::pair<Index, Type>>>;
     using ArrayUpdateMap = std::unordered_map<HeapType, Type>;
     StructUpdateMap structUpdates;
     ArrayUpdateMap arrayUpdates;
+    std::unordered_map<Name, Index> totalGlobalGets;
+    std::unordered_map<Name, Index> validArrayGlobalGets;
 
-    for (const auto& [key, state] : fieldCandidates) {
-      if (state.pinned) {
-        continue;
+    while (true) {
+      for (auto& [_, state] : fieldCandidates) {
+        state = FieldDemandState{
+          state.baseHT, state.baseHT.getTop(), true, true, false};
       }
-      const auto& family = subTypes.getSubTypes(key.anc);
-      Type aOldFT = key.anc.getStruct().fields[key.index].type;
-      bool canUnifyToAllowed =
-        state.canWidenHT && (state.acceptsNull || !aOldFT.isNullable());
-      for (auto U : family) {
-        Type oldFT = U.getStruct().fields[key.index].type;
-        Nullability newNull =
-          (oldFT.isNullable() || state.acceptsNull) ? Nullable : NonNullable;
-        HeapType newHT =
-          canUnifyToAllowed ? state.allowedHT : oldFT.getHeapType();
-        Type newFT(newHT, newNull);
-        if (newFT != oldFT) {
-          structUpdates[U].push_back({key.index, newFT});
+      for (auto& [_, state] : arrayCandidates) {
+        state = FieldDemandState{
+          state.baseHT, state.baseHT.getTop(), true, true, false};
+      }
+      for (auto& [_, state] : pureGlobalCandidates) {
+        state = FieldDemandState{
+          state.baseHT, state.baseHT.getTop(), true, true, false};
+      }
+      structUpdates.clear();
+      arrayUpdates.clear();
+      totalGlobalGets.clear();
+      validArrayGlobalGets.clear();
+
+      ModuleUtils::ParallelFunctionAnalysis<FuncFieldDemandSummary> summaries(
+        *module, [&](Function* func, FuncFieldDemandSummary& summary) {
+          if (!func->imported()) {
+            FieldAndArrayDemandWalker walker(*module,
+                                             func,
+                                             pureGlobalCandidateSet,
+                                             nullRelaxableFields,
+                                             nullRelaxableArrays,
+                                             summary);
+            walker.walk(func->body, walker.bodyReq, walker.bodyAcceptsNull);
+          }
+        });
+
+      FuncFieldDemandSummary moduleRootSummary;
+      {
+        FieldAndArrayDemandWalker rootWalker(*module,
+                                             nullptr,
+                                             pureGlobalCandidateSet,
+                                             nullRelaxableFields,
+                                             nullRelaxableArrays,
+                                             moduleRootSummary);
+        for (auto& g : module->globals) {
+          if (!g->imported() && g->init) {
+            rootWalker.walk(g->init,
+                            g->type.isRef()
+                              ? std::optional<HeapType>(g->type.getHeapType())
+                              : std::nullopt,
+                            g->type.isRef() && !g->type.isExact() &&
+                              g->type.isNullable());
+          }
+        }
+        for (auto& seg : module->elementSegments) {
+          for (auto* expr : seg->data) {
+            rootWalker.walk(expr,
+                            seg->type.isRef()
+                              ? std::optional<HeapType>(seg->type.getHeapType())
+                              : std::nullopt,
+                            seg->type.isRef() && !seg->type.isExact() &&
+                              seg->type.isNullable());
+          }
         }
       }
-    }
 
-    if (hasImmCandidate) {
-      std::unordered_map<FieldKey, Type, FieldKeyHash> finalImmFieldTypes;
-      auto subTypesFirst = subTypes.getSubTypesFirstSort();
-      for (auto it = subTypesFirst.rbegin(); it != subTypesFirst.rend(); ++it) {
-        auto U = *it;
-        if (!U.isStruct()) {
+      std::unordered_map<FieldKey,
+                         std::vector<std::pair<HeapType, bool>>,
+                         FieldKeyHash>
+        immFieldDemands;
+      auto mergeSummary = [&](const FuncFieldDemandSummary& sum) {
+        for (const auto& k : sum.pinnedFields) {
+          if (auto it = fieldCandidates.find(k); it != fieldCandidates.end()) {
+            it->second.pin();
+          }
+        }
+        for (const auto& r : sum.fieldReqs) {
+          if (auto it = fieldCandidates.find(r.key);
+              it != fieldCandidates.end()) {
+            it->second.require(r.reqHT, r.reqNull);
+          }
+        }
+        for (const auto& r : sum.immFieldReqs) {
+          immFieldDemands[r.key].push_back({r.reqHT, r.reqNull});
+        }
+        for (const auto& arrHT : sum.pinnedArrays) {
+          if (auto it = arrayCandidates.find(arrHT);
+              it != arrayCandidates.end()) {
+            it->second.pin();
+          }
+        }
+        for (const auto& r : sum.arrayReqs) {
+          if (auto it = arrayCandidates.find(r.arrHT);
+              it != arrayCandidates.end()) {
+            it->second.require(r.reqHT, r.reqNull);
+          }
+        }
+        for (const auto& r : sum.pureGlobalReqs) {
+          if (auto it = pureGlobalCandidates.find(r.name);
+              it != pureGlobalCandidates.end()) {
+            it->second.require(r.reqHT, r.reqNull);
+          }
+        }
+        for (const auto& [name, count] : sum.totalGlobalGets) {
+          totalGlobalGets[name] += count;
+        }
+        for (const auto& [name, count] : sum.validArrayGlobalGets) {
+          validArrayGlobalGets[name] += count;
+        }
+      };
+
+      for (auto& fn : module->functions) {
+        if (!fn->imported()) {
+          mergeSummary(summaries.map[fn.get()]);
+        }
+      }
+      mergeSummary(moduleRootSummary);
+
+      for (const auto& [gName, gState] : pureGlobalCandidates) {
+        HeapType arrHT = module->getGlobal(gName)->type.getHeapType();
+        if (auto it = arrayCandidates.find(arrHT);
+            it != arrayCandidates.end()) {
+          if (validArrayGlobalGets[gName] > 0) {
+            it->second.mergeIn(gState);
+          }
+        }
+      }
+
+      for (const auto& [key, state] : fieldCandidates) {
+        if (state.pinned) {
           continue;
         }
-        const auto& uFields = U.getStruct().fields;
-        auto super = U.getDeclaredSuperType();
-        bool uFixed = fixed.count(U) || U.isShared() || U.getDescriptorType() ||
-                      U.getDescribedType();
-        for (Index fi = 0; fi < uFields.size(); ++fi) {
-          const auto& f = uFields[fi];
-          if (f.mutable_ != Immutable || f.isPacked() || !f.type.isRef()) {
-            continue;
-          }
-          Type oldFT = f.type;
-          if (uFixed || oldFT.isExact()) {
-            finalImmFieldTypes[FieldKey{U, fi}] = oldFT;
-            continue;
-          }
-          bool hasParentField =
-            super && super->isStruct() && fi < super->getStruct().fields.size();
-          Type boundFT = oldFT;
-          if (hasParentField) {
-            auto pIt = finalImmFieldTypes.find(FieldKey{*super, fi});
-            boundFT = pIt != finalImmFieldTypes.end()
-                        ? pIt->second
-                        : super->getStruct().fields[fi].type;
-          } else if (!oldFT.isNull()) {
-            boundFT = Type(oldFT.getHeapType().getTop(), Nullable);
-          } else {
-            finalImmFieldTypes[FieldKey{U, fi}] = oldFT;
-            continue;
-          }
-          if (boundFT.isExact() || boundFT.isNull()) {
-            finalImmFieldTypes[FieldKey{U, fi}] = oldFT;
-            continue;
-          }
-          HeapType allowedHT = boundFT.getHeapType();
-          bool acceptsNull = boundFT.isNullable();
-          if (auto demIt = immFieldDemands.find(FieldKey{U, fi});
-              demIt != immFieldDemands.end()) {
-            for (const auto& [reqHT, reqNull] : demIt->second) {
-              if (!reqNull) {
-                acceptsNull = false;
-              }
-              if (HeapType::isSubType(allowedHT, reqHT)) {
-                continue;
-              }
-              if (oldFT.isNull()) {
-                if (HeapType::isSubType(reqHT, allowedHT) &&
-                    !reqHT.isBottom()) {
-                  allowedHT = reqHT;
-                } else {
-                  allowedHT = oldFT.getHeapType();
-                }
-              } else {
-                HeapType oldHT = oldFT.getHeapType();
-                if (HeapType::isSubType(reqHT, allowedHT) &&
-                    HeapType::isSubType(oldHT, reqHT)) {
-                  allowedHT = reqHT;
-                } else {
-                  allowedHT = tightenAncestor(
-                    oldHT,
-                    HeapType::isSubType(oldHT, allowedHT) ? allowedHT : oldHT,
-                    reqHT);
-                }
-              }
-            }
-          }
-          Type newFT = oldFT;
-          if (oldFT.isNull()) {
-            if (acceptsNull && !allowedHT.isBottom()) {
-              newFT = Type(allowedHT, Nullable);
-            }
-          } else {
-            Nullability newNull =
-              (oldFT.isNullable() || acceptsNull) ? Nullable : NonNullable;
-            newFT = Type(allowedHT, newNull);
-          }
-          if (!Type::isSubType(oldFT, newFT) ||
-              !Type::isSubType(newFT, boundFT)) {
-            newFT = oldFT;
-          }
-          finalImmFieldTypes[FieldKey{U, fi}] = newFT;
+        const auto& family = subTypes.getSubTypes(key.anc);
+        Type aOldFT = key.anc.getStruct().fields[key.index].type;
+        bool canUnifyToAllowed =
+          state.canWidenHT && (state.acceptsNull || !aOldFT.isNullable());
+        for (auto U : family) {
+          Type oldFT = U.getStruct().fields[key.index].type;
+          Nullability newNull =
+            (oldFT.isNullable() || state.acceptsNull) ? Nullable : NonNullable;
+          HeapType newHT =
+            canUnifyToAllowed ? state.allowedHT : oldFT.getHeapType();
+          Type newFT(newHT, newNull);
           if (newFT != oldFT) {
-            structUpdates[U].push_back({fi, newFT});
+            structUpdates[U].push_back({key.index, newFT});
           }
         }
       }
-    }
 
-    for (const auto& [arrHT, state] : arrayCandidates) {
-      if (state.pinned) {
-        continue;
+      std::unordered_map<FieldKey, Type, FieldKeyHash> finalImmFieldTypes;
+      if (hasImmCandidate) {
+        auto subTypesFirst = subTypes.getSubTypesFirstSort();
+        for (auto it = subTypesFirst.rbegin(); it != subTypesFirst.rend();
+             ++it) {
+          auto U = *it;
+          if (!U.isStruct()) {
+            continue;
+          }
+          const auto& uFields = U.getStruct().fields;
+          auto super = U.getDeclaredSuperType();
+          bool uFixed = fixed.count(U) || U.isShared() ||
+                        U.getDescriptorType() || U.getDescribedType();
+          for (Index fi = 0; fi < uFields.size(); ++fi) {
+            const auto& f = uFields[fi];
+            if (f.mutable_ != Immutable || f.isPacked() || !f.type.isRef()) {
+              continue;
+            }
+            Type oldFT = f.type;
+            if (uFixed || oldFT.isExact()) {
+              finalImmFieldTypes[FieldKey{U, fi}] = oldFT;
+              continue;
+            }
+            bool hasParentField = super && super->isStruct() &&
+                                  fi < super->getStruct().fields.size();
+            Type boundFT = oldFT;
+            if (hasParentField) {
+              auto pIt = finalImmFieldTypes.find(FieldKey{*super, fi});
+              boundFT = pIt != finalImmFieldTypes.end()
+                          ? pIt->second
+                          : super->getStruct().fields[fi].type;
+            } else if (!oldFT.isNull()) {
+              boundFT = Type(oldFT.getHeapType().getTop(), Nullable);
+            } else {
+              finalImmFieldTypes[FieldKey{U, fi}] = oldFT;
+              continue;
+            }
+            if (boundFT.isExact() || boundFT.isNull()) {
+              finalImmFieldTypes[FieldKey{U, fi}] = oldFT;
+              continue;
+            }
+            HeapType allowedHT = boundFT.getHeapType();
+            bool acceptsNull = boundFT.isNullable();
+            if (auto demIt = immFieldDemands.find(FieldKey{U, fi});
+                demIt != immFieldDemands.end()) {
+              for (const auto& [reqHT, reqNull] : demIt->second) {
+                if (!reqNull) {
+                  acceptsNull = false;
+                }
+                if (HeapType::isSubType(allowedHT, reqHT)) {
+                  continue;
+                }
+                if (oldFT.isNull()) {
+                  if (HeapType::isSubType(reqHT, allowedHT) &&
+                      !reqHT.isBottom()) {
+                    allowedHT = reqHT;
+                  } else {
+                    allowedHT = oldFT.getHeapType();
+                  }
+                } else {
+                  HeapType oldHT = oldFT.getHeapType();
+                  if (HeapType::isSubType(reqHT, allowedHT) &&
+                      HeapType::isSubType(oldHT, reqHT)) {
+                    allowedHT = reqHT;
+                  } else {
+                    allowedHT = tightenAncestor(
+                      oldHT,
+                      HeapType::isSubType(oldHT, allowedHT) ? allowedHT : oldHT,
+                      reqHT);
+                  }
+                }
+              }
+            }
+            Type newFT = oldFT;
+            if (oldFT.isNull()) {
+              if (acceptsNull && !allowedHT.isBottom()) {
+                newFT = Type(allowedHT, Nullable);
+              }
+            } else {
+              Nullability newNull =
+                (oldFT.isNullable() || acceptsNull) ? Nullable : NonNullable;
+              newFT = Type(allowedHT, newNull);
+            }
+            if (!Type::isSubType(oldFT, newFT) ||
+                !Type::isSubType(newFT, boundFT)) {
+              newFT = oldFT;
+            }
+            finalImmFieldTypes[FieldKey{U, fi}] = newFT;
+            if (newFT != oldFT) {
+              structUpdates[U].push_back({fi, newFT});
+            }
+          }
+        }
       }
-      Type oldET = arrHT.getArray().element.type;
-      Nullability newNull =
-        (oldET.isNullable() || state.acceptsNull) ? Nullable : NonNullable;
-      HeapType newHT = state.canWidenHT ? state.allowedHT : oldET.getHeapType();
-      Type newET(newHT, newNull);
-      if (newET != oldET) {
-        arrayUpdates[arrHT] = newET;
+
+      for (const auto& [arrHT, state] : arrayCandidates) {
+        if (state.pinned) {
+          continue;
+        }
+        Type oldET = arrHT.getArray().element.type;
+        Nullability newNull =
+          (oldET.isNullable() || state.acceptsNull) ? Nullable : NonNullable;
+        HeapType newHT =
+          state.canWidenHT ? state.allowedHT : oldET.getHeapType();
+        Type newET(newHT, newNull);
+        if (newET != oldET) {
+          arrayUpdates[arrHT] = newET;
+        }
+      }
+
+      bool shrunk = false;
+      for (auto it = nullRelaxableFields.begin();
+           it != nullRelaxableFields.end();) {
+        bool becameNullable = false;
+        if (auto fIt = fieldCandidates.find(*it);
+            fIt != fieldCandidates.end()) {
+          becameNullable = !fIt->second.pinned && fIt->second.acceptsNull;
+        } else if (auto iIt = finalImmFieldTypes.find(*it);
+                   iIt != finalImmFieldTypes.end()) {
+          becameNullable = iIt->second.isNullable();
+        }
+        if (!becameNullable) {
+          it = nullRelaxableFields.erase(it);
+          shrunk = true;
+        } else {
+          ++it;
+        }
+      }
+      for (auto it = nullRelaxableArrays.begin();
+           it != nullRelaxableArrays.end();) {
+        auto aIt = arrayCandidates.find(*it);
+        bool becameNullable = aIt != arrayCandidates.end() &&
+                              !aIt->second.pinned && aIt->second.acceptsNull;
+        if (!becameNullable) {
+          it = nullRelaxableArrays.erase(it);
+          shrunk = true;
+        } else {
+          ++it;
+        }
+      }
+      if (!shrunk) {
+        break;
       }
     }
 
@@ -4803,8 +5258,11 @@ struct RelaxNullability : public Pass {
         bool canRelaxRes =
           !escapedFuncs.count(func->name) ||
           (candidateSigSet.count(sigHT) && !pinnedResultSigs.count(sigHT));
-        if (canRelaxRes &&
-            (!callsTo[func.get()].empty() || !callRefsTo[sigHT].empty()) &&
+        bool hasResultConsumerOrUnreachableStub =
+          !callsTo[func.get()].empty() || !callRefsTo[sigHT].empty() ||
+          (func->body && func->body->is<Unreachable>() &&
+           escapedFuncs.count(func->name) && !sigUsedAsRef.count(sigHT));
+        if (canRelaxRes && hasResultConsumerOrUnreachableStub &&
             !hasReturnCall.count(func->name) && origRes.isRef() &&
             !origRes.isExact() && !origRes.isTuple()) {
           curFuncResultDemands[func.get()] = CallReturnDemand{
