@@ -183,7 +183,8 @@ struct DemandAnalyzer : public ChildTyper<DemandAnalyzer> {
     const FuncResultDemandMap* funcResultDemands = nullptr,
     const std::unordered_set<HeapType>* candidateSigSet = nullptr,
     std::unordered_map<Expression*, std::optional<HeapType>>* exprDemands =
-      nullptr)
+      nullptr,
+    bool allowTopForVars = false)
     : ChildTyper(wasm, func), sigParamHTs(sigParamHTs),
       funcParamHTs(funcParamHTs), funcResultDemands(funcResultDemands),
       candidateSigSet(candidateSigSet), useSigParamsForSet(useSigParamsForSet),
@@ -200,9 +201,13 @@ struct DemandAnalyzer : public ChildTyper<DemandAnalyzer> {
         HeapType ht = t.getHeapType();
         origHT[i] = ht;
         if ((allowParams || i >= numParams) && !t.isExact() &&
-            ht.getDeclaredSuperType()) {
+            (ht.getDeclaredSuperType() ||
+             (allowTopForVars && i >= numParams && ht.isStruct()))) {
           isCandidate[i] = true;
-          rootHT[i] = getRootAncestor(ht);
+          rootHT[i] =
+            (allowTopForVars && i >= numParams && !ht.getDeclaredSuperType())
+              ? ht.getTop()
+              : getRootAncestor(ht);
           curHT[i] = rootHT[i];
           nextHT[i] = rootHT[i];
         } else {
@@ -815,8 +820,10 @@ struct FunctionRelaxer
   : public WalkerPass<
       PostWalker<FunctionRelaxer, UnifiedExpressionVisitor<FunctionRelaxer>>> {
   bool widenTypes;
+  bool allowTopForVars;
 
-  FunctionRelaxer(bool widenTypes = true) : widenTypes(widenTypes) {}
+  FunctionRelaxer(bool widenTypes = true, bool allowTopForVars = false)
+    : widenTypes(widenTypes), allowTopForVars(allowTopForVars) {}
 
   bool isFunctionParallel() override { return true; }
 
@@ -824,7 +831,7 @@ struct FunctionRelaxer
   bool requiresNonNullableLocalFixups() override { return false; }
 
   std::unique_ptr<Pass> create() override {
-    return std::make_unique<FunctionRelaxer>(widenTypes);
+    return std::make_unique<FunctionRelaxer>(widenTypes, allowTopForVars);
   }
 
   bool stripTrailingCasts(Expression** exprp, Type demanded, bool stripRefAs) {
@@ -1530,7 +1537,16 @@ struct FunctionRelaxer
         }
       }
       if (hasRefVars) {
-        DemandAnalyzer analyzer(*getModule(), func, nullptr, false);
+        DemandAnalyzer analyzer(*getModule(),
+                                func,
+                                nullptr,
+                                false,
+                                false,
+                                nullptr,
+                                nullptr,
+                                nullptr,
+                                nullptr,
+                                allowTopForVars);
         auto allowedHTs = analyzer.analyze();
         Index numParams = func->getNumParams();
         for (Index i = 0; i < func->vars.size(); ++i) {
@@ -1860,6 +1876,7 @@ void scanFunctionConsumers(Module& wasm,
     decltype(recordChild)& record;
     std::unordered_set<Expression*> handled;
     std::vector<Block*> blockStack;
+    std::unordered_map<Block*, Type> blockDemands;
 
     Scanner(Module& wasm,
             Function* func,
@@ -1867,11 +1884,34 @@ void scanFunctionConsumers(Module& wasm,
             decltype(recordChild)& record)
       : wasm(wasm), func(func), out(out), record(record) {}
 
+    void propagateBlockDemand(Expression* e, Type t) {
+      while (auto* b = e->dynCast<Block>()) {
+        if (!b->type.isRef() || b->type.isExact()) {
+          break;
+        }
+        if (b->name.is()) {
+          blockDemands[b] = t;
+        }
+        if (b->list.empty()) {
+          break;
+        }
+        e = b->list.back();
+      }
+    }
+
     static void doEnterBlock(Scanner* self, Expression** currp) {
       self->blockStack.push_back((*currp)->cast<Block>());
     }
 
     static void scan(Scanner* self, Expression** currp) {
+      if (auto* set = (*currp)->dynCast<LocalSet>()) {
+        if (!set->isTee()) {
+          Type lt = self->func->getLocalType(set->index);
+          if (lt.isRef() && !lt.isExact()) {
+            self->propagateBlockDemand(set->value, lt);
+          }
+        }
+      }
       PostWalker<Scanner, UnifiedExpressionVisitor<Scanner>>::scan(self, currp);
       if (auto* block = (*currp)->dynCast<Block>()) {
         if (block->name.is()) {
@@ -1883,7 +1923,8 @@ void scanFunctionConsumers(Module& wasm,
     Type getTargetBlockType(Name name) const {
       for (auto it = blockStack.rbegin(); it != blockStack.rend(); ++it) {
         if ((*it)->name == name) {
-          return (*it)->type;
+          auto dIt = blockDemands.find(*it);
+          return dIt != blockDemands.end() ? dIt->second : (*it)->type;
         }
       }
       return Type::none;
@@ -1988,11 +2029,13 @@ void scanFunctionConsumers(Module& wasm,
         }
         if (!block->list.empty() && block->type.isRef() &&
             !block->type.isExact() && block->list.back()->type.isRef()) {
+          auto dIt = blockDemands.find(block);
+          Type bt = dIt != blockDemands.end() ? dIt->second : block->type;
           markAndRecord(&block->list.back(),
                         true,
                         false,
-                        block->type.getHeapType(),
-                        block->type.getNullability());
+                        bt.getHeapType(),
+                        bt.getNullability());
         }
       } else if (auto* br = curr->dynCast<Break>()) {
         if (!br->condition && br->value && br->value->type.isRef()) {
@@ -2186,6 +2229,7 @@ void scanFunctionConsumers(Module& wasm,
 
   Type rt = func->getResults();
   if (rt.isRef() && !rt.isExact()) {
+    scanner.propagateBlockDemand(func->body, rt);
     scanner.markAndRecord(
       &func->body, true, true, rt.getHeapType(), rt.getNullability());
   }
@@ -4241,7 +4285,11 @@ struct RelaxNullability : public Pass {
               break;
             }
           }
-          if (candRes != origRes && !origRes.getHeapType().isBasic()) {
+          if (candRes != origRes && !origRes.getHeapType().isBasic() &&
+              !(widenFields && candParams == origParams &&
+                !origRes.getHeapType().getDeclaredSuperType() &&
+                !origRes.getHeapType().isOpen() &&
+                subTypes.getImmediateSubTypes(origRes.getHeapType()).empty())) {
             isBasicSubtypeWiden = false;
           }
           if (isBasicSubtypeWiden) {
@@ -4875,6 +4923,11 @@ struct RelaxNullability : public Pass {
     std::unordered_map<Name, Index> totalGlobalGets;
     std::unordered_map<Name, Index> validArrayGlobalGets;
     std::unordered_set<Name> pureGlobalHasGet;
+    std::unordered_map<FieldKey,
+                       std::vector<std::pair<HeapType, bool>>,
+                       FieldKeyHash>
+      immFieldDemands;
+    std::unordered_map<FieldKey, Type, FieldKeyHash> finalImmFieldTypes;
 
     while (true) {
       for (auto& [_, state] : fieldCandidates) {
@@ -4894,6 +4947,8 @@ struct RelaxNullability : public Pass {
       totalGlobalGets.clear();
       validArrayGlobalGets.clear();
       pureGlobalHasGet.clear();
+      immFieldDemands.clear();
+      finalImmFieldTypes.clear();
 
       ModuleUtils::ParallelFunctionAnalysis<FuncFieldDemandSummary> summaries(
         *module, [&](Function* func, FuncFieldDemandSummary& summary) {
@@ -4938,10 +4993,6 @@ struct RelaxNullability : public Pass {
         }
       }
 
-      std::unordered_map<FieldKey,
-                         std::vector<std::pair<HeapType, bool>>,
-                         FieldKeyHash>
-        immFieldDemands;
       auto mergeSummary = [&](const FuncFieldDemandSummary& sum) {
         for (const auto& k : sum.pinnedFields) {
           if (auto it = fieldCandidates.find(k); it != fieldCandidates.end()) {
@@ -5022,7 +5073,6 @@ struct RelaxNullability : public Pass {
         }
       }
 
-      std::unordered_map<FieldKey, Type, FieldKeyHash> finalImmFieldTypes;
       if (hasImmCandidate) {
         auto subTypesFirst = subTypes.getSubTypesFirstSort();
         for (auto it = subTypesFirst.rbegin(); it != subTypesFirst.rend();
@@ -5182,6 +5232,282 @@ struct RelaxNullability : public Pass {
       }
     }
 
+    std::unordered_map<FieldKey, Type, FieldKeyHash> castWidenedImmFields;
+    if (hasImmCandidate) {
+      auto getTypeBytes = [&](Type t) -> int {
+        if (!t.isRef()) {
+          return 1;
+        }
+        HeapType ht = t.getHeapType();
+        if (ht.isBasic()) {
+          return (t.isNullable() && !ht.isShared()) ? 1 : 2;
+        }
+        if (!ht.getDeclaredSuperType() &&
+            !subTypes.getImmediateSubTypes(ht).empty()) {
+          return 2;
+        }
+        return 3;
+      };
+
+      std::unordered_map<HeapType, int> totalStructFieldHTCount;
+      for (auto S : allTypes) {
+        if (!S.isStruct()) {
+          continue;
+        }
+        const auto& sFields = S.getStruct().fields;
+        for (Index fi = 0; fi < sFields.size(); ++fi) {
+          Type curFT = sFields[fi].type;
+          if (auto iIt = finalImmFieldTypes.find(FieldKey{S, fi});
+              iIt != finalImmFieldTypes.end()) {
+            curFT = iIt->second;
+          } else if (auto uIt = structUpdates.find(S);
+                     uIt != structUpdates.end()) {
+            for (const auto& [ufi, uFT] : uIt->second) {
+              if (ufi == fi) {
+                curFT = uFT;
+                break;
+              }
+            }
+          }
+          if (curFT.isRef()) {
+            totalStructFieldHTCount[curFT.getHeapType()]++;
+          }
+        }
+      }
+
+      std::unordered_set<Type> existingTargetMutElemTypes;
+      for (auto ht : allTypes) {
+        if (ht.isArray() && !ht.isShared() && !ht.getDescriptorType() &&
+            !ht.getDescribedType() && !ht.getDeclaredSuperType() &&
+            subTypes.getImmediateSubTypes(ht).empty()) {
+          const auto& elem = ht.getArray().element;
+          if (!elem.isPacked() && elem.mutable_ == Mutable &&
+              elem.type.isRef() && !elem.type.isExact() &&
+              !arrayUpdates.count(ht)) {
+            existingTargetMutElemTypes.insert(elem.type);
+          }
+        }
+      }
+
+      std::unordered_set<HeapType> pureGlobalArrHTs;
+      for (const auto& [gName, gState] : pureGlobalCandidates) {
+        if (!gState.pinned && pureGlobalHasGet.count(gName) &&
+            totalGlobalGets[gName] == validArrayGlobalGets[gName]) {
+          pureGlobalArrHTs.insert(module->getGlobal(gName)->type.getHeapType());
+        }
+      }
+
+      auto hasCoupledMutArray = [&](Type oldFT,
+                                    Type boundFT,
+                                    int groupStructCount) -> bool {
+        if (!oldFT.isStruct() || !existingTargetMutElemTypes.count(boundFT)) {
+          return false;
+        }
+        auto cntIt = totalStructFieldHTCount.find(oldFT.getHeapType());
+        if (cntIt == totalStructFieldHTCount.end() ||
+            cntIt->second != groupStructCount) {
+          return false;
+        }
+        for (const auto& [arrHT, state] : arrayCandidates) {
+          if (!state.pinned && arrHT.getArray().element.mutable_ == Mutable &&
+              arrHT.getArray().element.type == oldFT &&
+              !arrayUpdates.count(arrHT) && pureGlobalArrHTs.count(arrHT)) {
+            return true;
+          }
+        }
+        return false;
+      };
+
+      auto applyGroupWiden = [&](const std::vector<HeapType>& ws,
+                                 Index fi,
+                                 Type curFT,
+                                 Type boundFT) {
+        for (auto W : ws) {
+          finalImmFieldTypes[FieldKey{W, fi}] = boundFT;
+          castWidenedImmFields[FieldKey{W, fi}] = curFT;
+          auto& vec = structUpdates[W];
+          bool found = false;
+          for (auto& [ufi, uFT] : vec) {
+            if (ufi == fi) {
+              uFT = boundFT;
+              found = true;
+              break;
+            }
+          }
+          if (!found && boundFT != W.getStruct().fields[fi].type) {
+            vec.push_back({fi, boundFT});
+          }
+        }
+      };
+
+      auto countNarrowGets = [&](const std::vector<HeapType>& ws,
+                                 Index fi,
+                                 Type boundFT) -> int {
+        int narrowGets = 0;
+        for (auto W : ws) {
+          if (auto demIt = immFieldDemands.find(FieldKey{W, fi});
+              demIt != immFieldDemands.end()) {
+            for (const auto& [reqHT, reqNull] : demIt->second) {
+              if (!HeapType::isSubType(boundFT.getHeapType(), reqHT) ||
+                  (boundFT.isNullable() && !reqNull)) {
+                narrowGets++;
+              }
+            }
+          }
+        }
+        return narrowGets;
+      };
+
+      for (auto anc : allTypes) {
+        if (!anc.isStruct()) {
+          continue;
+        }
+        const auto& aFields = anc.getStruct().fields;
+        for (Index fi = 0; fi < aFields.size(); ++fi) {
+          if (aFields[fi].mutable_ != Immutable ||
+              getHighestFieldAncestor(anc, fi) != anc) {
+            continue;
+          }
+          auto ancIt = finalImmFieldTypes.find(FieldKey{anc, fi});
+          if (ancIt == finalImmFieldTypes.end()) {
+            continue;
+          }
+          Type ancFT = ancIt->second;
+          if (ancFT.isExact() || ancFT.isNull()) {
+            continue;
+          }
+          const auto& family = subTypes.getSubTypes(anc);
+          std::unordered_map<Type, std::vector<HeapType>> groups;
+          for (auto W : family) {
+            if (W == anc) {
+              continue;
+            }
+            bool wFixed = fixed.count(W) || W.isShared() ||
+                          W.getDescriptorType() || W.getDescribedType();
+            Type origFT = W.getStruct().fields[fi].type;
+            if (wFixed || origFT.isExact() || origFT.isNull() ||
+                origFT.getHeapType().isSignature()) {
+              continue;
+            }
+            auto wIt = finalImmFieldTypes.find(FieldKey{W, fi});
+            if (wIt == finalImmFieldTypes.end()) {
+              continue;
+            }
+            Type curFT = wIt->second;
+            if (curFT.getHeapType() == ancFT.getHeapType() ||
+                !Type::isSubType(curFT, ancFT)) {
+              continue;
+            }
+            groups[curFT].push_back(W);
+          }
+
+          if (!groups.empty()) {
+            Type boundFT = ancFT;
+            std::unordered_map<Type, Type> parentGroup;
+            std::unordered_map<Type, std::vector<Type>> childrenGroups;
+            std::unordered_set<Type> invalidGroups;
+            for (const auto& [curFT, ws] : groups) {
+              for (auto W : ws) {
+                HeapType p = *W.getDeclaredSuperType();
+                auto pIt = finalImmFieldTypes.find(FieldKey{p, fi});
+                Type pFT = pIt != finalImmFieldTypes.end()
+                             ? pIt->second
+                             : p.getStruct().fields[fi].type;
+                if (pFT != boundFT && pFT != curFT) {
+                  if (!groups.count(pFT) ||
+                      (parentGroup.count(curFT) && parentGroup[curFT] != pFT)) {
+                    invalidGroups.insert(curFT);
+                  } else if (!parentGroup.count(curFT)) {
+                    parentGroup[curFT] = pFT;
+                    childrenGroups[pFT].push_back(curFT);
+                  }
+                }
+              }
+            }
+            std::unordered_map<Type, int> groupSelfNet;
+            for (const auto& [curFT, ws] : groups) {
+              int defSavings =
+                int(ws.size()) * (getTypeBytes(curFT) - getTypeBytes(boundFT));
+              int narrowGets = countNarrowGets(ws, fi, boundFT);
+              int arrBonus =
+                hasCoupledMutArray(curFT, boundFT, int(ws.size())) ? 21 : 0;
+              groupSelfNet[curFT] = defSavings + arrBonus - narrowGets * 3;
+            }
+            std::unordered_map<Type, int> groupBestNet;
+            auto computeDP = [&](auto& self, Type ft) -> int {
+              if (invalidGroups.count(ft)) {
+                groupBestNet[ft] = -1000000;
+                return -1000000;
+              }
+              int total = groupSelfNet[ft];
+              for (Type childFT : childrenGroups[ft]) {
+                int childBest = self(self, childFT);
+                if (childBest > 0) {
+                  total += childBest;
+                }
+              }
+              groupBestNet[ft] = total;
+              return total;
+            };
+            for (const auto& [ft, _] : groups) {
+              if (!parentGroup.count(ft)) {
+                computeDP(computeDP, ft);
+              }
+            }
+            auto selectDP = [&](auto& self, Type ft) -> void {
+              if (groupBestNet[ft] <= 0) {
+                return;
+              }
+              applyGroupWiden(groups[ft], fi, ft, boundFT);
+              for (Type childFT : childrenGroups[ft]) {
+                if (groupBestNet[childFT] > 0) {
+                  self(self, childFT);
+                }
+              }
+            };
+            for (const auto& [ft, _] : groups) {
+              if (!parentGroup.count(ft)) {
+                selectDP(selectDP, ft);
+              }
+            }
+          } else {
+            auto ancSuper = anc.getDeclaredSuperType();
+            bool ancHasParentField =
+              ancSuper && ancSuper->isStruct() &&
+              fi < ancSuper->getStruct().fields.size();
+            if (!ancHasParentField && !ancFT.getHeapType().isSignature()) {
+              Type boundFT(ancFT.getHeapType().getTop(), Nullable);
+              if (ancFT.getHeapType() != boundFT.getHeapType() &&
+                  Type::isSubType(ancFT, boundFT)) {
+                bool allValid = true;
+                for (auto W : family) {
+                  bool wFixed = fixed.count(W) || W.isShared() ||
+                                W.getDescriptorType() || W.getDescribedType();
+                  Type origFT = W.getStruct().fields[fi].type;
+                  auto wIt = finalImmFieldTypes.find(FieldKey{W, fi});
+                  if (wFixed || origFT.isExact() || origFT.isNull() ||
+                      wIt == finalImmFieldTypes.end() || wIt->second != ancFT) {
+                    allValid = false;
+                    break;
+                  }
+                }
+                if (allValid &&
+                    hasCoupledMutArray(ancFT, boundFT, int(family.size()))) {
+                  int defSavings =
+                    int(family.size()) *
+                    (getTypeBytes(ancFT) - getTypeBytes(boundFT));
+                  int narrowGets = countNarrowGets(family, fi, boundFT);
+                  if (defSavings + 21 - narrowGets * 3 > 0) {
+                    applyGroupWiden(family, fi, ancFT, boundFT);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
     std::unordered_set<HeapType> arrayMutUpdates;
     for (const auto& [arrHT, state] : arrayCandidates) {
       if (state.pinned || arrHT.getArray().element.mutable_ != Immutable) {
@@ -5272,6 +5598,16 @@ struct RelaxNullability : public Pass {
       }
       return ht;
     };
+
+    std::unordered_map<FieldKey, Type, FieldKeyHash> mappedCastWidened;
+    for (const auto& [k, oldFT] : castWidenedImmFields) {
+      HeapType newU = mapNewHT(k.anc);
+      HeapType newOldHT = oldFT.getHeapType().isBasic()
+                            ? oldFT.getHeapType()
+                            : mapNewHT(oldFT.getHeapType());
+      mappedCastWidened[FieldKey{newU, k.index}] =
+        Type(newOldHT, oldFT.getNullability());
+    }
 
     // Check if any pure array global can switch to an existing wider or
     // canonical mutable/immutable array HeapType.
@@ -5386,6 +5722,31 @@ struct RelaxNullability : public Pass {
                 gget->type = module->getGlobal(gget->name)->type;
               }
             }
+          }
+          if (!mappedCastWidened.empty()) {
+            struct CastInserter : public PostWalker<CastInserter> {
+              Module* module;
+              const std::unordered_map<FieldKey, Type, FieldKeyHash>&
+                mappedCastWidened;
+              CastInserter(
+                Module* module,
+                const std::unordered_map<FieldKey, Type, FieldKeyHash>&
+                  mappedCastWidened)
+                : module(module), mappedCastWidened(mappedCastWidened) {}
+              void visitStructGet(StructGet* curr) {
+                if (curr->type == Type::unreachable ||
+                    !curr->ref->type.isStruct()) {
+                  return;
+                }
+                HeapType uHT = curr->ref->type.getHeapType();
+                auto it = mappedCastWidened.find(FieldKey{uHT, curr->index});
+                if (it != mappedCastWidened.end()) {
+                  curr->type = uHT.getStruct().fields[curr->index].type;
+                  replaceCurrent(Builder(*module).makeRefCast(curr, it->second));
+                }
+              }
+            } inserter(module, mappedCastWidened);
+            inserter.walk(func->body);
           }
           ReFinalize().walkFunctionInModule(func, module);
         });
@@ -6049,7 +6410,15 @@ struct RelaxNullability : public Pass {
 
     // 2 + 3. Relax locals, un-alias cast temporaries, and fix up casts in
     // every function.
-    FunctionRelaxer(widenTypes).run(getPassRunner(), module);
+    std::string modeArg = getArgumentOrDefault("relax-nullability", "");
+    bool widenFields =
+      widenTypes &&
+      getPassOptions().worldMode == WorldMode::Closed &&
+      (hasArgument("relax-nullability-widen-fields") ||
+       hasArgument("relax-nullability-merge-signatures") ||
+       modeArg == "widen-fields" || modeArg == "merge-signatures" ||
+       modeArg == "cache-param-casts");
+    FunctionRelaxer(widenTypes, widenFields).run(getPassRunner(), module);
   }
 
   void runGeneralizeSignatures(Module* module, bool widenFields) {
@@ -6112,13 +6481,12 @@ struct RelaxNullability : public Pass {
 
     // 6. Second pass of field/array widening after signature generalization.
     if (widenFields && widenFieldsAndArrays(module)) {
+      relaxSignaturesAndLocals(module, widenTypes);
       widenFieldsAndArrays(module);
-      FunctionRelaxer(widenTypes).run(getPassRunner(), module);
-      if (modeArg == "cache-param-casts") {
-        runGeneralizeSignatures(module, widenFields);
-        if (widenFieldsAndArrays(module)) {
-          FunctionRelaxer(widenTypes).run(getPassRunner(), module);
-        }
+      FunctionRelaxer(widenTypes, widenFields).run(getPassRunner(), module);
+      runGeneralizeSignatures(module, widenFields);
+      if (widenFieldsAndArrays(module)) {
+        FunctionRelaxer(widenTypes, widenFields).run(getPassRunner(), module);
       }
     }
   }

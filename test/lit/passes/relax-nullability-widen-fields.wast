@@ -469,3 +469,157 @@
     )
   )
 )
+
+(module
+  ;; Covariant immutable field 0 on $ObjSub has 1 narrow struct.get and is
+  ;; coupled to a sole-use mutable DGA cache array $VtSubCacheArr and factory
+  ;; $get-vt-sub. Widen ($ObjSub, 0) from (ref null $VtSub) to (ref null $VtBase)
+  ;; by inserting a ref.cast at the narrow struct.get, which unpins $get-vt-sub's
+  ;; return type at (struct.new $ObjSub (call $get-vt-sub ...)) and allows
+  ;; $sub-cache to retarget to $VtBaseMutArr.
+  (rec
+    ;; CHECK:      (rec
+    ;; CHECK-NEXT:  (type $ObjBase (sub (struct (field (ref null $VtBase)))))
+
+    ;; CHECK:       (type $VtBase (sub (struct (field i32))))
+    (type $VtBase (sub (struct (field i32))))
+    ;; CHECK:       (type $ObjSub (sub $ObjBase (struct (field (ref null $VtBase)))))
+
+    ;; CHECK:       (type $VtSub (sub $VtBase (struct (field i32) (field i64))))
+    (type $VtSub (sub $VtBase (struct (field i32) (field i64))))
+    (type $ObjBase (sub (struct (field (ref null $VtBase)))))
+    (type $ObjSub (sub $ObjBase (struct (field (ref null $VtSub)))))
+    ;; CHECK:       (type $4 (func (param i32) (result (ref null $VtBase))))
+
+    ;; CHECK:       (type $VtBaseMutArr (array (mut (ref null $VtBase))))
+    (type $VtBaseMutArr (array (mut (ref null $VtBase))))
+    (type $VtSubCacheArr (array (mut (ref null $VtSub))))
+  )
+
+  ;; CHECK:      (type $6 (func (param i32) (result i32)))
+
+  ;; CHECK:      (global $base-obj (ref $ObjBase) (struct.new_default $ObjBase))
+  (global $base-obj (ref $ObjBase) (struct.new_default $ObjBase))
+  ;; CHECK:      (global $base-arr (ref $VtBaseMutArr) (array.new_default $VtBaseMutArr
+  ;; CHECK-NEXT:  (i32.const 2)
+  ;; CHECK-NEXT: ))
+  (global $base-arr (ref $VtBaseMutArr) (array.new_default $VtBaseMutArr (i32.const 2)))
+  ;; CHECK:      (global $sub-cache (ref $VtBaseMutArr) (array.new_default $VtBaseMutArr
+  ;; CHECK-NEXT:  (i32.const 4)
+  ;; CHECK-NEXT: ))
+  (global $sub-cache (ref $VtSubCacheArr) (array.new_default $VtSubCacheArr (i32.const 4)))
+
+  ;; CHECK:      (export "entry4" (func $entry4))
+
+  ;; CHECK:      (func $get-vt-sub (type $4) (param $idx i32) (result (ref null $VtBase))
+  ;; CHECK-NEXT:  (local $v (ref null $VtBase))
+  ;; CHECK-NEXT:  (block $found (result (ref null $VtBase))
+  ;; CHECK-NEXT:   (br_on_non_null $found
+  ;; CHECK-NEXT:    (array.get $VtBaseMutArr
+  ;; CHECK-NEXT:     (global.get $sub-cache)
+  ;; CHECK-NEXT:     (local.get $idx)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (array.set $VtBaseMutArr
+  ;; CHECK-NEXT:    (global.get $sub-cache)
+  ;; CHECK-NEXT:    (local.get $idx)
+  ;; CHECK-NEXT:    (local.tee $v
+  ;; CHECK-NEXT:     (struct.new $VtSub
+  ;; CHECK-NEXT:      (local.get $idx)
+  ;; CHECK-NEXT:      (i64.const 9)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.get $v)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $get-vt-sub (param $idx i32) (result (ref null $VtSub))
+    (local $v (ref null $VtSub))
+    (block $found (result (ref null $VtSub))
+      (br_on_non_null $found
+        (array.get $VtSubCacheArr
+          (global.get $sub-cache)
+          (local.get $idx)
+        )
+      )
+      (array.set $VtSubCacheArr
+        (global.get $sub-cache)
+        (local.get $idx)
+        (local.tee $v
+          (struct.new $VtSub
+            (local.get $idx)
+            (i64.const 9)
+          )
+        )
+      )
+      (local.get $v)
+    )
+  )
+
+  ;; CHECK:      (func $entry4 (type $6) (param $i i32) (result i32)
+  ;; CHECK-NEXT:  (local $s (ref null $ObjBase))
+  ;; CHECK-NEXT:  (local.set $s
+  ;; CHECK-NEXT:   (struct.new $ObjSub
+  ;; CHECK-NEXT:    (call $get-vt-sub
+  ;; CHECK-NEXT:     (local.get $i)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (i32.add
+  ;; CHECK-NEXT:   (i32.add
+  ;; CHECK-NEXT:    (struct.get $VtBase 0
+  ;; CHECK-NEXT:     (struct.get $ObjBase 0
+  ;; CHECK-NEXT:      (global.get $base-obj)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (struct.get $VtBase 0
+  ;; CHECK-NEXT:     (array.get $VtBaseMutArr
+  ;; CHECK-NEXT:      (global.get $base-arr)
+  ;; CHECK-NEXT:      (local.get $i)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (i32.wrap_i64
+  ;; CHECK-NEXT:    (struct.get $VtSub 1
+  ;; CHECK-NEXT:     (ref.cast (ref null $VtSub)
+  ;; CHECK-NEXT:      (struct.get $ObjBase 0
+  ;; CHECK-NEXT:       (local.get $s)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $entry4 (export "entry4") (param $i i32) (result i32)
+    (local $s (ref null $ObjSub))
+    (local.set $s
+      (struct.new $ObjSub
+        (call $get-vt-sub
+          (local.get $i)
+        )
+      )
+    )
+    (i32.add
+      (i32.add
+        (struct.get $VtBase 0
+          (struct.get $ObjBase 0
+            (global.get $base-obj)
+          )
+        )
+        (struct.get $VtBase 0
+          (array.get $VtBaseMutArr
+            (global.get $base-arr)
+            (local.get $i)
+          )
+        )
+      )
+      (i32.wrap_i64
+        (struct.get $VtSub 1
+          (struct.get $ObjSub 0
+            (local.get $s)
+          )
+        )
+      )
+    )
+  )
+)
