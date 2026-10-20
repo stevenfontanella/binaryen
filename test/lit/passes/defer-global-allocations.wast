@@ -2860,3 +2860,457 @@
 ;; CHECK-NEXT:   (local.get $1)
 ;; CHECK-NEXT:  )
 ;; CHECK-NEXT: )
+
+;; Cross-column palette pooling & collapsed init-only StructNew global inlining,
+;; read-only mutable-element palette nullification with slot-0 RefNull and
+;; inline StructNew elements (defer$pal$null0$), 1-param specialized defer$pal$
+;; folding to array.new_default, and existing array type reuse.
+(module
+  ;; CHECK:      (type $sub (struct (field i32) (field i32) (field i32) (field i32) (field i32)))
+
+  ;; CHECK:      (type $leafB (struct (field i64)))
+
+  ;; CHECK:      (type $mut_sub_arr (array (mut (ref null $sub))))
+
+  ;; CHECK:      (type $u8_arr (array (mut i8)))
+
+  ;; CHECK:      (type $row (struct (field i32) (field eqref) (field eqref) (field i32) (field i32) (field i32)))
+
+  ;; CHECK:      (type $5 (array (mut (ref null $row))))
+
+  ;; CHECK:      (type $6 (array eqref))
+
+  ;; CHECK:      (type $leafA (struct (field i32) (field i32)))
+  (type $leafA (struct (field i32) (field i32)))
+  (type $leafB (struct (field i64)))
+  (type $sub (struct (field i32) (field i32) (field i32) (field i32) (field i32)))
+  (type $mut_sub_arr (array (mut (ref null $sub))))
+  (type $u8_arr (array (mut i8)))
+  (type $row (struct (field i32) (field eqref) (field eqref) (field i32) (field i32) (field i32)))
+
+  (global $sh0 (ref $leafA) (struct.new $leafA (i32.const 1) (i32.const 2)))
+  (global $sh1 (ref $leafA) (struct.new $leafA (i32.const 3) (i32.const 4)))
+  ;; CHECK:      (type $8 (func (param i32) (result (ref $sub))))
+
+  ;; CHECK:      (type $9 (func (param i32) (result (ref null $sub))))
+
+  ;; CHECK:      (type $10 (func (param i32) (result (ref $row))))
+
+  ;; CHECK:      (type $11 (func (param (ref $mut_sub_arr) i32) (result (ref null $sub))))
+
+  ;; CHECK:      (global $sh2 (ref $leafB) (struct.new $leafB
+  ;; CHECK-NEXT:  (i64.const 5)
+  ;; CHECK-NEXT: ))
+  (global $sh2 (ref $leafB) (struct.new $leafB (i64.const 5)))
+  ;; CHECK:      (global $sh3 (ref $leafB) (struct.new $leafB
+  ;; CHECK-NEXT:  (i64.const 6)
+  ;; CHECK-NEXT: ))
+  (global $sh3 (ref $leafB) (struct.new $leafB (i64.const 6)))
+  ;; CHECK:      (global $sh4 (ref $leafB) (struct.new $leafB
+  ;; CHECK-NEXT:  (i64.const 7)
+  ;; CHECK-NEXT: ))
+  (global $sh4 (ref $leafB) (struct.new $leafB (i64.const 7)))
+  ;; CHECK:      (global $sh5 (ref $leafB) (struct.new $leafB
+  ;; CHECK-NEXT:  (i64.const 8)
+  ;; CHECK-NEXT: ))
+  (global $sh5 (ref $leafB) (struct.new $leafB (i64.const 8)))
+  ;; CHECK:      (global $u6 (ref $leafB) (struct.new $leafB
+  ;; CHECK-NEXT:  (i64.const 9)
+  ;; CHECK-NEXT: ))
+  (global $u6 (ref $leafB) (struct.new $leafB (i64.const 9)))
+  ;; CHECK:      (global $u7 (ref $leafB) (struct.new $leafB
+  ;; CHECK-NEXT:  (i64.const 10)
+  ;; CHECK-NEXT: ))
+  (global $u7 (ref $leafB) (struct.new $leafB (i64.const 10)))
+  ;; CHECK:      (global $u8 (ref $leafB) (struct.new $leafB
+  ;; CHECK-NEXT:  (i64.const 11)
+  ;; CHECK-NEXT: ))
+  (global $u8 (ref $leafB) (struct.new $leafB (i64.const 11)))
+  ;; CHECK:      (global $u9 (ref $leafB) (struct.new $leafB
+  ;; CHECK-NEXT:  (i64.const 12)
+  ;; CHECK-NEXT: ))
+  (global $u9 (ref $leafB) (struct.new $leafB (i64.const 12)))
+
+  (global $r0 (ref $row) (struct.new $row (i32.const 10) (global.get $sh0) (global.get $sh0) (i32.const 200) (i32.const 300) (i32.const 400)))
+  (global $r1 (ref $row) (struct.new $row (i32.const 20) (global.get $sh1) (global.get $sh1) (i32.const 200) (i32.const 300) (i32.const 400)))
+  (global $r2 (ref $row) (struct.new $row (i32.const 30) (global.get $sh2) (global.get $sh2) (i32.const 200) (i32.const 300) (i32.const 400)))
+  (global $r3 (ref $row) (struct.new $row (i32.const 40) (global.get $sh3) (global.get $sh3) (i32.const 200) (i32.const 300) (i32.const 400)))
+  (global $r4 (ref $row) (struct.new $row (i32.const 50) (global.get $sh4) (global.get $sh4) (i32.const 200) (i32.const 300) (i32.const 400)))
+  (global $r5 (ref $row) (struct.new $row (i32.const 60) (global.get $sh5) (global.get $sh5) (i32.const 200) (i32.const 300) (i32.const 400)))
+  (global $r6 (ref $row) (struct.new $row (i32.const 70) (global.get $u6) (global.get $sh2) (i32.const 200) (i32.const 300) (i32.const 400)))
+  (global $r7 (ref $row) (struct.new $row (i32.const 80) (global.get $u7) (global.get $sh3) (i32.const 200) (i32.const 300) (i32.const 400)))
+  (global $r8 (ref $row) (struct.new $row (i32.const 90) (global.get $u8) (global.get $sh4) (i32.const 200) (i32.const 300) (i32.const 400)))
+  (global $r9 (ref $row) (struct.new $row (i32.const 100) (global.get $u9) (global.get $sh5) (i32.const 200) (i32.const 300) (i32.const 400)))
+  (global $r10 (ref $row) (struct.new $row (i32.const 110) (global.get $sh2) (global.get $sh2) (i32.const 200) (i32.const 300) (i32.const 400)))
+  (global $r11 (ref $row) (struct.new $row (i32.const 120) (global.get $sh3) (global.get $sh3) (i32.const 200) (i32.const 300) (i32.const 400)))
+  (global $r12 (ref $row) (struct.new $row (i32.const 130) (global.get $sh4) (global.get $sh4) (i32.const 200) (i32.const 300) (i32.const 400)))
+  (global $r13 (ref $row) (struct.new $row (i32.const 140) (global.get $sh5) (global.get $sh5) (i32.const 200) (i32.const 300) (i32.const 400)))
+
+  ;; CHECK:      (global $sub_hot (ref $sub) (struct.new $sub
+  ;; CHECK-NEXT:  (i32.const 1)
+  ;; CHECK-NEXT:  (i32.const 2)
+  ;; CHECK-NEXT:  (i32.const 3)
+  ;; CHECK-NEXT:  (i32.const 4)
+  ;; CHECK-NEXT:  (i32.const 5)
+  ;; CHECK-NEXT: ))
+  (global $sub_hot (ref $sub) (struct.new $sub (i32.const 1) (i32.const 2) (i32.const 3) (i32.const 4) (i32.const 5)))
+
+  ;; CHECK:      (global $pal_null0 (ref $mut_sub_arr) (array.new_fixed $mut_sub_arr 3
+  ;; CHECK-NEXT:  (ref.null none)
+  ;; CHECK-NEXT:  (global.get $sub_hot)
+  ;; CHECK-NEXT:  (ref.null none)
+  ;; CHECK-NEXT: ))
+  (global $pal_null0 (ref $mut_sub_arr) (array.new_fixed $mut_sub_arr 7
+    (ref.null none)
+    (global.get $sub_hot)
+    (struct.new $sub (i32.const 11) (i32.const 22) (i32.const 33) (i32.const 44) (i32.const 55))
+    (struct.new $sub (i32.const 11) (i32.const 22) (i32.const 33) (i32.const 44) (i32.const 55))
+    (struct.new $sub (i32.const 11) (i32.const 22) (i32.const 33) (i32.const 44) (i32.const 55))
+    (struct.new $sub (i32.const 11) (i32.const 22) (i32.const 33) (i32.const 44) (i32.const 55))
+    (struct.new $sub (i32.const 11) (i32.const 22) (i32.const 33) (i32.const 44) (i32.const 55))
+  ))
+
+  ;; CHECK:      (global $pal_spec (ref $mut_sub_arr) (array.new_default $mut_sub_arr
+  ;; CHECK-NEXT:  (i32.const 4)
+  ;; CHECK-NEXT: ))
+  (global $pal_spec (ref $mut_sub_arr) (array.new_fixed $mut_sub_arr 4
+    (ref.null none)
+    (ref.null none)
+    (struct.new $sub (i32.const 11) (i32.const 22) (i32.const 33) (i32.const 44) (i32.const 99))
+    (ref.null none)
+  ))
+
+  ;; CHECK:      (global $u8_tbl (mut (ref null $u8_arr)) (ref.null none))
+  (global $u8_tbl (mut (ref null $u8_arr)) (ref.null none))
+  ;; CHECK:      (global $defer$row$cache (ref $5) (array.new_default $5
+  ;; CHECK-NEXT:  (i32.const 14)
+  ;; CHECK-NEXT: ))
+
+  ;; CHECK:      (global $defer$row$palette$2 (ref $6) (array.new_fixed $6 10
+  ;; CHECK-NEXT:  (struct.new $leafA
+  ;; CHECK-NEXT:   (i32.const 1)
+  ;; CHECK-NEXT:   (i32.const 2)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (struct.new $leafA
+  ;; CHECK-NEXT:   (i32.const 3)
+  ;; CHECK-NEXT:   (i32.const 4)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (global.get $sh2)
+  ;; CHECK-NEXT:  (global.get $sh3)
+  ;; CHECK-NEXT:  (global.get $sh4)
+  ;; CHECK-NEXT:  (global.get $sh5)
+  ;; CHECK-NEXT:  (global.get $u6)
+  ;; CHECK-NEXT:  (global.get $u7)
+  ;; CHECK-NEXT:  (global.get $u8)
+  ;; CHECK-NEXT:  (global.get $u9)
+  ;; CHECK-NEXT: ))
+
+  ;; CHECK:      (global $defer$row$table$w1 (mut (ref null $u8_arr)) (ref.null none))
+
+  ;; CHECK:      (data $prev_seg "\00\01\02\02\02\02\02")
+  (data $prev_seg "\00\01\02\03\04\05\06")
+
+  ;; CHECK:      (data $defer$data "\n\14\1e(2<FPZdnx\82\8c\00\01\02\03\04\05\06\07\08\t\02\03\04\05\00\01\02\03\04\05\02\03\04\05\02\03\04\05")
+
+  ;; CHECK:      (export "use_all" (func $use_all))
+
+  ;; CHECK:      (func $spec_helper (type $8) (param $idx i32) (result (ref $sub))
+  ;; CHECK-NEXT:  (local $tmp (ref $sub))
+  ;; CHECK-NEXT:  (block $cached (result (ref $sub))
+  ;; CHECK-NEXT:   (br_on_non_null $cached
+  ;; CHECK-NEXT:    (array.get $mut_sub_arr
+  ;; CHECK-NEXT:     (global.get $pal_spec)
+  ;; CHECK-NEXT:     (local.get $idx)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (array.set $mut_sub_arr
+  ;; CHECK-NEXT:    (global.get $pal_spec)
+  ;; CHECK-NEXT:    (local.get $idx)
+  ;; CHECK-NEXT:    (local.tee $tmp
+  ;; CHECK-NEXT:     (struct.new $sub
+  ;; CHECK-NEXT:      (i32.const 11)
+  ;; CHECK-NEXT:      (i32.const 22)
+  ;; CHECK-NEXT:      (i32.const 33)
+  ;; CHECK-NEXT:      (i32.const 44)
+  ;; CHECK-NEXT:      (select
+  ;; CHECK-NEXT:       (i32.const 99)
+  ;; CHECK-NEXT:       (i32.const 55)
+  ;; CHECK-NEXT:       (i32.eq
+  ;; CHECK-NEXT:        (local.get $idx)
+  ;; CHECK-NEXT:        (i32.const 2)
+  ;; CHECK-NEXT:       )
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (local.get $tmp)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $spec_helper (param $idx i32) (result (ref $sub))
+    (local $tmp (ref $sub))
+    (block $cached (result (ref $sub))
+      (br_on_non_null $cached
+        (array.get $mut_sub_arr (global.get $pal_spec) (local.get $idx))
+      )
+      (array.set $mut_sub_arr
+        (global.get $pal_spec)
+        (local.get $idx)
+        (local.tee $tmp
+          (struct.new $sub (i32.const 11) (i32.const 22) (i32.const 33) (i32.const 44) (i32.const 55))
+        )
+      )
+      (local.get $tmp)
+    )
+  )
+
+  ;; CHECK:      (func $use_all (type $9) (param $i i32) (result (ref null $sub))
+  ;; CHECK-NEXT:  (if
+  ;; CHECK-NEXT:   (ref.is_null
+  ;; CHECK-NEXT:    (global.get $u8_tbl)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:   (then
+  ;; CHECK-NEXT:    (global.set $u8_tbl
+  ;; CHECK-NEXT:     (array.new_data $u8_arr $prev_seg
+  ;; CHECK-NEXT:      (i32.const 0)
+  ;; CHECK-NEXT:      (i32.const 7)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$row
+  ;; CHECK-NEXT:    (i32.const 0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$row
+  ;; CHECK-NEXT:    (i32.const 1)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$row
+  ;; CHECK-NEXT:    (i32.const 2)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$row
+  ;; CHECK-NEXT:    (i32.const 3)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$row
+  ;; CHECK-NEXT:    (i32.const 4)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$row
+  ;; CHECK-NEXT:    (i32.const 5)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$row
+  ;; CHECK-NEXT:    (i32.const 6)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$row
+  ;; CHECK-NEXT:    (i32.const 7)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$row
+  ;; CHECK-NEXT:    (i32.const 8)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$row
+  ;; CHECK-NEXT:    (i32.const 9)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$row
+  ;; CHECK-NEXT:    (i32.const 10)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$row
+  ;; CHECK-NEXT:    (i32.const 11)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$row
+  ;; CHECK-NEXT:    (i32.const 12)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $defer$row
+  ;; CHECK-NEXT:    (i32.const 13)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $sh2)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $sh3)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $sh4)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $sh5)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $u6)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $u7)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $u8)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $u9)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (global.get $sub_hot)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (call $spec_helper
+  ;; CHECK-NEXT:    (local.get $i)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (call $defer$pal$null0$sub
+  ;; CHECK-NEXT:   (global.get $pal_null0)
+  ;; CHECK-NEXT:   (array.get_u $u8_arr
+  ;; CHECK-NEXT:    (global.get $u8_tbl)
+  ;; CHECK-NEXT:    (local.get $i)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $use_all (export "use_all") (param $i i32) (result (ref null $sub))
+    (if (ref.is_null (global.get $u8_tbl))
+      (then
+        (global.set $u8_tbl (array.new_data $u8_arr $prev_seg (i32.const 0) (i32.const 7)))
+      )
+    )
+    (drop (global.get $r0))
+    (drop (global.get $r1))
+    (drop (global.get $r2))
+    (drop (global.get $r3))
+    (drop (global.get $r4))
+    (drop (global.get $r5))
+    (drop (global.get $r6))
+    (drop (global.get $r7))
+    (drop (global.get $r8))
+    (drop (global.get $r9))
+    (drop (global.get $r10))
+    (drop (global.get $r11))
+    (drop (global.get $r12))
+    (drop (global.get $r13))
+    (drop (global.get $sh2))
+    (drop (global.get $sh3))
+    (drop (global.get $sh4))
+    (drop (global.get $sh5))
+    (drop (global.get $u6))
+    (drop (global.get $u7))
+    (drop (global.get $u8))
+    (drop (global.get $u9))
+    (drop (global.get $sub_hot))
+    (drop (call $spec_helper (local.get $i)))
+    (array.get $mut_sub_arr
+      (global.get $pal_null0)
+      (array.get_u $u8_arr (global.get $u8_tbl) (local.get $i))
+    )
+  )
+)
+;; CHECK:      (func $defer$row (type $10) (param $0 i32) (result (ref $row))
+;; CHECK-NEXT:  (local $1 (ref $row))
+;; CHECK-NEXT:  (block $cached (result (ref $row))
+;; CHECK-NEXT:   (br_on_non_null $cached
+;; CHECK-NEXT:    (array.get $5
+;; CHECK-NEXT:     (global.get $defer$row$cache)
+;; CHECK-NEXT:     (local.get $0)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (if
+;; CHECK-NEXT:    (ref.is_null
+;; CHECK-NEXT:     (global.get $defer$row$table$w1)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:    (then
+;; CHECK-NEXT:     (global.set $defer$row$table$w1
+;; CHECK-NEXT:      (array.new_data $u8_arr $defer$data
+;; CHECK-NEXT:       (i32.const 0)
+;; CHECK-NEXT:       (i32.const 42)
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (array.set $5
+;; CHECK-NEXT:    (global.get $defer$row$cache)
+;; CHECK-NEXT:    (local.get $0)
+;; CHECK-NEXT:    (local.tee $1
+;; CHECK-NEXT:     (struct.new $row
+;; CHECK-NEXT:      (array.get_u $u8_arr
+;; CHECK-NEXT:       (global.get $defer$row$table$w1)
+;; CHECK-NEXT:       (local.get $0)
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:      (array.get $6
+;; CHECK-NEXT:       (global.get $defer$row$palette$2)
+;; CHECK-NEXT:       (array.get_u $u8_arr
+;; CHECK-NEXT:        (global.get $defer$row$table$w1)
+;; CHECK-NEXT:        (i32.add
+;; CHECK-NEXT:         (local.get $0)
+;; CHECK-NEXT:         (i32.const 14)
+;; CHECK-NEXT:        )
+;; CHECK-NEXT:       )
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:      (array.get $6
+;; CHECK-NEXT:       (global.get $defer$row$palette$2)
+;; CHECK-NEXT:       (array.get_u $u8_arr
+;; CHECK-NEXT:        (global.get $defer$row$table$w1)
+;; CHECK-NEXT:        (i32.add
+;; CHECK-NEXT:         (local.get $0)
+;; CHECK-NEXT:         (i32.const 28)
+;; CHECK-NEXT:        )
+;; CHECK-NEXT:       )
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:      (i32.const 200)
+;; CHECK-NEXT:      (i32.const 300)
+;; CHECK-NEXT:      (i32.const 400)
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (local.get $1)
+;; CHECK-NEXT:  )
+;; CHECK-NEXT: )
+
+;; CHECK:      (func $defer$pal$null0$sub (type $11) (param $0 (ref $mut_sub_arr)) (param $1 i32) (result (ref null $sub))
+;; CHECK-NEXT:  (local $2 (ref null $sub))
+;; CHECK-NEXT:  (block $cached (result (ref null $sub))
+;; CHECK-NEXT:   (br_on_non_null $cached
+;; CHECK-NEXT:    (array.get $mut_sub_arr
+;; CHECK-NEXT:     (local.get $0)
+;; CHECK-NEXT:     (local.get $1)
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (if
+;; CHECK-NEXT:    (local.get $1)
+;; CHECK-NEXT:    (then
+;; CHECK-NEXT:     (array.set $mut_sub_arr
+;; CHECK-NEXT:      (local.get $0)
+;; CHECK-NEXT:      (local.get $1)
+;; CHECK-NEXT:      (local.tee $2
+;; CHECK-NEXT:       (struct.new $sub
+;; CHECK-NEXT:        (i32.const 11)
+;; CHECK-NEXT:        (i32.const 22)
+;; CHECK-NEXT:        (i32.const 33)
+;; CHECK-NEXT:        (i32.const 44)
+;; CHECK-NEXT:        (i32.const 55)
+;; CHECK-NEXT:       )
+;; CHECK-NEXT:      )
+;; CHECK-NEXT:     )
+;; CHECK-NEXT:    )
+;; CHECK-NEXT:   )
+;; CHECK-NEXT:   (local.get $2)
+;; CHECK-NEXT:  )
+;; CHECK-NEXT: )

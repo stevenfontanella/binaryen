@@ -169,6 +169,7 @@ struct DeferGlobalAllocations : public Pass {
   std::unordered_map<Name, std::vector<PaletteSlice>> paletteSlices;
   std::unordered_set<Name> hoistedGlobalNames;
   Index numHoisted = 0;
+  std::vector<HeapType> moduleArrayTypes;
   bool includeAllocationOperands = false;
   bool preserveThunkTypes = false;
   bool onceOnly = false;
@@ -180,6 +181,44 @@ struct DeferGlobalAllocations : public Pass {
   Name segmentName;
   std::vector<char> segmentData;
 
+  void refreshModuleArrayTypes() {
+    moduleArrayTypes.clear();
+    auto allTypes = ModuleUtils::collectHeapTypes(*module);
+    std::unordered_set<HeapType> hasSubtypes;
+    for (auto ht : allTypes) {
+      if (auto super = ht.getDeclaredSuperType()) {
+        hasSubtypes.insert(*super);
+      }
+    }
+    for (auto ht : allTypes) {
+      if (ht.isArray() && !ht.isShared() && !ht.getDescriptorType() &&
+          !ht.getDescribedType() && !ht.getDeclaredSuperType() &&
+          !hasSubtypes.count(ht)) {
+        moduleArrayTypes.push_back(ht);
+      }
+    }
+  }
+
+  HeapType getOrCreateArrayType(Field wantField) {
+    std::optional<HeapType> openMatch;
+    for (auto ht : moduleArrayTypes) {
+      if (ht.getArray().element == wantField) {
+        if (!ht.isOpen()) {
+          return ht;
+        }
+        if (!openMatch) {
+          openMatch = ht;
+        }
+      }
+    }
+    if (openMatch) {
+      return *openMatch;
+    }
+    HeapType created{Array(wantField)};
+    moduleArrayTypes.push_back(created);
+    return created;
+  }
+
   void run(Module* module_) override {
     module = module_;
     if (!module->features.hasGC()) {
@@ -189,6 +228,7 @@ struct DeferGlobalAllocations : public Pass {
     paletteSlices.clear();
     hoistedGlobalNames.clear();
     numHoisted = 0;
+    refreshModuleArrayTypes();
     includeAllocationOperands =
       !getArgumentOrDefault("defer-global-allocations-allocation-operands", "")
          .empty();
@@ -1462,31 +1502,31 @@ private:
     return int64_t(raw);
   }
 
-  static void classifyI32Range(int64_t minVal,
-                               int64_t maxVal,
-                               Index& width,
-                               bool& signed_,
-                               HeapType& arrType) {
+  void classifyI32Range(int64_t minVal,
+                        int64_t maxVal,
+                        Index& width,
+                        bool& signed_,
+                        HeapType& arrType) {
     if (minVal >= 0 && maxVal <= 255) {
       width = 1;
       signed_ = false;
-      arrType = HeapTypes::getMutI8Array();
+      arrType = getOrCreateArrayType(Field(Field::i8, Mutable));
     } else if (minVal >= -128 && maxVal <= 127) {
       width = 1;
       signed_ = true;
-      arrType = HeapTypes::getMutI8Array();
+      arrType = getOrCreateArrayType(Field(Field::i8, Mutable));
     } else if (minVal >= 0 && maxVal <= 65535) {
       width = 2;
       signed_ = false;
-      arrType = HeapTypes::getMutI16Array();
+      arrType = getOrCreateArrayType(Field(Field::i16, Mutable));
     } else if (minVal >= -32768 && maxVal <= 32767) {
       width = 2;
       signed_ = true;
-      arrType = HeapTypes::getMutI16Array();
+      arrType = getOrCreateArrayType(Field(Field::i16, Mutable));
     } else {
       width = 4;
       signed_ = false;
-      arrType = HeapType(Array(Field(Type::i32, Mutable)));
+      arrType = getOrCreateArrayType(Field(Type::i32, Mutable));
     }
   }
 
@@ -1523,6 +1563,101 @@ private:
       nonSoleCount++;
     }
     return nonSoleCount > 0 ? (D - mergedCount) : D;
+  }
+
+  Index getPooledPaletteSharedCount(
+    Type elemType,
+    Index colIdx,
+    const std::vector<Expression*>& distinct,
+    const std::vector<Index>& varying,
+    const std::vector<Field>& leafFields,
+    const std::vector<Candidate*>& members,
+    Index w1Extra) {
+    Index N = members.size();
+    std::vector<Expression*> pool;
+    auto addToPool = [&](Expression* val) -> bool {
+      for (auto* ex : pool) {
+        if (sameRefLeaf(ex, val)) {
+          return true;
+        }
+      }
+      if (pool.size() == 256) {
+        return false;
+      }
+      pool.push_back(val);
+      return true;
+    };
+    for (auto& [palName, _] : paletteSlices) {
+      auto* palG = module->getGlobalOrNull(palName);
+      if (!palG || palG->imported() || palG->mutable_ || !palG->init ||
+          !palG->type.isRef() || !palG->type.getHeapType().isArray()) {
+        continue;
+      }
+      Field elemF = palG->type.getHeapType().getArray().element;
+      if (elemF.isPacked() || elemF.mutable_ != Immutable ||
+          elemF.type != elemType) {
+        continue;
+      }
+      auto* anf = palG->init->dynCast<ArrayNewFixed>();
+      if (!anf) {
+        continue;
+      }
+      for (auto* val : anf->values) {
+        if (!addToPool(val)) {
+          return 0;
+        }
+      }
+    }
+    for (Index j : varying) {
+      if (j == colIdx || !isPaletteCandidate(leafFields[j]) ||
+          leafFields[j].type != elemType) {
+        continue;
+      }
+      std::vector<Expression*> jDistinct;
+      bool jOk = true;
+      for (Index k = 0; k < N; k++) {
+        auto* leaf = members[k]->leaves[j];
+        Index idx = 0;
+        while (idx < jDistinct.size() && !sameRefLeaf(jDistinct[idx], leaf)) {
+          idx++;
+        }
+        if (idx == jDistinct.size()) {
+          if (jDistinct.size() == 256) {
+            jOk = false;
+            break;
+          }
+          jDistinct.push_back(leaf);
+        }
+      }
+      if (!jOk) {
+        continue;
+      }
+      Index jEffD = getEffectivePaletteCount(jDistinct);
+      if (9 + 3 * jEffD + N + w1Extra < 9 + 3 * N) {
+        for (auto* val : jDistinct) {
+          if (!addToPool(val)) {
+            return 0;
+          }
+        }
+      }
+    }
+    if (pool.empty()) {
+      return 0;
+    }
+    Index sharedD = 0;
+    for (auto* val : distinct) {
+      for (auto* ex : pool) {
+        if (sameRefLeaf(ex, val)) {
+          sharedD++;
+          break;
+        }
+      }
+    }
+    Index newD = distinct.size() - sharedD;
+    if (pool.size() + newD > 256) {
+      return 0;
+    }
+    return sharedD;
   }
 
   ColumnCosts computeColumnCosts(const Group& group,
@@ -1757,7 +1892,17 @@ private:
         Index D = distinct.size();
         Index effD = ok ? getEffectivePaletteCount(distinct) : D;
         Index w1Extra = hasW1Col ? 8 : 25;
-        if (ok && 9 + 3 * effD + N + w1Extra < 9 + 3 * N) {
+        Index sharedD = 0;
+        bool palOk = ok && (9 + 3 * effD + N + w1Extra < 9 + 3 * N);
+        if (!palOk && ok) {
+          sharedD = getPooledPaletteSharedCount(
+            field.type, i, distinct, varying, leafFields, members, w1Extra);
+          if (sharedD > 0) {
+            Index newEffD = effD > sharedD ? effD - sharedD : 0;
+            palOk = (3 * newEffD + N + w1Extra < 9 + 3 * N);
+          }
+        }
+        if (palOk) {
           for (auto* m : members) {
             costs.memberTableBytes[m] += 1;
           }
@@ -1770,10 +1915,16 @@ private:
             distinctBytes =
               distinctBytes > savedPal ? distinctBytes - savedPal : 0;
           }
+          if (sharedD > 0) {
+            Index savedShared = 3 * sharedD;
+            distinctBytes =
+              distinctBytes > savedShared ? distinctBytes - savedShared : 0;
+          }
           Index uncompressedTableCost =
             9 + getLEBSize(U32LEB(N)) + elemBytesSum + 6;
-          Index w1PaletteCost =
-            9 + getLEBSize(U32LEB(effD)) + distinctBytes + N + w1Extra;
+          Index palHeader = sharedD > 0 ? 0 : 9;
+          Index w1PaletteCost = palHeader + getLEBSize(U32LEB(effD)) +
+                                distinctBytes + N + w1Extra;
           Index selectCodeCost = Index(-1);
           if (D >= 2 && D <= 5 && D < N && D == effD &&
               tryPlanSelectChain(distinct,
@@ -1788,7 +1939,7 @@ private:
             paletteOverhead += (selectCodeCost > N ? selectCodeCost - N : 0);
             continue;
           }
-          Index palBytes = 9 + distinctBytes;
+          Index palBytes = palHeader + distinctBytes;
           paletteOverhead += palBytes + 6;
           dataWidthCols[1]++;
           hasW1Col = true;
@@ -2244,7 +2395,8 @@ private:
           builder.makeRefNull(resultType.getHeapType()),
           Builder::Mutable));
       } else {
-        HeapType cacheType(Array(Field(cacheElementType, Mutable)));
+        HeapType cacheType =
+          getOrCreateArrayType(Field(cacheElementType, Mutable));
         cacheGlobalType = Type(cacheType, NonNullable);
         module->addGlobal(builder.makeGlobal(
           cacheName,
@@ -2489,10 +2641,9 @@ private:
         continue;
       }
       uniqueVarying.push_back(i);
-      HeapType tableType(Array(Field(field.type, Immutable)));
-      if (field.isPacked()) {
-        tableType = HeapType(Array(Field(field.packedType, Immutable)));
-      }
+      HeapType tableType = getOrCreateArrayType(
+        field.isPacked() ? Field(field.packedType, Immutable)
+                         : Field(field.type, Immutable));
       if (canUseData && N >= 7 && field.type == Type::i32 &&
           std::all_of(members.begin(), members.end(), [&](Candidate* m) {
             return m->leaves[i]->is<Const>();
@@ -2652,9 +2803,25 @@ private:
         Index uncompressedTableCost =
           9 + getLEBSize(U32LEB(N)) + elemBytesSum + 6;
         Index w1Extra = willHaveW1Col ? 8 : 25;
+        Index sharedD = 0;
+        bool palOk = canUseData && ok && (9 + 3 * effD + N + w1Extra < 9 + 3 * N);
+        if (!palOk && canUseData && ok) {
+          sharedD = getPooledPaletteSharedCount(
+            field.type, i, distinct, varying, leafFields, members, w1Extra);
+          if (sharedD > 0) {
+            Index newEffD = effD > sharedD ? effD - sharedD : 0;
+            palOk = (3 * newEffD + N + w1Extra < 9 + 3 * N);
+          }
+        }
+        if (sharedD > 0) {
+          Index savedShared = 3 * sharedD;
+          distinctBytes =
+            distinctBytes > savedShared ? distinctBytes - savedShared : 0;
+        }
+        Index palHeader = sharedD > 0 ? 0 : 9;
         Index w1PaletteCost =
           (canUseData && ok)
-            ? (9 + getLEBSize(U32LEB(effD)) + distinctBytes + N + w1Extra)
+            ? (palHeader + getLEBSize(U32LEB(effD)) + distinctBytes + N + w1Extra)
             : Index(-1);
         Expression* selectExpr = nullptr;
         Index selectCodeCost = Index(-1);
@@ -2678,7 +2845,7 @@ private:
                         selectExpr};
           continue;
         }
-        if (canUseData && ok && 9 + 3 * effD + N + w1Extra < 9 + 3 * N) {
+        if (palOk) {
           willHaveW1Col = true;
           std::vector<Expression*> palValues;
           palValues.reserve(D);
@@ -2696,7 +2863,7 @@ private:
           for (uint8_t idx : indices) {
             colBytes.push_back(char(idx));
           }
-          auto idxArrType = HeapTypes::getMutI8Array();
+          auto idxArrType = getOrCreateArrayType(Field(Field::i8, Mutable));
           pendingDataCols.push_back({i, 1, idxArrType, std::move(colBytes)});
           columns[i] = {Name(),
                         Type(idxArrType, Nullable),
@@ -2747,7 +2914,9 @@ private:
         continue;
       }
       HeapType arrType =
-        !groupCols.empty() ? groupCols[0]->arrType : HeapTypes::getMutI8Array();
+        !groupCols.empty()
+          ? groupCols[0]->arrType
+          : getOrCreateArrayType(Field(Field::i8, Mutable));
       std::string suffix =
         (groupCols.size() == 1 && !packSecHere)
           ? std::to_string(groupCols[0]->leafIndex)
@@ -3728,6 +3897,7 @@ private:
       Name elemGlobalName;
       StructNew* sn;
       Name existingHelper;
+      bool hasNullSlot0 = false;
     };
     InsertOrderedMap<HeapType, std::vector<SoleSlot>> byStructType;
     std::unordered_map<HeapType, std::vector<std::pair<Name, StructNew*>>>
@@ -3759,46 +3929,57 @@ private:
       HeapType structHt = elemField.type.getHeapType();
       Name existingHelper;
       StructNew* existingTempl = nullptr;
-      if (elemField.mutable_ == Immutable) {
+      bool hasNullSlot0 = false;
+      if (elemField.mutable_ == Immutable ||
+          (allPalCallTargets[g->name].empty() &&
+           totalGets == arrayGetSites[g->name].size())) {
         if (totalGets != arrayGetSites[g->name].size()) {
           continue;
         }
-        bool allNonNullGlobalGets = true;
+        bool allValidElems = true;
         HeapType commonElemHt;
         bool hasCommonElemHt = false;
-        for (auto* val : anf->values) {
-          auto* gg = val->dynCast<GlobalGet>();
-          if (!gg) {
-            allNonNullGlobalGets = false;
+        for (Index k = 0; k < anf->values.size(); k++) {
+          auto* val = anf->values[k];
+          if (k == 0 && val->is<RefNull>() && elemField.type.isNullable()) {
+            hasNullSlot0 = true;
+            continue;
+          }
+          HeapType eHt;
+          if (auto* gg = val->dynCast<GlobalGet>()) {
+            auto* eg = module->getGlobalOrNull(gg->name);
+            if (!eg || !eg->type.isRef() || eg->type.isNullable()) {
+              allValidElems = false;
+              break;
+            }
+            eHt = eg->type.getHeapType();
+          } else if (auto* sn = val->dynCast<StructNew>()) {
+            if (sn->desc || !sn->type.isRef() || sn->type.isNullable()) {
+              allValidElems = false;
+              break;
+            }
+            eHt = sn->type.getHeapType();
+          } else {
+            allValidElems = false;
             break;
           }
-          auto* eg = module->getGlobalOrNull(gg->name);
-          if (!eg || !eg->type.isRef() || eg->type.isNullable()) {
-            allNonNullGlobalGets = false;
-            break;
-          }
-          HeapType eHt = eg->type.getHeapType();
           if (!eHt.isStruct() || eHt.isShared()) {
-            allNonNullGlobalGets = false;
+            allValidElems = false;
             break;
           }
           if (!hasCommonElemHt) {
             commonElemHt = eHt;
             hasCommonElemHt = true;
           } else if (commonElemHt != eHt) {
-            allNonNullGlobalGets = false;
+            allValidElems = false;
             break;
           }
         }
-        if (!allNonNullGlobalGets || !hasCommonElemHt) {
+        if (!allValidElems || !hasCommonElemHt) {
           continue;
         }
-        if (structHt.isStruct()) {
-          if (structHt.isShared() || commonElemHt != structHt) {
-            continue;
-          }
-        } else if (Type::isSubType(Type(commonElemHt, NonNullable),
-                                   elemField.type)) {
+        if (!commonElemHt.isShared() &&
+            Type::isSubType(Type(commonElemHt, NonNullable), elemField.type)) {
           structHt = commonElemHt;
         } else {
           continue;
@@ -3904,7 +4085,8 @@ private:
         }
         bool validVals = true;
         for (auto* val : anf->values) {
-          if (!val->is<GlobalGet>() && !val->is<RefNull>()) {
+          if (!val->is<GlobalGet>() && !val->is<RefNull>() &&
+              !val->is<StructNew>()) {
             validVals = false;
             break;
           }
@@ -3918,21 +4100,25 @@ private:
         continue;
       }
       for (Index k = 0; k < anf->values.size(); k++) {
-        auto* gg = anf->values[k]->dynCast<GlobalGet>();
-        if (!gg) {
+        Name ename;
+        StructNew* sn = nullptr;
+        if (auto* gg = anf->values[k]->dynCast<GlobalGet>()) {
+          ename = gg->name;
+          if (initGlobalUses[ename] == 0 || codeGlobalGets[ename] != 0 ||
+              nonCodeUses.count(ename)) {
+            continue;
+          }
+          auto* eg = module->getGlobalOrNull(ename);
+          if (!eg || eg->imported() || eg->mutable_ ||
+              eg->type != Type(structHt, NonNullable)) {
+            continue;
+          }
+          sn = eg->init->dynCast<StructNew>();
+        } else if (auto* inlineSn = anf->values[k]->dynCast<StructNew>()) {
+          sn = inlineSn;
+        } else {
           continue;
         }
-        Name ename = gg->name;
-        if (initGlobalUses[ename] == 0 || codeGlobalGets[ename] != 0 ||
-            nonCodeUses.count(ename)) {
-          continue;
-        }
-        auto* eg = module->getGlobalOrNull(ename);
-        if (!eg || eg->imported() || eg->mutable_ ||
-            eg->type != Type(structHt, NonNullable)) {
-          continue;
-        }
-        auto* sn = eg->init->dynCast<StructNew>();
         if (!sn || sn->desc || !sn->type.isRef() ||
             sn->type.getHeapType() != structHt ||
             sn->operands.size() != structHt.getStruct().fields.size() ||
@@ -3951,7 +4137,7 @@ private:
         }
         if (validOps) {
           byStructType[structHt].push_back(
-            {g.get(), anf, k, ename, sn, existingHelper});
+            {g.get(), anf, k, ename, sn, existingHelper, hasNullSlot0});
         }
       }
     }
@@ -3960,6 +4146,7 @@ private:
     std::unordered_set<Function*> refinalizeFuncs;
     std::vector<Name> globalsToRemove;
     std::unordered_set<Name> globalsToRemoveSet;
+    std::unordered_set<Name> null0PaletteGlobals;
 
     for (auto& [structHt, slots] : byStructType) {
       // Group slots by identical StructNew initializers for structHt, keeping
@@ -3968,7 +4155,16 @@ private:
       for (auto& slot : slots) {
         bool placed = false;
         for (auto& grp : rawGroups) {
-          if (ExpressionAnalyzer::equal(grp[0].sn, slot.sn)) {
+          if (grp[0].hasNullSlot0 == slot.hasNullSlot0 &&
+              (!slot.hasNullSlot0 ||
+               grp[0]
+                   .arrGlobal->type.getHeapType()
+                   .getArray()
+                   .element.type.with(Nullable) ==
+                 slot.arrGlobal->type.getHeapType()
+                   .getArray()
+                   .element.type.with(Nullable)) &&
+              ExpressionAnalyzer::equal(grp[0].sn, slot.sn)) {
             grp.push_back(slot);
             placed = true;
             break;
@@ -3982,12 +4178,15 @@ private:
       for (auto& grp : rawGroups) {
         std::unordered_map<Name, Index> grpElemUses;
         for (auto& slot : grp) {
-          grpElemUses[slot.elemGlobalName]++;
+          if (slot.elemGlobalName.is()) {
+            grpElemUses[slot.elemGlobalName]++;
+          }
         }
         std::vector<SoleSlot> validGrp;
         for (auto& slot : grp) {
-          if (grpElemUses[slot.elemGlobalName] ==
-              initGlobalUses[slot.elemGlobalName]) {
+          if (!slot.elemGlobalName.is() ||
+              grpElemUses[slot.elemGlobalName] ==
+                initGlobalUses[slot.elemGlobalName]) {
             validGrp.push_back(slot);
           }
         }
@@ -4017,20 +4216,26 @@ private:
           continue;
         }
         StructNew* templ = bestGroup[0].sn;
+        bool groupHasNullSlot0 = bestGroup[0].hasNullSlot0;
 
         // Ensure no operand of templ references any global being removed.
         std::unordered_set<Name> removingSet;
+        Index inlineSlotCount = 0;
         bool hasNewArray = false;
         Name reusedHelper;
         for (auto& slot : bestGroup) {
-          removingSet.insert(slot.elemGlobalName);
+          if (slot.elemGlobalName.is()) {
+            removingSet.insert(slot.elemGlobalName);
+          } else {
+            inlineSlotCount++;
+          }
           if (slot.existingHelper.is()) {
             reusedHelper = slot.existingHelper;
           } else {
             hasNewArray = true;
           }
         }
-        if (!reusedHelper.is()) {
+        if (!reusedHelper.is() && !groupHasNullSlot0) {
           auto exIt = existingPalHelpers.find(structHt);
           if (exIt != existingPalHelpers.end()) {
             for (auto& [hName, hTempl] : exIt->second) {
@@ -4041,9 +4246,14 @@ private:
             }
           }
         }
+        Index templOpBytes = getOperandBytes(templ);
+        Index inlineSlotSavings =
+          inlineSlotCount * (templOpBytes > 2 ? templOpBytes - 2 : 0);
         Index totalSavings =
-          removingSet.size() * getGlobalEntryBytes(templ) + bestGroup.size();
-        Index helperCost = reusedHelper.is() ? 0 : 45;
+          removingSet.size() * getGlobalEntryBytes(templ) +
+          (bestGroup.size() - inlineSlotCount) + inlineSlotSavings;
+        Index helperCost =
+          reusedHelper.is() ? 0 : (groupHasNullSlot0 ? 49 : 45);
         if (!always && totalSavings <= helperCost) {
           continue;
         }
@@ -4063,8 +4273,18 @@ private:
 
         Type nonNullStructType(structHt, NonNullable);
         Type nullStructType(structHt, Nullable);
-        HeapType mutArrHt(Array(Field(nullStructType, Mutable)));
-        if (reusedHelper.is()) {
+        HeapType mutArrHt =
+          getOrCreateArrayType(Field(nullStructType, Mutable));
+        if (groupHasNullSlot0) {
+          HeapType origArrHt = bestGroup[0].arrGlobal->type.getHeapType();
+          Field origElemF = origArrHt.getArray().element;
+          if (origElemF.mutable_ == Mutable && origElemF.type.isNullable()) {
+            mutArrHt = origArrHt;
+          } else {
+            mutArrHt = getOrCreateArrayType(
+              Field(origElemF.type.with(Nullable), Mutable));
+          }
+        } else if (reusedHelper.is()) {
           mutArrHt =
             module->getFunction(reusedHelper)->getParams()[0].getHeapType();
         }
@@ -4080,32 +4300,65 @@ private:
             typeName = std::to_string(numFactories);
           }
           numFactories++;
-          helperName =
-            Names::getValidFunctionName(*module, "defer$pal$" + typeName);
-          Name label("cached");
-          auto* cacheGet =
-            builder.makeArrayGet(builder.makeLocalGet(0, mutArrRefType),
-                                 builder.makeLocalGet(1, Type::i32),
-                                 MemoryOrder::Unordered,
-                                 nullStructType);
-          auto* brOn = builder.makeBrOn(BrOnNonNull, label, cacheGet);
-          auto* tee = builder.makeLocalTee(
-            2, ExpressionManipulator::copy(templ, *module), nonNullStructType);
-          auto* cacheSet =
-            builder.makeArraySet(builder.makeLocalGet(0, mutArrRefType),
-                                 builder.makeLocalGet(1, Type::i32),
-                                 tee,
-                                 MemoryOrder::Unordered);
-          auto* body = builder.makeBlock(
-            label,
-            {brOn, cacheSet, builder.makeLocalGet(2, nonNullStructType)},
-            nonNullStructType);
-          module->addFunction(builder.makeFunction(
-            helperName,
-            Signature({mutArrRefType, Type::i32}, nonNullStructType),
-            {nonNullStructType},
-            body));
-          existingPalHelpers[structHt].push_back({helperName, templ});
+          if (groupHasNullSlot0) {
+            helperName = Names::getValidFunctionName(
+              *module, "defer$pal$null0$" + typeName);
+            Type helperResType = mutArrHt.getArray().element.type;
+            Name label("cached");
+            auto* cacheGet =
+              builder.makeArrayGet(builder.makeLocalGet(0, mutArrRefType),
+                                   builder.makeLocalGet(1, Type::i32),
+                                   MemoryOrder::Unordered,
+                                   helperResType);
+            auto* brOn = builder.makeBrOn(BrOnNonNull, label, cacheGet);
+            auto* tee = builder.makeLocalTee(
+              2,
+              ExpressionManipulator::copy(templ, *module),
+              helperResType);
+            auto* cacheSet =
+              builder.makeArraySet(builder.makeLocalGet(0, mutArrRefType),
+                                   builder.makeLocalGet(1, Type::i32),
+                                   tee,
+                                   MemoryOrder::Unordered);
+            auto* condSet =
+              builder.makeIf(builder.makeLocalGet(1, Type::i32), cacheSet);
+            auto* body = builder.makeBlock(
+              label,
+              {brOn, condSet, builder.makeLocalGet(2, helperResType)},
+              helperResType);
+            module->addFunction(builder.makeFunction(
+              helperName,
+              Signature({mutArrRefType, Type::i32}, helperResType),
+              {helperResType},
+              body));
+          } else {
+            helperName =
+              Names::getValidFunctionName(*module, "defer$pal$" + typeName);
+            Name label("cached");
+            auto* cacheGet =
+              builder.makeArrayGet(builder.makeLocalGet(0, mutArrRefType),
+                                   builder.makeLocalGet(1, Type::i32),
+                                   MemoryOrder::Unordered,
+                                   nullStructType);
+            auto* brOn = builder.makeBrOn(BrOnNonNull, label, cacheGet);
+            auto* tee = builder.makeLocalTee(
+              2, ExpressionManipulator::copy(templ, *module), nonNullStructType);
+            auto* cacheSet =
+              builder.makeArraySet(builder.makeLocalGet(0, mutArrRefType),
+                                   builder.makeLocalGet(1, Type::i32),
+                                   tee,
+                                   MemoryOrder::Unordered);
+            auto* body = builder.makeBlock(
+              label,
+              {brOn, cacheSet, builder.makeLocalGet(2, nonNullStructType)},
+              nonNullStructType);
+            module->addFunction(builder.makeFunction(
+              helperName,
+              Signature({mutArrRefType, Type::i32}, nonNullStructType),
+              {nonNullStructType},
+              body));
+            existingPalHelpers[structHt].push_back({helperName, templ});
+          }
         }
 
         std::unordered_set<Global*> touchedNewArrays;
@@ -4115,7 +4368,8 @@ private:
           if (!slot.existingHelper.is()) {
             touchedNewArrays.insert(slot.arrGlobal);
           }
-          if (globalsToRemoveSet.insert(slot.elemGlobalName).second) {
+          if (slot.elemGlobalName.is() &&
+              globalsToRemoveSet.insert(slot.elemGlobalName).second) {
             globalsToRemove.push_back(slot.elemGlobalName);
           }
         }
@@ -4127,17 +4381,23 @@ private:
           Type helperRes = module->getFunction(helperName)->getResults();
           for (auto& [fn, site] : arrayGetSites[arrG->name]) {
             auto* ag = (*site)->cast<ArrayGet>();
+            Type origAgType = ag->type;
             ag->ref->cast<GlobalGet>()->type = mutArrRefType;
             Call* rawCall =
               builder.makeCall(helperName, {ag->ref, ag->index}, helperRes);
-            allPalCalls[arrG->name].push_back({fn, rawCall});
             Expression* call = rawCall;
-            if (helperRes.isNullable()) {
+            if (helperRes.isNullable() && origAgType.isNonNullable()) {
               call = builder.makeRefAs(RefAsNonNull, call);
+            } else {
+              allPalCalls[arrG->name].push_back({fn, rawCall});
             }
             *site = call;
             refinalizeFuncs.insert(fn);
           }
+          if (groupHasNullSlot0) {
+            null0PaletteGlobals.insert(arrG->name);
+          }
+          arrayGetSites[arrG->name].clear();
         }
       }
     }
@@ -4420,8 +4680,7 @@ private:
           continue;
         }
       } else if (palCalls.empty() &&
-                 arrayGetSites[g->name].size() == totalGets &&
-                 !g->type.getHeapType().getArray().element.mutable_) {
+                 arrayGetSites[g->name].size() == totalGets) {
         bool validRefs = true;
         for (auto& [fn, site] : arrayGetSites[g->name]) {
           auto* ag = (*site)->cast<ArrayGet>();
@@ -4637,11 +4896,12 @@ private:
 
     // Step A: Compact each palette individually first.
     for (auto& vp : verifiedPalettes) {
+      bool isNull0Pal = null0PaletteGlobals.count(vp.global->name);
       std::vector<Expression*> compacted;
       std::vector<uint8_t> remap(vp.anf->values.size());
       for (Index oldIdx = 0; oldIdx < vp.anf->values.size(); oldIdx++) {
         Expression* val = vp.anf->values[oldIdx];
-        Index newIdx = 0;
+        Index newIdx = (isNull0Pal && oldIdx > 0 && !compacted.empty()) ? 1 : 0;
         while (newIdx < compacted.size() &&
                !sameRefLeaf(compacted[newIdx], val)) {
           newIdx++;
@@ -4673,8 +4933,8 @@ private:
     std::vector<Index> totalSliceLen(verifiedPalettes.size(), 0);
     for (Index i = 0; i < verifiedPalettes.size(); i++) {
       auto& vp = verifiedPalettes[i];
-      if (vp.helperTarget.is() && !vp.slices.empty() &&
-          vp.slices[0].isCurrentSegment) {
+      if (vp.helperTarget.is() && !null0PaletteGlobals.count(vp.global->name) &&
+          !vp.slices.empty() && vp.slices[0].isCurrentSegment) {
         continue;
       }
       Index lenSum = 0;
@@ -4685,7 +4945,11 @@ private:
       poolOrder.push_back(i);
     }
     std::stable_sort(poolOrder.begin(), poolOrder.end(), [&](Index a, Index b) {
-      return totalSliceLen[a] > totalSliceLen[b];
+      if (totalSliceLen[a] != totalSliceLen[b]) {
+        return totalSliceLen[a] > totalSliceLen[b];
+      }
+      return verifiedPalettes[a].anf->values.size() <
+             verifiedPalettes[b].anf->values.size();
     });
 
     struct CanonPalette {
@@ -4697,6 +4961,7 @@ private:
     std::vector<Name> palGlobalsToRemove;
     for (Index idx : poolOrder) {
       auto& vp = verifiedPalettes[idx];
+      bool isNull0Pal = null0PaletteGlobals.count(vp.global->name);
       CanonPalette* matchedCp = nullptr;
       std::vector<Expression*> trialCompacted;
       std::vector<uint8_t> remap(vp.anf->values.size());
@@ -4710,13 +4975,23 @@ private:
         Index sharedBytes = 0;
         for (Index oldIdx = 0; oldIdx < vp.anf->values.size(); oldIdx++) {
           Expression* val = vp.anf->values[oldIdx];
-          Index newIdx = 0;
+          Index newIdx =
+            (isNull0Pal && oldIdx > 0 && !trialCompacted.empty()) ? 1 : 0;
           while (newIdx < trialCompacted.size() &&
                  !sameRefLeaf(trialCompacted[newIdx], val)) {
             newIdx++;
           }
           if (newIdx < cp.compacted.size()) {
             sharedBytes += getOperandBytes(val);
+            if (auto* gg = val->dynCast<GlobalGet>()) {
+              if (codeGlobalGets[gg->name] == 0 && !nonCodeUses.count(gg->name)) {
+                auto* eg = module->getGlobalOrNull(gg->name);
+                if (eg && !eg->imported() && !eg->mutable_ && eg->init &&
+                    eg->init->is<StructNew>()) {
+                  sharedBytes += 8;
+                }
+              }
+            }
           }
           if (newIdx == trialCompacted.size()) {
             if (trialCompacted.size() == 256) {
@@ -4892,6 +5167,223 @@ private:
     }
     for (Name gname : palGlobalsToRemove) {
       module->removeGlobal(gname);
+    }
+
+    // Fold 1-param DAE-specialized defer$pal$ array.new_fixed globals whose
+    // non-null slots are all identical StructNew expressions into the helper's
+    // template StructNew and convert the array to array.new_default.
+    std::vector<Name> specElemGlobalsToRemove;
+    for (auto& g : module->globals) {
+      if (g->imported() || g->mutable_ || !g->init ||
+          nonCodeUses.count(g->name) || initGlobalUses[g->name] > 0) {
+        continue;
+      }
+      auto* anf = g->init->dynCast<ArrayNewFixed>();
+      if (!anf || anf->values.size() < 2 || !g->type.isRef() ||
+          g->type.isNullable() || !g->type.getHeapType().isArray()) {
+        continue;
+      }
+      HeapType arrHt = g->type.getHeapType();
+      Field elemField = arrHt.getArray().element;
+      if (elemField.mutable_ != Mutable || !elemField.type.isRef() ||
+          !elemField.type.isNullable() ||
+          !elemField.type.getHeapType().isStruct()) {
+        continue;
+      }
+      HeapType structHt = elemField.type.getHeapType();
+      if (codeGlobalGets[g->name] != 2 || arrayGetSites[g->name].size() != 1) {
+        continue;
+      }
+      Function* helperFn = arrayGetSites[g->name][0].first;
+      if (!helperFn || helperFn->imported() || !helperFn->body ||
+          helperFn->getNumParams() != 1 ||
+          helperFn->getParams()[0] != Type::i32 ||
+          !helperFn->getResults().isRef() ||
+          helperFn->getResults().getHeapType() != structHt ||
+          FindAll<BrOn>(helperFn->body).list.size() != 1 ||
+          FindAll<ArrayGet>(helperFn->body).list.size() != 1 ||
+          FindAll<ArraySet>(helperFn->body).list.size() != 1) {
+        continue;
+      }
+      auto* aset = FindAll<ArraySet>(helperFn->body).list[0];
+      auto* setGg = aset->ref->dynCast<GlobalGet>();
+      auto* setLg = aset->index->dynCast<LocalGet>();
+      auto* tee = aset->value->dynCast<LocalSet>();
+      if (!setGg || setGg->name != g->name || !setLg || setLg->index != 0 ||
+          !tee || !tee->isTee()) {
+        continue;
+      }
+      auto* existingTempl = tee->value->dynCast<StructNew>();
+      if (!existingTempl || existingTempl->desc ||
+          existingTempl->isWithDefault() || !existingTempl->type.isRef() ||
+          existingTempl->type.getHeapType() != structHt ||
+          existingTempl->operands.size() !=
+            structHt.getStruct().fields.size()) {
+        continue;
+      }
+      auto isValidTemplOp = [&](Expression* op) -> bool {
+        if (isValidLeaf(op)) {
+          return true;
+        }
+        if (auto* subSn = op->dynCast<StructNew>()) {
+          if (subSn->desc || !subSn->type.isRef() ||
+              (preserveThunkTypes && hasImmutableSigRefFunc(subSn))) {
+            return false;
+          }
+          for (auto* subOp : subSn->operands) {
+            if (!isValidLeaf(subOp)) {
+              return false;
+            }
+          }
+          return true;
+        }
+        return false;
+      };
+      bool existingOpsOk = true;
+      for (auto* op : existingTempl->operands) {
+        if (!isValidTemplOp(op)) {
+          existingOpsOk = false;
+          break;
+        }
+      }
+      if (!existingOpsOk) {
+        continue;
+      }
+      std::vector<Index> nonNullIndices;
+      std::vector<Index> nullIndices;
+      StructNew* slotTempl = nullptr;
+      std::unordered_map<Name, Index> slotElemGlobalCounts;
+      bool slotsOk = true;
+      Index anfElemBytes = 0;
+      for (Index k = 0; k < anf->values.size(); k++) {
+        Expression* val = anf->values[k];
+        anfElemBytes += getOperandBytes(val);
+        if (val->is<RefNull>()) {
+          nullIndices.push_back(k);
+          continue;
+        }
+        StructNew* sn = nullptr;
+        if (auto* gg = val->dynCast<GlobalGet>()) {
+          if (codeGlobalGets[gg->name] != 0 || nonCodeUses.count(gg->name)) {
+            slotsOk = false;
+            break;
+          }
+          auto* eg = module->getGlobalOrNull(gg->name);
+          if (!eg || eg->imported() || eg->mutable_ || !eg->init) {
+            slotsOk = false;
+            break;
+          }
+          sn = eg->init->dynCast<StructNew>();
+          slotElemGlobalCounts[gg->name]++;
+        } else if (auto* inlineSn = val->dynCast<StructNew>()) {
+          sn = inlineSn;
+        }
+        if (!sn || sn->desc || sn->isWithDefault() || !sn->type.isRef() ||
+            sn->type.getHeapType() != structHt ||
+            sn->operands.size() != existingTempl->operands.size() ||
+            (preserveThunkTypes && hasImmutableSigRefFunc(sn))) {
+          slotsOk = false;
+          break;
+        }
+        for (auto* op : sn->operands) {
+          if (!isValidTemplOp(op)) {
+            slotsOk = false;
+            break;
+          }
+        }
+        if (!slotsOk) {
+          break;
+        }
+        if (!slotTempl) {
+          slotTempl = sn;
+        } else if (!ExpressionAnalyzer::equal(slotTempl, sn)) {
+          slotsOk = false;
+          break;
+        }
+        nonNullIndices.push_back(k);
+      }
+      if (!slotsOk || !slotTempl || nonNullIndices.empty() ||
+          nullIndices.empty()) {
+        continue;
+      }
+      Index removedGlobalBytes = 0;
+      std::vector<Name> localRemovable;
+      for (auto& [ename, cnt] : slotElemGlobalCounts) {
+        if (cnt != initGlobalUses[ename]) {
+          slotsOk = false;
+          break;
+        }
+        removedGlobalBytes += getGlobalEntryBytes(slotTempl);
+        localRemovable.push_back(ename);
+      }
+      if (!slotsOk) {
+        continue;
+      }
+      Index defaultIdx = 0;
+      std::vector<std::pair<Index, SelectArmPlan>> steps;
+      if (!planSelectChainSteps({existingTempl, slotTempl},
+                                {nullIndices, nonNullIndices},
+                                anf->values.size(),
+                                defaultIdx,
+                                steps) ||
+          steps.size() != 1) {
+        continue;
+      }
+      const SelectArmPlan& armPlan = steps[0].second;
+      bool trueIsSlot = (steps[0].first == 1);
+      const auto& fields = structHt.getStruct().fields;
+      Index addedHelperBytes = 0;
+      for (Index fi = 0; fi < existingTempl->operands.size(); fi++) {
+        Expression* slotOp = slotTempl->operands[fi];
+        Expression* baseOp = existingTempl->operands[fi];
+        if (ExpressionAnalyzer::equal(slotOp, baseOp)) {
+          continue;
+        }
+        Index condBytes = 2 + armPlan.condExtra;
+        if (slotOp->is<StructNew>() || baseOp->is<StructNew>()) {
+          addedHelperBytes += condBytes + getOperandBytes(slotOp) + 5;
+        } else {
+          addedHelperBytes += condBytes + getOperandBytes(slotOp) +
+                              (fields[fi].type.isRef() ? 4 : 1);
+        }
+      }
+      Index savedAnfBytes =
+        (5 + anfElemBytes + removedGlobalBytes) > 6
+          ? (5 + anfElemBytes + removedGlobalBytes - 6)
+          : 0;
+      if (!always && addedHelperBytes >= savedAnfBytes) {
+        continue;
+      }
+      for (Index fi = 0; fi < existingTempl->operands.size(); fi++) {
+        Expression* slotOp = slotTempl->operands[fi];
+        Expression* baseOp = existingTempl->operands[fi];
+        if (ExpressionAnalyzer::equal(slotOp, baseOp)) {
+          continue;
+        }
+        Expression* idxExpr = builder.makeLocalGet(0, Type::i32);
+        Expression* cond = buildSelectCond(builder, armPlan, idxExpr);
+        Expression* trueExpr = ExpressionManipulator::copy(
+          trueIsSlot ? slotOp : baseOp, *module);
+        Expression* falseExpr = ExpressionManipulator::copy(
+          trueIsSlot ? baseOp : slotOp, *module);
+        if (slotOp->is<StructNew>() || baseOp->is<StructNew>()) {
+          existingTempl->operands[fi] =
+            builder.makeIf(cond, trueExpr, falseExpr, fields[fi].type);
+        } else {
+          existingTempl->operands[fi] =
+            builder.makeSelect(cond, trueExpr, falseExpr);
+        }
+      }
+      ReFinalize().walkFunctionInModule(helperFn, module);
+      for (Index k : nonNullIndices) {
+        anf->values[k] = builder.makeRefNull(HeapTypes::none);
+      }
+      for (Name ename : localRemovable) {
+        specElemGlobalsToRemove.push_back(ename);
+      }
+    }
+    for (Name ename : specElemGlobalsToRemove) {
+      module->removeGlobal(ename);
     }
 
     // Convert any array.new_fixed global initializer whose elements are all
@@ -9621,7 +10113,7 @@ private:
             segmentData.push_back(char(idx));
           }
           paletteSlices[g->name].push_back({startOffset, N});
-          auto i8ArrType = HeapTypes::getMutI8Array();
+          auto i8ArrType = getOrCreateArrayType(Field(Field::i8, Mutable));
           for (auto& [fn, site] : sites) {
             auto* ag = (*site)->cast<ArrayGet>();
             auto* slice =
@@ -10179,6 +10671,15 @@ private:
 
     Builder builder(*module);
     std::unordered_map<HeapType, std::vector<Global*>> hoistedByType;
+    for (auto& g : module->globals) {
+      if (!g->imported() && !g->mutable_ && g->init) {
+        if (auto* sn = g->init->dynCast<StructNew>()) {
+          if (!sn->desc && sn->type.isRef()) {
+            hoistedByType[sn->type.getHeapType()].push_back(g.get());
+          }
+        }
+      }
+    }
 
     auto getOrAddHoistedGlobalGet = [&](StructNew* subSn,
                                         const Field& parentField) -> GlobalGet* {
@@ -10463,12 +10964,9 @@ private:
   }
 
   void inlineInitOnlyStructGlobals() {
-    if (hoistedGlobalNames.empty()) {
-      return;
-    }
     std::unordered_set<Function*> refinalizeFuncs;
     bool changed = true;
-    while (changed && !hoistedGlobalNames.empty()) {
+    while (changed) {
       changed = false;
       std::unordered_set<Name> otherNonCodeUses;
       std::unordered_map<Name, std::vector<Expression**>> initUseSites;
@@ -10537,11 +11035,10 @@ private:
                 }
               }
               if (auto* gg = curr->dynCast<GlobalGet>()) {
-                if (hoistedGlobalNames.count(gg->name)) {
-                  info.counts[gg->name]++;
-                  if (inCachedMiss && !inLoopOrTry) {
-                    info.cachedBlockSites[gg->name].push_back(exprp);
-                  }
+                info.counts[gg->name]++;
+                if (inCachedMiss && !inLoopOrTry &&
+                    hoistedGlobalNames.count(gg->name)) {
+                  info.cachedBlockSites[gg->name].push_back(exprp);
                 }
                 return;
               }
@@ -10576,14 +11073,29 @@ private:
       std::unordered_set<Name> mutatedTargetGlobals;
 
       for (auto& g : module->globals) {
-        if (!hoistedGlobalNames.count(g->name) || g->imported() ||
-            g->mutable_ || otherNonCodeUses.count(g->name) ||
+        if (g->imported() || g->mutable_ || otherNonCodeUses.count(g->name) ||
             mutatedTargetGlobals.count(g->name)) {
           continue;
         }
+        bool isHoisted = hoistedGlobalNames.count(g->name);
         auto* sn = g->init->dynCast<StructNew>();
         if (!sn || sn->desc || !sn->type.isRef()) {
           continue;
+        }
+        if (!isHoisted) {
+          if (preserveThunkTypes && hasImmutableSigRefFunc(sn)) {
+            continue;
+          }
+          bool validOps = true;
+          for (auto* op : sn->operands) {
+            if (!isValidLeaf(op)) {
+              validOps = false;
+              break;
+            }
+          }
+          if (!validOps) {
+            continue;
+          }
         }
         bool dependsOnRemoving = false;
         for (auto* gg : FindAll<GlobalGet>(sn).list) {
@@ -10598,13 +11110,18 @@ private:
         Index cUses = codeUseCounts[g->name];
         auto& iSites = initUseSites[g->name];
         if (cUses == 0 && iSites.empty()) {
-          globalsToRemove.push_back(g->name);
-          removingSet.insert(g->name);
-          changed = true;
+          if (isHoisted) {
+            globalsToRemove.push_back(g->name);
+            removingSet.insert(g->name);
+            changed = true;
+          }
           continue;
         }
         if (cUses == 0 && !iSites.empty()) {
           Index m = iSites.size();
+          if (!isHoisted && m != 1) {
+            continue;
+          }
           Index snBytes = getOperandBytes(sn);
           Index entryBytes = getGlobalEntryBytes(sn);
           Index getBytes = 1 + getLEBSize(U32LEB(globalIndexes[g->name]));
@@ -10621,7 +11138,7 @@ private:
           }
           continue;
         }
-        if (iSites.empty() && cUses == 1) {
+        if (isHoisted && iSites.empty() && cUses == 1) {
           auto& cSites = cachedFactorySites[g->name];
           if (cSites.size() == 1) {
             auto [fn, sitePtr] = cSites[0];
